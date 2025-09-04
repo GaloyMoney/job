@@ -12,4 +12,3 @@ impl IncludeMigrations for sqlx::migrate::Migrator {
         self
     }
 }
-

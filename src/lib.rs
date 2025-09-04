@@ -1,18 +1,18 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 
-mod migrate;
 mod config;
 mod current;
 mod dispatcher;
 mod entity;
 mod handle;
+mod migrate;
 mod poller;
 mod registry;
 mod repo;
+mod runner;
 mod time;
 mod tracker;
-mod runner;
 
 pub mod error;
 
@@ -22,10 +22,10 @@ use tracing::{Span, instrument};
 
 use std::sync::{Arc, Mutex};
 
-pub use migrate::*;
 pub use config::*;
 pub use current::*;
 pub use entity::*;
+pub use migrate::*;
 pub use registry::*;
 pub use runner::*;
 

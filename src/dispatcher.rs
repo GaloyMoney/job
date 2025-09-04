@@ -8,8 +8,8 @@ use tracing::{Span, instrument};
 use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use super::{
-    JobId, current::CurrentJob, error::JobError, handle::OwnedTaskHandle, repo::JobRepo,
-    tracker::JobTracker, runner::*,
+    JobId, current::CurrentJob, error::JobError, handle::OwnedTaskHandle, repo::JobRepo, runner::*,
+    tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -104,6 +104,10 @@ impl JobDispatcher {
                 span.record("conclusion", "CompleteWithOp");
                 self.complete_job(op, job.id).await?;
             }
+            Ok(JobCompletion::CompleteWithTx(tx)) => {
+                span.record("conclusion", "CompleteWithTx");
+                self.complete_job(tx, job.id).await?;
+            }
             Ok(JobCompletion::RescheduleNow) => {
                 span.record("conclusion", "RescheduleNow");
                 let op = self.repo.begin_op().await?;
@@ -114,6 +118,11 @@ impl JobDispatcher {
                 span.record("conclusion", "RescheduleNowWithOp");
                 let t = op.now().unwrap_or_else(crate::time::now);
                 self.reschedule_job(op, job.id, t).await?;
+            }
+            Ok(JobCompletion::RescheduleNowWithTx(tx)) => {
+                span.record("conclusion", "RescheduleNowWithTx");
+                let t = crate::time::now();
+                self.reschedule_job(tx, job.id, t).await?;
             }
             Ok(JobCompletion::RescheduleIn(d)) => {
                 span.record("conclusion", "RescheduleIn");
@@ -128,14 +137,23 @@ impl JobDispatcher {
                 let t = t + d;
                 self.reschedule_job(op, job.id, t).await?;
             }
+            Ok(JobCompletion::RescheduleInWithTx(d, tx)) => {
+                span.record("conclusion", "RescheduleInWithOp");
+                let t = crate::time::now() + d;
+                self.reschedule_job(tx, job.id, t).await?;
+            }
             Ok(JobCompletion::RescheduleAt(t)) => {
                 span.record("conclusion", "RescheduleAt");
                 let op = self.repo.begin_op().await?;
                 self.reschedule_job(op, job.id, t).await?;
             }
-            Ok(JobCompletion::RescheduleAtWithOp(op, t)) => {
+            Ok(JobCompletion::RescheduleAtWithOp(t, op)) => {
                 span.record("conclusion", "RescheduleAtWithOp");
                 self.reschedule_job(op, job.id, t).await?;
+            }
+            Ok(JobCompletion::RescheduleAtWithTx(t, tx)) => {
+                span.record("conclusion", "RescheduleAtWithTx");
+                self.reschedule_job(tx, job.id, t).await?;
             }
         }
         Ok(())
@@ -244,9 +262,10 @@ impl JobDispatcher {
 
     async fn complete_job(
         &mut self,
-        mut op: es_entity::DbOp<'_>,
+        op: impl Into<sqlx::Transaction<'_, sqlx::Postgres>>,
         id: JobId,
     ) -> Result<(), JobError> {
+        let mut tx = op.into();
         let mut job = self.repo.find_by_id(&id).await?;
         self.stop_keep_alive().await;
         sqlx::query!(
@@ -256,20 +275,21 @@ impl JobDispatcher {
         "#,
             id as JobId
         )
-        .execute(op.as_executor())
+        .execute(&mut *tx)
         .await?;
         job.job_completed();
-        self.repo.update_in_op(&mut op, &mut job).await?;
-        op.commit().await?;
+        self.repo.update_in_op(&mut tx, &mut job).await?;
+        tx.commit().await?;
         Ok(())
     }
 
     async fn reschedule_job(
         &mut self,
-        mut op: es_entity::DbOp<'_>,
+        op: impl Into<sqlx::Transaction<'_, sqlx::Postgres>>,
         id: JobId,
         reschedule_at: DateTime<Utc>,
     ) -> Result<(), JobError> {
+        let mut tx = op.into();
         self.rescheduled = true;
         let mut job = self.repo.find_by_id(&id).await?;
         self.stop_keep_alive().await;
@@ -282,11 +302,11 @@ impl JobDispatcher {
             id as JobId,
             reschedule_at,
         )
-        .execute(op.as_executor())
+        .execute(&mut *tx)
         .await?;
         job.execution_rescheduled(reschedule_at);
-        self.repo.update_in_op(&mut op, &mut job).await?;
-        op.commit().await?;
+        self.repo.update_in_op(&mut tx, &mut job).await?;
+        tx.commit().await?;
         Ok(())
     }
 
