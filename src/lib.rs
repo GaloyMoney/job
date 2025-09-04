@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 
+mod migrate;
 mod config;
 mod current;
 mod dispatcher;
@@ -21,6 +22,7 @@ use tracing::{Span, instrument};
 
 use std::sync::{Arc, Mutex};
 
+pub use migrate::*;
 pub use config::*;
 pub use current::*;
 pub use entity::*;
@@ -51,6 +53,21 @@ impl Jobs {
             registry,
             poller_handle: None,
         }
+    }
+
+    pub async fn start_poll(&mut self) -> Result<(), JobError> {
+        let registry = self
+            .registry
+            .lock()
+            .expect("Couldn't lock Registry Mutex")
+            .take()
+            .expect("Registry has been consumed by executor");
+        self.poller_handle = Some(Arc::new(
+            JobPoller::new(self.config.clone(), self.repo.clone(), registry)
+                .start()
+                .await?,
+        ));
+        Ok(())
     }
 
     pub fn add_initializer<I: JobInitializer>(&self, initializer: I) {
@@ -153,21 +170,6 @@ impl Jobs {
     #[instrument(name = "job.find", skip(self))]
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
         self.repo.find_by_id(id).await
-    }
-
-    pub async fn start_poll(&mut self) -> Result<(), JobError> {
-        let registry = self
-            .registry
-            .lock()
-            .expect("Couldn't lock Registry Mutex")
-            .take()
-            .expect("Registry has been consumed by executor");
-        self.poller_handle = Some(Arc::new(
-            JobPoller::new(self.config.clone(), self.repo.clone(), registry)
-                .start()
-                .await?,
-        ));
-        Ok(())
     }
 
     async fn insert_execution<I: JobInitializer>(
