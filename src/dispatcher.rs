@@ -9,7 +9,7 @@ use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use super::{
     JobId, current::CurrentJob, error::JobError, handle::OwnedTaskHandle, repo::JobRepo,
-    tracker::JobTracker, traits::*,
+    tracker::JobTracker, runner::*,
 };
 
 #[derive(Debug)]

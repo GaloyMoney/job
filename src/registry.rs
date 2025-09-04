@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{entity::*, error::JobError, traits::*};
+use super::{entity::*, error::JobError, runner::*};
 
 pub struct JobRegistry {
     initializers: HashMap<JobType, Box<dyn JobInitializer>>,

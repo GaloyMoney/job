@@ -12,7 +12,7 @@ mod registry;
 mod repo;
 mod time;
 mod tracker;
-mod traits;
+mod runner;
 
 pub mod error;
 
@@ -27,7 +27,7 @@ pub use config::*;
 pub use current::*;
 pub use entity::*;
 pub use registry::*;
-pub use traits::*;
+pub use runner::*;
 
 use error::*;
 use poller::*;
