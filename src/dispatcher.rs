@@ -56,7 +56,7 @@ impl JobDispatcher {
     #[instrument(name = "job.execute_job", skip_all,
         fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now),
     err)]
-    #[es_entity::es_event_context]
+    #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_job(mut self, polled_job: PolledJob) -> Result<(), JobError> {
         let job = self.repo.find_by_id(polled_job.id).await?;
         let span = Span::current();
@@ -64,6 +64,7 @@ impl JobDispatcher {
         span.record("job_type", tracing::field::display(&job.job_type));
         span.record("attempt", polled_job.attempt);
         span.record("now", tracing::field::display(crate::time::now()));
+        #[cfg(feature = "es-entity")]
         {
             let mut ctx = es_entity::EventContext::current();
             ctx.insert(
@@ -100,6 +101,7 @@ impl JobDispatcher {
                 let op = self.repo.begin_op().await?;
                 self.complete_job(op, job.id).await?;
             }
+            #[cfg(feature = "es-entity")]
             Ok(JobCompletion::CompleteWithOp(op)) => {
                 span.record("conclusion", "CompleteWithOp");
                 self.complete_job(op, job.id).await?;
@@ -114,6 +116,7 @@ impl JobDispatcher {
                 let t = op.now().unwrap_or_else(crate::time::now);
                 self.reschedule_job(op, job.id, t).await?;
             }
+            #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleNowWithOp(op)) => {
                 span.record("conclusion", "RescheduleNowWithOp");
                 let t = op.now().unwrap_or_else(crate::time::now);
@@ -131,6 +134,7 @@ impl JobDispatcher {
                 let t = t + d;
                 self.reschedule_job(op, job.id, t).await?;
             }
+            #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleInWithOp(d, op)) => {
                 span.record("conclusion", "RescheduleInWithOp");
                 let t = op.now().unwrap_or_else(crate::time::now);
@@ -147,6 +151,7 @@ impl JobDispatcher {
                 let op = self.repo.begin_op().await?;
                 self.reschedule_job(op, job.id, t).await?;
             }
+            #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleAtWithOp(t, op)) => {
                 span.record("conclusion", "RescheduleAtWithOp");
                 self.reschedule_job(op, job.id, t).await?;

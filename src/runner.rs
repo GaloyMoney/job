@@ -27,18 +27,22 @@ pub trait JobConfig: serde::Serialize {
 
 pub enum JobCompletion {
     Complete,
+    #[cfg(feature = "es-entity")]
     CompleteWithOp(es_entity::DbOp<'static>),
     CompleteWithTx(sqlx::Transaction<'static, sqlx::Postgres>),
     RescheduleNow,
+    #[cfg(feature = "es-entity")]
     RescheduleNowWithOp(es_entity::DbOp<'static>),
     RescheduleNowWithTx(sqlx::Transaction<'static, sqlx::Postgres>),
     RescheduleIn(std::time::Duration),
+    #[cfg(feature = "es-entity")]
     RescheduleInWithOp(std::time::Duration, es_entity::DbOp<'static>),
     RescheduleInWithTx(
         std::time::Duration,
         sqlx::Transaction<'static, sqlx::Postgres>,
     ),
     RescheduleAt(DateTime<Utc>),
+    #[cfg(feature = "es-entity")]
     RescheduleAtWithOp(DateTime<Utc>, es_entity::DbOp<'static>),
     RescheduleAtWithTx(DateTime<Utc>, sqlx::Transaction<'static, sqlx::Postgres>),
 }
