@@ -1,6 +1,6 @@
 #@data/values
 ---
-git_uri: git@github.com:GaloyMoney/es-entity.git
+git_uri: git@github.com:GaloyMoney/job.git
 git_branch: main
 github_private_key: ((github.private_key))
 github_token: ((github.api_token))
@@ -12,9 +12,9 @@ gar_registry_password: ((gar-creds.password))
 
 git_version_branch: version
 gh_org: GaloyMoney
-gh_repository: es-entity
+gh_repository: job
 
 crates_api_token: ((crates.token))
 
 cachix_auth_token: ((cachix-token.token))
-cachix_cache_name: es-entity-ci
+cachix_cache_name: job-ci
