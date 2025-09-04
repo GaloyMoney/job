@@ -15,22 +15,44 @@ json-schema = ["dep:schemars", "es-entity/json-schema"]
 
 [dependencies]
 es-entity = { workspace = true }
-sim-time = { workspace = true, optional = true }
 
+async-trait = { workspace = true }
 derive_builder = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
-async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
+
+sim-time = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+
+[workspace.dependencies]
+
+es-entity = "0.7.17"
+sim-time = "0.7"
+
+anyhow = "1.0.99"
+async-trait = "0.1.89"
+chrono = { version = "0.4.41", features = ["clock", "serde"], default-features = false }
+derive_builder = "0.20.1"
+tracing = { version = "0.1.41" }
+sqlx = { version = "0.8.6", default-features = false, features = ["macros", "runtime-tokio-rustls", "postgres", "uuid", "chrono", "json" ] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+serde_with = "3.14.0"
+thiserror = "2.0.12"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1.17", features = ["serde", "v7"] }
+futures = "0.3.29"
+rand = "0.9"
+schemars = { version = "1.0.4", features = ["derive", "chrono04", "rust_decimal1"] }

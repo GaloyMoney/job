@@ -38,9 +38,9 @@ mod tests {
     async fn unique_per_job_type() -> anyhow::Result<()> {
         let pool = init_pool().await?;
         let repo = JobRepo::new(&pool);
-        let type_a = JobType::from_owned(uuid::Uuid::new_v4().to_string());
-        let type_b = JobType::from_owned(uuid::Uuid::new_v4().to_string());
-        let type_c = JobType::from_owned(uuid::Uuid::new_v4().to_string());
+        let type_a = JobType::from_owned(uuid::Uuid::now_v7().to_string());
+        let type_b = JobType::from_owned(uuid::Uuid::now_v7().to_string());
+        let type_c = JobType::from_owned(uuid::Uuid::now_v7().to_string());
 
         let a_id = JobId::new();
         let new_job = NewJob::builder()
