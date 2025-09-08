@@ -37,7 +37,7 @@ impl CurrentJob {
         }
     }
 
-    pub async fn update_execution_state_in_tx<T: Serialize>(
+    pub async fn update_execution_state_in_op<T: Serialize>(
         &mut self,
         op: &mut impl es_entity::AtomicOperation,
         execution_state: &T,

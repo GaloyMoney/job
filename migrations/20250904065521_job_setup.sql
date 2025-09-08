@@ -1,5 +1,5 @@
 CREATE TABLE jobs (
-  id UUID NOT NULL UNIQUE,
+  id UUID PRIMARY KEY,
   unique_per_type BOOLEAN NOT NULL,
   job_type VARCHAR NOT NULL,
   created_at TIMESTAMPTZ NOT NULL
@@ -52,5 +52,5 @@ EXECUTE FUNCTION notify_job_execution_insert();
 
 CREATE TRIGGER job_executions_notify_update_trigger
 AFTER UPDATE ON job_executions
-FOR EACH ROW
+FOR EACH STATEMENT
 EXECUTE FUNCTION notify_job_execution_update();
