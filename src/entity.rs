@@ -31,7 +31,7 @@ impl std::fmt::Display for JobType {
 
 #[derive(EsEvent, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[es_event(id = "JobId")]
+#[es_event(id = "JobId", event_context = false)]
 pub enum JobEvent {
     Initialized {
         id: JobId,
