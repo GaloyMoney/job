@@ -46,7 +46,7 @@ impl From<sqlx::Error> for JobError {
             if constraint.contains("type") {
                 return Self::DuplicateUniqueJobType;
             }
-            if constraint.contains("id") {
+            if constraint.contains("jobs_pkey") {
                 return Self::DuplicateId;
             }
         }
