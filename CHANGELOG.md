@@ -1,3 +1,10 @@
+# [cala release v0.1.4](https://github.com/GaloyMoney/cala/releases/tag/0.1.4)
+
+
+### Testing
+
+- Add integration test
+
 # [cala release v0.1.3](https://github.com/GaloyMoney/cala/releases/tag/0.1.3)
 
 
