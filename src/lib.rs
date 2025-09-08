@@ -116,6 +116,22 @@ impl Jobs {
     }
 
     #[instrument(
+        name = "job.create_and_spawn",
+        skip(self, config),
+        fields(job_type, now)
+    )]
+    pub async fn create_and_spawn<C: JobConfig>(
+        &self,
+        job_id: impl Into<JobId> + std::fmt::Debug,
+        config: C,
+    ) -> Result<Job, JobError> {
+        let mut op = self.repo.begin_op().await?;
+        let job = self.create_and_spawn_in_op(&mut op, job_id, config).await?;
+        op.commit().await?;
+        Ok(job)
+    }
+
+    #[instrument(
         name = "job.create_and_spawn_in_op",
         skip(self, op, config),
         fields(job_type, now)

@@ -63,6 +63,13 @@ impl Job {
         serde_json::from_value(self.config.clone())
     }
 
+    pub fn completed(&self) -> bool {
+        self.events
+            .iter_all()
+            .rev()
+            .any(|event| matches!(event, JobEvent::JobCompleted))
+    }
+
     pub(super) fn execution_scheduled(&mut self, scheduled_at: DateTime<Utc>) {
         self.events.push(JobEvent::ExecutionScheduled {
             attempt: 1,
