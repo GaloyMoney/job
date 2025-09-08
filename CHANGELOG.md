@@ -1,3 +1,10 @@
+# [cala release v0.1.5](https://github.com/GaloyMoney/cala/releases/tag/0.1.5)
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity
+
 # [cala release v0.1.4](https://github.com/GaloyMoney/cala/releases/tag/0.1.4)
 
 
