@@ -13,7 +13,7 @@
 #@ )
 
 groups:
-- name: es-entity
+- name: job
   jobs:
   - check-code
   - tests
