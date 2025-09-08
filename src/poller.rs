@@ -211,7 +211,7 @@ async fn poll_jobs(pool: &PgPool, n_jobs_to_poll: usize) -> Result<JobPollResult
             AND execute_at > $2::timestamptz
         ),
         selected_jobs AS (
-            SELECT je.id, je.execution_state_json AS data_json, je.job_type, je.attempt_index
+            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index
             FROM job_executions je
             JOIN jobs ON je.id = jobs.id
             WHERE execute_at <= $2::timestamptz
@@ -225,12 +225,11 @@ async fn poll_jobs(pool: &PgPool, n_jobs_to_poll: usize) -> Result<JobPollResult
             SET state = 'running', alive_at = $2, execute_at = NULL
             FROM selected_jobs
             WHERE je.id = selected_jobs.id
-            RETURNING je.id, je.job_type, selected_jobs.data_json, je.attempt_index
+            RETURNING je.id, selected_jobs.data_json, je.attempt_index
         )
         SELECT * FROM (
             SELECT 
                 u.id AS "id?: JobId",
-                u.job_type AS "job_type?",
                 u.data_json AS "data_json?: JsonValue",
                 u.attempt_index AS "attempt_index?",
                 NULL::INTERVAL AS "max_wait?: PgInterval"
@@ -238,7 +237,6 @@ async fn poll_jobs(pool: &PgPool, n_jobs_to_poll: usize) -> Result<JobPollResult
             UNION ALL
             SELECT 
                 NULL::UUID AS "id?: JobId",
-                NULL::VARCHAR AS "job_type?",
                 NULL::JSONB AS "data_json?: JsonValue",
                 NULL::INT AS "attempt_index?",
                 mw.wait_time AS "max_wait?: PgInterval"
@@ -264,7 +262,6 @@ enum JobPollResult {
 #[derive(Debug)]
 struct JobPollRow {
     id: Option<JobId>,
-    job_type: Option<String>,
     data_json: Option<JsonValue>,
     attempt_index: Option<i32>,
     max_wait: Option<PgInterval>,
@@ -285,12 +282,9 @@ impl JobPollResult {
             let jobs = rows
                 .into_iter()
                 .filter_map(|row| {
-                    if let (Some(id), Some(job_type), Some(attempt_index)) =
-                        (row.id, row.job_type, row.attempt_index)
-                    {
+                    if let (Some(id), Some(attempt_index)) = (row.id, row.attempt_index) {
                         Some(PolledJob {
                             id,
-                            job_type,
                             data_json: row.data_json,
                             attempt: attempt_index as u32,
                         })

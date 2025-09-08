@@ -15,8 +15,6 @@ use super::{
 #[derive(Debug)]
 pub struct PolledJob {
     pub id: JobId,
-    #[allow(dead_code)]
-    pub job_type: String,
     pub data_json: Option<JsonValue>,
     pub attempt: u32,
 }
