@@ -17,7 +17,6 @@ mod tracker;
 pub mod error;
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
 use tracing::{Span, instrument};
 
 use std::sync::{Arc, Mutex};
@@ -37,22 +36,42 @@ es_entity::entity_id! { JobId }
 
 #[derive(Clone)]
 pub struct Jobs {
-    config: JobsConfig,
+    config: JobSvcConfig,
     repo: JobRepo,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     poller_handle: Option<Arc<JobPollerHandle>>,
 }
 
 impl Jobs {
-    pub fn new(pool: &PgPool, config: JobsConfig) -> Self {
-        let repo = JobRepo::new(pool);
+    pub async fn init(config: JobSvcConfig) -> Result<Self, JobError> {
+        let pool = match (config.pool.clone(), config.pg_con.clone()) {
+            (Some(pool), None) => pool,
+            (None, Some(pg_con)) => {
+                let mut pool_opts = sqlx::postgres::PgPoolOptions::new();
+                if let Some(max_connections) = config.max_connections {
+                    pool_opts = pool_opts.max_connections(max_connections);
+                }
+                pool_opts.connect(&pg_con).await.map_err(JobError::Sqlx)?
+            }
+            _ => {
+                return Err(JobError::Config(
+                    "One of pg_con or pool must be set".to_string(),
+                ));
+            }
+        };
+
+        if config.exec_migrations {
+            sqlx::migrate!().run(&pool).await?;
+        }
+
+        let repo = JobRepo::new(&pool);
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
-        Self {
+        Ok(Self {
             repo,
             config,
             registry,
             poller_handle: None,
-        }
+        })
     }
 
     pub async fn start_poll(&mut self) -> Result<(), JobError> {
@@ -63,9 +82,13 @@ impl Jobs {
             .take()
             .expect("Registry has been consumed by executor");
         self.poller_handle = Some(Arc::new(
-            JobPoller::new(self.config.clone(), self.repo.clone(), registry)
-                .start()
-                .await?,
+            JobPoller::new(
+                self.config.process_config.clone(),
+                self.repo.clone(),
+                registry,
+            )
+            .start()
+            .await?,
         ));
         Ok(())
     }

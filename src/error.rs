@@ -28,6 +28,10 @@ pub enum JobError {
     DuplicateId,
     #[error("JobError - DuplicateUniqueJobType")]
     DuplicateUniqueJobType,
+    #[error("JobError - Config: {0}")]
+    Config(String),
+    #[error("JobError - Migration: {0}")]
+    Migration(#[from] sqlx::migrate::MigrateError),
 }
 
 es_entity::from_es_entity_error!(JobError);

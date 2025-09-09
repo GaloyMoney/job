@@ -69,14 +69,19 @@ async fn main() -> anyhow::Result<()> {
     // Connect to database (requires PostgreSQL with migrations applied)
     let pool = sqlx::PgPool::connect("postgresql://user:pass@localhost/db").await?;
     
-    // Create job system
-    let config = JobsConfig::default();
-    let mut jobs = Jobs::new(&pool, config);
+    // Create Jobs service
+    let config = JobsSvcConfig::builder()
+        .pg_con("postgresql://user:pass@localhost/db")
+        // .pool(pool) // If you are using sqlx and already have a pool
+        .build()
+        .expect("Could not build JobSvcConfig");
+    let mut jobs = Jobs::init(config).await?;
     
     // Register job type
     jobs.add_initializer(MyJobInitializer);
     
     // Start job processing
+    // Must be called after all initializers have been added
     jobs.start_poll().await?;
     
     // Create and spawn a job

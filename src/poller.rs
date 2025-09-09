@@ -5,12 +5,12 @@ use tracing::{Span, instrument};
 use std::{sync::Arc, time::Duration};
 
 use super::{
-    JobId, config::JobsConfig, dispatcher::*, error::JobError, handle::OwnedTaskHandle,
+    JobId, config::JobPollerConfig, dispatcher::*, error::JobError, handle::OwnedTaskHandle,
     registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
 };
 
 pub(crate) struct JobPoller {
-    config: JobsConfig,
+    config: JobPollerConfig,
     repo: JobRepo,
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
@@ -25,7 +25,7 @@ pub(crate) struct JobPollerHandle {
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
 impl JobPoller {
-    pub fn new(config: JobsConfig, repo: JobRepo, registry: JobRegistry) -> Self {
+    pub fn new(config: JobPollerConfig, repo: JobRepo, registry: JobRegistry) -> Self {
         Self {
             tracker: Arc::new(JobTracker::new(
                 config.min_jobs_per_process,

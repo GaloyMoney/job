@@ -3,8 +3,8 @@ mod helpers;
 use async_trait::async_trait;
 
 use job::{
-    CurrentJob, Job, JobCompletion, JobConfig, JobId, JobInitializer, JobRunner, JobType, Jobs,
-    JobsConfig,
+    CurrentJob, Job, JobCompletion, JobConfig, JobId, JobInitializer, JobRunner, JobSvcConfig,
+    JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,9 +49,12 @@ impl JobRunner for TestJobRunner {
 #[tokio::test]
 async fn test_create_and_run_job() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
-    let config = JobsConfig::default();
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
 
-    let mut jobs = Jobs::new(&pool, config);
+    let mut jobs = Jobs::init(config).await?;
     jobs.add_initializer(TestJobInitializer);
     jobs.start_poll()
         .await
