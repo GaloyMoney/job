@@ -1,3 +1,10 @@
+# [cala release v0.1.8](https://github.com/GaloyMoney/cala/releases/tag/0.1.8)
+
+
+### Refactor
+
+- Rename process_config -> poller_config
+
 # [cala release v0.1.7](https://github.com/GaloyMoney/cala/releases/tag/0.1.7)
 
 
