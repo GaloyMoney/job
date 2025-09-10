@@ -84,7 +84,7 @@ impl Jobs {
             .expect("Registry has been consumed by executor");
         self.poller_handle = Some(Arc::new(
             JobPoller::new(
-                self.config.process_config.clone(),
+                self.config.poller_config.clone(),
                 self.repo.clone(),
                 registry,
             )

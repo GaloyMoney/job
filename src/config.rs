@@ -37,7 +37,7 @@ pub struct JobSvcConfig {
     #[builder(setter(into, strip_option), default)]
     pub(super) pool: Option<sqlx::PgPool>,
     #[builder(default)]
-    pub process_config: JobPollerConfig,
+    pub poller_config: JobPollerConfig,
 }
 
 impl JobSvcConfig {
@@ -67,7 +67,7 @@ impl JobSvcConfigBuilder {
             max_connections: self.max_connections.flatten(),
             exec_migrations: self.exec_migrations.unwrap_or(false),
             pool: self.pool.clone().flatten(),
-            process_config: self.process_config.clone().unwrap_or_default(),
+            poller_config: self.poller_config.clone().unwrap_or_default(),
         })
     }
 }
