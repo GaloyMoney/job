@@ -1,3 +1,14 @@
+# [cala release v0.1.6](https://github.com/GaloyMoney/cala/releases/tag/0.1.6)
+
+
+### Documentation
+
+- Update README
+
+### Refactor
+
+- Use builder to pass pool
+
 # [cala release v0.1.5](https://github.com/GaloyMoney/cala/releases/tag/0.1.5)
 
 
