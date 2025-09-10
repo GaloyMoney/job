@@ -1,12 +1,18 @@
 # Job
+[![Crates.io](https://img.shields.io/crates/v/job)](https://crates.io/crates/job)
+[![Documentation](https://docs.rs/job/badge.svg)](https://docs.rs/job)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Unsafe Rust forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-An async / distributed job runner for Rust applications.
+An async / distributed job runner for Rust applications with Postgres backend.
+
+Uses [sqlx](https://docs.rs/sqlx/latest/sqlx/) for interfacing with the DB.
 
 ## Features
 
 - Async job execution with PostgreSQL backend
-- Configurable retry logic with exponential backoff
 - Job scheduling and rescheduling
+- Configurable retry logic with exponential backoff
 - Built-in job tracking and monitoring
 
 ## Usage
@@ -72,7 +78,8 @@ async fn main() -> anyhow::Result<()> {
     // Create Jobs service
     let config = JobsSvcConfig::builder()
         .pg_con("postgresql://user:pass@localhost/db")
-        // .pool(pool) // If you are using sqlx and already have a pool
+        // If you are using sqlx and already have a pool
+        // .pool(sqlx::PgPool::connect("postgresql://user:pass@localhost/db")
         .build()
         .expect("Could not build JobSvcConfig");
     let mut jobs = Jobs::init(config).await?;
@@ -98,6 +105,36 @@ async fn main() -> anyhow::Result<()> {
     
     Ok(())
 }
+```
+
+### Setup
+
+In order to use the jobs crate migrations need to run on Postgres to initialize the tables.
+You can either let the library run them, copy them into your project or add them to your migrations via code.
+
+Option 1.
+Let the library run the migrations - this is useful when you are not using sqlx in the rest of your project.
+To avoid compilation errors set `export SQLX_OFFLINE=true` in your dev shell.
+```rust
+let config = JobsSvcConfig::builder()
+    .pool(sqlx::PgPool::connect("postgresql://user:pass@localhost/db")
+    // set to true by default when passing .pg_con("<con>") - false otherwise
+    .exec_migration(true)
+    .build()
+    .expect("Could not build JobSvcConfig");
+```
+
+Option 2.
+If you are using sqlx you can copy the migration file into your project:
+```
+cp ./migrations/20250904065521_job_setup.sql <path>/<to>/<your>/<project>/migrations/
+```
+
+Option 3.
+You can also add the job migrations in code when you run your own migrations without copying the file:
+```rust
+use job::IncludeMigrations;
+sqlx::migrate!().include_job_migrations().run(&pool).await?;
 ```
 
 ## License
