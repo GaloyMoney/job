@@ -1,3 +1,11 @@
+# [cala release v0.1.9](https://github.com/GaloyMoney/cala/releases/tag/0.1.9)
+
+
+### Miscellaneous Tasks
+
+- Bump sim-time
+- Bump es-entity
+
 # [cala release v0.1.8](https://github.com/GaloyMoney/cala/releases/tag/0.1.8)
 
 
