@@ -1,3 +1,10 @@
+# [cala release v0.1.11](https://github.com/GaloyMoney/cala/releases/tag/0.1.11)
+
+
+### Miscellaneous Tasks
+
+- Widen sqlx version requirements
+
 # [cala release v0.1.10](https://github.com/GaloyMoney/cala/releases/tag/0.1.10)
 
 
