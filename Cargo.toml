@@ -40,8 +40,8 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.8"
-sim-time = "0.8"
+es-entity = "0.9"
+sim-time = "0.9"
 
 anyhow = "1.0.99"
 async-trait = "0.1.89"
