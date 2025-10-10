@@ -220,14 +220,16 @@ impl JobPoller {
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = self.repo.clone();
         let tracker = self.tracker.clone();
+        let instance_id = self.instance_id;
         span.record("now", tracing::field::display(crate::time::now()));
 
         let job_handle = tokio::spawn(async move {
             let id = job.id;
             let attempt = polled_job.attempt;
-            if let Err(e) = JobDispatcher::new(repo, tracker, retry_settings, job.id, runner)
-                .execute_job(polled_job)
-                .await
+            if let Err(e) =
+                JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
+                    .execute_job(polled_job)
+                    .await
             {
                 eprintln!("JobDispatcher.execute_job {id} ({attempt}) returned error {e}")
             }

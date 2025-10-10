@@ -23,6 +23,7 @@ pub(crate) struct JobDispatcher {
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
     rescheduled: bool,
+    instance_id: uuid::Uuid,
 }
 impl JobDispatcher {
     pub fn new(
@@ -31,6 +32,7 @@ impl JobDispatcher {
         retry_settings: RetrySettings,
         _id: JobId,
         runner: Box<dyn JobRunner>,
+        instance_id: uuid::Uuid,
     ) -> Self {
         Self {
             repo,
@@ -38,6 +40,7 @@ impl JobDispatcher {
             runner: Some(runner),
             tracker,
             rescheduled: false,
+            instance_id,
         }
     }
 
@@ -225,11 +228,12 @@ impl JobDispatcher {
                 r#"
                 UPDATE job_executions
                 SET state = 'pending', execute_at = $2, attempt_index = $3, poller_instance_id = NULL
-                WHERE id = $1
+                WHERE id = $1 AND poller_instance_id = $4
               "#,
                 id as JobId,
                 reschedule_at,
-                next_attempt as i32
+                next_attempt as i32,
+                self.instance_id
             )
             .execute(op.as_executor())
             .await?;
@@ -238,9 +242,10 @@ impl JobDispatcher {
             sqlx::query!(
                 r#"
                 DELETE FROM job_executions
-                WHERE id = $1
+                WHERE id = $1 AND poller_instance_id = $2
               "#,
-                id as JobId
+                id as JobId,
+                self.instance_id
             )
             .execute(op.as_executor())
             .await?;
@@ -262,9 +267,10 @@ impl JobDispatcher {
         sqlx::query!(
             r#"
           DELETE FROM job_executions
-          WHERE id = $1
+          WHERE id = $1 AND poller_instance_id = $2
         "#,
-            id as JobId
+            id as JobId,
+            self.instance_id
         )
         .execute(&mut *tx)
         .await?;
@@ -287,10 +293,11 @@ impl JobDispatcher {
             r#"
           UPDATE job_executions
           SET state = 'pending', execute_at = $2, attempt_index = 1, poller_instance_id = NULL
-          WHERE id = $1
+          WHERE id = $1 AND poller_instance_id = $3
         "#,
             id as JobId,
             reschedule_at,
+            self.instance_id
         )
         .execute(&mut *tx)
         .await?;
