@@ -2,14 +2,12 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
 use tracing::{Span, instrument};
 
-use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use super::{
-    JobId, current::CurrentJob, error::JobError, handle::OwnedTaskHandle, repo::JobRepo, runner::*,
-    tracker::JobTracker,
+    JobId, current::CurrentJob, error::JobError, repo::JobRepo, runner::*, tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -24,7 +22,6 @@ pub(crate) struct JobDispatcher {
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
-    keep_alive: Option<OwnedTaskHandle>,
     rescheduled: bool,
 }
 impl JobDispatcher {
@@ -32,21 +29,14 @@ impl JobDispatcher {
         repo: JobRepo,
         tracker: Arc<JobTracker>,
         retry_settings: RetrySettings,
-        id: JobId,
+        _id: JobId,
         runner: Box<dyn JobRunner>,
-        job_lost_interval: Duration,
     ) -> Self {
-        let keep_alive = Some(OwnedTaskHandle::new(tokio::task::spawn(keep_job_alive(
-            repo.pool().clone(),
-            id,
-            job_lost_interval,
-        ))));
         Self {
             repo,
             retry_settings,
             runner: Some(runner),
             tracker,
-            keep_alive,
             rescheduled: false,
         }
     }
@@ -224,7 +214,6 @@ impl JobDispatcher {
 
     #[instrument(name = "job.fail_job", skip(self))]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
-        self.stop_keep_alive().await;
         let mut op = self.repo.begin_op().await?;
         let mut job = self.repo.find_by_id(id).await?;
         if self.retry_settings.n_attempts.unwrap_or(u32::MAX) > attempt {
@@ -270,7 +259,6 @@ impl JobDispatcher {
     ) -> Result<(), JobError> {
         let mut tx = op.into();
         let mut job = self.repo.find_by_id(&id).await?;
-        self.stop_keep_alive().await;
         sqlx::query!(
             r#"
           DELETE FROM job_executions
@@ -295,7 +283,6 @@ impl JobDispatcher {
         let mut tx = op.into();
         self.rescheduled = true;
         let mut job = self.repo.find_by_id(&id).await?;
-        self.stop_keep_alive().await;
         sqlx::query!(
             r#"
           UPDATE job_executions
@@ -312,42 +299,10 @@ impl JobDispatcher {
         tx.commit().await?;
         Ok(())
     }
-
-    async fn stop_keep_alive(&mut self) {
-        if let Some(keep_alive) = self.keep_alive.take() {
-            keep_alive.stop().await;
-        }
-    }
 }
 
 impl Drop for JobDispatcher {
     fn drop(&mut self) {
         self.tracker.job_completed(self.rescheduled)
-    }
-}
-
-async fn keep_job_alive(pool: PgPool, id: JobId, job_lost_interval: Duration) {
-    let mut failures = 0;
-    loop {
-        let now = crate::time::now();
-        let timeout = match sqlx::query!(
-            "UPDATE job_executions SET state = 'running', alive_at = $2 WHERE id = $1",
-            id as JobId,
-            now,
-        )
-        .execute(&pool)
-        .await
-        {
-            Ok(_) => {
-                failures = 0;
-                job_lost_interval / 4
-            }
-            Err(e) => {
-                failures += 1;
-                eprintln!("Keep alive job ({id}) errored: {e}");
-                Duration::from_millis(50 << failures)
-            }
-        };
-        crate::time::sleep(timeout).await;
     }
 }

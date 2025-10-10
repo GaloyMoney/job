@@ -7,12 +7,14 @@ impl OwnedTaskHandle {
         Self(Some(inner))
     }
 
+    #[allow(dead_code)]
     pub async fn stop(self) {
         let handle = self.into_inner();
         handle.abort();
         let _ = handle.await;
     }
 
+    #[allow(dead_code)]
     fn into_inner(mut self) -> JoinHandle<()> {
         self.0.take().expect("Only consumed once")
     }

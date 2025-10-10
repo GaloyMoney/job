@@ -42,11 +42,13 @@ impl JobPoller {
     pub async fn start(self) -> Result<JobPollerHandle, sqlx::Error> {
         let listener_handle = self.start_listener().await?;
         let lost_handle = self.start_lost_handler();
+        let keep_alive_handle = self.start_keep_alive_handler();
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(tokio::task::spawn(Self::main_loop(
             Arc::clone(&executor),
             listener_handle,
             lost_handle,
+            keep_alive_handle,
         )));
         Ok(JobPollerHandle {
             poller: executor,
@@ -58,6 +60,7 @@ impl JobPoller {
         self: Arc<Self>,
         _listener_task: OwnedTaskHandle,
         _lost_task: OwnedTaskHandle,
+        _keep_alive_task: OwnedTaskHandle,
     ) {
         let mut failures = 0;
         let mut woken_up = false;
@@ -160,6 +163,41 @@ impl JobPoller {
         }))
     }
 
+    fn start_keep_alive_handler(&self) -> OwnedTaskHandle {
+        let job_lost_interval = self.config.job_lost_interval;
+        let pool = self.repo.pool().clone();
+        let instance_id = self.instance_id;
+        OwnedTaskHandle::new(tokio::task::spawn(async move {
+            let mut failures = 0;
+            loop {
+                let now = crate::time::now();
+                let timeout = match sqlx::query!(
+                    r#"
+                    UPDATE job_executions
+                    SET alive_at = $1
+                    WHERE poller_instance_id = $2 AND state = 'running'
+                    "#,
+                    now,
+                    instance_id,
+                )
+                .execute(&pool)
+                .await
+                {
+                    Ok(_) => {
+                        failures = 0;
+                        job_lost_interval / 4
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("Keep alive for instance {instance_id} errored: {e}");
+                        Duration::from_millis(50 << failures)
+                    }
+                };
+                crate::time::sleep(timeout).await;
+            }
+        }))
+    }
+
     #[instrument(
         name = "job.dispatch_job",
         skip(self, polled_job),
@@ -176,21 +214,13 @@ impl JobPoller {
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = self.repo.clone();
         let tracker = self.tracker.clone();
-        let job_lost_interval = self.config.job_lost_interval;
         span.record("now", tracing::field::display(crate::time::now()));
         tokio::spawn(async move {
             let id = job.id;
             let attempt = polled_job.attempt;
-            if let Err(e) = JobDispatcher::new(
-                repo,
-                tracker,
-                retry_settings,
-                job.id,
-                runner,
-                job_lost_interval,
-            )
-            .execute_job(polled_job)
-            .await
+            if let Err(e) = JobDispatcher::new(repo, tracker, retry_settings, job.id, runner)
+                .execute_job(polled_job)
+                .await
             {
                 eprintln!("JobDispatcher.execute_job {id} ({attempt}) returned error {e}")
             }
