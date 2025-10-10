@@ -14,6 +14,7 @@ pub(crate) struct JobPoller {
     repo: JobRepo,
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
+    instance_id: uuid::Uuid,
 }
 
 #[allow(dead_code)]
@@ -34,6 +35,7 @@ impl JobPoller {
             repo,
             config,
             registry,
+            instance_id: uuid::Uuid::now_v7(),
         }
     }
 
@@ -91,7 +93,7 @@ impl JobPoller {
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         };
-        let rows = match poll_jobs(self.repo.pool(), n_jobs_to_poll).await? {
+        let rows = match poll_jobs(self.repo.pool(), n_jobs_to_poll, self.instance_id).await? {
             JobPollResult::WaitTillNextJob(duration) => {
                 span.record("next_poll_in", tracing::field::debug(duration));
                 span.record("n_jobs_to_start", 0);
@@ -136,7 +138,7 @@ impl JobPoller {
                 if let Ok(rows) = sqlx::query!(
                     r#"
             UPDATE job_executions
-            SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1
+            SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1, poller_instance_id = NULL
             WHERE state = 'running' AND alive_at < $1::timestamptz
             RETURNING id as id
             "#,
@@ -197,7 +199,11 @@ impl JobPoller {
     }
 }
 
-async fn poll_jobs(pool: &PgPool, n_jobs_to_poll: usize) -> Result<JobPollResult, sqlx::Error> {
+async fn poll_jobs(
+    pool: &PgPool,
+    n_jobs_to_poll: usize,
+    instance_id: uuid::Uuid,
+) -> Result<JobPollResult, sqlx::Error> {
     let now = crate::time::now();
     Span::current().record("now", tracing::field::display(now));
 
@@ -222,7 +228,7 @@ async fn poll_jobs(pool: &PgPool, n_jobs_to_poll: usize) -> Result<JobPollResult
         ),
         updated AS (
             UPDATE job_executions AS je
-            SET state = 'running', alive_at = $2, execute_at = NULL
+            SET state = 'running', alive_at = $2, execute_at = NULL, poller_instance_id = $3
             FROM selected_jobs
             WHERE je.id = selected_jobs.id
             RETURNING je.id, selected_jobs.data_json, je.attempt_index
@@ -246,6 +252,7 @@ async fn poll_jobs(pool: &PgPool, n_jobs_to_poll: usize) -> Result<JobPollResult
         "#,
         n_jobs_to_poll as i32,
         now,
+        instance_id,
     )
     .fetch_all(pool)
     .await?;

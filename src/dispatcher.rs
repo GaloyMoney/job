@@ -235,7 +235,7 @@ impl JobDispatcher {
             sqlx::query!(
                 r#"
                 UPDATE job_executions
-                SET state = 'pending', execute_at = $2, attempt_index = $3
+                SET state = 'pending', execute_at = $2, attempt_index = $3, poller_instance_id = NULL
                 WHERE id = $1
               "#,
                 id as JobId,
@@ -299,7 +299,7 @@ impl JobDispatcher {
         sqlx::query!(
             r#"
           UPDATE job_executions
-          SET state = 'pending', execute_at = $2, attempt_index = 1
+          SET state = 'pending', execute_at = $2, attempt_index = 1, poller_instance_id = NULL
           WHERE id = $1
         "#,
             id as JobId,
