@@ -15,18 +15,21 @@ pub(crate) struct JobPoller {
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
     instance_id: uuid::Uuid,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 #[allow(dead_code)]
 pub(crate) struct JobPollerHandle {
     poller: Arc<JobPoller>,
     handle: OwnedTaskHandle,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
 impl JobPoller {
     pub fn new(config: JobPollerConfig, repo: JobRepo, registry: JobRegistry) -> Self {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
         Self {
             tracker: Arc::new(JobTracker::new(
                 config.min_jobs_per_process,
@@ -36,6 +39,7 @@ impl JobPoller {
             config,
             registry,
             instance_id: uuid::Uuid::now_v7(),
+            shutdown_tx,
         }
     }
 
@@ -43,6 +47,7 @@ impl JobPoller {
         let listener_handle = self.start_listener().await?;
         let lost_handle = self.start_lost_handler();
         let keep_alive_handle = self.start_keep_alive_handler();
+        let shutdown_tx = self.shutdown_tx.clone();
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(tokio::task::spawn(Self::main_loop(
             Arc::clone(&executor),
@@ -53,6 +58,7 @@ impl JobPoller {
         Ok(JobPollerHandle {
             poller: executor,
             handle,
+            shutdown_tx,
         })
     }
 
@@ -215,7 +221,8 @@ impl JobPoller {
         let repo = self.repo.clone();
         let tracker = self.tracker.clone();
         span.record("now", tracing::field::display(crate::time::now()));
-        tokio::spawn(async move {
+
+        let job_handle = tokio::spawn(async move {
             let id = job.id;
             let attempt = polled_job.attempt;
             if let Err(e) = JobDispatcher::new(repo, tracker, retry_settings, job.id, runner)
@@ -225,6 +232,14 @@ impl JobPoller {
                 eprintln!("JobDispatcher.execute_job {id} ({attempt}) returned error {e}")
             }
         });
+
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            if shutdown_rx.recv().await.is_ok() {
+                job_handle.abort();
+            }
+        });
+
         Ok(())
     }
 }
@@ -343,5 +358,14 @@ fn pg_interval_to_duration(interval: &PgInterval) -> Duration {
         let days = (interval.days as u64) + (interval.months as u64) * 30;
         Duration::from_micros(interval.microseconds as u64)
             + Duration::from_secs(days * SECONDS_PER_DAY)
+    }
+}
+
+impl Drop for JobPollerHandle {
+    fn drop(&mut self) {
+        // Send shutdown signal to all running jobs
+        // All spawned shutdown listeners will receive this signal
+        // and abort their respective job tasks
+        let _ = self.shutdown_tx.send(());
     }
 }
