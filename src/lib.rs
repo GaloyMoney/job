@@ -212,6 +212,21 @@ impl Jobs {
         self.repo.find_by_id(id).await
     }
 
+    /// Gracefully shut down the job poller.
+    ///
+    /// This method is idempotent and can be called multiple times safely.
+    /// It will send a shutdown signal to all running jobs, wait briefly for them
+    /// to complete, and reschedule any jobs still running.
+    ///
+    /// If not called manually, shutdown will be automatically triggered when the
+    /// Jobs instance is dropped.
+    pub async fn shutdown(&self) -> Result<(), JobError> {
+        if let Some(handle) = &self.poller_handle {
+            handle.shutdown().await?;
+        }
+        Ok(())
+    }
+
     async fn insert_execution<I: JobInitializer>(
         &self,
         op: &mut impl es_entity::AtomicOperation,

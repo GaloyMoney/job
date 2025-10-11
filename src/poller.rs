@@ -1,8 +1,15 @@
+use es_entity::AtomicOperation;
 use serde_json::Value as JsonValue;
 use sqlx::postgres::{PgListener, PgPool, types::PgInterval};
 use tracing::{Span, instrument};
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use super::{
     JobId, config::JobPollerConfig, dispatcher::*, error::JobError, handle::OwnedTaskHandle,
@@ -18,11 +25,15 @@ pub(crate) struct JobPoller {
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct JobPollerHandle {
+    #[allow(dead_code)]
     poller: Arc<JobPoller>,
+    #[allow(dead_code)]
     handle: OwnedTaskHandle,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    shutdown_called: Arc<AtomicBool>,
+    repo: JobRepo,
+    instance_id: uuid::Uuid,
 }
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -48,6 +59,8 @@ impl JobPoller {
         let lost_handle = self.start_lost_handler();
         let keep_alive_handle = self.start_keep_alive_handler();
         let shutdown_tx = self.shutdown_tx.clone();
+        let repo = self.repo.clone();
+        let instance_id = self.instance_id;
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(tokio::task::spawn(Self::main_loop(
             Arc::clone(&executor),
@@ -59,6 +72,9 @@ impl JobPoller {
             poller: executor,
             handle,
             shutdown_tx,
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+            repo,
+            instance_id,
         })
     }
 
@@ -70,6 +86,8 @@ impl JobPoller {
     ) {
         let mut failures = 0;
         let mut woken_up = false;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
         loop {
             let timeout = match self.poll_and_dispatch(woken_up).await {
                 Ok(duration) => {
@@ -82,9 +100,17 @@ impl JobPoller {
                     Duration::from_millis(50 << failures)
                 }
             };
-            woken_up = crate::time::timeout(timeout, self.tracker.notified())
-                .await
-                .is_ok();
+
+            tokio::select! {
+                biased;
+
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+                result = crate::time::timeout(timeout, self.tracker.notified()) => {
+                    woken_up = result.is_ok();
+                }
+            }
         }
     }
 
@@ -363,11 +389,92 @@ fn pg_interval_to_duration(interval: &PgInterval) -> Duration {
     }
 }
 
+impl JobPollerHandle {
+    /// Gracefully shut down the job poller.
+    ///
+    /// This method is idempotent and can be called multiple times safely.
+    /// It will:
+    /// 1. Send shutdown signal to all running job tasks
+    /// 2. Wait briefly for tasks to complete naturally
+    /// 3. Reschedule any jobs still running for this instance
+    ///
+    /// If not called manually, it will be called automatically when the handle is dropped.
+    pub async fn shutdown(&self) -> Result<(), JobError> {
+        perform_shutdown(
+            self.shutdown_tx.clone(),
+            self.repo.clone(),
+            self.instance_id,
+            self.shutdown_called.clone(),
+        )
+        .await
+    }
+}
+
 impl Drop for JobPollerHandle {
     fn drop(&mut self) {
-        // Send shutdown signal to all running jobs
-        // All spawned shutdown listeners will receive this signal
-        // and abort their respective job tasks
-        let _ = self.shutdown_tx.send(());
+        let shutdown_tx = self.shutdown_tx.clone();
+        let repo = self.repo.clone();
+        let instance_id = self.instance_id;
+        let shutdown_called = self.shutdown_called.clone();
+
+        tokio::spawn(async move {
+            let _ = perform_shutdown(shutdown_tx, repo, instance_id, shutdown_called).await;
+        });
     }
+}
+
+#[instrument(name = "job.shutdown", skip(shutdown_tx, repo))]
+async fn perform_shutdown(
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    repo: JobRepo,
+    instance_id: uuid::Uuid,
+    shutdown_called: Arc<AtomicBool>,
+) -> Result<(), JobError> {
+    if shutdown_called
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let _ = shutdown_tx.send(());
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    reschedule_running_jobs(repo, instance_id).await
+}
+
+async fn reschedule_running_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Result<(), JobError> {
+    let mut op = repo.begin_op().await?;
+    let now = crate::time::now();
+    let rows = sqlx::query!(
+        r#"
+            UPDATE job_executions
+            SET state = 'pending',
+                execute_at = $1,
+                poller_instance_id = NULL
+            WHERE poller_instance_id = $2 AND state = 'running'
+            RETURNING id as "id!: JobId", attempt_index
+            "#,
+        now,
+        instance_id
+    )
+    .fetch_all(op.as_executor())
+    .await?;
+
+    let attempt_map: std::collections::HashMap<JobId, u32> = rows
+        .into_iter()
+        .map(|r| (r.id, r.attempt_index as u32))
+        .collect();
+
+    let ids: Vec<JobId> = attempt_map.keys().copied().collect();
+    let entities = repo.find_all::<crate::Job>(&ids).await?;
+
+    for (job_id, mut job) in entities {
+        let attempt_index = attempt_map[&job_id];
+        job.execution_aborted("graceful shutdown".to_string(), now, attempt_index);
+        repo.update_in_op(&mut op, &mut job).await?;
+    }
+    op.commit().await?;
+    Ok(())
 }
