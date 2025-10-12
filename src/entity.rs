@@ -43,6 +43,9 @@ pub enum JobEvent {
         scheduled_at: DateTime<Utc>,
     },
     ExecutionCompleted,
+    ExecutionAborted {
+        reason: String,
+    },
     ExecutionErrored {
         error: String,
     },
@@ -81,6 +84,19 @@ impl Job {
         self.events.push(JobEvent::ExecutionCompleted);
         self.events.push(JobEvent::ExecutionScheduled {
             attempt: 1,
+            scheduled_at,
+        });
+    }
+
+    pub(super) fn execution_aborted(
+        &mut self,
+        reason: String,
+        scheduled_at: DateTime<Utc>,
+        attempt: u32,
+    ) {
+        self.events.push(JobEvent::ExecutionAborted { reason });
+        self.events.push(JobEvent::ExecutionScheduled {
+            attempt,
             scheduled_at,
         });
     }
@@ -127,6 +143,7 @@ impl TryFromEvents<JobEvent> for Job {
                 }
                 JobEvent::ExecutionScheduled { .. } => {}
                 JobEvent::ExecutionCompleted => {}
+                JobEvent::ExecutionAborted { .. } => {}
                 JobEvent::ExecutionErrored { .. } => {}
                 JobEvent::JobCompleted => {}
             }
