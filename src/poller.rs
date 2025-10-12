@@ -423,7 +423,7 @@ impl Drop for JobPollerHandle {
     }
 }
 
-#[instrument(name = "job.shutdown", skip(shutdown_tx, repo))]
+#[instrument(name = "jobs.shutdown", skip(shutdown_tx, repo), fields(n_jobs))]
 async fn perform_shutdown(
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     repo: JobRepo,
@@ -461,6 +461,8 @@ async fn reschedule_running_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Resu
     )
     .fetch_all(op.as_executor())
     .await?;
+
+    tracing::Span::current().record("n_jobs", rows.len());
 
     let attempt_map: std::collections::HashMap<JobId, u32> = rows
         .into_iter()
