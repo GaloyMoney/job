@@ -1,3 +1,22 @@
+# [cala release v0.2.0](https://github.com/GaloyMoney/cala/releases/tag/0.2.0)
+
+
+### Features
+
+- [**breaking**] Graceful shutdown
+
+### Miscellaneous Tasks
+
+- Tracing
+- Shutdown and reschedule jobs
+- Scope execution updates to instance
+- Add shutdown task
+
+### Refactor
+
+- Centralize keep_alive loop
+- Add poller_instance_id to job_executions tbl
+
 # [cala release v0.1.12](https://github.com/GaloyMoney/cala/releases/tag/0.1.12)
 
 
