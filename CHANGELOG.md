@@ -1,3 +1,11 @@
+# [cala release v0.2.1](https://github.com/GaloyMoney/cala/releases/tag/0.2.1)
+
+
+### Miscellaneous Tasks
+
+- Connect traces from spawn to execute
+- Connect traces from spawn to execute
+
 # [cala release v0.2.0](https://github.com/GaloyMoney/cala/releases/tag/0.2.0)
 
 
