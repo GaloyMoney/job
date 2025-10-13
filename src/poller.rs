@@ -118,11 +118,12 @@ impl JobPoller {
         name = "job.poll_and_dispatch",
         level = "trace",
         skip(self),
-        fields(n_jobs_running, n_jobs_to_start, now, next_poll_in),
+        fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in),
         err
     )]
     async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
         let span = Span::current();
+        span.record("poller_id", tracing::field::display(self.instance_id));
         let Some(n_jobs_to_poll) = self.tracker.next_batch_size() else {
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
@@ -233,7 +234,7 @@ impl JobPoller {
     #[instrument(
         name = "job.dispatch_job",
         skip(self, polled_job),
-        fields(job_id, job_type, attempt, now),
+        fields(job_id, job_type, poller_id, attempt, now),
         err
     )]
     async fn dispatch_job(&self, polled_job: PolledJob) -> Result<(), JobError> {
@@ -248,6 +249,7 @@ impl JobPoller {
         let tracker = self.tracker.clone();
         let instance_id = self.instance_id;
         span.record("now", tracing::field::display(crate::time::now()));
+        span.record("poller_id", tracing::field::display(instance_id));
 
         let job_handle = tokio::spawn(async move {
             let id = job.id;

@@ -24,11 +24,12 @@ use std::sync::{Arc, Mutex};
 
 pub use config::*;
 pub use current::*;
-pub use entity::*;
+pub use entity::{Job, JobType};
 pub use migrate::*;
 pub use registry::*;
 pub use runner::*;
 
+use entity::NewJob;
 use error::*;
 use poller::*;
 use repo::*;
@@ -102,6 +103,11 @@ impl Jobs {
             .add_initializer(initializer);
     }
 
+    #[instrument(
+        name = "job.add_initializer_and_spawn_unique",
+        skip(self, initializer, config),
+        fields(job_type, now)
+    )]
     pub async fn add_initializer_and_spawn_unique<C: JobConfig>(
         &self,
         initializer: <C as JobConfig>::Initializer,
@@ -114,11 +120,14 @@ impl Jobs {
                 .expect("Registry has been consumed by executor")
                 .add_initializer(initializer);
         }
+        let job_type = <<C as JobConfig>::Initializer as JobInitializer>::job_type();
+        Span::current().record("job_type", tracing::field::display(&job_type));
         let new_job = NewJob::builder()
             .id(JobId::new())
             .unique_per_type(true)
-            .job_type(<<C as JobConfig>::Initializer as JobInitializer>::job_type())
+            .job_type(job_type)
             .config(config)?
+            .tracing_context(es_entity::context::TracingContext::current())
             .build()
             .expect("Could not build new job");
         let mut op = self.repo.begin_op().await?;
@@ -172,6 +181,7 @@ impl Jobs {
             .id(job_id.into())
             .job_type(<<C as JobConfig>::Initializer as JobInitializer>::job_type())
             .config(config)?
+            .tracing_context(es_entity::context::TracingContext::current())
             .build()
             .expect("Could not build new job");
         let mut job = self.repo.create_in_op(op, new_job).await?;
@@ -199,6 +209,7 @@ impl Jobs {
             .id(job_id.into())
             .job_type(job_type)
             .config(config)?
+            .tracing_context(es_entity::context::TracingContext::current())
             .build()
             .expect("Could not build new job");
         let mut job = self.repo.create_in_op(op, new_job).await?;
