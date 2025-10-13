@@ -16,7 +16,7 @@ sim-time = [ "dep:sim-time", "es-entity/sim-time" ]
 json-schema = ["dep:schemars", "es-entity/json-schema"]
 
 [dependencies]
-es-entity = { workspace = true }
+es-entity = { workspace = true, features = ["tracing-context"] }
 
 async-trait = { workspace = true }
 derive_builder = { workspace = true }
@@ -40,7 +40,7 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.9"
+es-entity = "0.9.4"
 sim-time = "0.9"
 
 anyhow = "1.0.99"

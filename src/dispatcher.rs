@@ -53,8 +53,10 @@ impl JobDispatcher {
         let span = Span::current();
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
+        span.record("poller_id", tracing::field::display(self.instance_id));
         span.record("attempt", polled_job.attempt);
         span.record("now", tracing::field::display(crate::time::now()));
+        job.inject_tracing_parent();
         #[cfg(feature = "es-entity")]
         {
             let mut ctx = es_entity::EventContext::current();
@@ -64,6 +66,7 @@ impl JobDispatcher {
                     "job_id": job.id,
                     "job_type": job.job_type,
                     "attempt": polled_job.attempt,
+                    "poller_id": self.instance_id
                 }),
             )
             .expect("EventContext insert job data");

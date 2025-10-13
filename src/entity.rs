@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use std::borrow::Cow;
 
-use es_entity::*;
+use es_entity::{context::TracingContext, *};
 
 use crate::{JobId, error::JobError};
 
@@ -37,6 +37,7 @@ pub enum JobEvent {
         id: JobId,
         job_type: JobType,
         config: serde_json::Value,
+        tracing_context: Option<TracingContext>,
     },
     ExecutionScheduled {
         attempt: u32,
@@ -71,6 +72,16 @@ impl Job {
             .iter_all()
             .rev()
             .any(|event| matches!(event, JobEvent::JobCompleted))
+    }
+
+    pub(crate) fn inject_tracing_parent(&self) {
+        if let JobEvent::Initialized {
+            tracing_context: Some(tracing_context),
+            ..
+        } = self.events.iter_all().next().expect("first event")
+        {
+            tracing_context.inject_as_parent();
+        }
     }
 
     pub(super) fn execution_scheduled(&mut self, scheduled_at: DateTime<Utc>) {
@@ -161,6 +172,8 @@ pub struct NewJob {
     pub(super) job_type: JobType,
     #[builder(setter(custom))]
     pub(super) config: serde_json::Value,
+    #[builder(default)]
+    pub(super) tracing_context: Option<TracingContext>,
 }
 
 impl NewJob {
@@ -185,6 +198,7 @@ impl IntoEvents<JobEvent> for NewJob {
                 id: self.id,
                 job_type: self.job_type,
                 config: self.config,
+                tracing_context: self.tracing_context,
             }],
         )
     }
