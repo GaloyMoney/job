@@ -3,7 +3,7 @@ name = "job"
 description = "Async / distributed job runner"
 repository = "https://github.com/GaloyMoney/job"
 documentation = "https://docs.rs/job"
-version = "0.2.2-dev"
+version = "0.2.1"
 license = "Apache-2.0"
 edition = "2024"
 categories = ["database"]
@@ -40,8 +40,8 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.9.4"
-sim-time = "0.9"
+es-entity = "0.10"
+sim-time = "0.10"
 
 anyhow = "1.0.99"
 async-trait = "0.1.89"
