@@ -1,3 +1,11 @@
+# [cala release v0.2.2](https://github.com/GaloyMoney/cala/releases/tag/0.2.2)
+
+
+### Miscellaneous Tasks
+
+- Revert back local version
+- Update es-entity
+
 # [cala release v0.2.1](https://github.com/GaloyMoney/cala/releases/tag/0.2.1)
 
 
