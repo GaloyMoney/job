@@ -218,14 +218,15 @@ impl JobDispatcher {
         }
     }
 
-    #[instrument(name = "job.fail_job", skip(self))]
+    #[instrument(name = "job.fail_job", skip(self), fields(attempt, will_retry = tracing::field::Empty))]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
         let mut op = self.repo.begin_op().await?;
         let mut job = self.repo.find_by_id(id).await?;
         if self.retry_settings.n_attempts.unwrap_or(u32::MAX) > attempt {
             self.rescheduled = true;
-            let reschedule_at = self.retry_settings.next_attempt_at(attempt);
             let next_attempt = attempt + 1;
+            Span::current().record("will_retry", true);
+            let reschedule_at = self.retry_settings.next_attempt_at(attempt);
             job.retry_scheduled(error.to_string(), reschedule_at, next_attempt);
             sqlx::query!(
                 r#"
@@ -241,6 +242,7 @@ impl JobDispatcher {
             .execute(op.as_executor())
             .await?;
         } else {
+            Span::current().record("will_retry", false);
             job.job_errored(error.to_string());
             sqlx::query!(
                 r#"
@@ -260,6 +262,7 @@ impl JobDispatcher {
         Ok(())
     }
 
+    #[instrument(name = "job.complete_job", skip(self, op), fields(id = %id))]
     async fn complete_job(
         &mut self,
         op: impl Into<sqlx::Transaction<'_, sqlx::Postgres>>,
@@ -283,6 +286,7 @@ impl JobDispatcher {
         Ok(())
     }
 
+    #[instrument(name = "job.reschedule_job", skip(self, op), fields(id = %id, reschedule_at = %reschedule_at, attempt = 1))]
     async fn reschedule_job(
         &mut self,
         op: impl Into<sqlx::Transaction<'_, sqlx::Postgres>>,
