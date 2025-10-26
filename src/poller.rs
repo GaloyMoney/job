@@ -172,7 +172,7 @@ impl JobPoller {
                 let now = crate::time::now();
                 let check_time = now - job_lost_interval;
 
-                let span = tracing::warn_span!(
+                let span = tracing::info_span!(
                     parent: None,
                     "job.detect_lost_jobs",
                     check_time = %check_time,
