@@ -171,6 +171,15 @@ impl JobPoller {
                 crate::time::sleep(job_lost_interval / 2).await;
                 let now = crate::time::now();
                 let check_time = now - job_lost_interval;
+
+                let span = tracing::info_span!(
+                    parent: None,
+                    "job.detect_lost_jobs",
+                    check_time = %check_time,
+                    n_lost_jobs = tracing::field::Empty,
+                );
+                let _guard = span.enter();
+
                 if let Ok(rows) = sqlx::query!(
                     r#"
             UPDATE job_executions
@@ -184,6 +193,7 @@ impl JobPoller {
                 .await
                     && !rows.is_empty()
                 {
+                    Span::current().record("n_lost_jobs", rows.len());
                     eprintln!(
                         "job.lost_job: {}",
                         rows.into_iter()
@@ -191,6 +201,8 @@ impl JobPoller {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
+                } else {
+                    Span::current().record("n_lost_jobs", 0);
                 }
             }
         }))
@@ -204,6 +216,16 @@ impl JobPoller {
             let mut failures = 0;
             loop {
                 let now = crate::time::now();
+                let span = tracing::info_span!(
+                    parent: None,
+                    "job.keep_alive",
+                    instance_id = %instance_id,
+                    now = %now,
+                    failures,
+                    result = tracing::field::Empty
+                );
+                let _guard = span.enter();
+
                 let timeout = match sqlx::query!(
                     r#"
                     UPDATE job_executions
@@ -218,14 +240,17 @@ impl JobPoller {
                 {
                     Ok(_) => {
                         failures = 0;
+                        Span::current().record("result", "success");
                         job_lost_interval / 4
                     }
                     Err(e) => {
                         failures += 1;
+                        Span::current().record("result", "error");
                         eprintln!("Keep alive for instance {instance_id} errored: {e}");
                         Duration::from_millis(50 << failures)
                     }
                 };
+                drop(_guard);
                 crate::time::sleep(timeout).await;
             }
         }))
@@ -274,6 +299,7 @@ impl JobPoller {
     }
 }
 
+#[instrument(name = "job.poll_jobs", skip(pool), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
 async fn poll_jobs(
     pool: &PgPool,
     n_jobs_to_poll: usize,
@@ -332,6 +358,7 @@ async fn poll_jobs(
     .fetch_all(pool)
     .await?;
 
+    Span::current().record("n_jobs_found", rows.len());
     Ok(JobPollResult::from_rows(rows))
 }
 
