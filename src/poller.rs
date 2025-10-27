@@ -172,7 +172,7 @@ impl JobPoller {
                 let now = crate::time::now();
                 let check_time = now - job_lost_interval;
 
-                let span = tracing::info_span!(
+                let span = tracing::debug_span!(
                     parent: None,
                     "job.detect_lost_jobs",
                     check_time = %check_time,
@@ -216,7 +216,7 @@ impl JobPoller {
             let mut failures = 0;
             loop {
                 let now = crate::time::now();
-                let span = tracing::info_span!(
+                let span = tracing::debug_span!(
                     parent: None,
                     "job.keep_alive",
                     instance_id = %instance_id,
