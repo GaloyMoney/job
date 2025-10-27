@@ -1,3 +1,12 @@
+# [cala release v0.2.3](https://github.com/GaloyMoney/cala/releases/tag/0.2.3)
+
+
+### Miscellaneous Tasks
+
+- Broaden deps
+- This should be an info span
+- More otel spans
+
 # [cala release v0.2.2](https://github.com/GaloyMoney/cala/releases/tag/0.2.2)
 
 
