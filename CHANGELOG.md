@@ -1,3 +1,11 @@
+# [cala release v0.2.4](https://github.com/GaloyMoney/cala/releases/tag/0.2.4)
+
+
+### Miscellaneous Tasks
+
+- Reducing loop span to debug (#6)
+- Bump tokio
+
 # [cala release v0.2.3](https://github.com/GaloyMoney/cala/releases/tag/0.2.3)
 
 
