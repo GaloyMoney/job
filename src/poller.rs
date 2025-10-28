@@ -96,7 +96,7 @@ impl JobPoller {
                 }
                 Err(e) => {
                     failures += 1;
-                    eprintln!("job.main_loop errored {e} ({failures})");
+                    tracing::error!(error = %e, failures, "main loop error");
                     Duration::from_millis(50 << failures)
                 }
             };
@@ -194,13 +194,9 @@ impl JobPoller {
                     && !rows.is_empty()
                 {
                     Span::current().record("n_lost_jobs", rows.len());
-                    eprintln!(
-                        "job.lost_job: {}",
-                        rows.into_iter()
-                            .map(|r| r.id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
+                    for row in rows {
+                        tracing::error!(job_id = %row.id, "lost job");
+                    }
                 } else {
                     Span::current().record("n_lost_jobs", 0);
                 }
@@ -221,8 +217,7 @@ impl JobPoller {
                     "job.keep_alive",
                     instance_id = %instance_id,
                     now = %now,
-                    failures,
-                    result = tracing::field::Empty
+                    failures
                 );
                 let _guard = span.enter();
 
@@ -240,13 +235,11 @@ impl JobPoller {
                 {
                     Ok(_) => {
                         failures = 0;
-                        Span::current().record("result", "success");
                         job_lost_interval / 4
                     }
                     Err(e) => {
                         failures += 1;
-                        Span::current().record("result", "error");
-                        eprintln!("Keep alive for instance {instance_id} errored: {e}");
+                        tracing::error!(instance_id = %instance_id, error = %e, "keep alive error");
                         Duration::from_millis(50 << failures)
                     }
                 };
@@ -284,7 +277,7 @@ impl JobPoller {
                     .execute_job(polled_job)
                     .await
             {
-                eprintln!("JobDispatcher.execute_job {id} ({attempt}) returned error {e}")
+                tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
             }
         });
 
