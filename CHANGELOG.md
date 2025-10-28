@@ -1,3 +1,10 @@
+# [cala release v0.2.5](https://github.com/GaloyMoney/cala/releases/tag/0.2.5)
+
+
+### Miscellaneous Tasks
+
+- Move poll_jobs to debug (#7)
+
 # [cala release v0.2.4](https://github.com/GaloyMoney/cala/releases/tag/0.2.4)
 
 
