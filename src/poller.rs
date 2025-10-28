@@ -299,7 +299,7 @@ impl JobPoller {
     }
 }
 
-#[instrument(name = "job.poll_jobs", skip(pool), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
+#[instrument(name = "job.poll_jobs", level = "debug", skip(pool), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
 async fn poll_jobs(
     pool: &PgPool,
     n_jobs_to_poll: usize,
