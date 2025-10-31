@@ -116,7 +116,7 @@ impl JobPoller {
 
     #[instrument(
         name = "job.poll_and_dispatch",
-        level = "trace",
+        level = "debug",
         skip(self),
         fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in),
         err
