@@ -231,6 +231,7 @@ impl Jobs {
     ///
     /// If not called manually, shutdown will be automatically triggered when the
     /// Jobs instance is dropped.
+    #[instrument(name = "job.shutdown", skip(self), err)]
     pub async fn shutdown(&self) -> Result<(), JobError> {
         if let Some(handle) = &self.poller_handle {
             handle.shutdown().await?;
@@ -238,6 +239,7 @@ impl Jobs {
         Ok(())
     }
 
+    #[instrument(name = "job.insert_execution", skip_all, err)]
     async fn insert_execution<I: JobInitializer>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
