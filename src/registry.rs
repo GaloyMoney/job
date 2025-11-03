@@ -1,7 +1,10 @@
+//! Registry storing job initializers and retry settings.
+
 use std::collections::HashMap;
 
 use super::{entity::*, error::JobError, runner::*};
 
+/// Keeps track of registered job types and their retry behaviour.
 pub struct JobRegistry {
     initializers: HashMap<JobType, Box<dyn JobInitializer>>,
     retry_settings: HashMap<JobType, RetrySettings>,
@@ -15,6 +18,7 @@ impl JobRegistry {
         }
     }
 
+    /// Register a [`JobInitializer`] and its associated retry settings.
     pub fn add_initializer<I: JobInitializer>(&mut self, initializer: I) {
         self.initializers
             .insert(<I as JobInitializer>::job_type(), Box::new(initializer));
@@ -32,6 +36,7 @@ impl JobRegistry {
             .map_err(|e| JobError::JobInitError(e.to_string()))
     }
 
+    /// Retrieve retry settings for a given job type.
     pub(super) fn retry_settings(&self, job_type: &JobType) -> &RetrySettings {
         self.retry_settings
             .get(job_type)

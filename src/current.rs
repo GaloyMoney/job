@@ -1,8 +1,11 @@
+//! Execution-time helpers available to running jobs.
+
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
 use super::{JobId, error::JobError};
 
+/// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
     id: JobId,
     attempt: u32,
@@ -29,6 +32,7 @@ impl CurrentJob {
         self.attempt
     }
 
+    /// Deserialize the persisted execution state into your custom type.
     pub fn execution_state<T: DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
         if let Some(execution_state) = self.execution_state_json.as_ref() {
             serde_json::from_value(execution_state.clone()).map(Some)
@@ -37,6 +41,7 @@ impl CurrentJob {
         }
     }
 
+    /// Update the execution state as part of an existing database operation.
     pub async fn update_execution_state_in_op<T: Serialize>(
         &mut self,
         op: &mut impl es_entity::AtomicOperation,

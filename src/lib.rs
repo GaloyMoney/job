@@ -1,3 +1,59 @@
+//! `job` is an async, Postgres-backed job scheduler and runner for Rust
+//! applications. It coordinates distributed workers, tracks job history, and
+//! handles retries with predictable backoff. The crate uses [`sqlx`] for
+//! database access and forbids `unsafe`.
+//!
+//! ## Documentation
+//! - [Github repository](https://github.com/GaloyMoney/job)
+//! - [Cargo package](https://crates.io/crates/job)
+//!
+//! ## Highlights
+//! - Durable Postgres-backed storage so jobs survive restarts and crashes.
+//! - Automatic exponential backoff with jitter, plus opt-in infinite retries.
+//! - Concurrency controls that let many worker instances share the workload,
+//!   configurable through [`JobPollerConfig`].
+//! - Optional at-most-one-per-type queueing.
+//! - Built-in migrations that you can run automatically or embed into your own
+//!   migration workflow.
+//!
+//! ## Core concepts
+//! - **Jobs service** – [`Jobs`] owns registration, polling, and shutdown.
+//! - **Initializer** – [`JobInitializer`] registers a job type and builds a
+//!   [`JobRunner`] for each execution.
+//! - **Runner** – [`JobRunner`] performs the work using the provided
+//!   [`CurrentJob`] context.
+//! - **Current job** – [`CurrentJob`] exposes attempt counts, execution state,
+//!   and access to the Postgres pool during a run.
+//! - **Completion** – [`JobCompletion`] returns the outcome: finish, retry, or
+//!   reschedule at a later time.
+//!
+//! ## Scheduling
+//! Jobs run immediately once a poller claims them. If you need a future start
+//! time, schedule it up front with [`Jobs::create_and_spawn_at_in_op`]. After a
+//! run completes, return `JobCompletion::Complete` for one-off work or use the
+//! `JobCompletion::Reschedule*` variants to book the next execution.
+//!
+//! ## Retries
+//! Retry behaviour comes from [`JobInitializer::retry_on_error_settings`]. Once
+//! attempts are exhausted the job is marked as errored and removed from the
+//! queue.
+//!
+//! ## Uniqueness
+//! For at-most-one semantics, use [`Jobs::add_initializer_and_spawn_unique`] or
+//! set `unique_per_type(true)` when building jobs manually.
+//!
+//! ## Database migrations
+//! See the [setup guide](https://github.com/GaloyMoney/job/blob/main/README.md#setup)
+//! for migration options and examples.
+//!
+//! ## Feature flags
+//! - `es-entity` enables advanced integration with the [`es_entity`] crate,
+//!   allowing runners to finish with `DbOp` handles and enriching tracing/event
+//!   metadata.
+//! - `sim-time` swaps time and sleeping utilities for the
+//!   [`sim_time`](https://docs.rs/sim-time) crate, making it easier to test
+//!   long-running backoff strategies deterministically.
+
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 #![forbid(unsafe_code)]
@@ -37,6 +93,7 @@ use repo::*;
 es_entity::entity_id! { JobId }
 
 #[derive(Clone)]
+/// High-level service that manages job registration, scheduling, and execution.
 pub struct Jobs {
     config: JobSvcConfig,
     repo: JobRepo,
@@ -45,6 +102,7 @@ pub struct Jobs {
 }
 
 impl Jobs {
+    /// Initialize the service with either a connection string or existing pool.
     pub async fn init(config: JobSvcConfig) -> Result<Self, JobError> {
         let pool = match (config.pool.clone(), config.pg_con.clone()) {
             (Some(pool), None) => pool,
@@ -76,6 +134,9 @@ impl Jobs {
         })
     }
 
+    /// Start the background poller that fetches and dispatches jobs.
+    ///
+    /// All initializers must be registered before calling this method.
     pub async fn start_poll(&mut self) -> Result<(), JobError> {
         let registry = self
             .registry
@@ -95,6 +156,7 @@ impl Jobs {
         Ok(())
     }
 
+    /// Register a [`JobInitializer`] so the service can construct runners.
     pub fn add_initializer<I: JobInitializer>(&self, initializer: I) {
         let mut registry = self.registry.lock().expect("Couldn't lock Registry Mutex");
         registry
@@ -108,6 +170,7 @@ impl Jobs {
         skip(self, initializer, config),
         fields(job_type, now)
     )]
+    /// Register an initializer and enqueue a job only if one of that type is not already pending.
     pub async fn add_initializer_and_spawn_unique<C: JobConfig>(
         &self,
         initializer: <C as JobConfig>::Initializer,
@@ -153,6 +216,7 @@ impl Jobs {
         skip(self, config),
         fields(job_type, now)
     )]
+    /// Persist a job with the provided ID and schedule it for immediate execution.
     pub async fn create_and_spawn<C: JobConfig>(
         &self,
         job_id: impl Into<JobId> + std::fmt::Debug,
@@ -169,6 +233,7 @@ impl Jobs {
         skip(self, op, config),
         fields(job_type, now)
     )]
+    /// Create and enqueue a job as part of an existing atomic operation.
     pub async fn create_and_spawn_in_op<C: JobConfig>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -196,6 +261,7 @@ impl Jobs {
         skip(self, op, config),
         fields(job_type, now)
     )]
+    /// Create a job and schedule it for a specific time within an atomic operation.
     pub async fn create_and_spawn_at_in_op<C: JobConfig>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -219,6 +285,7 @@ impl Jobs {
     }
 
     #[instrument(name = "job.find", skip(self))]
+    /// Fetch the current snapshot of a job aggregate by identifier.
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
         self.repo.find_by_id(id).await
     }
