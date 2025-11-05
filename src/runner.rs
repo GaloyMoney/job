@@ -1,3 +1,5 @@
+//! Traits and types used when defining job logic.
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
@@ -6,11 +8,14 @@ use super::{
     entity::{Job, JobType},
 };
 
+/// Describes how to construct a [`JobRunner`] for a given job type.
 pub trait JobInitializer: Send + Sync + 'static {
+    /// Unique identifier for the job type.
     fn job_type() -> JobType
     where
         Self: Sized;
 
+    /// Retry settings to use when the runner returns an error.
     fn retry_on_error_settings() -> RetrySettings
     where
         Self: Sized,
@@ -18,13 +23,16 @@ pub trait JobInitializer: Send + Sync + 'static {
         Default::default()
     }
 
+    /// Produce a runner instance for the provided job.
     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
+/// Associate a typed config payload with a [`JobInitializer`].
 pub trait JobConfig: serde::Serialize {
     type Initializer: JobInitializer;
 }
 
+/// Result returned by [`JobRunner::run`] describing how to progress the job.
 pub enum JobCompletion {
     Complete,
     #[cfg(feature = "es-entity")]
@@ -48,7 +56,9 @@ pub enum JobCompletion {
 }
 
 #[async_trait]
+/// Implemented by job executors that perform the actual work.
 pub trait JobRunner: Send + Sync + 'static {
+    /// Execute the job and return how it should be completed or retried.
     async fn run(
         &self,
         current_job: CurrentJob,
@@ -56,6 +66,7 @@ pub trait JobRunner: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone)]
+/// Controls retry attempt limits and exponential backoff behaviour.
 pub struct RetrySettings {
     pub n_attempts: Option<u32>,
     pub n_warn_attempts: Option<u32>,

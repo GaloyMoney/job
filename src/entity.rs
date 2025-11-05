@@ -1,3 +1,5 @@
+//! Core job entities and events persisted in Postgres.
+
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
@@ -11,6 +13,7 @@ use crate::{JobId, error::JobError};
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(transparent)]
 #[serde(transparent)]
+/// Identifier describing a job type or class of work.
 pub struct JobType(Cow<'static, str>);
 impl JobType {
     pub const fn new(job_type: &'static str) -> Self {
@@ -32,6 +35,7 @@ impl std::fmt::Display for JobType {
 #[derive(EsEvent, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[es_event(id = "JobId", event_context = false)]
+/// Stream of domain events emitted as jobs transition through execution.
 pub enum JobEvent {
     Initialized {
         id: JobId,
@@ -55,6 +59,7 @@ pub enum JobEvent {
 
 #[derive(EsEntity, Builder)]
 #[builder(pattern = "owned", build_fn(error = "EsEntityError"))]
+/// Aggregate root capturing immutable job metadata and lifecycle events.
 pub struct Job {
     pub id: JobId,
     pub job_type: JobType,
@@ -63,10 +68,12 @@ pub struct Job {
 }
 
 impl Job {
+    /// Decode the stored configuration payload into a typed struct.
     pub fn config<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_value(self.config.clone())
     }
 
+    /// Returns `true` once the job has emitted a `JobCompleted` event.
     pub fn completed(&self) -> bool {
         self.events
             .iter_all()
@@ -164,6 +171,7 @@ impl TryFromEvents<JobEvent> for Job {
 }
 
 #[derive(Debug, Builder)]
+/// Builder used internally when creating new jobs.
 pub struct NewJob {
     #[builder(setter(into))]
     pub(super) id: JobId,
@@ -177,12 +185,14 @@ pub struct NewJob {
 }
 
 impl NewJob {
+    /// Create a builder for constructing a [`NewJob`].
     pub fn builder() -> NewJobBuilder {
         NewJobBuilder::default()
     }
 }
 
 impl NewJobBuilder {
+    /// Serialize a typed configuration payload into the job.
     pub fn config<C: serde::Serialize>(&mut self, config: C) -> Result<&mut Self, JobError> {
         self.config =
             Some(serde_json::to_value(config).map_err(JobError::CouldNotSerializeConfig)?);

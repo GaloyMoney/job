@@ -1,8 +1,11 @@
+//! Error type returned by the job service and helpers.
+
 use thiserror::Error;
 
 use super::entity::JobType;
 
 #[derive(Error, Debug)]
+/// Exhaustive list of failures the job service can report.
 pub enum JobError {
     #[error("JobError - Sqlx: {0}")]
     Sqlx(sqlx::Error),

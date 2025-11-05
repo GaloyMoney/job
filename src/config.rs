@@ -1,3 +1,5 @@
+//! Service and poller configuration types.
+
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
@@ -5,13 +7,17 @@ use std::time::Duration;
 
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Controls how the background poller balances work across processes.
 pub struct JobPollerConfig {
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_job_lost_interval")]
+    /// How long a job may run without heartbeats before it is considered lost.
     pub job_lost_interval: Duration,
     #[serde(default = "default_max_jobs_per_process")]
+    /// Maximum number of concurrent jobs this process will execute.
     pub max_jobs_per_process: usize,
     #[serde(default = "default_min_jobs_per_process")]
+    /// Minimum number of concurrent jobs to keep queued before the poller sleeps.
     pub min_jobs_per_process: usize,
 }
 
@@ -27,6 +33,7 @@ impl Default for JobPollerConfig {
 
 #[derive(Builder, Debug, Clone)]
 #[builder(build_fn(skip))]
+/// Builder for initializing the [`Jobs`](crate::Jobs) service.
 pub struct JobSvcConfig {
     #[builder(setter(into, strip_option), default)]
     pub(super) pg_con: Option<String>,
@@ -47,6 +54,7 @@ impl JobSvcConfig {
 }
 
 impl JobSvcConfigBuilder {
+    /// Validate and construct a [`JobSvcConfig`], ensuring either `pg_con` or `pool` is set.
     pub fn build(&mut self) -> Result<JobSvcConfig, String> {
         // Validate configuration
         match (self.pg_con.as_ref(), self.pool.as_ref()) {
