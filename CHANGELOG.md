@@ -1,3 +1,14 @@
+# [cala release v0.2.7](https://github.com/GaloyMoney/cala/releases/tag/0.2.7)
+
+
+### Documentation
+
+- Add public crate docs (#11)
+
+### Miscellaneous Tasks
+
+- Add indexes (#10)
+
 # [cala release v0.2.6](https://github.com/GaloyMoney/cala/releases/tag/0.2.6)
 
 
