@@ -140,8 +140,8 @@ async fn jobs_with_same_entity_run_sequentially() -> anyhow::Result<()> {
         .await
         .expect("Failed to start job polling");
 
-    let entity_id = Uuid::new_v4();
-    let other_entity_id = Uuid::new_v4();
+    let entity_id = Uuid::now_v7();
+    let other_entity_id = Uuid::now_v7();
 
     let first_job_id = JobId::new();
     jobs.create_and_spawn(
