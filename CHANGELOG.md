@@ -1,3 +1,10 @@
+# [cala release v0.2.8](https://github.com/GaloyMoney/cala/releases/tag/0.2.8)
+
+
+### Documentation
+
+- Improve Job crate public docs (#12)
+
 # [cala release v0.2.7](https://github.com/GaloyMoney/cala/releases/tag/0.2.7)
 
 
