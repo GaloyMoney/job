@@ -95,6 +95,23 @@ async fn wait_for_state(
     }
 }
 
+async fn wait_until_removed(
+    pool: &sqlx::PgPool,
+    job_id: JobId,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fetch_job_state(pool, job_id).await?.is_none() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for job {job_id:?} to be removed");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_create_and_run_job() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -184,13 +201,7 @@ async fn jobs_with_same_entity_run_sequentially() -> anyhow::Result<()> {
     let second_state = fetch_job_state(&pool, second_job_id).await?;
     assert_eq!(second_state.as_deref(), Some("pending"));
 
-    tokio::time::sleep(Duration::from_millis(700)).await;
-
-    let second_state_post = fetch_job_state(&pool, second_job_id).await?;
-    assert!(
-        second_state_post.is_none(),
-        "second job did not complete after first finished"
-    );
+    wait_until_removed(&pool, second_job_id, Duration::from_secs(5)).await?;
 
     let first_job = jobs.find(first_job_id).await?;
     assert!(first_job.completed());
