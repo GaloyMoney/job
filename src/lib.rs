@@ -1,6 +1,9 @@
 //! `job` is an async, Postgres-backed job scheduler and runner for Rust
 //! applications. It coordinates distributed workers, tracks job history, and
-//! handles retries with predictable backoff. The crate uses [`sqlx`] for
+//! handles retries with predictable backoff. Inspired by earlier systems like
+//! [Sidekiq](https://sidekiq.org), it focuses on running your
+//! application code asynchronously, outside of request/response paths while keeping business
+//! logic in familiar Rust async functions. The crate uses [`sqlx`] for
 //! database access and forbids `unsafe`.
 //!
 //! ## Documentation
@@ -93,7 +96,8 @@ use repo::*;
 es_entity::entity_id! { JobId }
 
 #[derive(Clone)]
-/// High-level service that manages job registration, scheduling, and execution.
+/// Primary entry point for interacting with the Job crate. Provides APIs to register job
+/// handlers, manage configuration, and control scheduling and execution.
 pub struct Jobs {
     config: JobSvcConfig,
     repo: JobRepo,
@@ -102,7 +106,7 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    /// Initialize the service with either a connection string or existing pool.
+    /// Initialize the service using a [`JobSvcConfig`] for connection and runtime settings.
     pub async fn init(config: JobSvcConfig) -> Result<Self, JobError> {
         let pool = match (config.pool.clone(), config.pg_con.clone()) {
             (Some(pool), None) => pool,
@@ -134,9 +138,126 @@ impl Jobs {
         })
     }
 
-    /// Start the background poller that fetches and dispatches jobs.
+    /// Start the background poller that fetches and dispatches jobs from Postgres.
     ///
-    /// All initializers must be registered before calling this method.
+    /// Call this only after registering every job initializer. The call consumes the internal
+    /// registry; attempting to register additional initializers or starting the poller again
+    /// afterwards will panic with `Registry has been consumed by executor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Sqlx`] if the poller cannot initialise its database listeners or
+    /// supporting tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if invoked more than once, or if [`Jobs::add_initializer`] or
+    /// [`Jobs::add_initializer_and_spawn_unique`] are called after the poller has started.
+    ///
+    /// # Examples
+    ///
+    /// Register any initializers and then start the poller:
+    ///
+    /// ```no_run
+    /// use job::{
+    ///     Jobs, JobSvcConfig, Job, JobInitializer, JobRunner, JobType, JobCompletion, CurrentJob,
+    /// };
+    /// use job::error::JobError;
+    /// use async_trait::async_trait;
+    /// use sqlx::postgres::PgPoolOptions;
+    /// use std::error::Error;
+    ///
+    /// struct MyInitializer;
+    ///
+    /// impl JobInitializer for MyInitializer {
+    ///     fn job_type() -> JobType {
+    ///         JobType::new("example")
+    ///     }
+    ///
+    ///     fn init(&self, _job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    ///         Ok(Box::new(MyRunner))
+    ///     }
+    /// }
+    ///
+    /// struct MyRunner;
+    ///
+    /// #[async_trait]
+    /// impl JobRunner for MyRunner {
+    ///     async fn run(
+    ///         &self,
+    ///         _current_job: CurrentJob,
+    ///     ) -> Result<JobCompletion, Box<dyn Error>> {
+    ///         Ok(JobCompletion::Complete)
+    ///     }
+    /// }
+    ///
+    /// # async fn example() -> Result<(), JobError> {
+    /// let pool = PgPoolOptions::new()
+    ///     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
+    /// let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    /// let mut jobs = Jobs::init(config).await?;
+    ///
+    /// jobs.add_initializer(MyInitializer);
+    ///
+    /// jobs.start_poll().await?;
+    /// # Ok(())
+    /// # }
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(example()).unwrap();
+    /// ```
+    ///
+    /// Calling `start_poll` again, or attempting to register a new initializer afterwards,
+    /// results in a panic:
+    ///
+    /// ```no_run
+    /// use job::{
+    ///     Jobs, JobSvcConfig, Job, JobInitializer, JobRunner, JobType, JobCompletion, CurrentJob,
+    /// };
+    /// use job::error::JobError;
+    /// use async_trait::async_trait;
+    /// use sqlx::postgres::PgPoolOptions;
+    /// use std::error::Error;
+    ///
+    /// struct MyInitializer;
+    ///
+    /// impl JobInitializer for MyInitializer {
+    ///     fn job_type() -> JobType {
+    ///         JobType::new("example")
+    ///     }
+    ///
+    ///     fn init(&self, _job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    ///         Ok(Box::new(MyRunner))
+    ///     }
+    /// }
+    ///
+    /// struct MyRunner;
+    ///
+    /// #[async_trait]
+    /// impl JobRunner for MyRunner {
+    ///     async fn run(
+    ///         &self,
+    ///         _current_job: CurrentJob,
+    ///     ) -> Result<JobCompletion, Box<dyn Error>> {
+    ///         Ok(JobCompletion::Complete)
+    ///     }
+    /// }
+    ///
+    /// # async fn double_start() -> Result<(), JobError> {
+    /// let pool = PgPoolOptions::new()
+    ///     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
+    /// let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    /// let mut jobs = Jobs::init(config).await?;
+    ///
+    /// jobs.start_poll().await?;
+    ///
+    /// // Panics with "Registry has been consumed by executor".
+    /// // jobs.start_poll().await.unwrap();
+    ///
+    /// // Also panics because the registry moved into the poller.
+    /// // jobs.add_initializer(MyInitializer);
+    /// # Ok(())
+    /// # }
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(double_start()).unwrap();
+    /// ```
     pub async fn start_poll(&mut self) -> Result<(), JobError> {
         let registry = self
             .registry
@@ -171,6 +292,15 @@ impl Jobs {
         fields(job_type, now)
     )]
     /// Register an initializer and enqueue a job only if one of that type is not already pending.
+    ///
+    /// Use this when you want a single outstanding job for a given [`JobType`]. The new job is
+    /// created with `unique_per_type(true)`, so the insert simply succeeds without change if
+    /// another job of the same type is already queued or running.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`JobError`] if the initializer cannot be stored, the config fails to serialize,
+    /// or the database interaction (e.g., starting a transaction) fails.
     pub async fn add_initializer_and_spawn_unique<C: JobConfig>(
         &self,
         initializer: <C as JobConfig>::Initializer,
@@ -285,7 +415,7 @@ impl Jobs {
     }
 
     #[instrument(name = "job.find", skip(self))]
-    /// Fetch the current snapshot of a job aggregate by identifier.
+    /// Fetch the current snapshot of a job entity by identifier.
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
         self.repo.find_by_id(id).await
     }
