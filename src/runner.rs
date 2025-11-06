@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::{
+    JobSpawnOptions,
     current::CurrentJob,
     entity::{Job, JobType},
 };
@@ -30,6 +31,11 @@ pub trait JobInitializer: Send + Sync + 'static {
 /// Associate a typed config payload with a [`JobInitializer`].
 pub trait JobConfig: serde::Serialize {
     type Initializer: JobInitializer;
+
+    /// Customize how the job should be enqueued.
+    fn spawn_options(&self) -> JobSpawnOptions {
+        JobSpawnOptions::default()
+    }
 }
 
 /// Result returned by [`JobRunner::run`] describing how to progress the job.

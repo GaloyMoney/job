@@ -5,6 +5,7 @@ use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
 use std::borrow::Cow;
+use uuid::Uuid;
 
 use es_entity::{context::TracingContext, *};
 
@@ -42,6 +43,36 @@ impl std::fmt::Display for JobType {
     }
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(transparent)]
+#[serde(transparent)]
+/// Identifier representing the entity a job is scoped to.
+pub struct JobEntityId(Uuid);
+
+impl JobEntityId {
+    pub const fn new(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl From<Uuid> for JobEntityId {
+    fn from(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl From<JobEntityId> for Uuid {
+    fn from(value: JobEntityId) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for JobEntityId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(EsEvent, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[es_event(id = "JobId", event_context = false)]
@@ -49,6 +80,7 @@ pub enum JobEvent {
     Initialized {
         id: JobId,
         job_type: JobType,
+        entity_id: Option<JobEntityId>,
         config: serde_json::Value,
         tracing_context: Option<TracingContext>,
     },
@@ -72,6 +104,7 @@ pub enum JobEvent {
 pub struct Job {
     pub id: JobId,
     pub job_type: JobType,
+    entity_id: Option<JobEntityId>,
     config: serde_json::Value,
     events: EntityEvents<JobEvent>,
 }
@@ -150,6 +183,10 @@ impl Job {
         self.events.push(JobEvent::ExecutionErrored { error });
         self.events.push(JobEvent::JobCompleted);
     }
+
+    pub fn entity_id(&self) -> Option<&JobEntityId> {
+        self.entity_id.as_ref()
+    }
 }
 
 impl TryFromEvents<JobEvent> for Job {
@@ -160,12 +197,14 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::Initialized {
                     id,
                     job_type,
+                    entity_id,
                     config,
                     ..
                 } => {
                     builder = builder
                         .id(*id)
                         .job_type(job_type.clone())
+                        .entity_id(entity_id.clone())
                         .config(config.clone())
                 }
                 JobEvent::ExecutionScheduled { .. } => {}
@@ -186,6 +225,8 @@ pub struct NewJob {
     #[builder(default)]
     pub(super) unique_per_type: bool,
     pub(super) job_type: JobType,
+    #[builder(default)]
+    pub(super) entity_id: Option<JobEntityId>,
     #[builder(setter(custom))]
     pub(super) config: serde_json::Value,
     #[builder(default)]
@@ -213,6 +254,7 @@ impl IntoEvents<JobEvent> for NewJob {
             [JobEvent::Initialized {
                 id: self.id,
                 job_type: self.job_type,
+                entity_id: self.entity_id,
                 config: self.config,
                 tracing_context: self.tracing_context,
             }],

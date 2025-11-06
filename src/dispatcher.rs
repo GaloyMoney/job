@@ -76,6 +76,7 @@ impl JobDispatcher {
             polled_job.attempt,
             self.repo.pool().clone(),
             polled_job.data_json,
+            job.entity_id().cloned(),
         );
         self.tracker.dispatch_job();
         match Self::dispatch_job(

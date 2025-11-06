@@ -3,7 +3,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
-use super::{JobId, error::JobError};
+use super::{JobEntityId, JobId, error::JobError};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
@@ -11,6 +11,7 @@ pub struct CurrentJob {
     attempt: u32,
     pool: PgPool,
     execution_state_json: Option<serde_json::Value>,
+    entity_id: Option<JobEntityId>,
 }
 
 impl CurrentJob {
@@ -19,12 +20,14 @@ impl CurrentJob {
         attempt: u32,
         pool: PgPool,
         execution_state: Option<serde_json::Value>,
+        entity_id: Option<JobEntityId>,
     ) -> Self {
         Self {
             id,
             attempt,
             pool,
             execution_state_json: execution_state,
+            entity_id,
         }
     }
 
@@ -91,5 +94,9 @@ impl CurrentJob {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub fn entity_id(&self) -> Option<&JobEntityId> {
+        self.entity_id.as_ref()
     }
 }

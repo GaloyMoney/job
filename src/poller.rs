@@ -304,27 +304,47 @@ async fn poll_jobs(
     let rows = sqlx::query_as!(
         JobPollRow,
         r#"
-        WITH min_wait AS (
-            SELECT MIN(execute_at) - $2::timestamptz AS wait_time
+        WITH running_entities AS (
+            SELECT DISTINCT jobs.entity_id
             FROM job_executions
-            WHERE state = 'pending'
-            AND execute_at > $2::timestamptz
+            JOIN jobs ON job_executions.id = jobs.id
+            WHERE job_executions.state = 'running'
+            AND jobs.entity_id IS NOT NULL
         ),
-        selected_jobs AS (
-            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index
+        min_wait AS (
+            SELECT MIN(je.execute_at) - $2::timestamptz AS wait_time
             FROM job_executions je
             JOIN jobs ON je.id = jobs.id
-            WHERE execute_at <= $2::timestamptz
+            LEFT JOIN running_entities ON jobs.entity_id = running_entities.entity_id
+            WHERE je.state = 'pending'
+            AND je.execute_at > $2::timestamptz
+            AND (jobs.entity_id IS NULL OR running_entities.entity_id IS NULL)
+        ),
+        eligible_jobs AS (
+            SELECT DISTINCT ON (COALESCE(jobs.entity_id, je.id))
+                je.id,
+                je.execution_state_json AS data_json,
+                je.attempt_index,
+                je.execute_at
+            FROM job_executions je
+            JOIN jobs ON je.id = jobs.id
+            LEFT JOIN running_entities ON jobs.entity_id = running_entities.entity_id
+            WHERE je.execute_at <= $2::timestamptz
             AND je.state = 'pending'
-            ORDER BY execute_at ASC
+            AND (jobs.entity_id IS NULL OR running_entities.entity_id IS NULL)
+            ORDER BY COALESCE(jobs.entity_id, je.id), je.execute_at, je.id
+        ),
+        selected_jobs AS (
+            SELECT id, data_json, attempt_index
+            FROM eligible_jobs
+            ORDER BY execute_at, id
             LIMIT $1
-            FOR UPDATE
         ),
         updated AS (
             UPDATE job_executions AS je
             SET state = 'running', alive_at = $2, execute_at = NULL, poller_instance_id = $3
             FROM selected_jobs
-            WHERE je.id = selected_jobs.id
+            WHERE je.id = selected_jobs.id AND je.state = 'pending'
             RETURNING je.id, selected_jobs.data_json, je.attempt_index
         )
         SELECT * FROM (

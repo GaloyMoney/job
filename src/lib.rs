@@ -83,7 +83,7 @@ use std::sync::{Arc, Mutex};
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobType};
+pub use entity::{Job, JobEntityId, JobType};
 pub use migrate::*;
 pub use registry::*;
 pub use runner::*;
@@ -94,6 +94,35 @@ use poller::*;
 use repo::*;
 
 es_entity::entity_id! { JobId }
+
+#[derive(Debug, Clone, Default)]
+/// Options that influence how a job is enqueued.
+pub struct JobSpawnOptions {
+    entity_id: Option<JobEntityId>,
+}
+
+impl JobSpawnOptions {
+    /// Create a new options instance with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Associate the job with an entity to enforce sequential execution across job types.
+    pub fn with_entity_id(mut self, entity_id: impl Into<JobEntityId>) -> Self {
+        self.entity_id = Some(entity_id.into());
+        self
+    }
+
+    /// Associate the job with an optional entity identifier.
+    pub fn with_optional_entity_id(mut self, entity_id: Option<impl Into<JobEntityId>>) -> Self {
+        self.entity_id = entity_id.map(|value| value.into());
+        self
+    }
+
+    pub fn entity_id(&self) -> Option<JobEntityId> {
+        self.entity_id
+    }
+}
 
 #[derive(Clone)]
 /// Primary entry point for interacting with the Job crate. Provides APIs to register job
@@ -315,10 +344,12 @@ impl Jobs {
         }
         let job_type = <<C as JobConfig>::Initializer as JobInitializer>::job_type();
         Span::current().record("job_type", tracing::field::display(&job_type));
+        let options = config.spawn_options();
         let new_job = NewJob::builder()
             .id(JobId::new())
             .unique_per_type(true)
             .job_type(job_type)
+            .entity_id(options.entity_id())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
             .build()
@@ -372,9 +403,11 @@ impl Jobs {
     ) -> Result<Job, JobError> {
         let job_type = <<C as JobConfig>::Initializer as JobInitializer>::job_type();
         Span::current().record("job_type", tracing::field::display(&job_type));
+        let options = config.spawn_options();
         let new_job = NewJob::builder()
             .id(job_id.into())
             .job_type(<<C as JobConfig>::Initializer as JobInitializer>::job_type())
+            .entity_id(options.entity_id())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
             .build()
@@ -401,9 +434,11 @@ impl Jobs {
     ) -> Result<Job, JobError> {
         let job_type = <<C as JobConfig>::Initializer as JobInitializer>::job_type();
         Span::current().record("job_type", tracing::field::display(&job_type));
+        let options = config.spawn_options();
         let new_job = NewJob::builder()
             .id(job_id.into())
             .job_type(job_type)
+            .entity_id(options.entity_id())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
             .build()
