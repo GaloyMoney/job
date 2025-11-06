@@ -311,34 +311,44 @@ async fn poll_jobs(
             WHERE job_executions.state = 'running'
             AND jobs.entity_id IS NOT NULL
         ),
-        min_wait AS (
-            SELECT MIN(je.execute_at) - $2::timestamptz AS wait_time
+        pending_candidates AS (
+            SELECT
+                je.id,
+                je.execution_state_json AS data_json,
+                je.attempt_index,
+                je.execute_at,
+                COALESCE(jobs.entity_id, je.id) AS sequencing_key,
+                (running_entities.entity_id IS NOT NULL) AS is_blocked
             FROM job_executions je
             JOIN jobs ON je.id = jobs.id
             LEFT JOIN running_entities ON jobs.entity_id = running_entities.entity_id
             WHERE je.state = 'pending'
-            AND je.execute_at > $2::timestamptz
-            AND (jobs.entity_id IS NULL OR running_entities.entity_id IS NULL)
         ),
-        eligible_jobs AS (
-            SELECT DISTINCT ON (COALESCE(jobs.entity_id, je.id))
-                je.id,
-                je.execution_state_json AS data_json,
-                je.attempt_index,
-                je.execute_at
-            FROM job_executions je
-            JOIN jobs ON je.id = jobs.id
-            LEFT JOIN running_entities ON jobs.entity_id = running_entities.entity_id
-            WHERE je.execute_at <= $2::timestamptz
-            AND je.state = 'pending'
-            AND (jobs.entity_id IS NULL OR running_entities.entity_id IS NULL)
-            ORDER BY COALESCE(jobs.entity_id, je.id), je.execute_at, je.id
+        min_wait AS (
+            SELECT MIN(GREATEST(execute_at, $2::timestamptz)) - $2::timestamptz AS wait_time
+            FROM pending_candidates
+        ),
+        ranked_candidates AS (
+            SELECT
+                id,
+                data_json,
+                attempt_index,
+                execute_at,
+                is_blocked,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sequencing_key
+                    ORDER BY execute_at, id
+                ) AS seq
+            FROM pending_candidates
+            WHERE execute_at <= $2::timestamptz
         ),
         selected_jobs AS (
             SELECT id, data_json, attempt_index
-            FROM eligible_jobs
+            FROM ranked_candidates
+            WHERE seq = 1 AND NOT is_blocked
             ORDER BY execute_at, id
             LIMIT $1
+            FOR UPDATE
         ),
         updated AS (
             UPDATE job_executions AS je
