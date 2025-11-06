@@ -11,13 +11,13 @@ use std::time::Duration;
 pub struct JobPollerConfig {
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_job_lost_interval")]
-    /// How long a job may run without heartbeats before it is considered lost.
+    /// How long a job may be in a 'running' state
     pub job_lost_interval: Duration,
     #[serde(default = "default_max_jobs_per_process")]
     /// Maximum number of concurrent jobs this process will execute.
     pub max_jobs_per_process: usize,
     #[serde(default = "default_min_jobs_per_process")]
-    /// Minimum number of concurrent jobs to keep queued before the poller sleeps.
+    /// Minimum number of concurrent jobs to keep running before the poller sleeps.
     pub min_jobs_per_process: usize,
 }
 
@@ -33,21 +33,73 @@ impl Default for JobPollerConfig {
 
 #[derive(Builder, Debug, Clone)]
 #[builder(build_fn(skip))]
-/// Builder for initializing the [`Jobs`](crate::Jobs) service.
+/// Configuration consumed by [`Jobs::init`](crate::Jobs::init).
+/// Build with [`JobSvcConfig::builder`](Self::builder).
+///
+/// # Examples
+///
+/// Build a configuration that manages its own Postgres pool from a connection string:
+///
+/// ```no_run
+/// use job::{Jobs, JobSvcConfig};
+/// use job::error::JobError;
+///
+/// # async fn run() -> Result<(), JobError> {
+/// let config = JobSvcConfig::builder()
+///     .pg_con("postgres://postgres:password@localhost/postgres")
+///     .build()
+///     .unwrap();
+///
+/// let mut jobs = Jobs::init(config).await?;
+/// jobs.start_poll().await?;
+/// # Ok(())
+/// # }
+/// # tokio::runtime::Runtime::new().unwrap().block_on(run()).unwrap();
+/// ```
+///
+/// Reuse an existing `sqlx::PgPool` instead:
+///
+/// ```no_run
+/// use job::{Jobs, JobSvcConfig};
+/// use job::error::JobError;
+/// use sqlx::postgres::PgPoolOptions;
+///
+/// # async fn run() -> Result<(), JobError> {
+/// let pool = PgPoolOptions::new()
+///     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
+///
+/// let config = JobSvcConfig::builder()
+///     .pool(pool)
+///     .exec_migrations(false) // migrations already handled elsewhere
+///     .build()
+///     .unwrap();
+///
+/// let mut jobs = Jobs::init(config).await?;
+/// jobs.start_poll().await?;
+/// # Ok(())
+/// # }
+/// # tokio::runtime::Runtime::new().unwrap().block_on(run()).unwrap();
+/// ```
 pub struct JobSvcConfig {
     #[builder(setter(into, strip_option), default)]
+    /// Provide a Postgres connection string used to build an internal pool. Mutually exclusive with `pool`. When set, `exec_migrations` defaults to `true` unless overridden.
     pub(super) pg_con: Option<String>,
     #[builder(setter(into, strip_option), default)]
+    /// Override the maximum number of connections the internally managed pool may open. Ignored when `pool` is supplied.
     pub(super) max_connections: Option<u32>,
     #[builder(default)]
+    /// Set to `true` to have `Jobs::init` run the embedded database migrations during startup. Defaults to `false`, unless `pg_con` is supplied without an explicit value.
     pub(super) exec_migrations: bool,
     #[builder(setter(into, strip_option), default)]
+    /// Inject an existing `sqlx::PgPool` instead of letting the job service build one. Mutually exclusive with `pg_con`.
     pub(super) pool: Option<sqlx::PgPool>,
     #[builder(default)]
+    /// Override the defaults that control how the background poller distributes work across processes.
     pub poller_config: JobPollerConfig,
 }
 
 impl JobSvcConfig {
+    /// Create a [`JobSvcConfigBuilder`] with defaults for all optional settings.
     pub fn builder() -> JobSvcConfigBuilder {
         JobSvcConfigBuilder::default()
     }

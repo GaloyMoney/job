@@ -34,24 +34,36 @@ pub trait JobConfig: serde::Serialize {
 
 /// Result returned by [`JobRunner::run`] describing how to progress the job.
 pub enum JobCompletion {
+    /// Job finished successfully; mark the record as completed.
     Complete,
     #[cfg(feature = "es-entity")]
+    /// Job finished and returns an `EsEntity` operation that the job service will commit.
     CompleteWithOp(es_entity::DbOp<'static>),
+    /// Job finished and returns a transaction that the job service will commit.
     CompleteWithTx(sqlx::Transaction<'static, sqlx::Postgres>),
+    /// Schedule a new run immediately.
     RescheduleNow,
     #[cfg(feature = "es-entity")]
+    /// Schedule a new run immediately and return an `EsEntity` operation that the job service will commit.
     RescheduleNowWithOp(es_entity::DbOp<'static>),
+    /// Schedule a new run immediately and return a transaction that the job service will commit.
     RescheduleNowWithTx(sqlx::Transaction<'static, sqlx::Postgres>),
+    /// Schedule the next run after a delay.
     RescheduleIn(std::time::Duration),
     #[cfg(feature = "es-entity")]
+    /// Schedule the next run after a delay and return an `EsEntity` operation that the job service will commit.
     RescheduleInWithOp(std::time::Duration, es_entity::DbOp<'static>),
+    /// Schedule the next run after a delay and return a transaction that the job service will commit.
     RescheduleInWithTx(
         std::time::Duration,
         sqlx::Transaction<'static, sqlx::Postgres>,
     ),
+    /// Schedule the next run at an exact timestamp.
     RescheduleAt(DateTime<Utc>),
     #[cfg(feature = "es-entity")]
+    /// Schedule the next run at an exact timestamp and return an `EsEntity` operation that the job service will commit.
     RescheduleAtWithOp(DateTime<Utc>, es_entity::DbOp<'static>),
+    /// Schedule the next run at an exact timestamp and return a transaction that the job service will commit.
     RescheduleAtWithTx(DateTime<Utc>, sqlx::Transaction<'static, sqlx::Postgres>),
 }
 
