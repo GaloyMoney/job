@@ -204,7 +204,7 @@ impl TryFromEvents<JobEvent> for Job {
                     builder = builder
                         .id(*id)
                         .job_type(job_type.clone())
-                        .entity_id(entity_id.clone())
+                        .entity_id(*entity_id)
                         .config(config.clone())
                 }
                 JobEvent::ExecutionScheduled { .. } => {}
