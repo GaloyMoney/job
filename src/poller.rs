@@ -14,15 +14,8 @@ use std::{
 use crate::JobType;
 
 use super::{
-    JobId,
-    config::JobPollerConfig,
-    dispatcher::*,
-    error::JobError,
-    handle::OwnedTaskHandle,
-    observer::{JobObserver, LostJobContext},
-    registry::JobRegistry,
-    repo::JobRepo,
-    tracker::JobTracker,
+    JobId, config::JobPollerConfig, dispatcher::*, error::JobError, handle::OwnedTaskHandle,
+    observer::JobObserver, registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
 };
 
 pub(crate) struct JobPoller {
@@ -213,12 +206,7 @@ impl JobPoller {
                     Span::current().record("n_lost_jobs", rows.len());
                     for row in rows {
                         tracing::error!(job_id = %row.id, "lost job");
-                        observer.on_lost_job(&LostJobContext {
-                            job_id: row.id,
-                            job_type: row.job_type.clone(),
-                            attempt: row.attempt_index as u32,
-                            detected_at: now,
-                        });
+                        observer.on_lost_job(row.id, &row.job_type, row.attempt_index as u32);
                     }
                 } else {
                     Span::current().record("n_lost_jobs", 0);

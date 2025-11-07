@@ -114,17 +114,32 @@ callbacks when an attempt starts and when it completes, allowing you to emit
 metrics, logs, or alerts that match your own policies.
 
 ```rust
-use job::{JobAttemptContext, JobAttemptOutcome, JobObserver};
+use chrono::{DateTime, Utc};
+use job::{Job, JobCompletion, JobError, JobObserver};
 
 struct MetricsObserver;
 
 impl JobObserver for MetricsObserver {
-    fn on_attempt_outcome(
+    fn on_attempt_success(&self, job: &Job, attempt: u32, completion: &JobCompletion) {
+        tracing::info!(job_id = %job.id, attempt, ?completion);
+    }
+
+    fn on_attempt_failure(
         &self,
-        ctx: &JobAttemptContext,
-        outcome: &JobAttemptOutcome,
+        job: &Job,
+        attempt: u32,
+        error: &JobError,
+        retry_at: Option<DateTime<Utc>>,
+        will_retry: bool,
     ) {
-        tracing::info!(job_id = %ctx.job_id, attempt = ctx.attempt, ?outcome);
+        tracing::warn!(
+            job_id = %job.id,
+            attempt,
+            error = %error,
+            ?retry_at,
+            will_retry,
+            "job failed"
+        );
     }
 }
 

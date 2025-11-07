@@ -84,14 +84,8 @@ impl JobDispatcher {
             self.repo.pool().clone(),
             polled_job.data_json,
         );
-        let attempt_ctx = JobAttemptContext {
-            job_id: job.id,
-            job_type: job.job_type.clone(),
-            attempt: polled_job.attempt,
-            poller_instance_id: self.instance_id,
-            started_at,
-        };
-        self.observer.on_attempt_start(&attempt_ctx);
+        self.observer
+            .on_attempt_start(&job, polled_job.attempt, self.instance_id);
         self.tracker.dispatch_job();
         match Self::run_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
@@ -103,126 +97,83 @@ impl JobDispatcher {
                 } else {
                     None
                 };
-                let error_message = e.to_string();
-                self.fail_job(job.id, e, polled_job.attempt, retry_at.clone())
+                self.observer.on_attempt_failure(
+                    &job,
+                    polled_job.attempt,
+                    &e,
+                    retry_at.clone(),
+                    will_retry,
+                );
+                self.fail_job(job.id, e, polled_job.attempt, retry_at)
                     .await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Failed {
-                        error: error_message,
-                        retry_at,
-                        will_retry,
-                    },
-                );
             }
-            Ok(JobCompletion::Complete) => {
-                span.record("conclusion", "Complete");
-                let op = self.repo.begin_op().await?;
-                self.complete_job(op, job.id).await?;
+            Ok(completion) => {
                 self.observer
-                    .on_attempt_outcome(&attempt_ctx, &JobAttemptOutcome::Completed);
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::CompleteWithOp(op)) => {
-                span.record("conclusion", "CompleteWithOp");
-                self.complete_job(op, job.id).await?;
-                self.observer
-                    .on_attempt_outcome(&attempt_ctx, &JobAttemptOutcome::Completed);
-            }
-            Ok(JobCompletion::CompleteWithTx(tx)) => {
-                span.record("conclusion", "CompleteWithTx");
-                self.complete_job(tx, job.id).await?;
-                self.observer
-                    .on_attempt_outcome(&attempt_ctx, &JobAttemptOutcome::Completed);
-            }
-            Ok(JobCompletion::RescheduleNow) => {
-                span.record("conclusion", "RescheduleNow");
-                let op = self.repo.begin_op().await?;
-                let t = op.now().unwrap_or_else(crate::time::now);
-                self.reschedule_job(op, job.id, t).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::Immediate),
-                );
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleNowWithOp(op)) => {
-                span.record("conclusion", "RescheduleNowWithOp");
-                let t = op.now().unwrap_or_else(crate::time::now);
-                self.reschedule_job(op, job.id, t).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::Immediate),
-                );
-            }
-            Ok(JobCompletion::RescheduleNowWithTx(tx)) => {
-                span.record("conclusion", "RescheduleNowWithTx");
-                let t = crate::time::now();
-                self.reschedule_job(tx, job.id, t).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::Immediate),
-                );
-            }
-            Ok(JobCompletion::RescheduleIn(d)) => {
-                span.record("conclusion", "RescheduleIn");
-                let op = self.repo.begin_op().await?;
-                let t = op.now().unwrap_or_else(crate::time::now);
-                let t = t + d;
-                self.reschedule_job(op, job.id, t).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::In(d)),
-                );
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleInWithOp(d, op)) => {
-                span.record("conclusion", "RescheduleInWithOp");
-                let t = op.now().unwrap_or_else(crate::time::now);
-                let t = t + d;
-                self.reschedule_job(op, job.id, t).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::In(d)),
-                );
-            }
-            Ok(JobCompletion::RescheduleInWithTx(d, tx)) => {
-                span.record("conclusion", "RescheduleInWithOp");
-                let t = crate::time::now() + d;
-                self.reschedule_job(tx, job.id, t).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::In(d)),
-                );
-            }
-            Ok(JobCompletion::RescheduleAt(t)) => {
-                span.record("conclusion", "RescheduleAt");
-                let op = self.repo.begin_op().await?;
-                let schedule_at = t;
-                self.reschedule_job(op, job.id, schedule_at).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::At(schedule_at)),
-                );
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleAtWithOp(t, op)) => {
-                span.record("conclusion", "RescheduleAtWithOp");
-                let schedule_at = t;
-                self.reschedule_job(op, job.id, schedule_at).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::At(schedule_at)),
-                );
-            }
-            Ok(JobCompletion::RescheduleAtWithTx(t, tx)) => {
-                span.record("conclusion", "RescheduleAtWithTx");
-                let schedule_at = t;
-                self.reschedule_job(tx, job.id, schedule_at).await?;
-                self.observer.on_attempt_outcome(
-                    &attempt_ctx,
-                    &JobAttemptOutcome::Rescheduled(JobReschedule::At(schedule_at)),
-                );
+                    .on_attempt_success(&job, polled_job.attempt, &completion);
+                match completion {
+                    JobCompletion::Complete => {
+                        span.record("conclusion", "Complete");
+                        let op = self.repo.begin_op().await?;
+                        self.complete_job(op, job.id).await?;
+                    }
+                    #[cfg(feature = "es-entity")]
+                    JobCompletion::CompleteWithOp(op) => {
+                        span.record("conclusion", "CompleteWithOp");
+                        self.complete_job(op, job.id).await?;
+                    }
+                    JobCompletion::CompleteWithTx(tx) => {
+                        span.record("conclusion", "CompleteWithTx");
+                        self.complete_job(tx, job.id).await?;
+                    }
+                    JobCompletion::RescheduleNow => {
+                        span.record("conclusion", "RescheduleNow");
+                        let op = self.repo.begin_op().await?;
+                        let t = op.now().unwrap_or_else(crate::time::now);
+                        self.reschedule_job(op, job.id, t).await?;
+                    }
+                    #[cfg(feature = "es-entity")]
+                    JobCompletion::RescheduleNowWithOp(op) => {
+                        span.record("conclusion", "RescheduleNowWithOp");
+                        let t = op.now().unwrap_or_else(crate::time::now);
+                        self.reschedule_job(op, job.id, t).await?;
+                    }
+                    JobCompletion::RescheduleNowWithTx(tx) => {
+                        span.record("conclusion", "RescheduleNowWithTx");
+                        let t = crate::time::now();
+                        self.reschedule_job(tx, job.id, t).await?;
+                    }
+                    JobCompletion::RescheduleIn(d) => {
+                        span.record("conclusion", "RescheduleIn");
+                        let op = self.repo.begin_op().await?;
+                        let t = op.now().unwrap_or_else(crate::time::now) + d;
+                        self.reschedule_job(op, job.id, t).await?;
+                    }
+                    #[cfg(feature = "es-entity")]
+                    JobCompletion::RescheduleInWithOp(d, op) => {
+                        span.record("conclusion", "RescheduleInWithOp");
+                        let t = op.now().unwrap_or_else(crate::time::now) + d;
+                        self.reschedule_job(op, job.id, t).await?;
+                    }
+                    JobCompletion::RescheduleInWithTx(d, tx) => {
+                        span.record("conclusion", "RescheduleInWithOp");
+                        let t = crate::time::now() + d;
+                        self.reschedule_job(tx, job.id, t).await?;
+                    }
+                    JobCompletion::RescheduleAt(t) => {
+                        span.record("conclusion", "RescheduleAt");
+                        let op = self.repo.begin_op().await?;
+                        self.reschedule_job(op, job.id, t).await?;
+                    }
+                    #[cfg(feature = "es-entity")]
+                    JobCompletion::RescheduleAtWithOp(t, op) => {
+                        span.record("conclusion", "RescheduleAtWithOp");
+                        self.reschedule_job(op, job.id, t).await?;
+                    }
+                    JobCompletion::RescheduleAtWithTx(t, tx) => {
+                        span.record("conclusion", "RescheduleAtWithTx");
+                        self.reschedule_job(tx, job.id, t).await?;
+                    }
+                }
             }
         }
         Ok(())
