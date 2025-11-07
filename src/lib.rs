@@ -29,6 +29,7 @@
 //!   and access to the Postgres pool during a run.
 //! - **Completion** – [`JobCompletion`] returns the outcome: finish, retry, or
 //!   reschedule at a later time.
+//! - **Observer** – [`JobObserver`] receives callbacks when runs start or finish so you can emit custom telemetry.
 //!
 //! ## Scheduling
 //! Jobs run immediately once a poller claims them. If you need a future start
@@ -67,6 +68,7 @@ mod dispatcher;
 mod entity;
 mod handle;
 mod migrate;
+mod observer;
 mod poller;
 mod registry;
 mod repo;
@@ -85,6 +87,7 @@ pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobType};
 pub use migrate::*;
+pub use observer::*;
 pub use registry::*;
 pub use runner::*;
 
@@ -103,6 +106,7 @@ pub struct Jobs {
     repo: JobRepo,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     poller_handle: Option<Arc<JobPollerHandle>>,
+    observer: Arc<dyn JobObserver>,
 }
 
 impl Jobs {
@@ -130,11 +134,13 @@ impl Jobs {
 
         let repo = JobRepo::new(&pool);
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
+        let observer = config.observer.clone();
         Ok(Self {
             repo,
             config,
             registry,
             poller_handle: None,
+            observer,
         })
     }
 
@@ -270,6 +276,7 @@ impl Jobs {
                 self.config.poller_config.clone(),
                 self.repo.clone(),
                 registry,
+                Arc::clone(&self.observer),
             )
             .start()
             .await?,

@@ -97,14 +97,42 @@ async fn main() -> anyhow::Result<()> {
     let job = jobs.create_and_spawn(job_id, job_config).await?;
     
     // Do some other stuff...
-    tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
+tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
 
-    // Check if its completed
-    let job = jobs.find(job_id).await?;
-    assert!(job.completed());
-    
-    Ok(())
+// Check if its completed
+let job = jobs.find(job_id).await?;
+assert!(job.completed());
+
+Ok(())
 }
+```
+
+### Observing job attempts
+
+You can hook into every run using the `JobObserver` trait. Observers receive
+callbacks when an attempt starts and when it completes, allowing you to emit
+metrics, logs, or alerts that match your own policies.
+
+```rust
+use job::{JobAttemptContext, JobAttemptOutcome, JobObserver};
+
+struct MetricsObserver;
+
+impl JobObserver for MetricsObserver {
+    fn on_attempt_outcome(
+        &self,
+        ctx: &JobAttemptContext,
+        outcome: &JobAttemptOutcome,
+    ) {
+        tracing::info!(job_id = %ctx.job_id, attempt = ctx.attempt, ?outcome);
+    }
+}
+
+let config = JobSvcConfig::builder()
+    .pool(pool.clone())
+    .observer(MetricsObserver)
+    .build()
+    .unwrap();
 ```
 
 ### Setup

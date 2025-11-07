@@ -7,7 +7,8 @@ use tracing::{Span, instrument};
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use super::{
-    JobId, current::CurrentJob, error::JobError, repo::JobRepo, runner::*, tracker::JobTracker,
+    JobId, current::CurrentJob, error::JobError, observer::*, repo::JobRepo, runner::*,
+    tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -24,6 +25,7 @@ pub(crate) struct JobDispatcher {
     tracker: Arc<JobTracker>,
     rescheduled: bool,
     instance_id: uuid::Uuid,
+    observer: Arc<dyn JobObserver>,
 }
 impl JobDispatcher {
     pub fn new(
@@ -33,6 +35,7 @@ impl JobDispatcher {
         _id: JobId,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
+        observer: Arc<dyn JobObserver>,
     ) -> Self {
         Self {
             repo,
@@ -41,12 +44,15 @@ impl JobDispatcher {
             tracker,
             rescheduled: false,
             instance_id,
+            observer,
         }
     }
 
-    #[instrument(name = "job.execute_job", skip_all,
-        fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now),
-    err)]
+    #[instrument(
+        name = "job.execute_job",
+        skip_all,
+        fields(job_id, job_type, attempt, error, error.message, conclusion, now)
+    )]
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_job(mut self, polled_job: PolledJob) -> Result<(), JobError> {
         let job = self.repo.find_by_id(polled_job.id).await?;
@@ -55,7 +61,8 @@ impl JobDispatcher {
         span.record("job_type", tracing::field::display(&job.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
         span.record("attempt", polled_job.attempt);
-        span.record("now", tracing::field::display(crate::time::now()));
+        let started_at = crate::time::now();
+        span.record("now", tracing::field::display(started_at));
         job.inject_tracing_parent();
         #[cfg(feature = "es-entity")]
         {
@@ -77,49 +84,85 @@ impl JobDispatcher {
             self.repo.pool().clone(),
             polled_job.data_json,
         );
+        let attempt_ctx = JobAttemptContext {
+            job_id: job.id,
+            job_type: job.job_type.clone(),
+            attempt: polled_job.attempt,
+            poller_instance_id: self.instance_id,
+            started_at,
+        };
+        self.observer.on_attempt_start(&attempt_ctx);
         self.tracker.dispatch_job();
-        match Self::dispatch_job(
-            self.runner.take().expect("runner"),
-            current_job,
-            self.retry_settings.n_warn_attempts,
-            polled_job.attempt,
-        )
-        .await
-        {
+        match Self::run_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
                 span.record("conclusion", "Error");
-                self.fail_job(job.id, e, polled_job.attempt).await?
+                let will_retry =
+                    self.retry_settings.n_attempts.unwrap_or(u32::MAX) > polled_job.attempt;
+                let retry_at = if will_retry {
+                    Some(self.retry_settings.next_attempt_at(polled_job.attempt))
+                } else {
+                    None
+                };
+                let error_message = e.to_string();
+                self.fail_job(job.id, e, polled_job.attempt, retry_at.clone())
+                    .await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Failed {
+                        error: error_message,
+                        retry_at,
+                        will_retry,
+                    },
+                );
             }
             Ok(JobCompletion::Complete) => {
                 span.record("conclusion", "Complete");
                 let op = self.repo.begin_op().await?;
                 self.complete_job(op, job.id).await?;
+                self.observer
+                    .on_attempt_outcome(&attempt_ctx, &JobAttemptOutcome::Completed);
             }
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::CompleteWithOp(op)) => {
                 span.record("conclusion", "CompleteWithOp");
                 self.complete_job(op, job.id).await?;
+                self.observer
+                    .on_attempt_outcome(&attempt_ctx, &JobAttemptOutcome::Completed);
             }
             Ok(JobCompletion::CompleteWithTx(tx)) => {
                 span.record("conclusion", "CompleteWithTx");
                 self.complete_job(tx, job.id).await?;
+                self.observer
+                    .on_attempt_outcome(&attempt_ctx, &JobAttemptOutcome::Completed);
             }
             Ok(JobCompletion::RescheduleNow) => {
                 span.record("conclusion", "RescheduleNow");
                 let op = self.repo.begin_op().await?;
                 let t = op.now().unwrap_or_else(crate::time::now);
                 self.reschedule_job(op, job.id, t).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::Immediate),
+                );
             }
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleNowWithOp(op)) => {
                 span.record("conclusion", "RescheduleNowWithOp");
                 let t = op.now().unwrap_or_else(crate::time::now);
                 self.reschedule_job(op, job.id, t).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::Immediate),
+                );
             }
             Ok(JobCompletion::RescheduleNowWithTx(tx)) => {
                 span.record("conclusion", "RescheduleNowWithTx");
                 let t = crate::time::now();
                 self.reschedule_job(tx, job.id, t).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::Immediate),
+                );
             }
             Ok(JobCompletion::RescheduleIn(d)) => {
                 span.record("conclusion", "RescheduleIn");
@@ -127,6 +170,10 @@ impl JobDispatcher {
                 let t = op.now().unwrap_or_else(crate::time::now);
                 let t = t + d;
                 self.reschedule_job(op, job.id, t).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::In(d)),
+                );
             }
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleInWithOp(d, op)) => {
@@ -134,35 +181,56 @@ impl JobDispatcher {
                 let t = op.now().unwrap_or_else(crate::time::now);
                 let t = t + d;
                 self.reschedule_job(op, job.id, t).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::In(d)),
+                );
             }
             Ok(JobCompletion::RescheduleInWithTx(d, tx)) => {
                 span.record("conclusion", "RescheduleInWithOp");
                 let t = crate::time::now() + d;
                 self.reschedule_job(tx, job.id, t).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::In(d)),
+                );
             }
             Ok(JobCompletion::RescheduleAt(t)) => {
                 span.record("conclusion", "RescheduleAt");
                 let op = self.repo.begin_op().await?;
-                self.reschedule_job(op, job.id, t).await?;
+                let schedule_at = t;
+                self.reschedule_job(op, job.id, schedule_at).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::At(schedule_at)),
+                );
             }
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleAtWithOp(t, op)) => {
                 span.record("conclusion", "RescheduleAtWithOp");
-                self.reschedule_job(op, job.id, t).await?;
+                let schedule_at = t;
+                self.reschedule_job(op, job.id, schedule_at).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::At(schedule_at)),
+                );
             }
             Ok(JobCompletion::RescheduleAtWithTx(t, tx)) => {
                 span.record("conclusion", "RescheduleAtWithTx");
-                self.reschedule_job(tx, job.id, t).await?;
+                let schedule_at = t;
+                self.reschedule_job(tx, job.id, schedule_at).await?;
+                self.observer.on_attempt_outcome(
+                    &attempt_ctx,
+                    &JobAttemptOutcome::Rescheduled(JobReschedule::At(schedule_at)),
+                );
             }
         }
         Ok(())
     }
 
-    async fn dispatch_job(
+    async fn run_job(
         runner: Box<dyn JobRunner>,
         current_job: CurrentJob,
-        n_warn_attempts: Option<u32>,
-        attempt: u32,
     ) -> Result<JobCompletion, JobError> {
         match AssertUnwindSafe(runner.run(current_job))
             .catch_unwind()
@@ -174,14 +242,6 @@ impl JobDispatcher {
                 let error = e.to_string();
                 span.record("error", true);
                 span.record("error.message", tracing::field::display(&error));
-                if attempt <= n_warn_attempts.unwrap_or(u32::MAX) {
-                    span.record("error.level", tracing::field::display(tracing::Level::WARN));
-                } else {
-                    span.record(
-                        "error.level",
-                        tracing::field::display(tracing::Level::ERROR),
-                    );
-                }
                 Err(JobError::JobExecutionError(error))
             }
             Err(panic) => {
@@ -199,10 +259,6 @@ impl JobDispatcher {
                     "error.message",
                     tracing::field::display(&format!("Panic: {message}")),
                 );
-                span.record(
-                    "error.level",
-                    tracing::field::display(tracing::Level::ERROR),
-                );
 
                 tracing::error!(
                     target: "job.panic",
@@ -219,14 +275,19 @@ impl JobDispatcher {
     }
 
     #[instrument(name = "job.fail_job", skip(self), fields(attempt, will_retry = tracing::field::Empty))]
-    async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
+    async fn fail_job(
+        &mut self,
+        id: JobId,
+        error: JobError,
+        attempt: u32,
+        retry_at: Option<DateTime<Utc>>,
+    ) -> Result<(), JobError> {
         let mut op = self.repo.begin_op().await?;
         let mut job = self.repo.find_by_id(id).await?;
-        if self.retry_settings.n_attempts.unwrap_or(u32::MAX) > attempt {
+        if let Some(reschedule_at) = retry_at {
             self.rescheduled = true;
             let next_attempt = attempt + 1;
             Span::current().record("will_retry", true);
-            let reschedule_at = self.retry_settings.next_attempt_at(attempt);
             job.retry_scheduled(error.to_string(), reschedule_at, next_attempt);
             sqlx::query!(
                 r#"

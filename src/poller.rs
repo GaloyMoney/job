@@ -11,9 +11,18 @@ use std::{
     time::Duration,
 };
 
+use crate::JobType;
+
 use super::{
-    JobId, config::JobPollerConfig, dispatcher::*, error::JobError, handle::OwnedTaskHandle,
-    registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
+    JobId,
+    config::JobPollerConfig,
+    dispatcher::*,
+    error::JobError,
+    handle::OwnedTaskHandle,
+    observer::{JobObserver, LostJobContext},
+    registry::JobRegistry,
+    repo::JobRepo,
+    tracker::JobTracker,
 };
 
 pub(crate) struct JobPoller {
@@ -23,6 +32,7 @@ pub(crate) struct JobPoller {
     tracker: Arc<JobTracker>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    observer: Arc<dyn JobObserver>,
 }
 
 pub(crate) struct JobPollerHandle {
@@ -39,7 +49,12 @@ pub(crate) struct JobPollerHandle {
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
 impl JobPoller {
-    pub fn new(config: JobPollerConfig, repo: JobRepo, registry: JobRegistry) -> Self {
+    pub fn new(
+        config: JobPollerConfig,
+        repo: JobRepo,
+        registry: JobRegistry,
+        observer: Arc<dyn JobObserver>,
+    ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
         Self {
             tracker: Arc::new(JobTracker::new(
@@ -51,6 +66,7 @@ impl JobPoller {
             registry,
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
+            observer,
         }
     }
 
@@ -166,6 +182,7 @@ impl JobPoller {
     fn start_lost_handler(&self) -> OwnedTaskHandle {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
+        let observer = Arc::clone(&self.observer);
         OwnedTaskHandle::new(tokio::task::spawn(async move {
             loop {
                 crate::time::sleep(job_lost_interval / 2).await;
@@ -185,7 +202,7 @@ impl JobPoller {
             UPDATE job_executions
             SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1, poller_instance_id = NULL
             WHERE state = 'running' AND alive_at < $1::timestamptz
-            RETURNING id as id
+            RETURNING id as id, job_type as "job_type!: JobType", attempt_index
             "#,
                     check_time,
                 )
@@ -196,6 +213,12 @@ impl JobPoller {
                     Span::current().record("n_lost_jobs", rows.len());
                     for row in rows {
                         tracing::error!(job_id = %row.id, "lost job");
+                        observer.on_lost_job(&LostJobContext {
+                            job_id: row.id,
+                            job_type: row.job_type.clone(),
+                            attempt: row.attempt_index as u32,
+                            detected_at: now,
+                        });
                     }
                 } else {
                     Span::current().record("n_lost_jobs", 0);
@@ -266,16 +289,24 @@ impl JobPoller {
         let repo = self.repo.clone();
         let tracker = self.tracker.clone();
         let instance_id = self.instance_id;
+        let observer = Arc::clone(&self.observer);
         span.record("now", tracing::field::display(crate::time::now()));
         span.record("poller_id", tracing::field::display(instance_id));
 
         let job_handle = tokio::spawn(async move {
             let id = job.id;
             let attempt = polled_job.attempt;
-            if let Err(e) =
-                JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
-                    .execute_job(polled_job)
-                    .await
+            if let Err(e) = JobDispatcher::new(
+                repo,
+                tracker,
+                retry_settings,
+                job.id,
+                runner,
+                instance_id,
+                observer,
+            )
+            .execute_job(polled_job)
+            .await
             {
                 tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
             }

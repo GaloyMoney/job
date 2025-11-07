@@ -3,7 +3,9 @@
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
+use crate::{JobObserver, NoopJobObserver};
 
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,7 +33,7 @@ impl Default for JobPollerConfig {
     }
 }
 
-#[derive(Builder, Debug, Clone)]
+#[derive(Builder, Clone)]
 #[builder(build_fn(skip))]
 /// Configuration consumed by [`Jobs::init`](crate::Jobs::init).
 /// Build with [`JobSvcConfig::builder`](Self::builder).
@@ -96,6 +98,9 @@ pub struct JobSvcConfig {
     #[builder(default)]
     /// Override the defaults that control how the background poller distributes work across processes.
     pub poller_config: JobPollerConfig,
+    #[builder(setter(skip), default = "default_observer()")]
+    /// Observer notified about job attempt lifecycle events. Defaults to a no-op implementation.
+    pub(super) observer: Arc<dyn JobObserver>,
 }
 
 impl JobSvcConfig {
@@ -128,7 +133,14 @@ impl JobSvcConfigBuilder {
             exec_migrations: self.exec_migrations.unwrap_or(false),
             pool: self.pool.clone().flatten(),
             poller_config: self.poller_config.clone().unwrap_or_default(),
+            observer: self.observer.clone().unwrap_or_else(default_observer),
         })
+    }
+
+    /// Set a custom job observer that receives lifecycle callbacks.
+    pub fn observer(&mut self, observer: impl JobObserver) -> &mut Self {
+        self.observer = Some(Arc::new(observer));
+        self
     }
 }
 
@@ -142,4 +154,20 @@ fn default_max_jobs_per_process() -> usize {
 
 fn default_min_jobs_per_process() -> usize {
     30
+}
+
+fn default_observer() -> Arc<dyn JobObserver> {
+    Arc::new(NoopJobObserver::default())
+}
+
+impl std::fmt::Debug for JobSvcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobSvcConfig")
+            .field("pg_con", &self.pg_con)
+            .field("max_connections", &self.max_connections)
+            .field("exec_migrations", &self.exec_migrations)
+            .field("pool", &self.pool.as_ref().map(|_| "PgPool{...}"))
+            .field("poller_config", &self.poller_config)
+            .finish()
+    }
 }

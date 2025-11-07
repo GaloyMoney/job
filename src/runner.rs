@@ -81,7 +81,6 @@ pub trait JobRunner: Send + Sync + 'static {
 /// Controls retry attempt limits and exponential backoff behaviour.
 pub struct RetrySettings {
     pub n_attempts: Option<u32>,
-    pub n_warn_attempts: Option<u32>,
     pub min_backoff: std::time::Duration,
     pub max_backoff: std::time::Duration,
     pub backoff_jitter_pct: u8,
@@ -91,7 +90,6 @@ impl RetrySettings {
     pub fn repeat_indefinitely() -> Self {
         Self {
             n_attempts: None,
-            n_warn_attempts: None,
             ..Default::default()
         }
     }
@@ -134,7 +132,6 @@ impl Default for RetrySettings {
         const SECS_IN_ONE_HOUR: u64 = 60 * 60;
         Self {
             n_attempts: Some(30),
-            n_warn_attempts: Some(3),
             min_backoff: std::time::Duration::from_secs(1),
             max_backoff: std::time::Duration::from_secs(SECS_IN_ONE_HOUR),
             backoff_jitter_pct: 20,
@@ -152,7 +149,6 @@ mod tests {
     fn test_settings(jitter_pct: u8) -> RetrySettings {
         RetrySettings {
             n_attempts: Some(10),
-            n_warn_attempts: Some(3),
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(60),
             backoff_jitter_pct: jitter_pct,

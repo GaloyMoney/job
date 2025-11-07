@@ -1,3 +1,13 @@
+## Unreleased
+
+### Breaking Changes
+
+- Remove `RetrySettings::n_warn_attempts`; alerting/logging decisions now belong to client-provided observers.
+
+### Features
+
+- Add the `JobObserver` trait and a configurable observer hook on `JobSvcConfig` so applications can implement custom telemetry for job attempts.
+
 # [cala release v0.2.8](https://github.com/GaloyMoney/cala/releases/tag/0.2.8)
 
 
