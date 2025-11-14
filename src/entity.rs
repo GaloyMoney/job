@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Duration};
 
 use es_entity::{context::TracingContext, *};
 
@@ -150,6 +150,34 @@ impl Job {
         self.events.push(JobEvent::ExecutionErrored { error });
         self.events.push(JobEvent::JobCompleted);
     }
+
+    pub(crate) fn recent_failures_in_window(
+        &self,
+        window: Option<Duration>,
+        now: DateTime<Utc>,
+    ) -> u32 {
+        let mut count = 0u32;
+        for persisted in self.events.iter_persisted().rev() {
+            if let Some(window) = window {
+                let elapsed = match now.signed_duration_since(persisted.recorded_at).to_std() {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                if elapsed > window {
+                    break;
+                }
+            }
+
+            if matches!(
+                persisted.event,
+                JobEvent::ExecutionErrored { .. } | JobEvent::ExecutionAborted { .. }
+            ) {
+                count = count.saturating_add(1);
+            }
+        }
+        count
+    }
 }
 
 impl TryFromEvents<JobEvent> for Job {
@@ -217,5 +245,114 @@ impl IntoEvents<JobEvent> for NewJob {
                 tracing_context: self.tracing_context,
             }],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, TimeZone};
+    use es_entity::events::GenericEvent;
+    use serde_json::json;
+
+    fn timestamp() -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn job_with_history(job_id: JobId, events: Vec<(JobEvent, DateTime<Utc>)>) -> Job {
+        let generic_events = events
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (event, recorded_at))| GenericEvent {
+                entity_id: job_id.clone(),
+                sequence: (idx as i32) + 1,
+                event: serde_json::to_value(event).expect("serialize event"),
+                context: None,
+                recorded_at,
+            })
+            .collect::<Vec<_>>();
+
+        EntityEvents::<JobEvent>::load_first::<Job>(generic_events).expect("load job")
+    }
+
+    #[test]
+    fn recent_failures_respect_window() {
+        let now = timestamp();
+        let job_type = JobType::new("test");
+        let job_id = JobId::new();
+        let events = vec![
+            (
+                JobEvent::Initialized {
+                    id: job_id.clone(),
+                    job_type: job_type.clone(),
+                    config: json!({}),
+                    tracing_context: None,
+                },
+                now - ChronoDuration::hours(3),
+            ),
+            (
+                JobEvent::ExecutionScheduled {
+                    attempt: 1,
+                    scheduled_at: now - ChronoDuration::hours(3),
+                },
+                now - ChronoDuration::hours(3),
+            ),
+            (
+                JobEvent::ExecutionErrored {
+                    error: "old".to_string(),
+                },
+                now - ChronoDuration::hours(2),
+            ),
+            (
+                JobEvent::ExecutionScheduled {
+                    attempt: 2,
+                    scheduled_at: now - ChronoDuration::hours(2),
+                },
+                now - ChronoDuration::hours(2),
+            ),
+            (
+                JobEvent::ExecutionErrored {
+                    error: "recent".to_string(),
+                },
+                now - ChronoDuration::minutes(5),
+            ),
+        ];
+        let job = job_with_history(job_id, events);
+        assert_eq!(
+            job.recent_failures_in_window(Some(Duration::from_secs(3600)), now),
+            1
+        );
+        assert_eq!(job.recent_failures_in_window(None, now), 2);
+    }
+
+    #[test]
+    fn recent_failures_include_aborted() {
+        let now = timestamp();
+        let job_type = JobType::new("test-abort");
+        let job_id = JobId::new();
+        let events = vec![
+            (
+                JobEvent::Initialized {
+                    id: job_id.clone(),
+                    job_type: job_type.clone(),
+                    config: json!({}),
+                    tracing_context: None,
+                },
+                now - ChronoDuration::hours(1),
+            ),
+            (
+                JobEvent::ExecutionAborted {
+                    reason: "shutdown".to_string(),
+                },
+                now - ChronoDuration::minutes(10),
+            ),
+        ];
+        let job = job_with_history(job_id, events);
+        assert_eq!(
+            job.recent_failures_in_window(Some(Duration::from_secs(3600)), now),
+            1
+        );
     }
 }

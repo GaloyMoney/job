@@ -7,7 +7,8 @@ use tracing::{Span, instrument};
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use super::{
-    JobId, current::CurrentJob, error::JobError, repo::JobRepo, runner::*, tracker::JobTracker,
+    JobId, current::CurrentJob, entity::Job, error::JobError, repo::JobRepo, runner::*,
+    tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -81,8 +82,8 @@ impl JobDispatcher {
         match Self::dispatch_job(
             self.runner.take().expect("runner"),
             current_job,
-            self.retry_settings.n_warn_attempts,
-            polled_job.attempt,
+            &self.retry_settings,
+            &job,
         )
         .await
         {
@@ -161,8 +162,8 @@ impl JobDispatcher {
     async fn dispatch_job(
         runner: Box<dyn JobRunner>,
         current_job: CurrentJob,
-        n_warn_attempts: Option<u32>,
-        attempt: u32,
+        retry_settings: &RetrySettings,
+        job: &Job,
     ) -> Result<JobCompletion, JobError> {
         match AssertUnwindSafe(runner.run(current_job))
             .catch_unwind()
@@ -174,14 +175,18 @@ impl JobDispatcher {
                 let error = e.to_string();
                 span.record("error", true);
                 span.record("error.message", tracing::field::display(&error));
-                if attempt <= n_warn_attempts.unwrap_or(u32::MAX) {
-                    span.record("error.level", tracing::field::display(tracing::Level::WARN));
+                let recent_failures = job.recent_failures_in_window(
+                    retry_settings.n_warn_attempts_window,
+                    crate::time::now(),
+                );
+                let level = if recent_failures.saturating_add(1)
+                    <= retry_settings.n_warn_attempts.unwrap_or(u32::MAX)
+                {
+                    tracing::Level::WARN
                 } else {
-                    span.record(
-                        "error.level",
-                        tracing::field::display(tracing::Level::ERROR),
-                    );
-                }
+                    tracing::Level::ERROR
+                };
+                span.record("error.level", tracing::field::display(level));
                 Err(JobError::JobExecutionError(error))
             }
             Err(panic) => {

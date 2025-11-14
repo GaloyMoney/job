@@ -78,20 +78,23 @@ pub trait JobRunner: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone)]
-/// Controls retry attempt limits and exponential backoff behaviour.
+/// Controls retry attempt limits, log escalation thresholds, and exponential backoff behaviour.
+/// Use [`RetrySettings::n_warn_attempts_window`] to only escalate errors when several failures
+/// occur within a rolling time window.
 pub struct RetrySettings {
     pub n_attempts: Option<u32>,
     pub n_warn_attempts: Option<u32>,
     pub min_backoff: std::time::Duration,
     pub max_backoff: std::time::Duration,
     pub backoff_jitter_pct: u8,
+    /// Optional rolling window used when counting warnable failures.
+    pub n_warn_attempts_window: Option<std::time::Duration>,
 }
 
 impl RetrySettings {
     pub fn repeat_indefinitely() -> Self {
         Self {
             n_attempts: None,
-            n_warn_attempts: None,
             ..Default::default()
         }
     }
@@ -138,6 +141,7 @@ impl Default for RetrySettings {
             min_backoff: std::time::Duration::from_secs(1),
             max_backoff: std::time::Duration::from_secs(SECS_IN_ONE_HOUR),
             backoff_jitter_pct: 20,
+            n_warn_attempts_window: None,
         }
     }
 }
@@ -156,6 +160,7 @@ mod tests {
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(60),
             backoff_jitter_pct: jitter_pct,
+            n_warn_attempts_window: Some(Duration::from_secs(300)),
         }
     }
 
