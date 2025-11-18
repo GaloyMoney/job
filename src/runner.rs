@@ -78,13 +78,28 @@ pub trait JobRunner: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone)]
-/// Controls retry attempt limits and exponential backoff behaviour.
+/// Controls retry attempt limits, telemetry escalation thresholds, and exponential backoff behaviour.
+/// Use [`RetrySettings::n_warn_attempts`] to decide how many failures remain `WARN` events before
+/// escalation. Set it to `None` to keep every retry at `WARN`.
 pub struct RetrySettings {
+    /// Maximum number of consecutive attempts before the job is failed for good. `None` retries
+    /// indefinitely.
     pub n_attempts: Option<u32>,
+    /// Number of consecutive failures that can be emitted as `WARN` telemetry before the crate
+    /// promotes subsequent failures to `ERROR`. `None` disables escalation and keeps every retry
+    /// at `WARN`.
     pub n_warn_attempts: Option<u32>,
+    /// Smallest backoff duration when rescheduling failures. Acts as the base for exponential
+    /// backoff growth.
     pub min_backoff: std::time::Duration,
+    /// Maximum backoff duration. Once the exponentially increasing delay reaches this value it will
+    /// stop growing.
     pub max_backoff: std::time::Duration,
+    /// Percentage (0-100) jitter applied to the computed backoff window to avoid thundering herds.
     pub backoff_jitter_pct: u8,
+    /// Multiplier applied to the previous backoff window. Once the elapsed time since the last
+    /// scheduled run exceeds `previous_backoff * attempt_reset_after_backoff_multiples`, the job is
+    /// treated as healthy again and the attempt counter resets to `1`.
     pub attempt_reset_after_backoff_multiples: u32,
 }
 
