@@ -328,3 +328,550 @@ impl IntoEvents<JobEvent> for NewJob {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod retry_scheduling {
+        use super::*;
+        use chrono::Duration as ChronoDuration;
+        use es_entity::events::GenericEvent;
+        use serde_json::json;
+        use std::time::Duration;
+
+        const TEST_MIN_BACKOFF_SECS: u64 = 30;
+        const TEST_MAX_BACKOFF_SECS: u64 = 600;
+        const TEST_RESET_MULTIPLE: u32 = 3;
+
+        fn backoff_duration() -> ChronoDuration {
+            ChronoDuration::seconds(TEST_MIN_BACKOFF_SECS as i64)
+        }
+
+        fn reset_threshold() -> ChronoDuration {
+            backoff_duration() * TEST_RESET_MULTIPLE as i32
+        }
+
+        fn elapsed_just_under_reset() -> ChronoDuration {
+            reset_threshold() - ChronoDuration::seconds(1)
+        }
+
+        fn elapsed_just_over_reset() -> ChronoDuration {
+            reset_threshold() + ChronoDuration::seconds(1)
+        }
+
+        fn schedule_timestamps(
+            now: DateTime<Utc>,
+            elapsed_since_schedule: ChronoDuration,
+        ) -> (DateTime<Utc>, DateTime<Utc>) {
+            let scheduled_at = now - elapsed_since_schedule;
+            let recorded_at = scheduled_at - backoff_duration();
+            (scheduled_at, recorded_at)
+        }
+
+        fn job_with_history(job_id: JobId, events: Vec<(JobEvent, DateTime<Utc>)>) -> Job {
+            let generic_events = events
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (event, recorded_at))| GenericEvent {
+                    entity_id: job_id,
+                    sequence: (idx as i32) + 1,
+                    event: serde_json::to_value(event).expect("serialize event"),
+                    context: None,
+                    recorded_at,
+                })
+                .collect::<Vec<_>>();
+
+            EntityEvents::<JobEvent>::load_first::<Job>(generic_events).expect("load job")
+        }
+
+        fn build_retry_policy(max_attempts: Option<u32>) -> RetryPolicy {
+            RetryPolicy {
+                max_attempts,
+                min_backoff: Duration::from_secs(TEST_MIN_BACKOFF_SECS),
+                max_backoff: Duration::from_secs(TEST_MAX_BACKOFF_SECS),
+                backoff_jitter_pct: 0,
+                attempt_reset_after_backoff_multiples: TEST_RESET_MULTIPLE,
+            }
+        }
+
+        #[test]
+        fn maybe_schedule_retry_emits_next_attempt_when_allowed() {
+            let now = time::now();
+            let job_type = JobType::new("retry-success");
+            let job_id = JobId::new();
+            let (latest_schedule_at, latest_recorded_at) =
+                schedule_timestamps(now, elapsed_just_under_reset());
+            let events = vec![
+                (
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: job_type.clone(),
+                        config: json!({}),
+                        tracing_context: None,
+                    },
+                    now - ChronoDuration::minutes(5),
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 1,
+                        scheduled_at: latest_schedule_at,
+                    },
+                    latest_recorded_at,
+                ),
+            ];
+            let mut job = job_with_history(job_id, events);
+            let retry_policy = build_retry_policy(Some(3));
+
+            let (_, next_attempt) = job
+                .maybe_schedule_retry(1, &retry_policy, "boom".to_string())
+                .expect("retry expected");
+
+            assert_eq!(next_attempt, 2);
+            let events: Vec<_> = job.events.iter_all().collect();
+            assert!(matches!(
+                events[events.len() - 2],
+                JobEvent::ExecutionErrored { .. }
+            ));
+            assert!(matches!(
+                events.last(),
+                Some(JobEvent::ExecutionScheduled { attempt: 2, .. })
+            ));
+        }
+
+        #[test]
+        fn maybe_schedule_retry_handles_zero_attempt_index() {
+            let now = time::now();
+            let job_type = JobType::new("retry-zero");
+            let job_id = JobId::new();
+            let events = vec![(
+                JobEvent::Initialized {
+                    id: job_id,
+                    job_type: job_type.clone(),
+                    config: json!({}),
+                    tracing_context: None,
+                },
+                now - ChronoDuration::minutes(5),
+            )];
+            let mut job = job_with_history(job_id, events);
+            let retry_policy = build_retry_policy(Some(3));
+
+            let (_, next_attempt) = job
+                .maybe_schedule_retry(0, &retry_policy, "boom".to_string())
+                .expect("retry expected when attempt starts at zero");
+
+            assert_eq!(next_attempt, 2);
+            let events: Vec<_> = job.events.iter_all().collect();
+            assert!(matches!(
+                events[events.len() - 2],
+                JobEvent::ExecutionErrored { .. }
+            ));
+            assert!(matches!(
+                events.last(),
+                Some(JobEvent::ExecutionScheduled { attempt: 2, .. })
+            ));
+        }
+
+        #[test]
+        fn maybe_schedule_retry_records_terminal_failure_when_limit_hit() {
+            let now = time::now();
+            let job_type = JobType::new("retry-terminal");
+            let job_id = JobId::new();
+            let (first_schedule_at, first_schedule_recorded_at) =
+                schedule_timestamps(now, ChronoDuration::minutes(5));
+            let first_error_at = first_schedule_at + ChronoDuration::seconds(1);
+            let (second_schedule_at, second_schedule_recorded_at) =
+                schedule_timestamps(now, elapsed_just_under_reset());
+            let events = vec![
+                (
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: job_type.clone(),
+                        config: json!({}),
+                        tracing_context: None,
+                    },
+                    now - ChronoDuration::minutes(10),
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 1,
+                        scheduled_at: first_schedule_at,
+                    },
+                    first_schedule_recorded_at,
+                ),
+                (
+                    JobEvent::ExecutionErrored {
+                        error: "first".to_string(),
+                    },
+                    first_error_at,
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 2,
+                        scheduled_at: second_schedule_at,
+                    },
+                    second_schedule_recorded_at,
+                ),
+            ];
+            let mut job = job_with_history(job_id, events);
+            let retry_policy = build_retry_policy(Some(2));
+
+            assert!(
+                job.maybe_schedule_retry(2, &retry_policy, "boom".to_string())
+                    .is_none(),
+                "should stop retrying when attempts exhausted"
+            );
+
+            let events: Vec<_> = job.events.iter_all().collect();
+            assert!(matches!(
+                events[events.len() - 2],
+                JobEvent::ExecutionErrored { .. }
+            ));
+            assert!(matches!(events.last(), Some(JobEvent::JobCompleted)));
+        }
+
+        #[test]
+        fn maybe_schedule_retry_resets_attempt_after_healthy_gap() {
+            let now = time::now();
+            let job_type = JobType::new("retry-reset");
+            let job_id = JobId::new();
+            let (first_schedule_at, first_schedule_recorded_at) =
+                schedule_timestamps(now, ChronoDuration::minutes(15));
+            let first_error_at = first_schedule_at + ChronoDuration::seconds(1);
+            let (healthy_gap_schedule_at, healthy_gap_schedule_recorded_at) =
+                schedule_timestamps(now, elapsed_just_over_reset());
+            let events = vec![
+                (
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: job_type.clone(),
+                        config: json!({}),
+                        tracing_context: None,
+                    },
+                    now - ChronoDuration::minutes(30),
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 1,
+                        scheduled_at: first_schedule_at,
+                    },
+                    first_schedule_recorded_at,
+                ),
+                (
+                    JobEvent::ExecutionErrored {
+                        error: "first".to_string(),
+                    },
+                    first_error_at,
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 2,
+                        scheduled_at: healthy_gap_schedule_at,
+                    },
+                    healthy_gap_schedule_recorded_at,
+                ),
+            ];
+            let mut job = job_with_history(job_id, events);
+            let retry_policy = build_retry_policy(Some(5));
+
+            let (_, next_attempt) = job
+                .maybe_schedule_retry(2, &retry_policy, "boom".to_string())
+                .expect("retry expected");
+
+            assert_eq!(
+                next_attempt, 2,
+                "a healthy gap should treat the next run as the second attempt"
+            );
+            let events: Vec<_> = job.events.iter_all().collect();
+            assert!(matches!(
+                events[events.len() - 2],
+                JobEvent::ExecutionErrored { .. }
+            ));
+            assert!(matches!(
+                events.last(),
+                Some(JobEvent::ExecutionScheduled { attempt: 2, .. })
+            ));
+        }
+
+        #[test]
+        fn maybe_schedule_retry_allows_retry_when_next_attempt_hits_limit() {
+            let now = time::now();
+            let job_type = JobType::new("retry-max-boundary");
+            let job_id = JobId::new();
+            let (first_schedule_at, first_schedule_recorded_at) =
+                schedule_timestamps(now, ChronoDuration::minutes(5));
+            let first_error_at = first_schedule_at + ChronoDuration::seconds(1);
+            let (latest_schedule_at, latest_schedule_recorded_at) =
+                schedule_timestamps(now, elapsed_just_under_reset());
+            let events = vec![
+                (
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: job_type.clone(),
+                        config: json!({}),
+                        tracing_context: None,
+                    },
+                    now - ChronoDuration::minutes(5),
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 1,
+                        scheduled_at: first_schedule_at,
+                    },
+                    first_schedule_recorded_at,
+                ),
+                (
+                    JobEvent::ExecutionErrored {
+                        error: "first".to_string(),
+                    },
+                    first_error_at,
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 2,
+                        scheduled_at: latest_schedule_at,
+                    },
+                    latest_schedule_recorded_at,
+                ),
+            ];
+            let mut job = job_with_history(job_id, events);
+            let retry_policy = build_retry_policy(Some(3));
+
+            let (_, next_attempt) = job
+                .maybe_schedule_retry(2, &retry_policy, "second failure".to_string())
+                .expect("final retry should still be scheduled");
+
+            assert_eq!(next_attempt, 3);
+            let events: Vec<_> = job.events.iter_all().collect();
+            assert!(matches!(
+                events[events.len() - 2],
+                JobEvent::ExecutionErrored { .. }
+            ));
+            assert!(matches!(
+                events.last(),
+                Some(JobEvent::ExecutionScheduled { attempt: 3, .. })
+            ));
+        }
+
+        #[test]
+        fn maybe_schedule_retry_resets_even_when_retry_limit_reached() {
+            let now = time::now();
+            let job_type = JobType::new("retry-reset-limit");
+            let job_id = JobId::new();
+            let (first_schedule_at, first_schedule_recorded_at) =
+                schedule_timestamps(now, ChronoDuration::minutes(20));
+            let first_error_at = first_schedule_at + ChronoDuration::seconds(1);
+            let (second_schedule_at, second_schedule_recorded_at) =
+                schedule_timestamps(now, ChronoDuration::minutes(10));
+            let second_error_at = second_schedule_at + ChronoDuration::seconds(1);
+            let (healthy_gap_schedule_at, healthy_gap_schedule_recorded_at) =
+                schedule_timestamps(now, elapsed_just_over_reset());
+            let events = vec![
+                (
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: job_type.clone(),
+                        config: json!({}),
+                        tracing_context: None,
+                    },
+                    now - ChronoDuration::hours(4),
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 1,
+                        scheduled_at: first_schedule_at,
+                    },
+                    first_schedule_recorded_at,
+                ),
+                (
+                    JobEvent::ExecutionErrored {
+                        error: "first".to_string(),
+                    },
+                    first_error_at,
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 2,
+                        scheduled_at: second_schedule_at,
+                    },
+                    second_schedule_recorded_at,
+                ),
+                (
+                    JobEvent::ExecutionErrored {
+                        error: "second".to_string(),
+                    },
+                    second_error_at,
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt: 3,
+                        scheduled_at: healthy_gap_schedule_at,
+                    },
+                    healthy_gap_schedule_recorded_at,
+                ),
+            ];
+            let mut job = job_with_history(job_id, events);
+            let retry_policy = build_retry_policy(Some(3));
+
+            let (_, next_attempt) = job
+                .maybe_schedule_retry(3, &retry_policy, "third failure".to_string())
+                .expect("a healthy gap should reset attempt even at limit");
+
+            assert_eq!(next_attempt, 2);
+            let events: Vec<_> = job.events.iter_all().collect();
+            assert!(matches!(
+                events[events.len() - 2],
+                JobEvent::ExecutionErrored { .. }
+            ));
+            assert!(matches!(
+                events.last(),
+                Some(JobEvent::ExecutionScheduled { attempt: 2, .. })
+            ));
+        }
+
+        #[test]
+        fn maybe_schedule_retry_with_unbounded_limit_handles_saturation() {
+            let now = time::now();
+            let job_type = JobType::new("retry-unbounded");
+            let job_id = JobId::new();
+            let attempt = u32::MAX;
+            let (latest_schedule_at, latest_recorded_at) =
+                schedule_timestamps(now, elapsed_just_under_reset());
+            let events = vec![
+                (
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: job_type.clone(),
+                        config: json!({}),
+                        tracing_context: None,
+                    },
+                    now - ChronoDuration::minutes(1),
+                ),
+                (
+                    JobEvent::ExecutionScheduled {
+                        attempt,
+                        scheduled_at: latest_schedule_at,
+                    },
+                    latest_recorded_at,
+                ),
+            ];
+            let mut job = job_with_history(job_id, events);
+            let retry_policy = build_retry_policy(None);
+
+            let (_, next_attempt) = job
+                .maybe_schedule_retry(attempt, &retry_policy, "overflow".to_string())
+                .expect("unbounded retries should permit another schedule");
+
+            assert_eq!(next_attempt, u32::MAX);
+            let events: Vec<_> = job.events.iter_all().collect();
+            assert!(matches!(
+                events[events.len() - 2],
+                JobEvent::ExecutionErrored { .. }
+            ));
+            match events.last() {
+                Some(JobEvent::ExecutionScheduled { attempt, .. }) => {
+                    assert_eq!(*attempt, u32::MAX);
+                }
+                other => panic!("expected execution scheduled event, got {other:?}"),
+            }
+        }
+    }
+
+    mod backoff {
+        use std::time::Duration;
+
+        const MAX_BACKOFF_MS: u64 = 60_000;
+
+        fn assert_delay_exact(actual: u64, expected: u64) {
+            assert_eq!(
+                actual, expected,
+                "Expected exactly {expected}ms, got {actual}ms"
+            );
+        }
+
+        fn assert_delay_in_range(actual: u64, min: u64, max: u64) {
+            assert!(
+                actual >= min && actual <= max,
+                "Expected delay in range {min}-{max}ms, got {actual}ms"
+            );
+        }
+
+        #[test]
+        fn exponential_backoff_grows_correctly() {
+            let min_backoff = Duration::from_millis(100);
+            let max_backoff = Duration::from_secs(60);
+            let expected_delays = [100, 200, 400, 800];
+
+            for (attempt, &expected) in (1..=4).zip(&expected_delays) {
+                let actual = super::calculate_backoff(attempt, min_backoff, max_backoff, 0);
+                assert_delay_exact(actual, expected);
+            }
+        }
+
+        #[test]
+        fn zero_attempt_handled_correctly() {
+            let min_backoff = Duration::from_millis(100);
+            let max_backoff = Duration::from_secs(60);
+            let delay = super::calculate_backoff(0, min_backoff, max_backoff, 0);
+
+            assert_delay_exact(delay, 100);
+        }
+
+        #[test]
+        fn high_attempts_capped_at_max_backoff() {
+            let min_backoff = Duration::from_millis(100);
+            let max_backoff = Duration::from_millis(MAX_BACKOFF_MS);
+
+            for high_attempt in [20, 31, 100, 1000, u32::MAX] {
+                let delay = super::calculate_backoff(high_attempt, min_backoff, max_backoff, 0);
+                assert_delay_exact(delay, MAX_BACKOFF_MS);
+            }
+        }
+
+        #[test]
+        fn attempts_capped_at_30() {
+            let min_backoff = Duration::from_millis(100);
+            let max_backoff = Duration::from_millis(MAX_BACKOFF_MS);
+            let backoff31 = super::calculate_backoff(31, min_backoff, max_backoff, 0);
+            let backoff100 = super::calculate_backoff(100, min_backoff, max_backoff, 0);
+
+            assert_eq!(backoff31, backoff100, "Both should be capped at attempt 30");
+            assert_eq!(backoff31, MAX_BACKOFF_MS);
+            assert_eq!(backoff100, MAX_BACKOFF_MS);
+        }
+
+        #[test]
+        fn jitter_adds_randomness() {
+            let min_backoff = Duration::from_millis(100);
+            let max_backoff = Duration::from_secs(60);
+            let delay = super::calculate_backoff(1, min_backoff, max_backoff, 20);
+
+            assert_delay_in_range(delay, 80, 120);
+        }
+
+        #[test]
+        fn jitter_never_negative() {
+            let min_backoff = Duration::from_millis(100);
+            let max_backoff = Duration::from_secs(60);
+
+            for _ in 0..10 {
+                let delay = super::calculate_backoff(1, min_backoff, max_backoff, 20);
+                assert!(delay <= 120, "Delay should be reasonable, got {delay}ms");
+            }
+        }
+
+        #[test]
+        fn deterministic_without_jitter() {
+            let min_backoff = Duration::from_millis(100);
+            let max_backoff = Duration::from_secs(60);
+
+            let backoff1 = super::calculate_backoff(5, min_backoff, max_backoff, 0);
+            let backoff2 = super::calculate_backoff(5, min_backoff, max_backoff, 0);
+
+            assert_eq!(
+                backoff1, backoff2,
+                "Backoffs should be identical without jitter"
+            );
+        }
+    }
+}
