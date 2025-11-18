@@ -2,13 +2,14 @@
 
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
+use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
 
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Duration};
 
 use es_entity::{context::TracingContext, *};
 
-use crate::{JobId, error::JobError};
+use crate::{JobId, error::JobError, time};
 
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(transparent)]
@@ -64,6 +65,15 @@ pub enum JobEvent {
         error: String,
     },
     JobCompleted,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RetryPolicy {
+    pub max_attempts: Option<u32>,
+    pub min_backoff: Duration,
+    pub max_backoff: Duration,
+    pub backoff_jitter_pct: u8,
+    pub attempt_reset_after_backoff_multiples: u32,
 }
 
 #[derive(EsEntity, Builder)]
@@ -150,6 +160,65 @@ impl Job {
         self.events.push(JobEvent::ExecutionErrored { error });
         self.events.push(JobEvent::JobCompleted);
     }
+
+    pub(super) fn maybe_schedule_retry(
+        &mut self,
+        attempt: u32,
+        retry_policy: &RetryPolicy,
+        error: String,
+    ) -> Option<(DateTime<Utc>, u32)> {
+        let max_attempts = retry_policy.max_attempts.unwrap_or(u32::MAX);
+        let mut next_attempt = attempt.max(1).saturating_add(1);
+        if self.should_reset_attempt_count(&time::now(), retry_policy) {
+            // If the attempt counter has reset, because enough time
+            // has passed, that means the current attempt is 1, and the
+            // next will be 2.
+            next_attempt = 2;
+        }
+
+        if next_attempt > max_attempts {
+            self.job_errored(error);
+            return None;
+        }
+
+        let reschedule_at = next_attempt_at(
+            // Based on current attempt counter
+            next_attempt.saturating_sub(1),
+            retry_policy.min_backoff,
+            retry_policy.max_backoff,
+            retry_policy.backoff_jitter_pct,
+        );
+        self.retry_scheduled(error, reschedule_at, next_attempt);
+        Some((reschedule_at, next_attempt))
+    }
+
+    fn should_reset_attempt_count(&self, now: &DateTime<Utc>, retry_policy: &RetryPolicy) -> bool {
+        self.latest_execution_scheduled()
+            .and_then(|(scheduled_at, recorded_at)| {
+                let previous_backoff = scheduled_at
+                    .signed_duration_since(recorded_at)
+                    .to_std()
+                    .ok()?;
+                let elapsed_since_scheduled =
+                    now.signed_duration_since(scheduled_at).to_std().ok()?;
+                let reset_threshold = previous_backoff
+                    .checked_mul(retry_policy.attempt_reset_after_backoff_multiples)?;
+                Some(elapsed_since_scheduled > reset_threshold)
+            })
+            .unwrap_or(false)
+    }
+
+    fn latest_execution_scheduled(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.events
+            .iter_persisted()
+            .rev()
+            .find_map(|persisted| match &persisted.event {
+                JobEvent::ExecutionScheduled { scheduled_at, .. } => {
+                    Some((*scheduled_at, persisted.recorded_at))
+                }
+                _ => None,
+            })
+    }
 }
 
 impl TryFromEvents<JobEvent> for Job {
@@ -177,6 +246,46 @@ impl TryFromEvents<JobEvent> for Job {
         }
         builder.events(events).build()
     }
+}
+
+fn next_attempt_at(
+    attempt: u32,
+    min_backoff: Duration,
+    max_backoff: Duration,
+    backoff_jitter_pct: u8,
+) -> DateTime<Utc> {
+    let backoff_ms = calculate_backoff(attempt, min_backoff, max_backoff, backoff_jitter_pct);
+    time::now() + Duration::from_millis(backoff_ms)
+}
+
+fn calculate_backoff(
+    attempt: u32,
+    min_backoff: Duration,
+    max_backoff: Duration,
+    backoff_jitter_pct: u8,
+) -> u64 {
+    // Calculate base exponential backoff with overflow protection
+    let safe_attempt = attempt.saturating_sub(1).min(30);
+    let base_ms = min_backoff.as_millis() as u64;
+    let max_ms = max_backoff.as_millis() as u64;
+
+    // Use u64 arithmetic with saturation to prevent overflow
+    let backoff = base_ms.saturating_mul(1u64 << safe_attempt).min(max_ms);
+
+    // Apply jitter if configured
+    if backoff_jitter_pct == 0 {
+        backoff
+    } else {
+        apply_jitter(backoff, max_ms, backoff_jitter_pct)
+    }
+}
+
+fn apply_jitter(backoff_ms: u64, max_ms: u64, backoff_jitter_pct: u8) -> u64 {
+    let jitter_amount = backoff_ms * backoff_jitter_pct as u64 / 100;
+    let jitter = rng().random_range(-(jitter_amount as i64)..=(jitter_amount as i64));
+
+    let jittered = (backoff_ms as i64 + jitter).max(0) as u64;
+    jittered.min(max_ms)
 }
 
 #[derive(Debug, Builder)]

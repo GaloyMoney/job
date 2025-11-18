@@ -7,7 +7,8 @@ use tracing::{Span, instrument};
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use super::{
-    JobId, current::CurrentJob, error::JobError, repo::JobRepo, runner::*, tracker::JobTracker,
+    JobId, current::CurrentJob, entity::RetryPolicy, error::JobError, repo::JobRepo, runner::*,
+    tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -78,14 +79,7 @@ impl JobDispatcher {
             polled_job.data_json,
         );
         self.tracker.dispatch_job();
-        match Self::dispatch_job(
-            self.runner.take().expect("runner"),
-            current_job,
-            self.retry_settings.n_warn_attempts,
-            polled_job.attempt,
-        )
-        .await
-        {
+        match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
                 span.record("conclusion", "Error");
                 self.fail_job(job.id, e, polled_job.attempt).await?
@@ -161,8 +155,6 @@ impl JobDispatcher {
     async fn dispatch_job(
         runner: Box<dyn JobRunner>,
         current_job: CurrentJob,
-        n_warn_attempts: Option<u32>,
-        attempt: u32,
     ) -> Result<JobCompletion, JobError> {
         match AssertUnwindSafe(runner.run(current_job))
             .catch_unwind()
@@ -174,14 +166,7 @@ impl JobDispatcher {
                 let error = e.to_string();
                 span.record("error", true);
                 span.record("error.message", tracing::field::display(&error));
-                if attempt <= n_warn_attempts.unwrap_or(u32::MAX) {
-                    span.record("error.level", tracing::field::display(tracing::Level::WARN));
-                } else {
-                    span.record(
-                        "error.level",
-                        tracing::field::display(tracing::Level::ERROR),
-                    );
-                }
+                span.record("error.level", tracing::field::display(tracing::Level::WARN));
                 Err(JobError::JobExecutionError(error))
             }
             Err(panic) => {
@@ -218,16 +203,53 @@ impl JobDispatcher {
         }
     }
 
-    #[instrument(name = "job.fail_job", skip(self), fields(attempt, will_retry = tracing::field::Empty))]
+    #[instrument(
+        name = "job.fail_job",
+        skip(self),
+        fields(
+            job_id = tracing::field::Empty,
+            job_type = tracing::field::Empty,
+            poller_id = tracing::field::Empty,
+            attempt,
+            will_retry = tracing::field::Empty,
+            error = tracing::field::Empty,
+            error.level = tracing::field::Empty,
+            error.message = tracing::field::Empty
+        )
+    )]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
         let mut op = self.repo.begin_op().await?;
         let mut job = self.repo.find_by_id(id).await?;
-        if self.retry_settings.n_attempts.unwrap_or(u32::MAX) > attempt {
+
+        let span = Span::current();
+        let error_str = error.to_string();
+        span.record("job_id", tracing::field::display(id));
+        span.record("job_type", tracing::field::display(&job.job_type));
+        span.record("poller_id", tracing::field::display(self.instance_id));
+        span.record("error", true);
+        span.record("error.message", tracing::field::display(&error_str));
+
+        let retry_policy = RetryPolicy {
+            max_attempts: self.retry_settings.n_attempts,
+            min_backoff: self.retry_settings.min_backoff,
+            max_backoff: self.retry_settings.max_backoff,
+            backoff_jitter_pct: self.retry_settings.backoff_jitter_pct,
+            attempt_reset_after_backoff_multiples: self
+                .retry_settings
+                .attempt_reset_after_backoff_multiples,
+        };
+
+        if let Some((reschedule_at, next_attempt)) =
+            job.maybe_schedule_retry(attempt, &retry_policy, error_str)
+        {
+            let level = match self.retry_settings.n_warn_attempts {
+                Some(limit) if next_attempt > limit => tracing::Level::ERROR,
+                _ => tracing::Level::WARN,
+            };
+            span.record("error.level", tracing::field::display(level));
             self.rescheduled = true;
-            let next_attempt = attempt + 1;
-            Span::current().record("will_retry", true);
-            let reschedule_at = self.retry_settings.next_attempt_at(attempt);
-            job.retry_scheduled(error.to_string(), reschedule_at, next_attempt);
+            span.record("will_retry", true);
+
             sqlx::query!(
                 r#"
                 UPDATE job_executions
@@ -242,8 +264,12 @@ impl JobDispatcher {
             .execute(op.as_executor())
             .await?;
         } else {
-            Span::current().record("will_retry", false);
-            job.job_errored(error.to_string());
+            span.record(
+                "error.level",
+                tracing::field::display(tracing::Level::ERROR),
+            );
+            span.record("will_retry", false);
+
             sqlx::query!(
                 r#"
                 DELETE FROM job_executions
@@ -257,7 +283,6 @@ impl JobDispatcher {
         }
 
         self.repo.update_in_op(&mut op, &mut job).await?;
-
         op.commit().await?;
         Ok(())
     }
