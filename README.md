@@ -15,6 +15,24 @@ Uses [sqlx](https://docs.rs/sqlx/latest/sqlx/) for interfacing with the DB.
 - Configurable retry logic with exponential backoff
 - Built-in job tracking and monitoring
 
+## Telemetry
+
+`job` emits structured telemetry via [`tracing`](https://docs.rs/tracing) spans such as `job.poll_jobs`,
+`job.fail_job`, and `job.complete_job`. Failed attempts push fields like `error`, `error.message`,
+`error.level`, and `will_retry`, so you can stream the events into your existing observability pipeline
+without wrapping the runner in additional logging.
+
+The [`RetrySettings`](https://docs.rs/job/latest/job/struct.RetrySettings.html) that you configure for each
+[`JobInitializer`](https://docs.rs/job/latest/job/trait.JobInitializer.html) directly influence that
+telemetry:
+
+- `n_attempts` caps how many times the dispatcher will retry before emitting a terminal `ERROR` and deleting the job execution.
+- `n_warn_attempts` controls how many consecutive failures remain `WARN` level events before the crate promotes them to `ERROR`. Setting it to `None` keeps every retry at `WARN`.
+- `min_backoff`, `max_backoff`, and `backoff_jitter_pct` determine the delay that is recorded in the `job.fail_job` span before the next retry is scheduled.
+- `attempt_reset_after_backoff_multiples` lets a job be considered healthy again after enough idle time (measured as multiples of the last backoff); the dispatcher resets the reported attempt counter accordingly.
+
+Together these make the emitted telemetry reflect both the severity and cadence of retryable failures, which is especially helpful when wiring the crate into alerting systems.
+
 ## Usage
 
 Add this to your `Cargo.toml`:
