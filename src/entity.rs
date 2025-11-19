@@ -107,12 +107,17 @@ impl RetryPolicy {
         jittered.min(max_ms)
     }
 
-    fn should_reset_attempt_count(&self, now: DateTime<Utc>, window: RetryWindow) -> Option<bool> {
-        let previous_backoff = window.backoff_duration();
-        let elapsed_since_scheduled = window.elapsed_since_retry_schedule(now)?;
-        let reset_threshold =
-            previous_backoff.checked_mul(self.attempt_reset_after_backoff_multiples)?;
-        Some(elapsed_since_scheduled > reset_threshold)
+    fn should_reset_attempt_count(&self, now: DateTime<Utc>, window: RetryWindow) -> bool {
+        let Some(elapsed_since_scheduled) = window.elapsed_since_retry_schedule(now) else {
+            return false;
+        };
+        let Some(reset_threshold) = window
+            .backoff_duration()
+            .checked_mul(self.attempt_reset_after_backoff_multiples)
+        else {
+            return false;
+        };
+        elapsed_since_scheduled > reset_threshold
     }
 }
 
@@ -245,7 +250,7 @@ impl Job {
         let mut current_attempt = attempt.max(1);
         if self
             .latest_retry_window()
-            .and_then(|window| retry_policy.should_reset_attempt_count(now, window))
+            .map(|window| retry_policy.should_reset_attempt_count(now, window))
             .unwrap_or(false)
         {
             current_attempt = 1;
@@ -1002,14 +1007,14 @@ mod tests {
         }
 
         #[test]
-        fn should_reset_attempt_count_returns_none_when_schedule_in_future() {
+        fn should_reset_attempt_count_returns_false_when_schedule_in_future() {
             let policy =
                 retry_policy_with_reset(Duration::from_secs(30), Duration::from_secs(600), 0, 3);
             let (window, now) = window_with_elapsed(30, -10);
 
             assert!(
-                policy.should_reset_attempt_count(now, window).is_none(),
-                "Should be None until the scheduled retry time has passed"
+                !policy.should_reset_attempt_count(now, window),
+                "Should be false until the scheduled retry time has passed"
             );
         }
 
@@ -1018,9 +1023,7 @@ mod tests {
             let policy =
                 retry_policy_with_reset(Duration::from_secs(30), Duration::from_secs(600), 0, 3);
             let (window, now) = window_with_elapsed(30, 80);
-            let reset = policy
-                .should_reset_attempt_count(now, window)
-                .expect("elapsed duration defined");
+            let reset = policy.should_reset_attempt_count(now, window);
 
             assert!(
                 !reset,
@@ -1033,9 +1036,7 @@ mod tests {
             let policy =
                 retry_policy_with_reset(Duration::from_secs(30), Duration::from_secs(600), 0, 3);
             let (window, now) = window_with_elapsed(30, 95);
-            let reset = policy
-                .should_reset_attempt_count(now, window)
-                .expect("elapsed duration defined");
+            let reset = policy.should_reset_attempt_count(now, window);
 
             assert!(
                 reset,
