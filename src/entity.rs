@@ -65,6 +65,7 @@ pub enum JobEvent {
         error: String,
     },
     JobCompleted,
+    AttemptCounterReset,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +255,7 @@ impl Job {
             .unwrap_or(false)
         {
             current_attempt = 1;
+            self.events.push(JobEvent::AttemptCounterReset);
         }
 
         let next_attempt = current_attempt.saturating_add(1);
@@ -310,6 +312,7 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionAborted { .. } => {}
                 JobEvent::ExecutionErrored { .. } => {}
                 JobEvent::JobCompleted => {}
+                JobEvent::AttemptCounterReset => {}
             }
         }
         builder.events(events).build()
@@ -593,6 +596,10 @@ mod tests {
                 JobEvent::ExecutionErrored { .. }
             ));
             assert!(matches!(
+                events[events.len() - 3],
+                JobEvent::AttemptCounterReset
+            ));
+            assert!(matches!(
                 events.last(),
                 Some(JobEvent::ExecutionScheduled { attempt: 2, .. })
             ));
@@ -667,6 +674,10 @@ mod tests {
             assert!(matches!(
                 events[events.len() - 2],
                 JobEvent::ExecutionErrored { .. }
+            ));
+            assert!(matches!(
+                events[events.len() - 3],
+                JobEvent::AttemptCounterReset
             ));
             assert!(matches!(
                 events.last(),
