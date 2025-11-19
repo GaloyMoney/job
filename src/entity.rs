@@ -163,13 +163,14 @@ impl Job {
 
     pub(super) fn maybe_schedule_retry(
         &mut self,
+        now: DateTime<Utc>,
         attempt: u32,
         retry_policy: &RetryPolicy,
         error: String,
     ) -> Option<(DateTime<Utc>, u32)> {
         let max_attempts = retry_policy.max_attempts.unwrap_or(u32::MAX);
         let mut next_attempt = attempt.max(1).saturating_add(1);
-        if self.should_reset_attempt_count(&time::now(), retry_policy) {
+        if self.should_reset_attempt_count(now, retry_policy) {
             // If the attempt counter has reset, because enough time
             // has passed, that means the current attempt is 1, and the
             // next will be 2.
@@ -192,7 +193,7 @@ impl Job {
         Some((reschedule_at, next_attempt))
     }
 
-    fn should_reset_attempt_count(&self, now: &DateTime<Utc>, retry_policy: &RetryPolicy) -> bool {
+    fn should_reset_attempt_count(&self, now: DateTime<Utc>, retry_policy: &RetryPolicy) -> bool {
         self.latest_execution_scheduled()
             .and_then(|(scheduled_at, recorded_at)| {
                 let previous_backoff = scheduled_at
@@ -424,7 +425,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(1, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(time::now(), 1, &retry_policy, "boom".to_string())
                 .expect("retry expected");
 
             assert_eq!(next_attempt, 2);
@@ -457,7 +458,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(0, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(time::now(), 0, &retry_policy, "boom".to_string())
                 .expect("retry expected when attempt starts at zero");
 
             assert_eq!(next_attempt, 2);
@@ -517,7 +518,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(2));
 
             assert!(
-                job.maybe_schedule_retry(2, &retry_policy, "boom".to_string())
+                job.maybe_schedule_retry(time::now(), 2, &retry_policy, "boom".to_string())
                     .is_none(),
                 "should stop retrying when attempts exhausted"
             );
@@ -575,7 +576,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(5));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(2, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(time::now(), 2, &retry_policy, "boom".to_string())
                 .expect("retry expected");
 
             assert_eq!(
@@ -638,7 +639,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(2, &retry_policy, "second failure".to_string())
+                .maybe_schedule_retry(time::now(), 2, &retry_policy, "second failure".to_string())
                 .expect("final retry should still be scheduled");
 
             assert_eq!(next_attempt, 3);
@@ -714,7 +715,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(3, &retry_policy, "third failure".to_string())
+                .maybe_schedule_retry(time::now(), 3, &retry_policy, "third failure".to_string())
                 .expect("a healthy gap should reset attempt even at limit");
 
             assert_eq!(next_attempt, 2);
@@ -759,7 +760,7 @@ mod tests {
             let retry_policy = build_retry_policy(None);
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(attempt, &retry_policy, "overflow".to_string())
+                .maybe_schedule_retry(time::now(), attempt, &retry_policy, "overflow".to_string())
                 .expect("unbounded retries should permit another schedule");
 
             assert_eq!(next_attempt, u32::MAX);

@@ -1,3 +1,4 @@
+use crate::time;
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use futures::FutureExt;
@@ -240,7 +241,7 @@ impl JobDispatcher {
         };
 
         if let Some((reschedule_at, next_attempt)) =
-            job.maybe_schedule_retry(attempt, &retry_policy, error_str)
+            job.maybe_schedule_retry(time::now(), attempt, &retry_policy, error_str)
         {
             let level = match self.retry_settings.n_warn_attempts {
                 Some(limit) if next_attempt > limit => tracing::Level::ERROR,
