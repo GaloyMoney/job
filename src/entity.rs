@@ -242,26 +242,22 @@ impl Job {
         retry_policy: &RetryPolicy,
         error: String,
     ) -> Option<(DateTime<Utc>, u32)> {
-        let max_attempts = retry_policy.max_attempts.unwrap_or(u32::MAX);
-        let mut next_attempt = attempt.max(1).saturating_add(1);
-
+        let mut current_attempt = attempt.max(1);
         if self
             .latest_retry_window()
             .and_then(|window| retry_policy.should_reset_attempt_count(now, window))
             .unwrap_or(false)
         {
-            // If the attempt counter has reset, because enough time
-            // has passed, that means the current attempt is 1, and the
-            // next will be 2.
-            next_attempt = 2;
+            current_attempt = 1;
         }
 
+        let next_attempt = current_attempt.saturating_add(1);
+        let max_attempts = retry_policy.max_attempts.unwrap_or(u32::MAX);
         if next_attempt > max_attempts {
             self.error_job(error);
             return None;
         }
 
-        let current_attempt = next_attempt.saturating_sub(1);
         let reschedule_at = retry_policy.next_attempt_at(now, current_attempt);
         self.schedule_retry(error, reschedule_at, next_attempt);
         Some((reschedule_at, next_attempt))
