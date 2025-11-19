@@ -306,7 +306,7 @@ impl JobDispatcher {
         )
         .execute(&mut *tx)
         .await?;
-        job.job_completed();
+        job.complete_job();
         self.repo.update_in_op(&mut tx, &mut job).await?;
         tx.commit().await?;
         Ok(())
@@ -334,7 +334,7 @@ impl JobDispatcher {
         )
         .execute(&mut *tx)
         .await?;
-        job.execution_rescheduled(reschedule_at);
+        job.reschedule_execution(reschedule_at);
         self.repo.update_in_op(&mut tx, &mut job).await?;
         tx.commit().await?;
         Ok(())

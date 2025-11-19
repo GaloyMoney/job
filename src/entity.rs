@@ -184,14 +184,14 @@ impl Job {
         }
     }
 
-    pub(super) fn execution_scheduled(&mut self, scheduled_at: DateTime<Utc>) {
+    pub(super) fn schedule_execution(&mut self, scheduled_at: DateTime<Utc>) {
         self.events.push(JobEvent::ExecutionScheduled {
             attempt: 1,
             scheduled_at,
         });
     }
 
-    pub(super) fn execution_rescheduled(&mut self, scheduled_at: DateTime<Utc>) {
+    pub(super) fn reschedule_execution(&mut self, scheduled_at: DateTime<Utc>) {
         self.events.push(JobEvent::ExecutionCompleted);
         self.events.push(JobEvent::ExecutionScheduled {
             attempt: 1,
@@ -199,7 +199,7 @@ impl Job {
         });
     }
 
-    pub(super) fn execution_aborted(
+    pub(super) fn abort_execution(
         &mut self,
         reason: String,
         scheduled_at: DateTime<Utc>,
@@ -212,12 +212,12 @@ impl Job {
         });
     }
 
-    pub(super) fn job_completed(&mut self) {
+    pub(super) fn complete_job(&mut self) {
         self.events.push(JobEvent::ExecutionCompleted);
         self.events.push(JobEvent::JobCompleted);
     }
 
-    pub(super) fn retry_scheduled(
+    pub(super) fn schedule_retry(
         &mut self,
         error: String,
         scheduled_at: DateTime<Utc>,
@@ -230,7 +230,7 @@ impl Job {
         });
     }
 
-    pub(super) fn job_errored(&mut self, error: String) {
+    pub(super) fn error_job(&mut self, error: String) {
         self.events.push(JobEvent::ExecutionErrored { error });
         self.events.push(JobEvent::JobCompleted);
     }
@@ -257,13 +257,13 @@ impl Job {
         }
 
         if next_attempt > max_attempts {
-            self.job_errored(error);
+            self.error_job(error);
             return None;
         }
 
         let current_attempt = next_attempt.saturating_sub(1);
         let reschedule_at = retry_policy.next_attempt_at(now, current_attempt);
-        self.retry_scheduled(error, reschedule_at, next_attempt);
+        self.schedule_retry(error, reschedule_at, next_attempt);
         Some((reschedule_at, next_attempt))
     }
 
