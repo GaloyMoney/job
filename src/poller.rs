@@ -496,7 +496,7 @@ async fn reschedule_running_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Resu
 
     for (job_id, mut job) in entities {
         let attempt_index = attempt_map[&job_id];
-        job.execution_aborted("graceful shutdown".to_string(), now, attempt_index);
+        job.abort_execution("graceful shutdown".to_string(), now, attempt_index);
         repo.update_in_op(&mut op, &mut job).await?;
     }
     op.commit().await?;

@@ -461,7 +461,7 @@ impl Jobs {
         )
         .execute(op.as_executor())
         .await?;
-        job.execution_scheduled(schedule_at);
+        job.schedule_execution(schedule_at);
         self.repo.update_in_op(op, job).await?;
         Ok(())
     }
