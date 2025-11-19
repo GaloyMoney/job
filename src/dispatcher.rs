@@ -230,15 +230,7 @@ impl JobDispatcher {
         span.record("error", true);
         span.record("error.message", tracing::field::display(&error_str));
 
-        let retry_policy = RetryPolicy {
-            max_attempts: self.retry_settings.n_attempts,
-            min_backoff: self.retry_settings.min_backoff,
-            max_backoff: self.retry_settings.max_backoff,
-            backoff_jitter_pct: self.retry_settings.backoff_jitter_pct,
-            attempt_reset_after_backoff_multiples: self
-                .retry_settings
-                .attempt_reset_after_backoff_multiples,
-        };
+        let retry_policy = RetryPolicy::from(&self.retry_settings);
 
         if let Some((reschedule_at, next_attempt)) =
             job.maybe_schedule_retry(time::now(), attempt, &retry_policy, error_str)

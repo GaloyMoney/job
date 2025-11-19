@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 
 use super::{
     current::CurrentJob,
-    entity::{Job, JobType},
+    entity::{Job, JobType, RetryPolicy},
 };
 
 /// Describes how to construct a [`JobRunner`] for a given job type.
@@ -122,6 +122,18 @@ impl Default for RetrySettings {
             max_backoff: std::time::Duration::from_secs(SECS_IN_ONE_HOUR),
             backoff_jitter_pct: 20,
             attempt_reset_after_backoff_multiples: 3,
+        }
+    }
+}
+
+impl From<&RetrySettings> for RetryPolicy {
+    fn from(settings: &RetrySettings) -> Self {
+        Self {
+            max_attempts: settings.n_attempts,
+            min_backoff: settings.min_backoff,
+            max_backoff: settings.max_backoff,
+            backoff_jitter_pct: settings.backoff_jitter_pct,
+            attempt_reset_after_backoff_multiples: settings.attempt_reset_after_backoff_multiples,
         }
     }
 }
