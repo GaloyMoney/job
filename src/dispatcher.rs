@@ -235,9 +235,15 @@ impl JobDispatcher {
         if let Some((reschedule_at, next_attempt)) =
             job.maybe_schedule_retry(time::now(), attempt, &retry_policy, error_str)
         {
-            let level = match self.retry_settings.n_warn_attempts {
-                Some(limit) if next_attempt > limit => tracing::Level::ERROR,
-                _ => tracing::Level::WARN,
+            let exceeded_warn_attempts = self
+                .retry_settings
+                .n_warn_attempts
+                .is_some_and(|limit| next_attempt > limit);
+
+            let level = if exceeded_warn_attempts {
+                tracing::Level::ERROR
+            } else {
+                tracing::Level::WARN
             };
             span.record("error.level", tracing::field::display(level));
             self.rescheduled = true;
