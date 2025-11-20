@@ -1,3 +1,14 @@
+# [cala release v0.2.9](https://github.com/GaloyMoney/cala/releases/tag/0.2.9)
+
+
+### Features
+
+- Reset job errors to warn after cooldown (#14)
+
+### Miscellaneous Tasks
+
+- Push AttemptCounterReset when reseting attempt counter (#15)
+
 # [cala release v0.2.8](https://github.com/GaloyMoney/cala/releases/tag/0.2.8)
 
 
