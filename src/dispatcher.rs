@@ -26,6 +26,7 @@ pub(crate) struct JobDispatcher {
     tracker: Arc<JobTracker>,
     rescheduled: bool,
     instance_id: uuid::Uuid,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 impl JobDispatcher {
     pub fn new(
@@ -35,6 +36,7 @@ impl JobDispatcher {
         _id: JobId,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
     ) -> Self {
         Self {
             repo,
@@ -43,6 +45,7 @@ impl JobDispatcher {
             tracker,
             rescheduled: false,
             instance_id,
+            shutdown_tx,
         }
     }
 
@@ -78,6 +81,7 @@ impl JobDispatcher {
             polled_job.attempt,
             self.repo.pool().clone(),
             polled_job.data_json,
+            self.shutdown_tx.subscribe(),
         );
         self.tracker.dispatch_job();
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {

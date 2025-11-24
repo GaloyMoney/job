@@ -11,6 +11,7 @@ pub struct CurrentJob {
     attempt: u32,
     pool: PgPool,
     execution_state_json: Option<serde_json::Value>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 }
 
 impl CurrentJob {
@@ -19,12 +20,14 @@ impl CurrentJob {
         attempt: u32,
         pool: PgPool,
         execution_state: Option<serde_json::Value>,
+        shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Self {
         Self {
             id,
             attempt,
             pool,
             execution_state_json: execution_state,
+            shutdown_rx,
         }
     }
 
@@ -91,5 +94,39 @@ impl CurrentJob {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Wait for a shutdown signal. Returns `true` if shutdown was requested.
+    ///
+    /// Job runners can use this to detect when the application is shutting down
+    /// and perform cleanup or finish their current work gracefully.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use job::CurrentJob;
+    /// # async fn example(mut current_job: CurrentJob) {
+    /// tokio::select! {
+    ///     _ = current_job.shutdown_requested() => {
+    ///         // Shutdown requested, exit gracefully
+    ///         return;
+    ///     }
+    ///     result = do_work() => {
+    ///         // Normal work completion
+    ///     }
+    /// }
+    /// # }
+    /// # async fn do_work() {}
+    /// ```
+    pub async fn shutdown_requested(&mut self) -> bool {
+        self.shutdown_rx.recv().await.is_ok()
+    }
+
+    /// Non-blocking check if shutdown has been requested.
+    ///
+    /// Returns `true` if a shutdown signal has been sent.
+    /// Use this for polling-style shutdown detection within loops.
+    pub fn is_shutdown_requested(&mut self) -> bool {
+        matches!(self.shutdown_rx.try_recv(), Ok(_))
     }
 }

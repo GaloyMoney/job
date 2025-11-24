@@ -1,7 +1,8 @@
 use es_entity::AtomicOperation;
+use futures::future::join_all;
 use serde_json::Value as JsonValue;
 use sqlx::postgres::{PgListener, PgPool, types::PgInterval};
-use tracing::{Span, instrument};
+use tracing::{Span, info, instrument};
 
 use std::{
     sync::{
@@ -23,6 +24,7 @@ pub(crate) struct JobPoller {
     tracker: Arc<JobTracker>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    job_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 pub(crate) struct JobPollerHandle {
@@ -34,6 +36,7 @@ pub(crate) struct JobPollerHandle {
     shutdown_called: Arc<AtomicBool>,
     repo: JobRepo,
     instance_id: uuid::Uuid,
+    job_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -51,6 +54,7 @@ impl JobPoller {
             registry,
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
+            job_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -61,6 +65,7 @@ impl JobPoller {
         let shutdown_tx = self.shutdown_tx.clone();
         let repo = self.repo.clone();
         let instance_id = self.instance_id;
+        let job_handles = self.job_handles.clone();
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(tokio::task::spawn(Self::main_loop(
             Arc::clone(&executor),
@@ -75,6 +80,7 @@ impl JobPoller {
             shutdown_called: Arc::new(AtomicBool::new(false)),
             repo,
             instance_id,
+            job_handles,
         })
     }
 
@@ -122,29 +128,28 @@ impl JobPoller {
         err
     )]
     async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
-        let span = Span::current();
-        span.record("poller_id", tracing::field::display(self.instance_id));
+        Span::current().record("poller_id", tracing::field::display(self.instance_id));
         let Some(n_jobs_to_poll) = self.tracker.next_batch_size() else {
-            span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
-            span.record("n_jobs_to_start", 0);
+            Span::current().record("next_poll_in", tracing::field::debug(MAX_WAIT));
+            Span::current().record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         };
         let rows = match poll_jobs(self.repo.pool(), n_jobs_to_poll, self.instance_id).await? {
             JobPollResult::WaitTillNextJob(duration) => {
-                span.record("next_poll_in", tracing::field::debug(duration));
-                span.record("n_jobs_to_start", 0);
+                Span::current().record("next_poll_in", tracing::field::debug(duration));
+                Span::current().record("n_jobs_to_start", 0);
                 return Ok(duration);
             }
             JobPollResult::Jobs(jobs) => jobs,
         };
-        span.record("n_jobs_to_start", rows.len());
+        Span::current().record("n_jobs_to_start", rows.len());
         if !rows.is_empty() {
             for row in rows {
                 self.dispatch_job(row).await?;
             }
         }
 
-        span.record("next_poll_in", tracing::field::debug(Duration::ZERO));
+        Span::current().record("next_poll_in", tracing::field::debug(Duration::ZERO));
         Ok(Duration::ZERO)
     }
 
@@ -256,37 +261,50 @@ impl JobPoller {
         err
     )]
     async fn dispatch_job(&self, polled_job: PolledJob) -> Result<(), JobError> {
-        let span = Span::current();
-        span.record("attempt", polled_job.attempt);
+        Span::current().record("attempt", polled_job.attempt);
         let job = self.repo.find_by_id(polled_job.id).await?;
-        span.record("job_id", tracing::field::display(job.id));
-        span.record("job_type", tracing::field::display(&job.job_type));
+        Span::current().record("job_id", tracing::field::display(job.id));
+        Span::current().record("job_type", tracing::field::display(&job.job_type));
         let runner = self.registry.init_job(&job)?;
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = self.repo.clone();
         let tracker = self.tracker.clone();
         let instance_id = self.instance_id;
-        span.record("now", tracing::field::display(crate::time::now()));
-        span.record("poller_id", tracing::field::display(instance_id));
+        let shutdown_tx = self.shutdown_tx.clone();
+        Span::current().record("now", tracing::field::display(crate::time::now()));
+        Span::current().record("poller_id", tracing::field::display(instance_id));
 
         let job_id = job.id;
         let job_type = job.job_type.clone();
         let task_name = format!("job-{}-{}", job_type, job_id);
 
-        let _job_handle = tokio::task::Builder::new()
+        let job_handle = tokio::task::Builder::new()
             .name(&task_name)
             .spawn(async move {
                 let id = job.id;
                 let attempt = polled_job.attempt;
-                if let Err(e) =
-                    JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
-                        .execute_job(polled_job)
-                        .await
+                if let Err(e) = JobDispatcher::new(
+                    repo,
+                    tracker,
+                    retry_settings,
+                    job.id,
+                    runner,
+                    instance_id,
+                    shutdown_tx,
+                )
+                .execute_job(polled_job)
+                .await
                 {
                     tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
                 }
             })
             .expect("failed to spawn job task");
+
+        // Store the handle for graceful shutdown
+        self.job_handles
+            .lock()
+            .map_err(|e| JobError::JobExecutionError(e.to_string()))?
+            .push(job_handle);
 
         Ok(())
     }
@@ -417,7 +435,7 @@ impl JobPollerHandle {
     /// This method is idempotent and can be called multiple times safely.
     /// It will:
     /// 1. Send shutdown signal to all running job tasks
-    /// 2. Wait briefly for tasks to complete naturally
+    /// 2. Wait for jobs to complete naturally (with timeout)
     /// 3. Reschedule any jobs still running for this instance
     ///
     /// If not called manually, it will be called automatically when the handle is dropped.
@@ -427,6 +445,8 @@ impl JobPollerHandle {
             self.repo.clone(),
             self.instance_id,
             self.shutdown_called.clone(),
+            self.job_handles.clone(),
+            self.poller.config.shutdown_timeout,
         )
         .await
     }
@@ -438,19 +458,36 @@ impl Drop for JobPollerHandle {
         let repo = self.repo.clone();
         let instance_id = self.instance_id;
         let shutdown_called = self.shutdown_called.clone();
+        let job_handles = self.job_handles.clone();
+        let shutdown_timeout = self.poller.config.shutdown_timeout;
 
         tokio::spawn(async move {
-            let _ = perform_shutdown(shutdown_tx, repo, instance_id, shutdown_called).await;
+            let _ = perform_shutdown(
+                shutdown_tx,
+                repo,
+                instance_id,
+                shutdown_called,
+                job_handles,
+                shutdown_timeout,
+            )
+            .await;
         });
     }
 }
 
-#[instrument(name = "jobs.shutdown", skip(shutdown_tx, repo), fields(n_jobs))]
+#[instrument(
+    name = "jobs.perform_shutdown",
+    skip(shutdown_tx, repo, job_handles, shutdown_timeout, shutdown_called),
+    fields(n_jobs, timeout_secs),
+    err
+)]
 async fn perform_shutdown(
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     repo: JobRepo,
     instance_id: uuid::Uuid,
     shutdown_called: Arc<AtomicBool>,
+    job_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    shutdown_timeout: Duration,
 ) -> Result<(), JobError> {
     if shutdown_called
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -459,14 +496,39 @@ async fn perform_shutdown(
         return Ok(());
     }
 
-    let _ = shutdown_tx.send(());
+    Span::current().record("timeout_secs", shutdown_timeout.as_secs());
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Take ownership of job handles
+    let handles = {
+        let mut handles_guard = job_handles
+            .lock()
+            .map_err(|e| JobError::JobExecutionError(e.to_string()))?;
+        std::mem::take(&mut *handles_guard)
+    };
 
-    reschedule_running_jobs(repo, instance_id).await
+    let n_jobs = handles.len();
+    Span::current().record("n_jobs", n_jobs);
+
+    match shutdown_tx.send(()) {
+        Ok(n_receivers) => tracing::info!(n_receivers, "Shutdown signal sent to receivers"),
+        Err(_) => tracing::warn!("No receivers for shutdown signal"),
+    }
+
+    match tokio::time::timeout(shutdown_timeout, join_all(handles)).await {
+        Ok(_) => {
+            tracing::info!("All jobs completed gracefully");
+        }
+        Err(_) => {
+            tracing::error!("Shutdown timeout reached, killing remaining jobs");
+            kill_remaining_jobs(repo, instance_id).await?;
+        }
+    }
+
+    Ok(())
 }
 
-async fn reschedule_running_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Result<(), JobError> {
+#[instrument(name = "jobs.kill_remaining_jobs", skip(repo), fields(instance_id = %instance_id, n_killed), err)]
+async fn kill_remaining_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Result<(), JobError> {
     let mut op = repo.begin_op().await?;
     let now = crate::time::now();
     let rows = sqlx::query!(
@@ -484,7 +546,9 @@ async fn reschedule_running_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Resu
     .fetch_all(op.as_executor())
     .await?;
 
-    tracing::Span::current().record("n_jobs", rows.len());
+    let n_killed = rows.len();
+    Span::current().record("n_killed", n_killed);
+    info!("Killing {} jobs", n_killed);
 
     let attempt_map: std::collections::HashMap<JobId, u32> = rows
         .into_iter()
@@ -496,9 +560,10 @@ async fn reschedule_running_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Resu
 
     for (job_id, mut job) in entities {
         let attempt_index = attempt_map[&job_id];
-        job.abort_execution("graceful shutdown".to_string(), now, attempt_index);
+        job.abort_execution("killed job".to_string(), now, attempt_index);
         repo.update_in_op(&mut op, &mut job).await?;
     }
     op.commit().await?;
+
     Ok(())
 }
