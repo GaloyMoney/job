@@ -269,24 +269,24 @@ impl JobPoller {
         span.record("now", tracing::field::display(crate::time::now()));
         span.record("poller_id", tracing::field::display(instance_id));
 
-        let job_handle = tokio::spawn(async move {
-            let id = job.id;
-            let attempt = polled_job.attempt;
-            if let Err(e) =
-                JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
-                    .execute_job(polled_job)
-                    .await
-            {
-                tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
-            }
-        });
+        let job_id = job.id;
+        let job_type = job.job_type.clone();
+        let task_name = format!("job-{}-{}", job_type, job_id);
 
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            if shutdown_rx.recv().await.is_ok() {
-                job_handle.abort();
-            }
-        });
+        let _job_handle = tokio::task::Builder::new()
+            .name(&task_name)
+            .spawn(async move {
+                let id = job.id;
+                let attempt = polled_job.attempt;
+                if let Err(e) =
+                    JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
+                        .execute_job(polled_job)
+                        .await
+                {
+                    tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
+                }
+            })
+            .expect("failed to spawn job task");
 
         Ok(())
     }
@@ -461,7 +461,7 @@ async fn perform_shutdown(
 
     let _ = shutdown_tx.send(());
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     reschedule_running_jobs(repo, instance_id).await
 }
