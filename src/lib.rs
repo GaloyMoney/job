@@ -258,6 +258,7 @@ impl Jobs {
     /// # }
     /// # tokio::runtime::Runtime::new().unwrap().block_on(double_start()).unwrap();
     /// ```
+    #[instrument(name = "job.start_poll", skip(self), err)]
     pub async fn start_poll(&mut self) -> Result<(), JobError> {
         let registry = self
             .registry
