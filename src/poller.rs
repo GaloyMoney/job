@@ -32,6 +32,7 @@ pub(crate) struct JobPollerHandle {
     handle: OwnedTaskHandle,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     shutdown_called: Arc<AtomicBool>,
+    shutdown_timeout: Duration,
     repo: JobRepo,
     instance_id: uuid::Uuid,
 }
@@ -61,6 +62,7 @@ impl JobPoller {
         let shutdown_tx = self.shutdown_tx.clone();
         let repo = self.repo.clone();
         let instance_id = self.instance_id;
+        let shutdown_timeout = self.config.shutdown_timeout;
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(tokio::task::spawn(Self::main_loop(
             Arc::clone(&executor),
@@ -75,6 +77,7 @@ impl JobPoller {
             shutdown_called: Arc::new(AtomicBool::new(false)),
             repo,
             instance_id,
+            shutdown_timeout,
         })
     }
 
@@ -269,12 +272,13 @@ impl JobPoller {
         span.record("now", tracing::field::display(crate::time::now()));
         span.record("poller_id", tracing::field::display(instance_id));
 
+        let shutdown_rx = self.shutdown_tx.subscribe();
         let job_handle = tokio::spawn(async move {
             let id = job.id;
             let attempt = polled_job.attempt;
             if let Err(e) =
                 JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
-                    .execute_job(polled_job)
+                    .execute_job(polled_job, shutdown_rx)
                     .await
             {
                 tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
@@ -282,9 +286,10 @@ impl JobPoller {
         });
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let shutdown_timeout = self.config.shutdown_timeout;
         tokio::spawn(async move {
             if shutdown_rx.recv().await.is_ok() {
-                job_handle.abort();
+                let _ = crate::time::timeout(shutdown_timeout, job_handle).await;
             }
         });
 
@@ -427,6 +432,7 @@ impl JobPollerHandle {
             self.repo.clone(),
             self.instance_id,
             self.shutdown_called.clone(),
+            self.shutdown_timeout,
         )
         .await
     }
@@ -438,9 +444,17 @@ impl Drop for JobPollerHandle {
         let repo = self.repo.clone();
         let instance_id = self.instance_id;
         let shutdown_called = self.shutdown_called.clone();
+        let shutdown_timeout = self.shutdown_timeout;
 
         tokio::spawn(async move {
-            let _ = perform_shutdown(shutdown_tx, repo, instance_id, shutdown_called).await;
+            let _ = perform_shutdown(
+                shutdown_tx,
+                repo,
+                instance_id,
+                shutdown_called,
+                shutdown_timeout,
+            )
+            .await;
         });
     }
 }
@@ -451,6 +465,7 @@ async fn perform_shutdown(
     repo: JobRepo,
     instance_id: uuid::Uuid,
     shutdown_called: Arc<AtomicBool>,
+    shutdown_timeout: Duration,
 ) -> Result<(), JobError> {
     if shutdown_called
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -461,7 +476,8 @@ async fn perform_shutdown(
 
     let _ = shutdown_tx.send(());
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    crate::time::sleep(shutdown_timeout).await;
+    crate::time::sleep(Duration::from_millis(100)).await;
 
     reschedule_running_jobs(repo, instance_id).await
 }
