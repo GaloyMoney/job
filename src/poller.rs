@@ -22,7 +22,9 @@ pub(crate) struct JobPoller {
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
     instance_id: uuid::Uuid,
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    shutdown_tx: tokio::sync::broadcast::Sender<
+        tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+    >,
 }
 
 pub(crate) struct JobPollerHandle {
@@ -30,9 +32,12 @@ pub(crate) struct JobPollerHandle {
     poller: Arc<JobPoller>,
     #[allow(dead_code)]
     handle: OwnedTaskHandle,
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    shutdown_tx: tokio::sync::broadcast::Sender<
+        tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+    >,
     shutdown_called: Arc<AtomicBool>,
     shutdown_timeout: Duration,
+    max_jobs_per_process: usize,
     repo: JobRepo,
     instance_id: uuid::Uuid,
 }
@@ -41,7 +46,9 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 
 impl JobPoller {
     pub fn new(config: JobPollerConfig, repo: JobRepo, registry: JobRegistry) -> Self {
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
+            tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+        >(1);
         Self {
             tracker: Arc::new(JobTracker::new(
                 config.min_jobs_per_process,
@@ -63,6 +70,7 @@ impl JobPoller {
         let repo = self.repo.clone();
         let instance_id = self.instance_id;
         let shutdown_timeout = self.config.shutdown_timeout;
+        let max_jobs_per_process = self.config.max_jobs_per_process;
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(tokio::task::spawn(Self::main_loop(
             Arc::clone(&executor),
@@ -78,6 +86,7 @@ impl JobPoller {
             repo,
             instance_id,
             shutdown_timeout,
+            max_jobs_per_process,
         })
     }
 
@@ -288,8 +297,13 @@ impl JobPoller {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_timeout = self.config.shutdown_timeout;
         tokio::spawn(async move {
-            if shutdown_rx.recv().await.is_ok() {
-                let _ = crate::time::timeout(shutdown_timeout, job_handle).await;
+            if let Ok(shutdown_notifier) = shutdown_rx.recv().await {
+                let (send, recv) = tokio::sync::oneshot::channel();
+                if shutdown_notifier.send(recv).await.is_ok() {
+                    drop(shutdown_notifier);
+                    let _ = crate::time::timeout(shutdown_timeout, job_handle).await;
+                    let _ = send.send(());
+                }
             }
         });
 
@@ -433,6 +447,7 @@ impl JobPollerHandle {
             self.instance_id,
             self.shutdown_called.clone(),
             self.shutdown_timeout,
+            self.max_jobs_per_process,
         )
         .await
     }
@@ -445,6 +460,7 @@ impl Drop for JobPollerHandle {
         let instance_id = self.instance_id;
         let shutdown_called = self.shutdown_called.clone();
         let shutdown_timeout = self.shutdown_timeout;
+        let max_jobs_per_process = self.max_jobs_per_process;
 
         tokio::spawn(async move {
             let _ = perform_shutdown(
@@ -453,6 +469,7 @@ impl Drop for JobPollerHandle {
                 instance_id,
                 shutdown_called,
                 shutdown_timeout,
+                max_jobs_per_process,
             )
             .await;
         });
@@ -461,11 +478,14 @@ impl Drop for JobPollerHandle {
 
 #[instrument(name = "jobs.shutdown", skip(shutdown_tx, repo), fields(n_jobs))]
 async fn perform_shutdown(
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    shutdown_tx: tokio::sync::broadcast::Sender<
+        tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+    >,
     repo: JobRepo,
     instance_id: uuid::Uuid,
     shutdown_called: Arc<AtomicBool>,
     shutdown_timeout: Duration,
+    max_jobs_per_process: usize,
 ) -> Result<(), JobError> {
     if shutdown_called
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -474,10 +494,23 @@ async fn perform_shutdown(
         return Ok(());
     }
 
-    let _ = shutdown_tx.send(());
+    let (send, mut recv) =
+        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Receiver<()>>(max_jobs_per_process);
 
-    crate::time::sleep(shutdown_timeout).await;
-    crate::time::sleep(Duration::from_millis(100)).await;
+    if shutdown_tx.send(send).is_ok() {
+        let mut receivers = Vec::with_capacity(max_jobs_per_process);
+        let receive_timeout = Duration::from_millis(100);
+
+        loop {
+            match tokio::time::timeout(receive_timeout, recv.recv()).await {
+                Ok(Some(oneshot_rx)) => receivers.push(oneshot_rx),
+                Ok(None) => break, // channel closed (all senders dropped)
+                Err(_) => break,   // timeout - no more responses coming
+            }
+        }
+
+        let _ = tokio::time::timeout(shutdown_timeout, futures::future::join_all(receivers)).await;
+    }
 
     reschedule_running_jobs(repo, instance_id).await
 }

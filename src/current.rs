@@ -11,7 +11,9 @@ pub struct CurrentJob {
     attempt: u32,
     pool: PgPool,
     execution_state_json: Option<serde_json::Value>,
-    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<
+        tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+    >,
 }
 
 impl CurrentJob {
@@ -20,7 +22,9 @@ impl CurrentJob {
         attempt: u32,
         pool: PgPool,
         execution_state: Option<serde_json::Value>,
-        shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        shutdown_rx: tokio::sync::broadcast::Receiver<
+            tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+        >,
     ) -> Self {
         Self {
             id,

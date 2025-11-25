@@ -53,7 +53,9 @@ impl JobDispatcher {
     pub async fn execute_job(
         mut self,
         polled_job: PolledJob,
-        shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        shutdown_rx: tokio::sync::broadcast::Receiver<
+            tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+        >,
     ) -> Result<(), JobError> {
         let job = self.repo.find_by_id(polled_job.id).await?;
         let span = Span::current();
