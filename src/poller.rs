@@ -297,12 +297,21 @@ impl JobPoller {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_timeout = self.config.shutdown_timeout;
         tokio::spawn(async move {
-            if let Ok(shutdown_notifier) = shutdown_rx.recv().await {
-                let (send, recv) = tokio::sync::oneshot::channel();
-                if shutdown_notifier.send(recv).await.is_ok() {
-                    drop(shutdown_notifier);
-                    let _ = crate::time::timeout(shutdown_timeout, job_handle).await;
-                    let _ = send.send(());
+            tokio::pin!(job_handle);
+
+            tokio::select! {
+                _ = &mut job_handle => {
+                    // Job completed before shutdown - nothing to do
+                }
+                Ok(shutdown_notifier) = shutdown_rx.recv() => {
+                    let (send, recv) = tokio::sync::oneshot::channel();
+                    if shutdown_notifier.send(recv).await.is_ok() {
+                        drop(shutdown_notifier);
+                        if crate::time::timeout(shutdown_timeout, &mut job_handle).await.is_err() {
+                            job_handle.abort();
+                        }
+                        let _ = send.send(());
+                    }
                 }
             }
         });
@@ -505,7 +514,7 @@ async fn perform_shutdown(
             match tokio::time::timeout(receive_timeout, recv.recv()).await {
                 Ok(Some(oneshot_rx)) => receivers.push(oneshot_rx),
                 Ok(None) => break, // channel closed (all senders dropped)
-                Err(_) => break,   // timeout - no more responses coming
+                Err(_) => break,   // timeout - no more responses expected
             }
         }
 
