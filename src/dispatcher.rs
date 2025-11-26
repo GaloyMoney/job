@@ -50,7 +50,13 @@ impl JobDispatcher {
         fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now),
     err)]
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
-    pub async fn execute_job(mut self, polled_job: PolledJob) -> Result<(), JobError> {
+    pub async fn execute_job(
+        mut self,
+        polled_job: PolledJob,
+        shutdown_rx: tokio::sync::broadcast::Receiver<
+            tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+        >,
+    ) -> Result<(), JobError> {
         let job = self.repo.find_by_id(polled_job.id).await?;
         let span = Span::current();
         span.record("job_id", tracing::field::display(job.id));
@@ -78,6 +84,7 @@ impl JobDispatcher {
             polled_job.attempt,
             self.repo.pool().clone(),
             polled_job.data_json,
+            shutdown_rx,
         );
         self.tracker.dispatch_job();
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {

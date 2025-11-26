@@ -19,6 +19,10 @@ pub struct JobPollerConfig {
     #[serde(default = "default_min_jobs_per_process")]
     /// Minimum number of concurrent jobs to keep running before the poller sleeps.
     pub min_jobs_per_process: usize,
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_shutdown_timeout")]
+    /// How long to wait for jobs to complete gracefully during shutdown before rescheduling them.
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for JobPollerConfig {
@@ -27,6 +31,7 @@ impl Default for JobPollerConfig {
             job_lost_interval: default_job_lost_interval(),
             max_jobs_per_process: default_max_jobs_per_process(),
             min_jobs_per_process: default_min_jobs_per_process(),
+            shutdown_timeout: default_shutdown_timeout(),
         }
     }
 }
@@ -142,4 +147,8 @@ fn default_max_jobs_per_process() -> usize {
 
 fn default_min_jobs_per_process() -> usize {
     30
+}
+
+fn default_shutdown_timeout() -> Duration {
+    Duration::from_secs(5)
 }
