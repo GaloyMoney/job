@@ -555,28 +555,36 @@ async fn perform_shutdown(
         let _ = tokio::time::timeout(shutdown_timeout, futures::future::join_all(receivers)).await;
     }
 
-    reschedule_running_jobs(repo, instance_id).await
+    kill_remaining_jobs(repo, instance_id).await
 }
 
-async fn reschedule_running_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Result<(), JobError> {
+#[instrument(name = "jobs.kill_remaining_jobs", skip(repo), fields(instance_id = %instance_id, n_killed = tracing::field::Empty), err)]
+async fn kill_remaining_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Result<(), JobError> {
     let mut op = repo.begin_op().await?;
     let now = crate::time::now();
     let rows = sqlx::query!(
         r#"
-            UPDATE job_executions
-            SET state = 'pending',
-                execute_at = $1,
-                poller_instance_id = NULL
-            WHERE poller_instance_id = $2 AND state = 'running'
-            RETURNING id as "id!: JobId", attempt_index
-            "#,
+        UPDATE job_executions
+        SET state = 'pending',
+            execute_at = $1,
+            poller_instance_id = NULL
+        WHERE poller_instance_id = $2 AND state = 'running'
+        RETURNING id as "id!: JobId", attempt_index
+        "#,
         now,
         instance_id
     )
     .fetch_all(op.as_executor())
     .await?;
 
-    tracing::Span::current().record("n_jobs", rows.len());
+    let n_killed = rows.len();
+    tracing::Span::current().record("n_killed", n_killed);
+
+    if n_killed == 0 {
+        return Ok(());
+    }
+
+    tracing::error!(n_killed, "Jobs still running after shutdown timeout");
 
     let attempt_map: std::collections::HashMap<JobId, u32> = rows
         .into_iter()
@@ -588,7 +596,7 @@ async fn reschedule_running_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Resu
 
     for (job_id, mut job) in entities {
         let attempt_index = attempt_map[&job_id];
-        job.abort_execution("graceful shutdown".to_string(), now, attempt_index);
+        job.abort_execution("killed job".to_string(), now, attempt_index);
         repo.update_in_op(&mut op, &mut job).await?;
     }
     op.commit().await?;
