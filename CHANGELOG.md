@@ -1,3 +1,11 @@
+# [cala release v0.2.11](https://github.com/GaloyMoney/cala/releases/tag/0.2.11)
+
+
+### Miscellaneous Tasks
+
+- Reporting on job not completing successfully (#20)
+- Adding thread name (#19)
+
 # [cala release v0.2.10](https://github.com/GaloyMoney/cala/releases/tag/0.2.10)
 
 
