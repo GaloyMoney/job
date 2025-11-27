@@ -72,12 +72,17 @@ impl JobPoller {
         let shutdown_timeout = self.config.shutdown_timeout;
         let max_jobs_per_process = self.config.max_jobs_per_process;
         let executor = Arc::new(self);
-        let handle = OwnedTaskHandle::new(tokio::task::spawn(Self::main_loop(
-            Arc::clone(&executor),
-            listener_handle,
-            lost_handle,
-            keep_alive_handle,
-        )));
+        let handle = OwnedTaskHandle::new(
+            tokio::task::Builder::new()
+                .name("job-poller-main-loop")
+                .spawn(Self::main_loop(
+                    Arc::clone(&executor),
+                    listener_handle,
+                    lost_handle,
+                    keep_alive_handle,
+                ))
+                .expect("failed to spawn main loop"),
+        );
         Ok(JobPollerHandle {
             poller: executor,
             handle,
@@ -164,101 +169,116 @@ impl JobPoller {
         let mut listener = PgListener::connect_with(self.repo.pool()).await?;
         listener.listen("job_execution").await?;
         let tracker = self.tracker.clone();
-        Ok(OwnedTaskHandle::new(tokio::task::spawn(async move {
-            loop {
-                if listener.recv().await.is_ok() {
-                    tracker.job_execution_inserted();
-                } else {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        })))
+        Ok(OwnedTaskHandle::new(
+            tokio::task::Builder::new()
+                .name("job-poller-listener")
+                .spawn(async move {
+                    loop {
+                        if listener.recv().await.is_ok() {
+                            tracker.job_execution_inserted();
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                })
+                .expect("failed to spawn listener"),
+        ))
     }
 
     fn start_lost_handler(&self) -> OwnedTaskHandle {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
-        OwnedTaskHandle::new(tokio::task::spawn(async move {
-            loop {
-                crate::time::sleep(job_lost_interval / 2).await;
-                let now = crate::time::now();
-                let check_time = now - job_lost_interval;
+        OwnedTaskHandle::new(
+            tokio::task::Builder::new()
+                .name("job-poller-lost-handler")
+                .spawn(async move {
+                    loop {
+                        crate::time::sleep(job_lost_interval / 2).await;
+                        let now = crate::time::now();
+                        let check_time = now - job_lost_interval;
 
-                let span = tracing::debug_span!(
-                    parent: None,
-                    "job.detect_lost_jobs",
-                    check_time = %check_time,
-                    n_lost_jobs = tracing::field::Empty,
-                );
-                let _guard = span.enter();
+                        let span = tracing::debug_span!(
+                            parent: None,
+                            "job.detect_lost_jobs",
+                            check_time = %check_time,
+                            n_lost_jobs = tracing::field::Empty,
+                        );
+                        let _guard = span.enter();
 
-                if let Ok(rows) = sqlx::query!(
-                    r#"
-            UPDATE job_executions
-            SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1, poller_instance_id = NULL
-            WHERE state = 'running' AND alive_at < $1::timestamptz
-            RETURNING id as id
-            "#,
-                    check_time,
-                )
-                .fetch_all(&pool)
-                .await
-                    && !rows.is_empty()
-                {
-                    Span::current().record("n_lost_jobs", rows.len());
-                    for row in rows {
-                        tracing::error!(job_id = %row.id, "lost job");
+                        if let Ok(rows) = sqlx::query!(
+                            r#"
+                            UPDATE job_executions
+                            SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1, poller_instance_id = NULL
+                            WHERE state = 'running' AND alive_at < $1::timestamptz
+                            RETURNING id as id
+                            "#,
+                            check_time,
+                        )
+                        .fetch_all(&pool)
+                        .await
+                            && !rows.is_empty()
+                        {
+                            Span::current().record("n_lost_jobs", rows.len());
+                            for row in rows {
+                                tracing::error!(job_id = %row.id, "lost job");
+                            }
+                        } else {
+                            Span::current().record("n_lost_jobs", 0);
+                        }
                     }
-                } else {
-                    Span::current().record("n_lost_jobs", 0);
-                }
-            }
-        }))
+                })
+                .expect("failed to spawn lost handler"),
+        )
     }
 
     fn start_keep_alive_handler(&self) -> OwnedTaskHandle {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
         let instance_id = self.instance_id;
-        OwnedTaskHandle::new(tokio::task::spawn(async move {
-            let mut failures = 0;
-            loop {
-                let now = crate::time::now();
-                let span = tracing::debug_span!(
-                    parent: None,
-                    "job.keep_alive",
-                    instance_id = %instance_id,
-                    now = %now,
-                    failures
-                );
-                let _guard = span.enter();
+        OwnedTaskHandle::new(
+            tokio::task::Builder::new()
+                .name("job-poller-keep-alive-handler")
+                .spawn(async move {
+                    let mut failures = 0;
+                    loop {
+                        let now = crate::time::now();
+                        let span = tracing::debug_span!(
+                            parent: None,
+                            "job.keep_alive",
+                            instance_id = %instance_id,
+                            now = %now,
+                            failures
+                        );
+                        let _guard = span.enter();
 
-                let timeout = match sqlx::query!(
-                    r#"
-                    UPDATE job_executions
-                    SET alive_at = $1
-                    WHERE poller_instance_id = $2 AND state = 'running'
-                    "#,
-                    now,
-                    instance_id,
-                )
-                .execute(&pool)
-                .await
-                {
-                    Ok(_) => {
-                        failures = 0;
-                        job_lost_interval / 4
+                        let timeout = match sqlx::query!(
+                            r#"
+                            UPDATE job_executions
+                            SET alive_at = $1
+                            WHERE poller_instance_id = $2 AND state = 'running'
+                            "#,
+                            now,
+                            instance_id,
+                        )
+                        .execute(&pool)
+                        .await
+                        {
+                            Ok(_) => {
+                                failures = 0;
+                                job_lost_interval / 4
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                tracing::error!(instance_id = %instance_id, error = %e, "keep alive error");
+                                Duration::from_millis(50 << failures)
+                            }
+                        };
+                        drop(_guard);
+                        crate::time::sleep(timeout).await;
                     }
-                    Err(e) => {
-                        failures += 1;
-                        tracing::error!(instance_id = %instance_id, error = %e, "keep alive error");
-                        Duration::from_millis(50 << failures)
-                    }
-                };
-                drop(_guard);
-                crate::time::sleep(timeout).await;
-            }
-        }))
+                })
+                .expect("failed to spawn keep alive handler"),
+        )
     }
 
     #[instrument(
@@ -282,21 +302,32 @@ impl JobPoller {
         span.record("poller_id", tracing::field::display(instance_id));
 
         let shutdown_rx = self.shutdown_tx.subscribe();
-        let job_handle = tokio::spawn(async move {
-            let id = job.id;
-            let attempt = polled_job.attempt;
-            if let Err(e) =
-                JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
-                    .execute_job(polled_job, shutdown_rx)
-                    .await
-            {
-                tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
-            }
-        });
+        let job_id = job.id;
+        let job_type = job.job_type.clone();
+        let task_name = format!("job-{}-{}", job_type, job_id);
+
+        let job_handle = tokio::task::Builder::new()
+            .name(&task_name)
+            .spawn(async move {
+                let id = job.id;
+                let attempt = polled_job.attempt;
+                if let Err(e) =
+                    JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
+                        .execute_job(polled_job, shutdown_rx)
+                        .await
+                {
+                    tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
+                }
+            })
+            .expect("failed to spawn job task");
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_timeout = self.config.shutdown_timeout;
-        tokio::spawn(async move {
+        let monitor_task_name = format!("job-{}-monitor-{}", job_type, job_id);
+
+        tokio::task::Builder::new()
+            .name(&monitor_task_name)
+            .spawn(async move {
             tokio::pin!(job_handle);
 
             tokio::select! {
@@ -314,7 +345,7 @@ impl JobPoller {
                     }
                 }
             }
-        });
+        }).expect("failed to spawn job monitor task");
 
         Ok(())
     }
@@ -471,17 +502,20 @@ impl Drop for JobPollerHandle {
         let shutdown_timeout = self.shutdown_timeout;
         let max_jobs_per_process = self.max_jobs_per_process;
 
-        tokio::spawn(async move {
-            let _ = perform_shutdown(
-                shutdown_tx,
-                repo,
-                instance_id,
-                shutdown_called,
-                shutdown_timeout,
-                max_jobs_per_process,
-            )
-            .await;
-        });
+        tokio::task::Builder::new()
+            .name("job-poller-shutdown-on-drop")
+            .spawn(async move {
+                let _ = perform_shutdown(
+                    shutdown_tx,
+                    repo,
+                    instance_id,
+                    shutdown_called,
+                    shutdown_timeout,
+                    max_jobs_per_process,
+                )
+                .await;
+            })
+            .expect("failed to spawn shutdown task");
     }
 }
 
