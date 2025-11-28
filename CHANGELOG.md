@@ -1,3 +1,10 @@
+# [cala release v0.2.12](https://github.com/GaloyMoney/cala/releases/tag/0.2.12)
+
+
+### Miscellaneous Tasks
+
+- Optional flag for tokio-task-names (#22)
+
 # [cala release v0.2.11](https://github.com/GaloyMoney/cala/releases/tag/0.2.11)
 
 
