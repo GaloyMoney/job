@@ -17,7 +17,8 @@ use super::{
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
-#[cfg(feature = "tokio-task-names")]
+/// Note: Requires both the feature AND tokio_unstable cfg to be set
+#[cfg(all(feature = "tokio-task-names", tokio_unstable))]
 macro_rules! spawn_named_task {
     ($name:expr, $future:expr) => {
         tokio::task::Builder::new()
@@ -27,7 +28,7 @@ macro_rules! spawn_named_task {
     };
 }
 
-#[cfg(not(feature = "tokio-task-names"))]
+#[cfg(not(all(feature = "tokio-task-names", tokio_unstable)))]
 macro_rules! spawn_named_task {
     ($name:expr, $future:expr) => {
         tokio::spawn($future)
@@ -311,7 +312,10 @@ impl JobPoller {
         let shutdown_rx = self.shutdown_tx.subscribe();
         let job_id = job.id;
         let job_type = job.job_type.clone();
-        #[cfg_attr(not(feature = "tokio-task-names"), allow(unused_variables))]
+        #[cfg_attr(
+            not(all(feature = "tokio-task-names", tokio_unstable)),
+            allow(unused_variables)
+        )]
         let task_name = format!("job-{}-{}", job_type, job_id);
 
         let job_handle = spawn_named_task!(&task_name, async move {
@@ -328,7 +332,10 @@ impl JobPoller {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_timeout = self.config.shutdown_timeout;
-        #[cfg_attr(not(feature = "tokio-task-names"), allow(unused_variables))]
+        #[cfg_attr(
+            not(all(feature = "tokio-task-names", tokio_unstable)),
+            allow(unused_variables)
+        )]
         let monitor_task_name = format!("job-{}-monitor-{}", job_type, job_id);
 
         spawn_named_task!(&monitor_task_name, async move {
