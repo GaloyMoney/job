@@ -19,7 +19,7 @@ Uses [sqlx](https://docs.rs/sqlx/latest/sqlx/) for interfacing with the DB.
 
 #### `tokio-task-names`
 
-Enables named tokio tasks for better debugging and observability. This feature requires setting the `tokio_unstable` compiler flag.
+Enables named tokio tasks for better debugging and observability. **This feature requires both the feature flag AND setting the `tokio_unstable` compiler flag.**
 
 To enable this feature:
 
@@ -35,7 +35,9 @@ And in your `.cargo/config.toml`:
 rustflags = ["--cfg", "tokio_unstable"]
 ```
 
-When enabled, all spawned tasks will have descriptive names like `job-poller-main-loop`, `job-{type}-{id}`, etc., which can be viewed in tokio-console and other diagnostic tools.
+**Important:** Both the feature flag AND the `tokio_unstable` cfg must be set. The feature alone will not enable task names - it requires the unstable tokio API which is only available with the compiler flag.
+
+When fully enabled, all spawned tasks will have descriptive names like `job-poller-main-loop`, `job-{type}-{id}`, etc., which can be viewed in tokio-console and other diagnostic tools.
 
 ## Telemetry
 
