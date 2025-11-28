@@ -15,6 +15,28 @@ Uses [sqlx](https://docs.rs/sqlx/latest/sqlx/) for interfacing with the DB.
 - Configurable retry logic with exponential backoff
 - Built-in job tracking and monitoring
 
+### Optional Features
+
+#### `tokio-task-names`
+
+Enables named tokio tasks for better debugging and observability. This feature requires setting the `tokio_unstable` compiler flag.
+
+To enable this feature:
+
+```toml
+[dependencies]
+job = { version = "0.1", features = ["tokio-task-names"] }
+```
+
+And in your `.cargo/config.toml`:
+
+```toml
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
+```
+
+When enabled, all spawned tasks will have descriptive names like `job-poller-main-loop`, `job-{type}-{id}`, etc., which can be viewed in tokio-console and other diagnostic tools.
+
 ## Telemetry
 
 `job` emits structured telemetry via [`tracing`](https://docs.rs/tracing) spans such as `job.poll_jobs`,
