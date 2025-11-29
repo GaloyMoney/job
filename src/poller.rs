@@ -335,15 +335,17 @@ impl JobPoller {
             tokio::pin!(job_handle);
 
             tokio::select! {
-                _ = &mut job_handle => {
-                    // Job completed before shutdown - nothing to do
-                }
+                // Biased select ensures we check for shutdown signal first
+                biased;
+
                 Ok(shutdown_notifier) = shutdown_rx.recv() => {
                     // Create a span for this specific job's shutdown sequence
                     let shutdown_span = tracing::info_span!(
+                        parent: None,
                         "job.shutdown_coordination",
                         job_id = %job_id,
                         job_type = %job_type,
+                        coordination_path = "shutdown_first",
                         ack_sent = tracing::field::Empty,
                         job_completed = tracing::field::Empty,
                     );
@@ -373,6 +375,44 @@ impl JobPoller {
                         Err(_) => {
                             shutdown_span.record("ack_sent", false);
                             tracing::error!("Failed to send acknowledgement - stopped listening");
+                        }
+                    }
+                }
+                _ = &mut job_handle => {
+                    // Job completed - check if shutdown signal is also pending
+                    match shutdown_rx.try_recv() {
+                        Ok(shutdown_notifier) => {
+                            // Shutdown was also requested, participate in coordination
+                            let shutdown_span = tracing::info_span!(
+                                parent: None,
+                                "job.shutdown_coordination",
+                                job_id = %job_id,
+                                job_type = %job_type,
+                                coordination_path = "job_completed_first",
+                                ack_sent = tracing::field::Empty,
+                                job_completed = tracing::field::Empty,
+                            );
+
+                            let _enter = shutdown_span.enter();
+
+                            let (send, recv) = tokio::sync::oneshot::channel();
+
+                            match shutdown_notifier.send(recv).await {
+                                Ok(()) => {
+                                    shutdown_span.record("ack_sent", true);
+                                    shutdown_span.record("job_completed", true);
+                                    tracing::info!("Job already completed, acknowledged shutdown");
+                                    let _ = send.send(());
+                                }
+                                Err(_) => {
+                                    shutdown_span.record("ack_sent", false);
+                                    tracing::error!("Failed to send acknowledgement - stopped listening");
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // No shutdown signal, job just completed normally
+                            tracing::info!("Job completed normally, no shutdown coordination needed");
                         }
                     }
                 }
@@ -578,7 +618,7 @@ async fn perform_shutdown(
 
     if broadcast_ok {
         let mut receivers = Vec::with_capacity(max_jobs_per_process);
-        let receive_timeout = Duration::from_millis(1000);
+        let receive_timeout = Duration::from_millis(100);
 
         tracing::info!("Starting to collect shutdown acknowledgements from job monitors");
 
