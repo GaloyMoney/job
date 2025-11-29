@@ -339,13 +339,41 @@ impl JobPoller {
                     // Job completed before shutdown - nothing to do
                 }
                 Ok(shutdown_notifier) = shutdown_rx.recv() => {
+                    // Create a span for this specific job's shutdown sequence
+                    let shutdown_span = tracing::info_span!(
+                        "job.shutdown_coordination",
+                        job_id = %job_id,
+                        job_type = %job_type,
+                        ack_sent = tracing::field::Empty,
+                        job_completed = tracing::field::Empty,
+                    );
+
+                    let _enter = shutdown_span.enter();
+
                     let (send, recv) = tokio::sync::oneshot::channel();
-                    if shutdown_notifier.send(recv).await.is_ok() {
-                        drop(shutdown_notifier);
-                        if crate::time::timeout(shutdown_timeout, &mut job_handle).await.is_err() {
-                            job_handle.abort();
+
+                    match shutdown_notifier.send(recv).await {
+                        Ok(()) => {
+                            shutdown_span.record("ack_sent", true);
+                            tracing::info!("Acknowledgement sent, waiting for job completion");
+                            drop(shutdown_notifier);
+
+                            if crate::time::timeout(shutdown_timeout, &mut job_handle).await.is_err() {
+                                shutdown_span.record("job_completed", false);
+                                tracing::warn!("Job exceeded timeout, aborting");
+                                job_handle.abort();
+                            } else {
+                                shutdown_span.record("job_completed", true);
+                                tracing::info!("Job completed gracefully");
+                            }
+
+                            let _ = send.send(());
+                            tracing::info!("Final completion signal sent");
                         }
-                        let _ = send.send(());
+                        Err(_) => {
+                            shutdown_span.record("ack_sent", false);
+                            tracing::error!("Failed to send acknowledgement - stopped listening");
+                        }
                     }
                 }
             }
@@ -520,7 +548,11 @@ impl Drop for JobPollerHandle {
     }
 }
 
-#[instrument(name = "jobs.shutdown", skip(shutdown_tx, repo), fields(n_jobs))]
+#[instrument(
+    name = "jobs.perform_shutdown",
+    skip(shutdown_tx, repo),
+    fields(n_jobs, instance_id = %instance_id, broadcast_ok, n_responses)
+)]
 async fn perform_shutdown(
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
@@ -541,19 +573,61 @@ async fn perform_shutdown(
     let (send, mut recv) =
         tokio::sync::mpsc::channel::<tokio::sync::oneshot::Receiver<()>>(max_jobs_per_process);
 
-    if shutdown_tx.send(send).is_ok() {
+    let broadcast_ok = shutdown_tx.send(send).is_ok();
+    tracing::Span::current().record("broadcast_ok", broadcast_ok);
+
+    if broadcast_ok {
         let mut receivers = Vec::with_capacity(max_jobs_per_process);
-        let receive_timeout = Duration::from_millis(100);
+        let receive_timeout = Duration::from_millis(1000);
+
+        tracing::info!("Starting to collect shutdown acknowledgements from job monitors");
 
         loop {
             match tokio::time::timeout(receive_timeout, recv.recv()).await {
-                Ok(Some(oneshot_rx)) => receivers.push(oneshot_rx),
-                Ok(None) => break, // channel closed (all senders dropped)
-                Err(_) => break,   // timeout - no more responses expected
+                Ok(Some(oneshot_rx)) => {
+                    receivers.push(oneshot_rx);
+                    tracing::info!(
+                        n_collected = receivers.len(),
+                        "Received acknowledgement from monitor task"
+                    );
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        n_collected = receivers.len(),
+                        "Channel closed, all monitors responded"
+                    );
+                    break;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        n_collected = receivers.len(),
+                        "Receive timeout expired, moving on with collected responses"
+                    );
+                    break;
+                }
             }
         }
 
-        let _ = tokio::time::timeout(shutdown_timeout, futures::future::join_all(receivers)).await;
+        tracing::Span::current().record("n_responses", receivers.len());
+
+        tracing::info!(
+            n_responses = receivers.len(),
+            "Waiting for all acknowledged jobs to complete"
+        );
+
+        if tokio::time::timeout(shutdown_timeout, futures::future::join_all(receivers))
+            .await
+            .is_err()
+        {
+            tracing::warn!("Some jobs did not signal completion within shutdown timeout");
+        } else {
+            tracing::info!("All acknowledged jobs completed");
+        }
+    } else {
+        // No active subscribers - wait for the shutdown timeout anyway
+        // to give jobs a chance to complete gracefully
+        tracing::warn!("No active shutdown subscribers, waiting for shutdown timeout");
+        crate::time::sleep(shutdown_timeout).await;
     }
 
     kill_remaining_jobs(repo, instance_id).await
