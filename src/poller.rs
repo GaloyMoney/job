@@ -380,20 +380,22 @@ impl JobPoller {
                 }
                 _ = &mut job_handle => {
                     // Job completed - check if shutdown signal is also pending
+
+                    let shutdown_span = tracing::info_span!(
+                        parent: None,
+                        "job.shutdown_coordination",
+                        job_id = %job_id,
+                        job_type = %job_type,
+                        coordination_path = "job_completed_first",
+                        ack_sent = tracing::field::Empty,
+                        job_completed = tracing::field::Empty,
+                    );
+
+                    let _enter = shutdown_span.enter();
+
                     match shutdown_rx.try_recv() {
                         Ok(shutdown_notifier) => {
                             // Shutdown was also requested, participate in coordination
-                            let shutdown_span = tracing::info_span!(
-                                parent: None,
-                                "job.shutdown_coordination",
-                                job_id = %job_id,
-                                job_type = %job_type,
-                                coordination_path = "job_completed_first",
-                                ack_sent = tracing::field::Empty,
-                                job_completed = tracing::field::Empty,
-                            );
-
-                            let _enter = shutdown_span.enter();
 
                             let (send, recv) = tokio::sync::oneshot::channel();
 
@@ -699,8 +701,6 @@ async fn kill_remaining_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Result<(
         return Ok(());
     }
 
-    tracing::error!(n_killed, "Jobs still running after shutdown timeout");
-
     let attempt_map: std::collections::HashMap<JobId, u32> = rows
         .into_iter()
         .map(|r| (r.id, r.attempt_index as u32))
@@ -711,6 +711,14 @@ async fn kill_remaining_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Result<(
 
     for (job_id, mut job) in entities {
         let attempt_index = attempt_map[&job_id];
+
+        tracing::error!(
+            job_id = %job_id,
+            job_type = %job.job_type,
+            attempt = attempt_index,
+            "Job still running after shutdown timeout, forcing reschedule"
+        );
+
         job.abort_execution("killed job".to_string(), now, attempt_index);
         repo.update_in_op(&mut op, &mut job).await?;
     }
