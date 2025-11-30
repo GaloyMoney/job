@@ -1,3 +1,10 @@
+# [cala release v0.2.13](https://github.com/GaloyMoney/cala/releases/tag/0.2.13)
+
+
+### Miscellaneous Tasks
+
+- Add instrumentation (#24)
+
 # [cala release v0.2.12](https://github.com/GaloyMoney/cala/releases/tag/0.2.12)
 
 
