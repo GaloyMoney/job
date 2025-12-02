@@ -339,91 +339,51 @@ impl JobPoller {
         let monitor_task_name = format!("job-{}-monitor-{}", job_type, job_id);
 
         spawn_named_task!(&monitor_task_name, async move {
+            use tracing::Instrument;
+
             tokio::pin!(job_handle);
 
             tokio::select! {
-                // Biased select ensures we check for shutdown signal first
-                biased;
-
+                _ = &mut job_handle => {
+                    // Job completed - no need for shutdown coordination
+                }
                 Ok(shutdown_notifier) = shutdown_rx.recv() => {
-                    // Create a span for this specific job's shutdown sequence
-                    let shutdown_span = tracing::info_span!(
-                        parent: None,
-                        "job.shutdown_coordination",
-                        job_id = %job_id,
-                        job_type = %job_type,
-                        coordination_path = "shutdown_first",
-                        ack_sent = tracing::field::Empty,
-                        job_completed = tracing::field::Empty,
-                    );
-
-                    let _enter = shutdown_span.enter();
-
                     let (send, recv) = tokio::sync::oneshot::channel();
 
-                    match shutdown_notifier.send(recv).await {
-                        Ok(()) => {
-                            shutdown_span.record("ack_sent", true);
-                            tracing::info!("Acknowledgement sent, waiting for job completion");
-                            drop(shutdown_notifier);
+                    async {
+                        match shutdown_notifier.send(recv).await {
+                            Ok(()) => {
+                                tracing::Span::current().record("ack_sent", true);
+                                tracing::info!("Acknowledgement sent, waiting for job completion");
+                                drop(shutdown_notifier);
 
-                            if tokio::time::timeout(shutdown_timeout, &mut job_handle).await.is_err() {
-                                shutdown_span.record("job_completed", false);
-                                tracing::warn!("Job exceeded timeout, aborting");
-                                job_handle.abort();
-                            } else {
-                                shutdown_span.record("job_completed", true);
-                                tracing::info!("Job completed gracefully");
+                                if tokio::time::timeout(shutdown_timeout, &mut job_handle).await.is_err() {
+                                    tracing::Span::current().record("job_completed", false);
+                                    tracing::warn!("Job exceeded timeout, aborting");
+                                    job_handle.abort();
+                                } else {
+                                    tracing::Span::current().record("job_completed", true);
+                                    tracing::info!("Job completed gracefully");
+                                }
+
+                                let _ = send.send(());
+                                tracing::info!("Final completion signal sent");
                             }
-
-                            let _ = send.send(());
-                            tracing::info!("Final completion signal sent");
-                        }
-                        Err(_) => {
-                            shutdown_span.record("ack_sent", false);
-                            tracing::error!("Failed to send acknowledgement - stopped listening");
-                        }
-                    }
-                }
-                _ = &mut job_handle => {
-                    // Job completed - check if shutdown signal is also pending
-
-                    let shutdown_span = tracing::info_span!(
-                        parent: None,
-                        "job.shutdown_coordination",
-                        job_id = %job_id,
-                        job_type = %job_type,
-                        coordination_path = "job_completed_first",
-                        ack_sent = tracing::field::Empty,
-                        job_completed = tracing::field::Empty,
-                    );
-
-                    let _enter = shutdown_span.enter();
-
-                    match shutdown_rx.try_recv() {
-                        Ok(shutdown_notifier) => {
-                            // Shutdown was also requested, participate in coordination
-
-                            let (send, recv) = tokio::sync::oneshot::channel();
-
-                            match shutdown_notifier.send(recv).await {
-                                Ok(()) => {
-                                    shutdown_span.record("ack_sent", true);
-                                    shutdown_span.record("job_completed", true);
-                                    tracing::info!("Job already completed, acknowledged shutdown");
-                                    let _ = send.send(());
-                                }
-                                Err(_) => {
-                                    shutdown_span.record("ack_sent", false);
-                                    tracing::error!("Failed to send acknowledgement - stopped listening");
-                                }
+                            Err(_) => {
+                                tracing::Span::current().record("ack_sent", false);
+                                tracing::error!("Failed to send acknowledgement - stopped listening");
                             }
                         }
-                        Err(_) => {
-                            // No shutdown signal, job just completed normally
-                            tracing::info!("Job completed normally, no shutdown coordination needed");
-                        }
-                    }
+                    }.instrument(tracing::info_span!(
+                            parent: None,
+                            "job.shutdown_coordination",
+                            job_id = %job_id,
+                            job_type = %job_type,
+                            coordination_path = "shutdown_first",
+                            ack_sent = tracing::field::Empty,
+                            job_completed = tracing::field::Empty,
+                        )
+                    ).await;
                 }
             }
         });
