@@ -1,3 +1,10 @@
+# [cala release v0.2.14](https://github.com/GaloyMoney/cala/releases/tag/0.2.14)
+
+
+### Bug Fixes
+
+- Do not use sim-time for shutdown-timer (#25)
+
 # [cala release v0.2.13](https://github.com/GaloyMoney/cala/releases/tag/0.2.13)
 
 
