@@ -367,7 +367,7 @@ impl JobPoller {
                             tracing::info!("Acknowledgement sent, waiting for job completion");
                             drop(shutdown_notifier);
 
-                            if crate::time::timeout(shutdown_timeout, &mut job_handle).await.is_err() {
+                            if tokio::time::timeout(shutdown_timeout, &mut job_handle).await.is_err() {
                                 shutdown_span.record("job_completed", false);
                                 tracing::warn!("Job exceeded timeout, aborting");
                                 job_handle.abort();
@@ -676,7 +676,7 @@ async fn perform_shutdown(
         // No active subscribers - wait for the shutdown timeout anyway
         // to give jobs a chance to complete gracefully
         tracing::warn!("No active shutdown subscribers, waiting for shutdown timeout");
-        crate::time::sleep(shutdown_timeout).await;
+        tokio::time::sleep(shutdown_timeout).await;
     }
 
     kill_remaining_jobs(repo, instance_id).await
