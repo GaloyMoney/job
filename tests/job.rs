@@ -20,7 +20,7 @@ impl JobConfig for TestJobConfig {
 struct TestJobInitializer;
 impl JobInitializer for TestJobInitializer {
     fn job_type() -> JobType {
-        JobType::new("test_job")
+        JobType::new("test-job")
     }
 
     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
