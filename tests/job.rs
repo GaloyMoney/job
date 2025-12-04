@@ -60,13 +60,14 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
         .await
         .expect("Failed to start job polling");
 
-    let job_config = TestJobConfig { delay_ms: 50 };
+    let delay_ms = 50;
+    let job_config = TestJobConfig { delay_ms };
     let job_id = JobId::new();
     jobs.create_and_spawn(job_id, job_config)
         .await
         .expect("Failed to create and spawn job");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms * 2)).await;
 
     let job = jobs.find(job_id).await?;
     assert!(job.completed());
