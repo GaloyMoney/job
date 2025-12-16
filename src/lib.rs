@@ -328,7 +328,7 @@ impl Jobs {
             Err(JobError::DuplicateUniqueJobType) => (),
             Err(e) => return Err(e),
             Ok(mut job) => {
-                let schedule_at = op.now().unwrap_or_else(crate::time::now);
+                let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
                 self.insert_execution::<<C as JobConfig>::Initializer>(
                     &mut op,
                     &mut job,
@@ -380,7 +380,7 @@ impl Jobs {
             .build()
             .expect("Could not build new job");
         let mut job = self.repo.create_in_op(op, new_job).await?;
-        let schedule_at = op.now().unwrap_or_else(crate::time::now);
+        let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
         self.insert_execution::<<C as JobConfig>::Initializer>(op, &mut job, schedule_at)
             .await?;
         Ok(job)
@@ -457,7 +457,7 @@ impl Jobs {
             job.id as JobId,
             &job.job_type as &JobType,
             schedule_at,
-            op.now()
+            op.maybe_now()
         )
         .execute(op.as_executor())
         .await?;

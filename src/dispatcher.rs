@@ -109,13 +109,13 @@ impl JobDispatcher {
             Ok(JobCompletion::RescheduleNow) => {
                 span.record("conclusion", "RescheduleNow");
                 let op = self.repo.begin_op().await?;
-                let t = op.now().unwrap_or_else(crate::time::now);
+                let t = op.maybe_now().unwrap_or_else(crate::time::now);
                 self.reschedule_job(op, job.id, t).await?;
             }
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleNowWithOp(op)) => {
                 span.record("conclusion", "RescheduleNowWithOp");
-                let t = op.now().unwrap_or_else(crate::time::now);
+                let t = op.maybe_now().unwrap_or_else(crate::time::now);
                 self.reschedule_job(op, job.id, t).await?;
             }
             Ok(JobCompletion::RescheduleNowWithTx(tx)) => {
@@ -126,14 +126,14 @@ impl JobDispatcher {
             Ok(JobCompletion::RescheduleIn(d)) => {
                 span.record("conclusion", "RescheduleIn");
                 let op = self.repo.begin_op().await?;
-                let t = op.now().unwrap_or_else(crate::time::now);
+                let t = op.maybe_now().unwrap_or_else(crate::time::now);
                 let t = t + d;
                 self.reschedule_job(op, job.id, t).await?;
             }
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleInWithOp(d, op)) => {
                 span.record("conclusion", "RescheduleInWithOp");
-                let t = op.now().unwrap_or_else(crate::time::now);
+                let t = op.maybe_now().unwrap_or_else(crate::time::now);
                 let t = t + d;
                 self.reschedule_job(op, job.id, t).await?;
             }
