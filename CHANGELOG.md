@@ -1,4 +1,4 @@
-# [cala release v0.3.0](https://github.com/GaloyMoney/cala/releases/tag/0.3.0)
+# [job release v0.3.0](https://github.com/GaloyMoney/job/releases/tag/0.3.0)
 
 
 ### Documentation
@@ -19,28 +19,28 @@
 - Faster integration test
 - Faster integration test
 
-# [cala release v0.2.14](https://github.com/GaloyMoney/cala/releases/tag/0.2.14)
+# [job release v0.2.14](https://github.com/GaloyMoney/job/releases/tag/0.2.14)
 
 
 ### Bug Fixes
 
 - Do not use sim-time for shutdown-timer (#25)
 
-# [cala release v0.2.13](https://github.com/GaloyMoney/cala/releases/tag/0.2.13)
+# [job release v0.2.13](https://github.com/GaloyMoney/job/releases/tag/0.2.13)
 
 
 ### Miscellaneous Tasks
 
 - Add instrumentation (#24)
 
-# [cala release v0.2.12](https://github.com/GaloyMoney/cala/releases/tag/0.2.12)
+# [job release v0.2.12](https://github.com/GaloyMoney/job/releases/tag/0.2.12)
 
 
 ### Miscellaneous Tasks
 
 - Optional flag for tokio-task-names (#22)
 
-# [cala release v0.2.11](https://github.com/GaloyMoney/cala/releases/tag/0.2.11)
+# [job release v0.2.11](https://github.com/GaloyMoney/job/releases/tag/0.2.11)
 
 
 ### Miscellaneous Tasks
@@ -48,11 +48,11 @@
 - Reporting on job not completing successfully (#20)
 - Adding thread name (#19)
 
-# [cala release v0.2.10](https://github.com/GaloyMoney/cala/releases/tag/0.2.10)
+# [job release v0.2.10](https://github.com/GaloyMoney/job/releases/tag/0.2.10)
 
 
 
-# [cala release v0.2.9](https://github.com/GaloyMoney/cala/releases/tag/0.2.9)
+# [job release v0.2.9](https://github.com/GaloyMoney/job/releases/tag/0.2.9)
 
 
 ### Features
@@ -63,14 +63,14 @@
 
 - Push AttemptCounterReset when reseting attempt counter (#15)
 
-# [cala release v0.2.8](https://github.com/GaloyMoney/cala/releases/tag/0.2.8)
+# [job release v0.2.8](https://github.com/GaloyMoney/job/releases/tag/0.2.8)
 
 
 ### Documentation
 
 - Improve Job crate public docs (#12)
 
-# [cala release v0.2.7](https://github.com/GaloyMoney/cala/releases/tag/0.2.7)
+# [job release v0.2.7](https://github.com/GaloyMoney/job/releases/tag/0.2.7)
 
 
 ### Documentation
@@ -81,7 +81,7 @@
 
 - Add indexes (#10)
 
-# [cala release v0.2.6](https://github.com/GaloyMoney/cala/releases/tag/0.2.6)
+# [job release v0.2.6](https://github.com/GaloyMoney/job/releases/tag/0.2.6)
 
 
 ### Miscellaneous Tasks
@@ -89,14 +89,14 @@
 - More otel update for job lib (#8)
 - Traces fine tuning (#9)
 
-# [cala release v0.2.5](https://github.com/GaloyMoney/cala/releases/tag/0.2.5)
+# [job release v0.2.5](https://github.com/GaloyMoney/job/releases/tag/0.2.5)
 
 
 ### Miscellaneous Tasks
 
 - Move poll_jobs to debug (#7)
 
-# [cala release v0.2.4](https://github.com/GaloyMoney/cala/releases/tag/0.2.4)
+# [job release v0.2.4](https://github.com/GaloyMoney/job/releases/tag/0.2.4)
 
 
 ### Miscellaneous Tasks
@@ -104,7 +104,7 @@
 - Reducing loop span to debug (#6)
 - Bump tokio
 
-# [cala release v0.2.3](https://github.com/GaloyMoney/cala/releases/tag/0.2.3)
+# [job release v0.2.3](https://github.com/GaloyMoney/job/releases/tag/0.2.3)
 
 
 ### Miscellaneous Tasks
@@ -113,7 +113,7 @@
 - This should be an info span
 - More otel spans
 
-# [cala release v0.2.2](https://github.com/GaloyMoney/cala/releases/tag/0.2.2)
+# [job release v0.2.2](https://github.com/GaloyMoney/job/releases/tag/0.2.2)
 
 
 ### Miscellaneous Tasks
@@ -121,7 +121,7 @@
 - Revert back local version
 - Update es-entity
 
-# [cala release v0.2.1](https://github.com/GaloyMoney/cala/releases/tag/0.2.1)
+# [job release v0.2.1](https://github.com/GaloyMoney/job/releases/tag/0.2.1)
 
 
 ### Miscellaneous Tasks
@@ -129,7 +129,7 @@
 - Connect traces from spawn to execute
 - Connect traces from spawn to execute
 
-# [cala release v0.2.0](https://github.com/GaloyMoney/cala/releases/tag/0.2.0)
+# [job release v0.2.0](https://github.com/GaloyMoney/job/releases/tag/0.2.0)
 
 
 ### Features
@@ -148,28 +148,28 @@
 - Centralize keep_alive loop
 - Add poller_instance_id to job_executions tbl
 
-# [cala release v0.1.12](https://github.com/GaloyMoney/cala/releases/tag/0.1.12)
+# [job release v0.1.12](https://github.com/GaloyMoney/job/releases/tag/0.1.12)
 
 
 ### Miscellaneous Tasks
 
 - Bump es-entity
 
-# [cala release v0.1.11](https://github.com/GaloyMoney/cala/releases/tag/0.1.11)
+# [job release v0.1.11](https://github.com/GaloyMoney/job/releases/tag/0.1.11)
 
 
 ### Miscellaneous Tasks
 
 - Widen sqlx version requirements
 
-# [cala release v0.1.10](https://github.com/GaloyMoney/cala/releases/tag/0.1.10)
+# [job release v0.1.10](https://github.com/GaloyMoney/job/releases/tag/0.1.10)
 
 
 ### Miscellaneous Tasks
 
 - Sqlx-prepare
 
-# [cala release v0.1.9](https://github.com/GaloyMoney/cala/releases/tag/0.1.9)
+# [job release v0.1.9](https://github.com/GaloyMoney/job/releases/tag/0.1.9)
 
 
 ### Miscellaneous Tasks
@@ -177,18 +177,18 @@
 - Bump sim-time
 - Bump es-entity
 
-# [cala release v0.1.8](https://github.com/GaloyMoney/cala/releases/tag/0.1.8)
+# [job release v0.1.8](https://github.com/GaloyMoney/job/releases/tag/0.1.8)
 
 
 ### Refactor
 
 - Rename process_config -> poller_config
 
-# [cala release v0.1.7](https://github.com/GaloyMoney/cala/releases/tag/0.1.7)
+# [job release v0.1.7](https://github.com/GaloyMoney/job/releases/tag/0.1.7)
 
 
 
-# [cala release v0.1.6](https://github.com/GaloyMoney/cala/releases/tag/0.1.6)
+# [job release v0.1.6](https://github.com/GaloyMoney/job/releases/tag/0.1.6)
 
 
 ### Documentation
@@ -199,21 +199,21 @@
 
 - Use builder to pass pool
 
-# [cala release v0.1.5](https://github.com/GaloyMoney/cala/releases/tag/0.1.5)
+# [job release v0.1.5](https://github.com/GaloyMoney/job/releases/tag/0.1.5)
 
 
 ### Miscellaneous Tasks
 
 - Bump es-entity
 
-# [cala release v0.1.4](https://github.com/GaloyMoney/cala/releases/tag/0.1.4)
+# [job release v0.1.4](https://github.com/GaloyMoney/job/releases/tag/0.1.4)
 
 
 ### Testing
 
 - Add integration test
 
-# [cala release v0.1.3](https://github.com/GaloyMoney/cala/releases/tag/0.1.3)
+# [job release v0.1.3](https://github.com/GaloyMoney/job/releases/tag/0.1.3)
 
 
 ### Bug Fixes
@@ -228,4 +228,4 @@
 
 - Cleanup schema and _in_op nameing
 
-# [cala release v0.1.2](https://github.com/GaloyMoney/cala/releases/tag/0.1.2)
+# [job release v0.1.2](https://github.com/GaloyMoney/job/releases/tag/0.1.2)

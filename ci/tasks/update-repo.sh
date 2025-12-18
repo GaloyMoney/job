@@ -11,7 +11,7 @@ pushd repo
 VERSION="$(cat ../version/version)"
 
 cat <<EOF >new_change_log.md
-# [cala release v${VERSION}](https://github.com/GaloyMoney/cala/releases/tag/${VERSION})
+# [job release v${VERSION}](https://github.com/GaloyMoney/job/releases/tag/${VERSION})
 
 $(cat ../artifacts/gh-release-notes.md)
 
@@ -23,8 +23,6 @@ for file in $(find . -name Cargo.toml); do
   sed -i'' "s/^version.*/version = \"${VERSION}\"/" ${file}
 done
 
-sed -i'' "s/sim-time\", version = .*/sim-time\", version = \"${VERSION}\" }/" ./Cargo.toml
-sed -i'' "s/es-entity-macros\", version = .*/es-entity-macros\", version = \"${VERSION}\" }/" ./Cargo.toml
 cargo update --workspace
 
 git status
