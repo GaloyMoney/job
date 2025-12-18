@@ -1,3 +1,24 @@
+# [cala release v0.3.0](https://github.com/GaloyMoney/cala/releases/tag/0.3.0)
+
+
+### Documentation
+
+- Restructure README
+
+### Miscellaneous Tasks
+
+- [**breaking**] Bump es-entity (#27)
+- Bump flake
+
+### Refactor
+
+- Remove redundant shutdown coordination (#26)
+
+### Testing
+
+- Faster integration test
+- Faster integration test
+
 # [cala release v0.2.14](https://github.com/GaloyMoney/cala/releases/tag/0.2.14)
 
 
