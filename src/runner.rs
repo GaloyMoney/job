@@ -52,19 +52,19 @@ pub enum JobCompletion {
     RescheduleIn(std::time::Duration),
     #[cfg(feature = "es-entity")]
     /// Schedule the next run after a delay and return an `EsEntity` operation that the job service will commit.
-    RescheduleInWithOp(std::time::Duration, es_entity::DbOp<'static>),
+    RescheduleInWithOp(es_entity::DbOp<'static>, std::time::Duration),
     /// Schedule the next run after a delay and return a transaction that the job service will commit.
     RescheduleInWithTx(
-        std::time::Duration,
         sqlx::Transaction<'static, sqlx::Postgres>,
+        std::time::Duration,
     ),
     /// Schedule the next run at an exact timestamp.
     RescheduleAt(DateTime<Utc>),
     #[cfg(feature = "es-entity")]
     /// Schedule the next run at an exact timestamp and return an `EsEntity` operation that the job service will commit.
-    RescheduleAtWithOp(DateTime<Utc>, es_entity::DbOp<'static>),
+    RescheduleAtWithOp(es_entity::DbOp<'static>, DateTime<Utc>),
     /// Schedule the next run at an exact timestamp and return a transaction that the job service will commit.
-    RescheduleAtWithTx(DateTime<Utc>, sqlx::Transaction<'static, sqlx::Postgres>),
+    RescheduleAtWithTx(sqlx::Transaction<'static, sqlx::Postgres>, DateTime<Utc>),
 }
 
 #[async_trait]

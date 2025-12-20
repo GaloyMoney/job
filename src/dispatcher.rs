@@ -138,14 +138,14 @@ impl JobDispatcher {
                 op.commit().await?;
             }
             #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleInWithOp(d, mut op)) => {
+            Ok(JobCompletion::RescheduleInWithOp(mut op, d)) => {
                 span.record("conclusion", "RescheduleInWithOp");
                 let t = op.maybe_now().unwrap_or_else(crate::time::now);
                 let t = t + d;
                 self.reschedule_job(&mut op, job.id, t).await?;
                 op.commit().await?;
             }
-            Ok(JobCompletion::RescheduleInWithTx(d, mut tx)) => {
+            Ok(JobCompletion::RescheduleInWithTx(mut tx, d)) => {
                 span.record("conclusion", "RescheduleInWithOp");
                 let t = crate::time::now() + d;
                 self.reschedule_job(&mut tx, job.id, t).await?;
@@ -158,12 +158,12 @@ impl JobDispatcher {
                 op.commit().await?;
             }
             #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleAtWithOp(t, mut op)) => {
+            Ok(JobCompletion::RescheduleAtWithOp(mut op, t)) => {
                 span.record("conclusion", "RescheduleAtWithOp");
                 self.reschedule_job(&mut op, job.id, t).await?;
                 op.commit().await?;
             }
-            Ok(JobCompletion::RescheduleAtWithTx(t, mut tx)) => {
+            Ok(JobCompletion::RescheduleAtWithTx(mut tx, t)) => {
                 span.record("conclusion", "RescheduleAtWithTx");
                 self.reschedule_job(&mut tx, job.id, t).await?;
                 tx.commit().await?;
