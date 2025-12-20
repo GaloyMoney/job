@@ -1,3 +1,14 @@
+# [job release v0.3.1](https://github.com/GaloyMoney/job/releases/tag/0.3.1)
+
+
+### Bug Fixes
+
+- Do not go from DbOp -> Transaction
+
+### Refactor
+
+- Switch order of op in JobCompletion
+
 # [job release v0.3.0](https://github.com/GaloyMoney/job/releases/tag/0.3.0)
 
 
