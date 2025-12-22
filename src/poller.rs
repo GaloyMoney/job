@@ -163,7 +163,15 @@ impl JobPoller {
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         };
-        let rows = match poll_jobs(self.repo.pool(), n_jobs_to_poll, self.instance_id).await? {
+        let supported_job_types = self.registry.registered_job_types();
+        let rows = match poll_jobs(
+            self.repo.pool(),
+            n_jobs_to_poll,
+            self.instance_id,
+            &supported_job_types,
+        )
+        .await?
+        {
             JobPollResult::WaitTillNextJob(duration) => {
                 span.record("next_poll_in", tracing::field::debug(duration));
                 span.record("n_jobs_to_start", 0);
@@ -186,14 +194,22 @@ impl JobPoller {
         let mut listener = PgListener::connect_with(self.repo.pool()).await?;
         listener.listen("job_execution").await?;
         let tracker = self.tracker.clone();
+        let supported_job_types = self.registry.registered_job_types();
         Ok(OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-listener",
             async move {
                 loop {
-                    if listener.recv().await.is_ok() {
-                        tracker.job_execution_inserted();
-                    } else {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    match listener.recv().await {
+                        Ok(notification) => {
+                            let job_type = notification.payload();
+                            // Only wake the tracker if this is a job type we support
+                            if supported_job_types.iter().any(|jt| jt.as_str() == job_type) {
+                                tracker.job_execution_inserted();
+                            }
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
             }
@@ -392,11 +408,12 @@ impl JobPoller {
     }
 }
 
-#[instrument(name = "job.poll_jobs", level = "debug", skip(pool), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
+#[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
 async fn poll_jobs(
     pool: &PgPool,
     n_jobs_to_poll: usize,
     instance_id: uuid::Uuid,
+    supported_job_types: &[super::entity::JobType],
 ) -> Result<JobPollResult, sqlx::Error> {
     let now = crate::time::now();
     Span::current().record("now", tracing::field::display(now));
@@ -406,9 +423,11 @@ async fn poll_jobs(
         r#"
         WITH min_wait AS (
             SELECT MIN(execute_at) - $2::timestamptz AS wait_time
-            FROM job_executions
-            WHERE state = 'pending'
-            AND execute_at > $2::timestamptz
+            FROM job_executions je
+            JOIN jobs j ON je.id = j.id
+            WHERE je.state = 'pending'
+            AND je.execute_at > $2::timestamptz
+            AND j.job_type = ANY($4)
         ),
         selected_jobs AS (
             SELECT je.id, je.execution_state_json AS data_json, je.attempt_index
@@ -416,6 +435,7 @@ async fn poll_jobs(
             JOIN jobs ON je.id = jobs.id
             WHERE execute_at <= $2::timestamptz
             AND je.state = 'pending'
+            AND jobs.job_type = ANY($4)
             ORDER BY execute_at ASC
             LIMIT $1
             FOR UPDATE
@@ -428,14 +448,14 @@ async fn poll_jobs(
             RETURNING je.id, selected_jobs.data_json, je.attempt_index
         )
         SELECT * FROM (
-            SELECT 
+            SELECT
                 u.id AS "id?: JobId",
                 u.data_json AS "data_json?: JsonValue",
                 u.attempt_index AS "attempt_index?",
                 NULL::INTERVAL AS "max_wait?: PgInterval"
             FROM updated u
             UNION ALL
-            SELECT 
+            SELECT
                 NULL::UUID AS "id?: JobId",
                 NULL::JSONB AS "data_json?: JsonValue",
                 NULL::INT AS "attempt_index?",
@@ -447,6 +467,7 @@ async fn poll_jobs(
         n_jobs_to_poll as i32,
         now,
         instance_id,
+        supported_job_types as _,
     )
     .fetch_all(pool)
     .await?;

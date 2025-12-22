@@ -44,7 +44,7 @@ CREATE INDEX idx_job_executions_pending_execute_at
 
 CREATE OR REPLACE FUNCTION notify_job_execution_insert() RETURNS TRIGGER AS $$
 BEGIN
-  PERFORM pg_notify('job_execution', '');
+  PERFORM pg_notify('job_execution', NEW.job_type);
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
@@ -52,7 +52,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION notify_job_execution_update() RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.execute_at IS DISTINCT FROM OLD.execute_at THEN
-    PERFORM pg_notify('job_execution', '');
+    PERFORM pg_notify('job_execution', NEW.job_type);
   END IF;
   RETURN NULL;
 END;
@@ -60,10 +60,10 @@ $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER job_executions_notify_insert_trigger
 AFTER INSERT ON job_executions
-FOR EACH STATEMENT
+FOR EACH ROW
 EXECUTE FUNCTION notify_job_execution_insert();
 
 CREATE TRIGGER job_executions_notify_update_trigger
 AFTER UPDATE ON job_executions
-FOR EACH STATEMENT
+FOR EACH ROW
 EXECUTE FUNCTION notify_job_execution_update();

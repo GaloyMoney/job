@@ -31,6 +31,10 @@ impl JobType {
         JobType(Cow::Borrowed(job_type))
     }
 
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     #[cfg(test)]
     pub(crate) fn from_owned(job_type: String) -> Self {
         JobType(Cow::Owned(job_type))

@@ -42,4 +42,9 @@ impl JobRegistry {
             .get(job_type)
             .expect("Retry settings not found")
     }
+
+    /// Get a list of all registered job types.
+    pub(crate) fn registered_job_types(&self) -> Vec<JobType> {
+        self.initializers.keys().cloned().collect()
+    }
 }
