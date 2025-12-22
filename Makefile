@@ -18,8 +18,9 @@ check-code:
 	SQLX_OFFLINE=true cargo fmt --check --all
 	SQLX_OFFLINE=true cargo check --workspace
 	SQLX_OFFLINE=true cargo clippy --workspace --all-features
-	SQLX_OFFLINE=true cargo audit
-	SQLX_OFFLINE=true cargo deny check
+	# temporarily disabled due to toml version issue
+	# SQLX_OFFLINE=true cargo audit
+	# SQLX_OFFLINE=true cargo deny check
 
 sqlx-prepare:
 	cargo sqlx prepare --workspace
