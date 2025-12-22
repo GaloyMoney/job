@@ -423,19 +423,17 @@ async fn poll_jobs(
         r#"
         WITH min_wait AS (
             SELECT MIN(execute_at) - $2::timestamptz AS wait_time
-            FROM job_executions je
-            JOIN jobs j ON je.id = j.id
-            WHERE je.state = 'pending'
-            AND je.execute_at > $2::timestamptz
-            AND j.job_type = ANY($4)
+            FROM job_executions
+            WHERE state = 'pending'
+            AND execute_at > $2::timestamptz
+            AND job_type = ANY($4)
         ),
         selected_jobs AS (
-            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index
-            FROM job_executions je
-            JOIN jobs ON je.id = jobs.id
+            SELECT id, execution_state_json AS data_json, attempt_index
+            FROM job_executions
             WHERE execute_at <= $2::timestamptz
-            AND je.state = 'pending'
-            AND jobs.job_type = ANY($4)
+            AND state = 'pending'
+            AND job_type = ANY($4)
             ORDER BY execute_at ASC
             LIMIT $1
             FOR UPDATE

@@ -42,6 +42,10 @@ CREATE INDEX idx_job_executions_pending_execute_at
   ON job_executions(execute_at)
   WHERE state = 'pending';
 
+CREATE INDEX idx_job_executions_pending_job_type_execute_at
+  ON job_executions(job_type, execute_at)
+  WHERE state = 'pending';
+
 CREATE OR REPLACE FUNCTION notify_job_execution_insert() RETURNS TRIGGER AS $$
 BEGIN
   PERFORM pg_notify('job_execution', NEW.job_type);
