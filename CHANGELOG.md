@@ -1,3 +1,14 @@
+# [job release v0.4.0](https://github.com/GaloyMoney/job/releases/tag/0.4.0)
+
+
+### Bug Fixes
+
+- Remove join from poll loop
+
+### Features
+
+- [**breaking**] Only poll registered job types (#28)
+
 # [job release v0.3.1](https://github.com/GaloyMoney/job/releases/tag/0.3.1)
 
 
