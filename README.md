@@ -14,6 +14,7 @@ Uses [sqlx](https://docs.rs/sqlx/latest/sqlx/) for interfacing with the DB.
 - Job scheduling and rescheduling
 - Configurable retry logic with exponential backoff
 - Built-in job tracking and monitoring
+- Type-safe job spawning via `JobSpawner`
 
 ## Usage
 
@@ -36,13 +37,14 @@ use job::*;
 struct MyJobConfig {
     delay_ms: u64,
 }
-impl JobConfig for MyJobConfig {
-    type Initializer = MyJobInitializer;
-}
 
+// Define your initializer
 struct MyJobInitializer;
+
 impl JobInitializer for MyJobInitializer {
-    fn job_type() -> JobType {
+    type Config = MyJobConfig;
+
+    fn job_type(&self) -> JobType {
         JobType::new("my_job")
     }
 
@@ -52,6 +54,7 @@ impl JobInitializer for MyJobInitializer {
     }
 }
 
+// Define your runner
 struct MyJobRunner {
     config: MyJobConfig,
 }
@@ -74,27 +77,27 @@ impl JobRunner for MyJobRunner {
 async fn main() -> anyhow::Result<()> {
     // Connect to database (requires PostgreSQL with migrations applied)
     let pool = sqlx::PgPool::connect("postgresql://user:pass@localhost/db").await?;
-    
+
     // Create Jobs service
-    let config = JobsSvcConfig::builder()
+    let config = JobSvcConfig::builder()
         .pg_con("postgresql://user:pass@localhost/db")
         // If you are using sqlx and already have a pool
-        // .pool(sqlx::PgPool::connect("postgresql://user:pass@localhost/db")
+        // .pool(pool)
         .build()
         .expect("Could not build JobSvcConfig");
     let mut jobs = Jobs::init(config).await?;
     
-    // Register job type
-    jobs.add_initializer(MyJobInitializer);
+    // Register job type - returns a type-safe spawner
+    let spawner: JobSpawner<MyJobConfig> = jobs.add_initializer(MyJobInitializer);
     
     // Start job processing
     // Must be called after all initializers have been added
     jobs.start_poll().await?;
     
-    // Create and spawn a job
+    // Use the spawner to create jobs
     let job_config = MyJobConfig { delay_ms: 1000 };
     let job_id = JobId::new();
-    let job = jobs.create_and_spawn(job_id, job_config).await?;
+    let job = spawner.spawn(job_id, job_config).await?;
     
     // Do some other stuff...
     tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
@@ -107,6 +110,43 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Unique Jobs
+
+For singleton jobs where only one instance should exist at a time,
+use `spawn_unique`. This method consumes the spawner, enforcing at the type level that only one
+job of this type can be created:
+
+```rust
+let cleanup_spawner = jobs.add_initializer(CleanupInitializer);
+
+// Consumes spawner - can't accidentally spawn twice
+cleanup_spawner.spawn_unique(JobId::new(), CleanupConfig::default()).await?;
+```
+
+### Parameterized Job Types
+
+For cases where the job type is configured at runtime,
+store the job type in your initializer:
+
+```rust
+struct TenantJobInitializer {
+    job_type: JobType,
+    tenant_id: String,
+}
+
+impl JobInitializer for TenantJobInitializer {
+    type Config = TenantJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()  // From instance, not hardcoded
+    }
+
+    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        // ...
+    }
+}
+```
+
 ### Setup
 
 In order to use the jobs crate migrations need to run on Postgres to initialize the tables.
@@ -116,7 +156,7 @@ Option 1.
 Let the library run the migrations - this is useful when you are not using sqlx in the rest of your project.
 To avoid compilation errors set `export SQLX_OFFLINE=true` in your dev shell.
 ```rust
-let config = JobsSvcConfig::builder()
+let config = JobSvcConfig::builder()
     .pool(sqlx::PgPool::connect("postgresql://user:pass@localhost/db")
     // set to true by default when passing .pg_con("<con>") - false otherwise
     .exec_migration(true)

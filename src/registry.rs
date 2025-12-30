@@ -4,9 +4,22 @@ use std::collections::HashMap;
 
 use super::{entity::*, error::JobError, runner::*};
 
+/// Internal trait for storing initializers with erased Config type.
+/// Only `init` is needed after registration - job_type and retry_settings
+/// are extracted before boxing and stored separately.
+pub(crate) trait AnyJobInitializer: Send + Sync + 'static {
+    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
+}
+
+impl<T: JobInitializer> AnyJobInitializer for T {
+    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        JobInitializer::init(self, job)
+    }
+}
+
 /// Keeps track of registered job types and their retry behaviour.
 pub struct JobRegistry {
-    initializers: HashMap<JobType, Box<dyn JobInitializer>>,
+    initializers: HashMap<JobType, Box<dyn AnyJobInitializer>>,
     retry_settings: HashMap<JobType, RetrySettings>,
 }
 
@@ -19,13 +32,14 @@ impl JobRegistry {
     }
 
     /// Register a [`JobInitializer`] and its associated retry settings.
-    pub fn add_initializer<I: JobInitializer>(&mut self, initializer: I) {
+    /// Returns the job type that was registered.
+    pub fn add_initializer<I: JobInitializer>(&mut self, initializer: I) -> JobType {
+        let job_type = initializer.job_type();
+        let retry_settings = initializer.retry_on_error_settings();
         self.initializers
-            .insert(<I as JobInitializer>::job_type(), Box::new(initializer));
-        self.retry_settings.insert(
-            <I as JobInitializer>::job_type(),
-            <I as JobInitializer>::retry_on_error_settings(),
-        );
+            .insert(job_type.clone(), Box::new(initializer));
+        self.retry_settings.insert(job_type.clone(), retry_settings);
+        job_type
     }
 
     pub(super) fn init_job(&self, job: &Job) -> Result<Box<dyn JobRunner>, JobError> {

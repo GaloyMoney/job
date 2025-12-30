@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Serialize, de::DeserializeOwned};
 
 use super::{
     current::CurrentJob,
@@ -10,26 +11,33 @@ use super::{
 
 /// Describes how to construct a [`JobRunner`] for a given job type.
 pub trait JobInitializer: Send + Sync + 'static {
-    /// Unique identifier for the job type.
-    fn job_type() -> JobType
-    where
-        Self: Sized;
+    /// The configuration type for jobs of this type.
+    type Config: Serialize + DeserializeOwned + Send + Sync;
+
+    /// Returns the job type identifier.
+    ///
+    /// For simple cases, return a constant:
+    /// ```ignore
+    /// fn job_type(&self) -> JobType {
+    ///     JobType::new("my-job")
+    /// }
+    /// ```
+    ///
+    /// For configured/parameterized initializers, return from instance:
+    /// ```ignore
+    /// fn job_type(&self) -> JobType {
+    ///     self.job_type.clone()
+    /// }
+    /// ```
+    fn job_type(&self) -> JobType;
 
     /// Retry settings to use when the runner returns an error.
-    fn retry_on_error_settings() -> RetrySettings
-    where
-        Self: Sized,
-    {
+    fn retry_on_error_settings(&self) -> RetrySettings {
         Default::default()
     }
 
     /// Produce a runner instance for the provided job.
     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
-}
-
-/// Associate a typed config payload with a [`JobInitializer`].
-pub trait JobConfig: serde::Serialize {
-    type Initializer: JobInitializer;
 }
 
 /// Result returned by [`JobRunner::run`] describing how to progress the job.

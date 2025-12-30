@@ -15,14 +15,16 @@
 //! - Automatic exponential backoff with jitter, plus opt-in infinite retries.
 //! - Concurrency controls that let many worker instances share the workload,
 //!   configurable through [`JobPollerConfig`].
-//! - Optional at-most-one-per-type queueing.
+//! - Optional at-most-one-per-type queueing via [`JobSpawner::spawn_unique`].
 //! - Built-in migrations that you can run automatically or embed into your own
 //!   migration workflow.
 //!
-//! ## Core concepts
+//! ## Core Concepts
 //! - **Jobs service** – [`Jobs`] owns registration, polling, and shutdown.
 //! - **Initializer** – [`JobInitializer`] registers a job type and builds a
-//!   [`JobRunner`] for each execution.
+//!   [`JobRunner`] for each execution. Defines the associated `Config` type.
+//! - **Spawner** – [`JobSpawner`] is returned from registration and provides
+//!   type-safe job creation methods. Parameterized by the config type.
 //! - **Runner** – [`JobRunner`] performs the work using the provided
 //!   [`CurrentJob`] context.
 //! - **Current job** – [`CurrentJob`] exposes attempt counts, execution state,
@@ -30,26 +32,153 @@
 //! - **Completion** – [`JobCompletion`] returns the outcome: finish, retry, or
 //!   reschedule at a later time.
 //!
+//! ## Lifecycle
+//!
+//! 1. Initialize the service with [`Jobs::init`]
+//! 2. Register initializers with [`Jobs::add_initializer`] – returns a [`JobSpawner`]
+//! 3. Start polling with [`Jobs::start_poll`]
+//! 4. Use spawners to create jobs throughout your application
+//! 5. Shut down gracefully with [`Jobs::shutdown`]
+//!
+//! ## Example
+//!
+//! ```ignore
+//! use async_trait::async_trait;
+//! use job::{
+//!     CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner,
+//!     JobSpawner, JobSvcConfig, JobType, Jobs,
+//! };
+//! use serde::{Deserialize, Serialize};
+//!
+//! // 1. Define your config (serialized to the database)
+//! #[derive(Debug, Serialize, Deserialize)]
+//! struct MyConfig {
+//!     value: i32,
+//! }
+//!
+//! // 2. Define your initializer
+//! struct MyInitializer;
+//!
+//! impl JobInitializer for MyInitializer {
+//!     type Config = MyConfig;
+//!
+//!     fn job_type(&self) -> JobType {
+//!         JobType::new("my-job")
+//!     }
+//!
+//!     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+//!         let config: MyConfig = job.config()?;
+//!         Ok(Box::new(MyRunner { value: config.value }))
+//!     }
+//! }
+//!
+//! // 3. Define your runner
+//! struct MyRunner {
+//!     value: i32,
+//! }
+//!
+//! #[async_trait]
+//! impl JobRunner for MyRunner {
+//!     async fn run(
+//!         &self,
+//!         _current_job: CurrentJob,
+//!     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+//!         println!("Processing value: {}", self.value);
+//!         Ok(JobCompletion::Complete)
+//!     }
+//! }
+//!
+//! // 4. Wire it up
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = JobSvcConfig::builder()
+//!         .pg_con("postgres://user:pass@localhost/db")
+//!         .build()?;
+//!
+//!     let mut jobs = Jobs::init(config).await?;
+//!
+//!     // Registration returns a type-safe spawner
+//!     let spawner: JobSpawner<MyConfig> = jobs.add_initializer(MyInitializer);
+//!
+//!     jobs.start_poll().await?;
+//!
+//!     // Use the spawner to create jobs
+//!     spawner.spawn(JobId::new(), MyConfig { value: 42 }).await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
 //! ## Scheduling
+//!
 //! Jobs run immediately once a poller claims them. If you need a future start
-//! time, schedule it up front with [`Jobs::create_and_spawn_at_in_op`]. After a
-//! run completes, return `JobCompletion::Complete` for one-off work or use the
+//! time, schedule it up front with [`JobSpawner::spawn_at_in_op`]. After a
+//! run completes, return [`JobCompletion::Complete`] for one-off work or use the
 //! `JobCompletion::Reschedule*` variants to book the next execution.
 //!
 //! ## Retries
+//!
 //! Retry behaviour comes from [`JobInitializer::retry_on_error_settings`]. Once
 //! attempts are exhausted the job is marked as errored and removed from the
 //! queue.
 //!
+//! ```ignore
+//! impl JobInitializer for MyInitializer {
+//!     // ...
+//!
+//!     fn retry_on_error_settings(&self) -> RetrySettings {
+//!         RetrySettings {
+//!             n_attempts: Some(5),
+//!             min_backoff: Duration::from_secs(10),
+//!             max_backoff: Duration::from_secs(300),
+//!             ..Default::default()
+//!         }
+//!     }
+//! }
+//! ```
+//!
 //! ## Uniqueness
-//! For at-most-one semantics, use [`Jobs::add_initializer_and_spawn_unique`] or
-//! set `unique_per_type(true)` when building jobs manually.
+//!
+//! For at-most-one semantics, use [`JobSpawner::spawn_unique`]. This method
+//! consumes the spawner, enforcing at the type level that only one job of
+//! this type can exist:
+//!
+//! ```ignore
+//! let cleanup_spawner = jobs.add_initializer(CleanupInitializer);
+//!
+//! // Consumes spawner - can't accidentally spawn twice
+//! cleanup_spawner.spawn_unique(JobId::new(), CleanupConfig::default()).await?;
+//! ```
+//!
+//! ## Parameterized Job Types
+//!
+//! For cases where the job type is configured at runtime (e.g., multi-tenant inboxes),
+//! store the job type in your initializer and return it from the instance method:
+//!
+//! ```ignore
+//! struct TenantJobInitializer {
+//!     job_type: JobType,
+//!     tenant_id: String,
+//! }
+//!
+//! impl JobInitializer for TenantJobInitializer {
+//!     type Config = TenantJobConfig;
+//!
+//!     fn job_type(&self) -> JobType {
+//!         self.job_type.clone()  // From instance, not hardcoded
+//!     }
+//!
+//!     // ...
+//! }
+//! ```
 //!
 //! ## Database migrations
+//!
 //! See the [setup guide](https://github.com/GaloyMoney/job/blob/main/README.md#setup)
 //! for migration options and examples.
 //!
 //! ## Feature flags
+//!
 //! - `es-entity` enables advanced integration with the [`es_entity`] crate,
 //!   allowing runners to finish with `DbOp` handles and enriching tracing/event
 //!   metadata.
@@ -71,13 +200,13 @@ mod poller;
 mod registry;
 mod repo;
 mod runner;
+mod spawner;
 mod time;
 mod tracker;
 
 pub mod error;
 
-use chrono::{DateTime, Utc};
-use tracing::{Span, instrument};
+use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
 
@@ -87,8 +216,8 @@ pub use entity::{Job, JobType};
 pub use migrate::*;
 pub use registry::*;
 pub use runner::*;
+pub use spawner::*;
 
-use entity::NewJob;
 use error::*;
 use poller::*;
 use repo::*;
@@ -100,7 +229,7 @@ es_entity::entity_id! { JobId }
 /// handlers, manage configuration, and control scheduling and execution.
 pub struct Jobs {
     config: JobSvcConfig,
-    repo: JobRepo,
+    repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     poller_handle: Option<Arc<JobPollerHandle>>,
 }
@@ -128,7 +257,7 @@ impl Jobs {
             sqlx::migrate!().run(&pool).await?;
         }
 
-        let repo = JobRepo::new(&pool);
+        let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
         Ok(Self {
             repo,
@@ -151,8 +280,8 @@ impl Jobs {
     ///
     /// # Panics
     ///
-    /// Panics if invoked more than once, or if [`Jobs::add_initializer`] or
-    /// [`Jobs::add_initializer_and_spawn_unique`] are called after the poller has started.
+    /// Panics if invoked more than once, or if [`Jobs::add_initializer`] is called after the
+    /// poller has started.
     ///
     /// # Examples
     ///
@@ -160,17 +289,26 @@ impl Jobs {
     ///
     /// ```no_run
     /// use job::{
-    ///     Jobs, JobSvcConfig, Job, JobInitializer, JobRunner, JobType, JobCompletion, CurrentJob,
+    ///     Jobs, JobSvcConfig, Job, JobId, JobInitializer, JobRunner, JobType, JobCompletion,
+    ///     CurrentJob, JobSpawner,
     /// };
     /// use job::error::JobError;
     /// use async_trait::async_trait;
+    /// use serde::{Serialize, Deserialize};
     /// use sqlx::postgres::PgPoolOptions;
     /// use std::error::Error;
+    ///
+    /// #[derive(Debug, Serialize, Deserialize)]
+    /// struct MyConfig {
+    ///     value: i32,
+    /// }
     ///
     /// struct MyInitializer;
     ///
     /// impl JobInitializer for MyInitializer {
-    ///     fn job_type() -> JobType {
+    ///     type Config = MyConfig;
+    ///
+    ///     fn job_type(&self) -> JobType {
     ///         JobType::new("example")
     ///     }
     ///
@@ -197,9 +335,13 @@ impl Jobs {
     /// let config = JobSvcConfig::builder().pool(pool).build().unwrap();
     /// let mut jobs = Jobs::init(config).await?;
     ///
-    /// jobs.add_initializer(MyInitializer);
+    /// // Registration returns a type-safe spawner
+    /// let spawner: JobSpawner<MyConfig> = jobs.add_initializer(MyInitializer);
     ///
     /// jobs.start_poll().await?;
+    ///
+    /// // Use the spawner to create jobs
+    /// spawner.spawn(JobId::new(), MyConfig { value: 42 }).await?;
     /// # Ok(())
     /// # }
     /// # tokio::runtime::Runtime::new().unwrap().block_on(example()).unwrap();
@@ -211,16 +353,25 @@ impl Jobs {
     /// ```no_run
     /// use job::{
     ///     Jobs, JobSvcConfig, Job, JobInitializer, JobRunner, JobType, JobCompletion, CurrentJob,
+    ///     JobSpawner,
     /// };
     /// use job::error::JobError;
     /// use async_trait::async_trait;
+    /// use serde::{Serialize, Deserialize};
     /// use sqlx::postgres::PgPoolOptions;
     /// use std::error::Error;
+    ///
+    /// #[derive(Debug, Serialize, Deserialize)]
+    /// struct MyConfig {
+    ///     value: i32,
+    /// }
     ///
     /// struct MyInitializer;
     ///
     /// impl JobInitializer for MyInitializer {
-    ///     fn job_type() -> JobType {
+    ///     type Config = MyConfig;
+    ///
+    ///     fn job_type(&self) -> JobType {
     ///         JobType::new("example")
     ///     }
     ///
@@ -247,6 +398,8 @@ impl Jobs {
     /// let config = JobSvcConfig::builder().pool(pool).build().unwrap();
     /// let mut jobs = Jobs::init(config).await?;
     ///
+    /// let _spawner = jobs.add_initializer(MyInitializer);
+    ///
     /// jobs.start_poll().await?;
     ///
     /// // Panics with "Registry has been consumed by executor".
@@ -268,7 +421,7 @@ impl Jobs {
         self.poller_handle = Some(Arc::new(
             JobPoller::new(
                 self.config.poller_config.clone(),
-                self.repo.clone(),
+                (*self.repo).clone(),
                 registry,
             )
             .start()
@@ -277,145 +430,31 @@ impl Jobs {
         Ok(())
     }
 
-    /// Register a [`JobInitializer`] so the service can construct runners.
-    pub fn add_initializer<I: JobInitializer>(&self, initializer: I) {
-        let mut registry = self.registry.lock().expect("Couldn't lock Registry Mutex");
-        registry
-            .as_mut()
-            .expect("Registry has been consumed by executor")
-            .add_initializer(initializer);
-    }
-
-    #[instrument(
-        name = "job.add_initializer_and_spawn_unique",
-        skip(self, initializer, config),
-        fields(job_type, now)
-    )]
-    /// Register an initializer and enqueue a job only if one of that type is not already pending.
+    /// Register a [`JobInitializer`] and return a [`JobSpawner`] for creating jobs.
     ///
-    /// Use this when you want a single outstanding job for a given [`JobType`]. The new job is
-    /// created with `unique_per_type(true)`, so the insert simply succeeds without change if
-    /// another job of the same type is already queued or running.
+    /// # Examples
     ///
-    /// # Errors
+    /// ```ignore
+    /// let spawner = jobs.add_initializer(MyInitializer);
+    /// spawner.spawn(JobId::new(), MyConfig { value: 42 }).await?;
+    /// ```
     ///
-    /// Propagates [`JobError`] if the initializer cannot be stored, the config fails to serialize,
-    /// or the database interaction (e.g., starting a transaction) fails.
-    pub async fn add_initializer_and_spawn_unique<C: JobConfig>(
-        &self,
-        initializer: <C as JobConfig>::Initializer,
-        config: C,
-    ) -> Result<(), JobError> {
-        {
+    /// # Panics
+    ///
+    /// Panics if called after [`start_poll`](Self::start_poll).
+    pub fn add_initializer<I: JobInitializer>(&mut self, initializer: I) -> JobSpawner<I::Config> {
+        let job_type = {
             let mut registry = self.registry.lock().expect("Couldn't lock Registry Mutex");
             registry
                 .as_mut()
                 .expect("Registry has been consumed by executor")
-                .add_initializer(initializer);
-        }
-        let job_type = <<C as JobConfig>::Initializer as JobInitializer>::job_type();
-        Span::current().record("job_type", tracing::field::display(&job_type));
-        let new_job = NewJob::builder()
-            .id(JobId::new())
-            .unique_per_type(true)
-            .job_type(job_type)
-            .config(config)?
-            .tracing_context(es_entity::context::TracingContext::current())
-            .build()
-            .expect("Could not build new job");
-        let mut op = self.repo.begin_op().await?;
-        match self.repo.create_in_op(&mut op, new_job).await {
-            Err(JobError::DuplicateUniqueJobType) => (),
-            Err(e) => return Err(e),
-            Ok(mut job) => {
-                let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
-                self.insert_execution::<<C as JobConfig>::Initializer>(
-                    &mut op,
-                    &mut job,
-                    schedule_at,
-                )
-                .await?;
-                op.commit().await?;
-            }
-        }
-        Ok(())
+                .add_initializer(initializer)
+        };
+        JobSpawner::new(Arc::clone(&self.repo), job_type)
     }
 
-    #[instrument(
-        name = "job.create_and_spawn",
-        skip(self, config),
-        fields(job_type, now)
-    )]
-    /// Persist a job with the provided ID and schedule it for immediate execution.
-    pub async fn create_and_spawn<C: JobConfig>(
-        &self,
-        job_id: impl Into<JobId> + std::fmt::Debug,
-        config: C,
-    ) -> Result<Job, JobError> {
-        let mut op = self.repo.begin_op().await?;
-        let job = self.create_and_spawn_in_op(&mut op, job_id, config).await?;
-        op.commit().await?;
-        Ok(job)
-    }
-
-    #[instrument(
-        name = "job.create_and_spawn_in_op",
-        skip(self, op, config),
-        fields(job_type, now)
-    )]
-    /// Create and enqueue a job as part of an existing atomic operation.
-    pub async fn create_and_spawn_in_op<C: JobConfig>(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        job_id: impl Into<JobId> + std::fmt::Debug,
-        config: C,
-    ) -> Result<Job, JobError> {
-        let job_type = <<C as JobConfig>::Initializer as JobInitializer>::job_type();
-        Span::current().record("job_type", tracing::field::display(&job_type));
-        let new_job = NewJob::builder()
-            .id(job_id.into())
-            .job_type(<<C as JobConfig>::Initializer as JobInitializer>::job_type())
-            .config(config)?
-            .tracing_context(es_entity::context::TracingContext::current())
-            .build()
-            .expect("Could not build new job");
-        let mut job = self.repo.create_in_op(op, new_job).await?;
-        let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
-        self.insert_execution::<<C as JobConfig>::Initializer>(op, &mut job, schedule_at)
-            .await?;
-        Ok(job)
-    }
-
-    #[instrument(
-        name = "job.create_and_spawn_at_in_op",
-        skip(self, op, config),
-        fields(job_type, now)
-    )]
-    /// Create a job and schedule it for a specific time within an atomic operation.
-    pub async fn create_and_spawn_at_in_op<C: JobConfig>(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        job_id: impl Into<JobId> + std::fmt::Debug,
-        config: C,
-        schedule_at: DateTime<Utc>,
-    ) -> Result<Job, JobError> {
-        let job_type = <<C as JobConfig>::Initializer as JobInitializer>::job_type();
-        Span::current().record("job_type", tracing::field::display(&job_type));
-        let new_job = NewJob::builder()
-            .id(job_id.into())
-            .job_type(job_type)
-            .config(config)?
-            .tracing_context(es_entity::context::TracingContext::current())
-            .build()
-            .expect("Could not build new job");
-        let mut job = self.repo.create_in_op(op, new_job).await?;
-        self.insert_execution::<<C as JobConfig>::Initializer>(op, &mut job, schedule_at)
-            .await?;
-        Ok(job)
-    }
-
-    #[instrument(name = "job.find", skip(self))]
     /// Fetch the current snapshot of a job entity by identifier.
+    #[instrument(name = "job.find", skip(self))]
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
         self.repo.find_by_id(id).await
     }
@@ -433,36 +472,6 @@ impl Jobs {
         if let Some(handle) = &self.poller_handle {
             handle.shutdown().await?;
         }
-        Ok(())
-    }
-
-    #[instrument(name = "job.insert_execution", skip_all, err)]
-    async fn insert_execution<I: JobInitializer>(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        job: &mut Job,
-        schedule_at: DateTime<Utc>,
-    ) -> Result<(), JobError> {
-        if job.job_type != I::job_type() {
-            return Err(JobError::JobTypeMismatch(
-                job.job_type.clone(),
-                I::job_type(),
-            ));
-        }
-        sqlx::query!(
-            r#"
-          INSERT INTO job_executions (id, job_type, execute_at, alive_at, created_at)
-          VALUES ($1, $2, $3, COALESCE($4, NOW()), COALESCE($4, NOW()))
-        "#,
-            job.id as JobId,
-            &job.job_type as &JobType,
-            schedule_at,
-            op.maybe_now()
-        )
-        .execute(op.as_executor())
-        .await?;
-        job.schedule_execution(schedule_at);
-        self.repo.update_in_op(op, job).await?;
         Ok(())
     }
 }
