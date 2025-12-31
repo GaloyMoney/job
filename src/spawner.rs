@@ -9,6 +9,7 @@ use super::{
     Job, JobId,
     entity::{JobType, NewJob},
     error::JobError,
+    poller::JobPollerHandle,
     repo::JobRepo,
 };
 
@@ -30,6 +31,7 @@ use super::{
 pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
     job_type: JobType,
+    _poller_handle: Option<Arc<JobPollerHandle>>,
     _phantom: PhantomData<Config>,
 }
 
@@ -37,10 +39,15 @@ impl<Config> JobSpawner<Config>
 where
     Config: Serialize + Send + Sync,
 {
-    pub(crate) fn new(repo: Arc<JobRepo>, job_type: JobType) -> Self {
+    pub(crate) fn new(
+        repo: Arc<JobRepo>,
+        job_type: JobType,
+        poller_handle: Option<Arc<JobPollerHandle>>,
+    ) -> Self {
         Self {
             repo,
             job_type,
+            _poller_handle: poller_handle,
             _phantom: PhantomData,
         }
     }

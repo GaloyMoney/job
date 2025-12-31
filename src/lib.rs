@@ -450,7 +450,7 @@ impl Jobs {
                 .expect("Registry has been consumed by executor")
                 .add_initializer(initializer)
         };
-        JobSpawner::new(Arc::clone(&self.repo), job_type)
+        JobSpawner::new(Arc::clone(&self.repo), job_type, self.poller_handle.clone())
     }
 
     /// Fetch the current snapshot of a job entity by identifier.
