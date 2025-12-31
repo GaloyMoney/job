@@ -1,3 +1,14 @@
+# [job release v0.5.0](https://github.com/GaloyMoney/job/releases/tag/0.5.0)
+
+
+### Miscellaneous Tasks
+
+- Bump flake (#30)
+
+### Refactor
+
+- [**breaking**] Extract JobSpawner (#29)
+
 # [job release v0.4.0](https://github.com/GaloyMoney/job/releases/tag/0.4.0)
 
 
