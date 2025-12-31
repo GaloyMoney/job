@@ -1,10 +1,8 @@
 mod helpers;
 
 use async_trait::async_trait;
-
 use job::{
-    CurrentJob, Job, JobCompletion, JobConfig, JobId, JobInitializer, JobRunner, JobSvcConfig,
-    JobType, Jobs,
+    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSvcConfig, JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,13 +11,12 @@ struct TestJobConfig {
     delay_ms: u64,
 }
 
-impl JobConfig for TestJobConfig {
-    type Initializer = TestJobInitializer;
-}
-
 struct TestJobInitializer;
+
 impl JobInitializer for TestJobInitializer {
-    fn job_type() -> JobType {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
         JobType::new("test-job")
     }
 
@@ -41,7 +38,6 @@ impl JobRunner for TestJobRunner {
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         // Simulate some work
         tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
-
         Ok(JobCompletion::Complete)
     }
 }
@@ -55,7 +51,9 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    jobs.add_initializer(TestJobInitializer);
+
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
     jobs.start_poll()
         .await
         .expect("Failed to start job polling");
@@ -63,13 +61,15 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
     let delay_ms = 50;
     let job_config = TestJobConfig { delay_ms };
     let job_id = JobId::new();
-    jobs.create_and_spawn(job_id, job_config)
+
+    let job = spawner
+        .spawn(job_id, job_config)
         .await
         .expect("Failed to create and spawn job");
 
     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms * 2)).await;
 
-    let job = jobs.find(job_id).await?;
+    let job = jobs.find(job.id).await?;
     assert!(job.completed());
 
     Ok(())
