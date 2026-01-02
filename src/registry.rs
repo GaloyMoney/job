@@ -1,19 +1,29 @@
 //! Registry storing job initializers and retry settings.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::{entity::*, error::JobError, runner::*};
+use super::{entity::*, error::JobError, repo::JobRepo, runner::*, spawner::JobSpawner};
 
 /// Internal trait for storing initializers with erased Config type.
 /// Only `init` is needed after registration - job_type and retry_settings
 /// are extracted before boxing and stored separately.
 pub(crate) trait AnyJobInitializer: Send + Sync + 'static {
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
+    fn init(
+        &self,
+        job: &Job,
+        repo: Arc<JobRepo>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
 impl<T: JobInitializer> AnyJobInitializer for T {
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        JobInitializer::init(self, job)
+    fn init(
+        &self,
+        job: &Job,
+        repo: Arc<JobRepo>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type());
+        JobInitializer::init(self, job, spawner)
     }
 }
 
@@ -42,11 +52,15 @@ impl JobRegistry {
         job_type
     }
 
-    pub(super) fn init_job(&self, job: &Job) -> Result<Box<dyn JobRunner>, JobError> {
+    pub(super) fn init_job(
+        &self,
+        job: &Job,
+        repo: Arc<JobRepo>,
+    ) -> Result<Box<dyn JobRunner>, JobError> {
         self.initializers
             .get(&job.job_type)
             .ok_or(JobError::NoInitializerPresent)?
-            .init(job)
+            .init(job, repo)
             .map_err(|e| JobError::JobInitError(e.to_string()))
     }
 

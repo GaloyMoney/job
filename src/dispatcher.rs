@@ -20,7 +20,7 @@ pub struct PolledJob {
 }
 
 pub(crate) struct JobDispatcher {
-    repo: JobRepo,
+    repo: Arc<JobRepo>,
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
@@ -29,7 +29,7 @@ pub(crate) struct JobDispatcher {
 }
 impl JobDispatcher {
     pub fn new(
-        repo: JobRepo,
+        repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
         retry_settings: RetrySettings,
         _id: JobId,

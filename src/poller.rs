@@ -37,7 +37,7 @@ macro_rules! spawn_named_task {
 
 pub(crate) struct JobPoller {
     config: JobPollerConfig,
-    repo: JobRepo,
+    repo: Arc<JobRepo>,
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
     instance_id: uuid::Uuid,
@@ -57,14 +57,14 @@ pub(crate) struct JobPollerHandle {
     shutdown_called: Arc<AtomicBool>,
     shutdown_timeout: Duration,
     max_jobs_per_process: usize,
-    repo: JobRepo,
+    repo: Arc<JobRepo>,
     instance_id: uuid::Uuid,
 }
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
 impl JobPoller {
-    pub fn new(config: JobPollerConfig, repo: JobRepo, registry: JobRegistry) -> Self {
+    pub fn new(config: JobPollerConfig, repo: Arc<JobRepo>, registry: JobRegistry) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >(1);
@@ -86,7 +86,7 @@ impl JobPoller {
         let lost_handle = self.start_lost_handler();
         let keep_alive_handle = self.start_keep_alive_handler();
         let shutdown_tx = self.shutdown_tx.clone();
-        let repo = self.repo.clone();
+        let repo = Arc::clone(&self.repo);
         let instance_id = self.instance_id;
         let shutdown_timeout = self.config.shutdown_timeout;
         let max_jobs_per_process = self.config.max_jobs_per_process;
@@ -317,9 +317,9 @@ impl JobPoller {
         let job = self.repo.find_by_id(polled_job.id).await?;
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
-        let runner = self.registry.init_job(&job)?;
+        let runner = self.registry.init_job(&job, Arc::clone(&self.repo))?;
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
-        let repo = self.repo.clone();
+        let repo = Arc::clone(&self.repo);
         let tracker = self.tracker.clone();
         let instance_id = self.instance_id;
         span.record("now", tracing::field::display(crate::time::now()));
@@ -543,7 +543,7 @@ impl JobPollerHandle {
     pub async fn shutdown(&self) -> Result<(), JobError> {
         perform_shutdown(
             self.shutdown_tx.clone(),
-            self.repo.clone(),
+            Arc::clone(&self.repo),
             self.instance_id,
             self.shutdown_called.clone(),
             self.shutdown_timeout,
@@ -556,7 +556,7 @@ impl JobPollerHandle {
 impl Drop for JobPollerHandle {
     fn drop(&mut self) {
         let shutdown_tx = self.shutdown_tx.clone();
-        let repo = self.repo.clone();
+        let repo = Arc::clone(&self.repo);
         let instance_id = self.instance_id;
         let shutdown_called = self.shutdown_called.clone();
         let shutdown_timeout = self.shutdown_timeout;
@@ -585,7 +585,7 @@ async fn perform_shutdown(
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
-    repo: JobRepo,
+    repo: Arc<JobRepo>,
     instance_id: uuid::Uuid,
     shutdown_called: Arc<AtomicBool>,
     shutdown_timeout: Duration,
@@ -662,7 +662,7 @@ async fn perform_shutdown(
 }
 
 #[instrument(name = "jobs.kill_remaining_jobs", skip(repo), fields(instance_id = %instance_id, n_killed = tracing::field::Empty), err)]
-async fn kill_remaining_jobs(repo: JobRepo, instance_id: uuid::Uuid) -> Result<(), JobError> {
+async fn kill_remaining_jobs(repo: Arc<JobRepo>, instance_id: uuid::Uuid) -> Result<(), JobError> {
     let mut op = repo.begin_op().await?;
     let now = crate::time::now();
     let rows = sqlx::query!(
