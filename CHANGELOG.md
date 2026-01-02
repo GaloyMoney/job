@@ -1,3 +1,14 @@
+# [job release v0.5.1](https://github.com/GaloyMoney/job/releases/tag/0.5.1)
+
+
+### Bug Fixes
+
+- Docs link
+
+### Refactor
+
+- Add self_spawner to init fn (#32)
+
 # [job release v0.5.0](https://github.com/GaloyMoney/job/releases/tag/0.5.0)
 
 
