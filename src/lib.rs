@@ -290,7 +290,7 @@ impl Jobs {
     /// ```no_run
     /// use job::{
     ///     Jobs, JobSvcConfig, Job, JobId, JobInitializer, JobRunner, JobType, JobCompletion,
-    ///     CurrentJob, JobSpawner,
+    ///     CurrentJob, JobSpawner
     /// };
     /// use job::error::JobError;
     /// use async_trait::async_trait;
@@ -312,7 +312,7 @@ impl Jobs {
     ///         JobType::new("example")
     ///     }
     ///
-    ///     fn init(&self, _job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    ///     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
     ///         Ok(Box::new(MyRunner))
     ///     }
     /// }
@@ -375,7 +375,7 @@ impl Jobs {
     ///         JobType::new("example")
     ///     }
     ///
-    ///     fn init(&self, _job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    ///     fn init(&self, _job: &Job, _spawner: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
     ///         Ok(Box::new(MyRunner))
     ///     }
     /// }
@@ -421,7 +421,7 @@ impl Jobs {
         self.poller_handle = Some(Arc::new(
             JobPoller::new(
                 self.config.poller_config.clone(),
-                (*self.repo).clone(),
+                Arc::clone(&self.repo),
                 registry,
             )
             .start()

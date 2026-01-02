@@ -7,6 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
+    spawner::JobSpawner,
 };
 
 /// Describes how to construct a [`JobRunner`] for a given job type.
@@ -37,7 +38,14 @@ pub trait JobInitializer: Send + Sync + 'static {
     }
 
     /// Produce a runner instance for the provided job.
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
+    ///
+    /// The spawner parameter allows the runner to spawn additional jobs of the
+    /// same type (e.g., for fan-out patterns).
+    fn init(
+        &self,
+        job: &Job,
+        spawner: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
 /// Result returned by [`JobRunner::run`] describing how to progress the job.

@@ -2,7 +2,8 @@ mod helpers;
 
 use async_trait::async_trait;
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSvcConfig, JobType, Jobs,
+    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSvcConfig,
+    JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +21,11 @@ impl JobInitializer for TestJobInitializer {
         JobType::new("test-job")
     }
 
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let config: TestJobConfig = job.config()?;
         Ok(Box::new(TestJobRunner { config }))
     }
