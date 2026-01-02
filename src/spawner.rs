@@ -14,7 +14,7 @@ use super::{
 
 /// A handle for spawning jobs of a specific type.
 ///
-/// Returned by [`Jobs::add_initializer`]. The spawner encapsulates the job type
+/// Returned by [`crate::Jobs::add_initializer`]. The spawner encapsulates the job type
 /// and provides type-safe job creation methods.
 ///
 /// # Examples
