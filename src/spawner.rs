@@ -108,8 +108,7 @@ where
     /// Only one job of this type can exist at a time. This method consumes the
     /// spawner since no further jobs of this type can be created.
     ///
-    /// Returns `Ok(job)` if created, or `Err(JobError::DuplicateUniqueJobType)`
-    /// if a job of this type already exists.
+    /// Returns `Ok(())` whether the job was created or already exists.
     #[instrument(
         name = "job_spawner.spawn_unique",
         skip(self, config),
@@ -120,32 +119,27 @@ where
         self,
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
-    ) -> Result<Job, JobError> {
+    ) -> Result<(), JobError> {
+        let new_job = NewJob::builder()
+            .id(id)
+            .unique_per_type(true)
+            .job_type(self.job_type.clone())
+            .config(config)?
+            .tracing_context(es_entity::context::TracingContext::current())
+            .build()
+            .expect("Could not build new job");
         let mut op = self.repo.begin_op().await?;
-        let job = self.spawn_unique_in_op(&mut op, id, config).await?;
-        op.commit().await?;
-        Ok(job)
-    }
-
-    /// Create and spawn a unique job as part of an existing atomic operation.
-    ///
-    /// Only one job of this type can exist at a time. This method consumes the
-    /// spawner since no further jobs of this type can be created.
-    #[instrument(
-        name = "job_spawner.spawn_unique_in_op",
-        skip(self, op, config),
-        fields(job_type = %self.job_type),
-        err
-    )]
-    pub async fn spawn_unique_in_op(
-        self,
-        op: &mut impl es_entity::AtomicOperation,
-        id: impl Into<JobId> + std::fmt::Debug,
-        config: Config,
-    ) -> Result<Job, JobError> {
-        let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
-        self.create_job_internal(op, id.into(), &self.job_type, config, schedule_at, true)
-            .await
+        match self.repo.create_in_op(&mut op, new_job).await {
+            Err(JobError::DuplicateUniqueJobType) => (),
+            Err(e) => return Err(e),
+            Ok(mut job) => {
+                let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
+                self.insert_execution(&mut op, &mut job, schedule_at)
+                    .await?;
+                op.commit().await?;
+            }
+        }
+        Ok(())
     }
 
     #[instrument(name = "job.create_internal", skip(self, op, config), fields(job_type = %job_type), err)]
