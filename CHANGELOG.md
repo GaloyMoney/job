@@ -1,3 +1,10 @@
+# [job release v0.6.0](https://github.com/GaloyMoney/job/releases/tag/0.6.0)
+
+
+### Refactor
+
+- [**breaking**] Remove spawn_unique_in_op and return unit type (#33)
+
 # [job release v0.5.1](https://github.com/GaloyMoney/job/releases/tag/0.5.1)
 
 
