@@ -15,7 +15,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 fail-on-warnings = []
 es-entity = []
-sim-time = [ "dep:sim-time", "es-entity/sim-time" ]
 json-schema = ["dep:schemars", "es-entity/json-schema"]
 tokio-task-names = ["tokio/tracing"]
 
@@ -36,7 +35,6 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 
-sim-time = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -44,8 +42,7 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.10"
-sim-time = "0.10"
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", branch = "time" }
 
 anyhow = "1.0"
 async-trait = "0.1"

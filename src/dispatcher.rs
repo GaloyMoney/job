@@ -1,6 +1,6 @@
-use crate::time;
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
+use es_entity::clock::ClockHandle;
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
 use tracing::{Span, instrument};
@@ -26,6 +26,7 @@ pub(crate) struct JobDispatcher {
     tracker: Arc<JobTracker>,
     rescheduled: bool,
     instance_id: uuid::Uuid,
+    clock: ClockHandle,
 }
 impl JobDispatcher {
     pub fn new(
@@ -35,6 +36,7 @@ impl JobDispatcher {
         _id: JobId,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
+        clock: ClockHandle,
     ) -> Self {
         Self {
             repo,
@@ -43,6 +45,7 @@ impl JobDispatcher {
             tracker,
             rescheduled: false,
             instance_id,
+            clock,
         }
     }
 
@@ -63,7 +66,7 @@ impl JobDispatcher {
         span.record("job_type", tracing::field::display(&job.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
         span.record("attempt", polled_job.attempt);
-        span.record("now", tracing::field::display(crate::time::now()));
+        span.record("now", tracing::field::display(self.clock.now()));
         job.inject_tracing_parent();
         #[cfg(feature = "es-entity")]
         {
@@ -85,6 +88,7 @@ impl JobDispatcher {
             self.repo.pool().clone(),
             polled_job.data_json,
             shutdown_rx,
+            self.clock.clone(),
         );
         self.tracker.dispatch_job();
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
@@ -112,27 +116,27 @@ impl JobDispatcher {
             Ok(JobCompletion::RescheduleNow) => {
                 span.record("conclusion", "RescheduleNow");
                 let mut op = self.repo.begin_op().await?;
-                let t = op.maybe_now().unwrap_or_else(crate::time::now);
+                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 self.reschedule_job(&mut op, job.id, t).await?;
                 op.commit().await?;
             }
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleNowWithOp(mut op)) => {
                 span.record("conclusion", "RescheduleNowWithOp");
-                let t = op.maybe_now().unwrap_or_else(crate::time::now);
+                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 self.reschedule_job(&mut op, job.id, t).await?;
                 op.commit().await?;
             }
             Ok(JobCompletion::RescheduleNowWithTx(mut tx)) => {
                 span.record("conclusion", "RescheduleNowWithTx");
-                let t = crate::time::now();
+                let t = self.clock.now();
                 self.reschedule_job(&mut tx, job.id, t).await?;
                 tx.commit().await?;
             }
             Ok(JobCompletion::RescheduleIn(d)) => {
                 span.record("conclusion", "RescheduleIn");
                 let mut op = self.repo.begin_op().await?;
-                let t = op.maybe_now().unwrap_or_else(crate::time::now);
+                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 let t = t + d;
                 self.reschedule_job(&mut op, job.id, t).await?;
                 op.commit().await?;
@@ -140,14 +144,14 @@ impl JobDispatcher {
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::RescheduleInWithOp(mut op, d)) => {
                 span.record("conclusion", "RescheduleInWithOp");
-                let t = op.maybe_now().unwrap_or_else(crate::time::now);
+                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 let t = t + d;
                 self.reschedule_job(&mut op, job.id, t).await?;
                 op.commit().await?;
             }
             Ok(JobCompletion::RescheduleInWithTx(mut tx, d)) => {
                 span.record("conclusion", "RescheduleInWithOp");
-                let t = crate::time::now() + d;
+                let t = self.clock.now() + d;
                 self.reschedule_job(&mut tx, job.id, t).await?;
                 tx.commit().await?;
             }
@@ -252,7 +256,7 @@ impl JobDispatcher {
         let retry_policy = RetryPolicy::from(&self.retry_settings);
 
         if let Some((reschedule_at, next_attempt)) =
-            job.maybe_schedule_retry(time::now(), attempt, &retry_policy, error_str)
+            job.maybe_schedule_retry(self.clock.now(), attempt, &retry_policy, error_str)
         {
             let exceeded_warn_attempts = self
                 .retry_settings

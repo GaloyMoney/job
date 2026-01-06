@@ -1,6 +1,7 @@
 //! Service and poller configuration types.
 
 use derive_builder::Builder;
+use es_entity::clock::{Clock, ClockHandle};
 use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
@@ -101,6 +102,10 @@ pub struct JobSvcConfig {
     #[builder(default)]
     /// Override the defaults that control how the background poller distributes work across processes.
     pub poller_config: JobPollerConfig,
+    #[builder(setter(into), default = "Clock::handle()")]
+    /// Clock handle for time operations. Defaults to the global clock.
+    /// The global clock is realtime unless an artificial clock was installed.
+    pub clock: ClockHandle,
 }
 
 impl JobSvcConfig {
@@ -133,6 +138,7 @@ impl JobSvcConfigBuilder {
             exec_migrations: self.exec_migrations.unwrap_or(false),
             pool: self.pool.clone().flatten(),
             poller_config: self.poller_config.clone().unwrap_or_default(),
+            clock: self.clock.clone().unwrap_or_else(|| Clock::handle().clone()),
         })
     }
 }

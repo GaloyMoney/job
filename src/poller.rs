@@ -1,4 +1,5 @@
 use es_entity::AtomicOperation;
+use es_entity::clock::ClockHandle;
 use serde_json::Value as JsonValue;
 use sqlx::postgres::{PgListener, PgPool, types::PgInterval};
 use tracing::{Span, instrument};
@@ -44,6 +45,7 @@ pub(crate) struct JobPoller {
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
+    clock: ClockHandle,
 }
 
 pub(crate) struct JobPollerHandle {
@@ -59,12 +61,18 @@ pub(crate) struct JobPollerHandle {
     max_jobs_per_process: usize,
     repo: Arc<JobRepo>,
     instance_id: uuid::Uuid,
+    clock: ClockHandle,
 }
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
 impl JobPoller {
-    pub fn new(config: JobPollerConfig, repo: Arc<JobRepo>, registry: JobRegistry) -> Self {
+    pub fn new(
+        config: JobPollerConfig,
+        repo: Arc<JobRepo>,
+        registry: JobRegistry,
+        clock: ClockHandle,
+    ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >(1);
@@ -78,6 +86,7 @@ impl JobPoller {
             registry,
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
+            clock,
         }
     }
 
@@ -90,6 +99,7 @@ impl JobPoller {
         let instance_id = self.instance_id;
         let shutdown_timeout = self.config.shutdown_timeout;
         let max_jobs_per_process = self.config.max_jobs_per_process;
+        let clock = self.clock.clone();
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-main-loop",
@@ -109,6 +119,7 @@ impl JobPoller {
             instance_id,
             shutdown_timeout,
             max_jobs_per_process,
+            clock,
         })
     }
 
@@ -141,7 +152,7 @@ impl JobPoller {
                 _ = shutdown_rx.recv() => {
                     break;
                 }
-                result = crate::time::timeout(timeout, self.tracker.notified()) => {
+                result = self.clock.timeout(timeout, self.tracker.notified()) => {
                     woken_up = result.is_ok();
                 }
             }
@@ -169,6 +180,7 @@ impl JobPoller {
             n_jobs_to_poll,
             self.instance_id,
             &supported_job_types,
+            &self.clock,
         )
         .await?
         {
@@ -219,10 +231,11 @@ impl JobPoller {
     fn start_lost_handler(&self) -> OwnedTaskHandle {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
+        let clock = self.clock.clone();
         OwnedTaskHandle::new(spawn_named_task!("job-poller-lost-handler", async move {
             loop {
-                crate::time::sleep(job_lost_interval / 2).await;
-                let now = crate::time::now();
+                clock.sleep(job_lost_interval / 2).await;
+                let now = clock.now();
                 let check_time = now - job_lost_interval;
 
                 let span = tracing::debug_span!(
@@ -261,12 +274,13 @@ impl JobPoller {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
         let instance_id = self.instance_id;
+        let clock = self.clock.clone();
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
             async move {
                 let mut failures = 0;
                 loop {
-                    let now = crate::time::now();
+                    let now = clock.now();
                     let span = tracing::debug_span!(
                         parent: None,
                         "job.keep_alive",
@@ -299,7 +313,7 @@ impl JobPoller {
                         }
                     };
                     drop(_guard);
-                    crate::time::sleep(timeout).await;
+                    clock.sleep(timeout).await;
                 }
             }
         ))
@@ -317,12 +331,13 @@ impl JobPoller {
         let job = self.repo.find_by_id(polled_job.id).await?;
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
-        let runner = self.registry.init_job(&job, Arc::clone(&self.repo))?;
+        let runner = self.registry.init_job(&job, Arc::clone(&self.repo), self.clock.clone())?;
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = Arc::clone(&self.repo);
         let tracker = self.tracker.clone();
         let instance_id = self.instance_id;
-        span.record("now", tracing::field::display(crate::time::now()));
+        let clock = self.clock.clone();
+        span.record("now", tracing::field::display(clock.now()));
         span.record("poller_id", tracing::field::display(instance_id));
 
         let shutdown_rx = self.shutdown_tx.subscribe();
@@ -337,10 +352,17 @@ impl JobPoller {
         let job_handle = spawn_named_task!(&task_name, async move {
             let id = job.id;
             let attempt = polled_job.attempt;
-            if let Err(e) =
-                JobDispatcher::new(repo, tracker, retry_settings, job.id, runner, instance_id)
-                    .execute_job(polled_job, shutdown_rx)
-                    .await
+            if let Err(e) = JobDispatcher::new(
+                repo,
+                tracker,
+                retry_settings,
+                job.id,
+                runner,
+                instance_id,
+                clock,
+            )
+            .execute_job(polled_job, shutdown_rx)
+            .await
             {
                 tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
             }
@@ -408,14 +430,15 @@ impl JobPoller {
     }
 }
 
-#[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
+#[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
 async fn poll_jobs(
     pool: &PgPool,
     n_jobs_to_poll: usize,
     instance_id: uuid::Uuid,
     supported_job_types: &[super::entity::JobType],
+    clock: &ClockHandle,
 ) -> Result<JobPollResult, sqlx::Error> {
-    let now = crate::time::now();
+    let now = clock.now();
     Span::current().record("now", tracing::field::display(now));
 
     let rows = sqlx::query_as!(
@@ -548,6 +571,7 @@ impl JobPollerHandle {
             self.shutdown_called.clone(),
             self.shutdown_timeout,
             self.max_jobs_per_process,
+            self.clock.clone(),
         )
         .await
     }
@@ -561,6 +585,7 @@ impl Drop for JobPollerHandle {
         let shutdown_called = self.shutdown_called.clone();
         let shutdown_timeout = self.shutdown_timeout;
         let max_jobs_per_process = self.max_jobs_per_process;
+        let clock = self.clock.clone();
 
         spawn_named_task!("job-poller-shutdown-on-drop", async move {
             let _ = perform_shutdown(
@@ -570,6 +595,7 @@ impl Drop for JobPollerHandle {
                 shutdown_called,
                 shutdown_timeout,
                 max_jobs_per_process,
+                clock,
             )
             .await;
         });
@@ -578,7 +604,7 @@ impl Drop for JobPollerHandle {
 
 #[instrument(
     name = "jobs.perform_shutdown",
-    skip(shutdown_tx, repo),
+    skip(shutdown_tx, repo, clock),
     fields(n_jobs, instance_id = %instance_id, broadcast_ok, n_responses)
 )]
 async fn perform_shutdown(
@@ -590,6 +616,7 @@ async fn perform_shutdown(
     shutdown_called: Arc<AtomicBool>,
     shutdown_timeout: Duration,
     max_jobs_per_process: usize,
+    clock: ClockHandle,
 ) -> Result<(), JobError> {
     if shutdown_called
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -658,13 +685,17 @@ async fn perform_shutdown(
         tokio::time::sleep(shutdown_timeout).await;
     }
 
-    kill_remaining_jobs(repo, instance_id).await
+    kill_remaining_jobs(repo, instance_id, clock).await
 }
 
-#[instrument(name = "jobs.kill_remaining_jobs", skip(repo), fields(instance_id = %instance_id, n_killed = tracing::field::Empty), err)]
-async fn kill_remaining_jobs(repo: Arc<JobRepo>, instance_id: uuid::Uuid) -> Result<(), JobError> {
+#[instrument(name = "jobs.kill_remaining_jobs", skip(repo, clock), fields(instance_id = %instance_id, n_killed = tracing::field::Empty), err)]
+async fn kill_remaining_jobs(
+    repo: Arc<JobRepo>,
+    instance_id: uuid::Uuid,
+    clock: ClockHandle,
+) -> Result<(), JobError> {
     let mut op = repo.begin_op().await?;
-    let now = crate::time::now();
+    let now = clock.now();
     let rows = sqlx::query!(
         r#"
         UPDATE job_executions
