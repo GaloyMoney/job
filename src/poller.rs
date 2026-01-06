@@ -331,7 +331,9 @@ impl JobPoller {
         let job = self.repo.find_by_id(polled_job.id).await?;
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
-        let runner = self.registry.init_job(&job, Arc::clone(&self.repo), self.clock.clone())?;
+        let runner = self
+            .registry
+            .init_job(&job, Arc::clone(&self.repo), self.clock.clone())?;
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = Arc::clone(&self.repo);
         let tracker = self.tracker.clone();
@@ -694,7 +696,7 @@ async fn kill_remaining_jobs(
     instance_id: uuid::Uuid,
     clock: ClockHandle,
 ) -> Result<(), JobError> {
-    let mut op = repo.begin_op().await?;
+    let mut op = repo.begin_op_with_clock(&clock).await?;
     let now = clock.now();
     let rows = sqlx::query!(
         r#"

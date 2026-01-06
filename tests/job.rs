@@ -3,8 +3,8 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobSvcConfig, JobType, Jobs, SimulationConfig,
+    ArtificialClockConfig, ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer,
+    JobRunner, JobSpawner, JobSvcConfig, JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -133,7 +133,7 @@ async fn test_scheduled_job_with_artificial_clock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
 
     // Create an artificial clock for deterministic testing
-    let (clock, controller) = ClockHandle::artificial(SimulationConfig::manual());
+    let (clock, controller) = ClockHandle::artificial(ArtificialClockConfig::manual());
     let initial_time = clock.now();
 
     let config = JobSvcConfig::builder()
@@ -175,9 +175,7 @@ async fn test_scheduled_job_with_artificial_clock() -> anyhow::Result<()> {
     );
 
     // Advance the clock past the scheduled time
-    controller
-        .advance(std::time::Duration::from_secs(61))
-        .await;
+    controller.advance(std::time::Duration::from_secs(61)).await;
 
     // Give the poller time to pick up and execute the job
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;

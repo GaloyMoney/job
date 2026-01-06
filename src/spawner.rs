@@ -65,7 +65,7 @@ where
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
     ) -> Result<Job, JobError> {
-        let mut op = self.repo.begin_op().await?;
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let job = self.spawn_in_op(&mut op, id, config).await?;
         op.commit().await?;
         Ok(job)
@@ -101,8 +101,10 @@ where
         config: Config,
         schedule_at: DateTime<Utc>,
     ) -> Result<Job, JobError> {
-        let mut op = self.repo.begin_op().await?;
-        let job = self.spawn_at_in_op(&mut op, id, config, schedule_at).await?;
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let job = self
+            .spawn_at_in_op(&mut op, id, config, schedule_at)
+            .await?;
         op.commit().await?;
         Ok(job)
     }
@@ -150,7 +152,7 @@ where
             .tracing_context(es_entity::context::TracingContext::current())
             .build()
             .expect("Could not build new job");
-        let mut op = self.repo.begin_op().await?;
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         match self.repo.create_in_op(&mut op, new_job).await {
             Err(JobError::DuplicateUniqueJobType) => (),
             Err(e) => return Err(e),

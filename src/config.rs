@@ -138,7 +138,10 @@ impl JobSvcConfigBuilder {
             exec_migrations: self.exec_migrations.unwrap_or(false),
             pool: self.pool.clone().flatten(),
             poller_config: self.poller_config.clone().unwrap_or_default(),
-            clock: self.clock.clone().unwrap_or_else(|| Clock::handle().clone()),
+            clock: self
+                .clock
+                .clone()
+                .unwrap_or_else(|| Clock::handle().clone()),
         })
     }
 }

@@ -98,7 +98,7 @@ impl JobDispatcher {
             }
             Ok(JobCompletion::Complete) => {
                 span.record("conclusion", "Complete");
-                let mut op = self.repo.begin_op().await?;
+                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
                 self.complete_job(&mut op, job.id).await?;
                 op.commit().await?;
             }
@@ -115,7 +115,7 @@ impl JobDispatcher {
             }
             Ok(JobCompletion::RescheduleNow) => {
                 span.record("conclusion", "RescheduleNow");
-                let mut op = self.repo.begin_op().await?;
+                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
                 let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 self.reschedule_job(&mut op, job.id, t).await?;
                 op.commit().await?;
@@ -135,7 +135,7 @@ impl JobDispatcher {
             }
             Ok(JobCompletion::RescheduleIn(d)) => {
                 span.record("conclusion", "RescheduleIn");
-                let mut op = self.repo.begin_op().await?;
+                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
                 let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 let t = t + d;
                 self.reschedule_job(&mut op, job.id, t).await?;
@@ -157,7 +157,7 @@ impl JobDispatcher {
             }
             Ok(JobCompletion::RescheduleAt(t)) => {
                 span.record("conclusion", "RescheduleAt");
-                let mut op = self.repo.begin_op().await?;
+                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
                 self.reschedule_job(&mut op, job.id, t).await?;
                 op.commit().await?;
             }
@@ -242,7 +242,7 @@ impl JobDispatcher {
         )
     )]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
-        let mut op = self.repo.begin_op().await?;
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id(id).await?;
 
         let span = Span::current();
