@@ -42,7 +42,7 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", branch = "time" }
+es-entity = "0.10"
 
 anyhow = "1.0"
 async-trait = "0.1"
