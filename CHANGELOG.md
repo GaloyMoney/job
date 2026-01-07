@@ -1,3 +1,10 @@
+# [job release v0.6.1](https://github.com/GaloyMoney/job/releases/tag/0.6.1)
+
+
+### Miscellaneous Tasks
+
+- Use es_entity::clock::Clock (#34)
+
 # [job release v0.6.0](https://github.com/GaloyMoney/job/releases/tag/0.6.0)
 
 
