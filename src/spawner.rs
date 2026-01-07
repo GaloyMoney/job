@@ -1,6 +1,7 @@
 //! Job spawner for creating jobs of a specific type.
 
 use chrono::{DateTime, Utc};
+use es_entity::clock::ClockHandle;
 use serde::Serialize;
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{Span, instrument};
@@ -30,6 +31,7 @@ use super::{
 pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
     job_type: JobType,
+    clock: ClockHandle,
     _phantom: PhantomData<Config>,
 }
 
@@ -37,10 +39,11 @@ impl<Config> JobSpawner<Config>
 where
     Config: Serialize + Send + Sync,
 {
-    pub(crate) fn new(repo: Arc<JobRepo>, job_type: JobType) -> Self {
+    pub(crate) fn new(repo: Arc<JobRepo>, job_type: JobType, clock: ClockHandle) -> Self {
         Self {
             repo,
             job_type,
+            clock,
             _phantom: PhantomData,
         }
     }
@@ -62,7 +65,7 @@ where
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
     ) -> Result<Job, JobError> {
-        let mut op = self.repo.begin_op().await?;
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let job = self.spawn_in_op(&mut op, id, config).await?;
         op.commit().await?;
         Ok(job)
@@ -81,11 +84,32 @@ where
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
     ) -> Result<Job, JobError> {
-        let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
+        let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
         self.spawn_at_in_op(op, id, config, schedule_at).await
     }
 
     /// Create and spawn a job for execution at a specific time.
+    #[instrument(
+        name = "job_spawner.spawn_at",
+        skip(self, config),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_at(
+        &self,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        schedule_at: DateTime<Utc>,
+    ) -> Result<Job, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let job = self
+            .spawn_at_in_op(&mut op, id, config, schedule_at)
+            .await?;
+        op.commit().await?;
+        Ok(job)
+    }
+
+    /// Create and spawn a job for execution at a specific time as part of an existing atomic operation.
     #[instrument(
         name = "job_spawner.spawn_at_in_op",
         skip(self, op, config),
@@ -128,12 +152,12 @@ where
             .tracing_context(es_entity::context::TracingContext::current())
             .build()
             .expect("Could not build new job");
-        let mut op = self.repo.begin_op().await?;
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         match self.repo.create_in_op(&mut op, new_job).await {
             Err(JobError::DuplicateUniqueJobType) => (),
             Err(e) => return Err(e),
             Ok(mut job) => {
-                let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
+                let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 self.insert_execution(&mut op, &mut job, schedule_at)
                     .await?;
                 op.commit().await?;

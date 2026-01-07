@@ -1,5 +1,6 @@
 //! Registry storing job initializers and retry settings.
 
+use es_entity::clock::ClockHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ pub(crate) trait AnyJobInitializer: Send + Sync + 'static {
         &self,
         job: &Job,
         repo: Arc<JobRepo>,
+        clock: ClockHandle,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
@@ -21,8 +23,9 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         &self,
         job: &Job,
         repo: Arc<JobRepo>,
+        clock: ClockHandle,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type());
+        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), clock);
         JobInitializer::init(self, job, spawner)
     }
 }
@@ -56,11 +59,12 @@ impl JobRegistry {
         &self,
         job: &Job,
         repo: Arc<JobRepo>,
+        clock: ClockHandle,
     ) -> Result<Box<dyn JobRunner>, JobError> {
         self.initializers
             .get(&job.job_type)
             .ok_or(JobError::NoInitializerPresent)?
-            .init(job, repo)
+            .init(job, repo, clock)
             .map_err(|e| JobError::JobInitError(e.to_string()))
     }
 

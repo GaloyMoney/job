@@ -182,9 +182,24 @@
 //! - `es-entity` enables advanced integration with the [`es_entity`] crate,
 //!   allowing runners to finish with `DbOp` handles and enriching tracing/event
 //!   metadata.
-//! - `sim-time` swaps time and sleeping utilities for the
-//!   [`sim_time`](https://docs.rs/sim-time) crate, making it easier to test
-//!   long-running backoff strategies deterministically.
+//!
+//! ## Testing with simulated time
+//!
+//! For deterministic testing of time-dependent behavior (e.g., backoff strategies),
+//! inject an artificial clock via [`JobSvcConfig::clock`]:
+//!
+//! ```ignore
+//! use job::{JobSvcConfig, ClockHandle, ArtificialClockConfig};
+//!
+//! let (clock, controller) = ClockHandle::artificial(ArtificialClockConfig::manual());
+//! let config = JobSvcConfig::builder()
+//!     .pool(pool)
+//!     .clock(clock)
+//!     .build()?;
+//!
+//! // Advance time deterministically
+//! controller.advance(Duration::from_secs(60)).await;
+//! ```
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
@@ -201,7 +216,6 @@ mod registry;
 mod repo;
 mod runner;
 mod spawner;
-mod time;
 mod tracker;
 
 pub mod error;
@@ -213,6 +227,9 @@ use std::sync::{Arc, Mutex};
 pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobType};
+pub use es_entity::clock::{
+    ArtificialClockConfig, ArtificialMode, Clock, ClockController, ClockHandle,
+};
 pub use migrate::*;
 pub use registry::*;
 pub use runner::*;
@@ -232,6 +249,7 @@ pub struct Jobs {
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     poller_handle: Option<Arc<JobPollerHandle>>,
+    clock: ClockHandle,
 }
 
 impl Jobs {
@@ -259,11 +277,13 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
+        let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
             poller_handle: None,
+            clock,
         })
     }
 
@@ -423,6 +443,7 @@ impl Jobs {
                 self.config.poller_config.clone(),
                 Arc::clone(&self.repo),
                 registry,
+                self.clock.clone(),
             )
             .start()
             .await?,
@@ -450,7 +471,7 @@ impl Jobs {
                 .expect("Registry has been consumed by executor")
                 .add_initializer(initializer)
         };
-        JobSpawner::new(Arc::clone(&self.repo), job_type)
+        JobSpawner::new(Arc::clone(&self.repo), job_type, self.clock.clone())
     }
 
     /// Fetch the current snapshot of a job entity by identifier.

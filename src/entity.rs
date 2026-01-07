@@ -370,8 +370,8 @@ mod tests {
 
     mod job {
         use super::*;
-        use crate::time;
         use chrono::Duration as ChronoDuration;
+        use es_entity::clock::Clock;
         use es_entity::events::GenericEvent;
         use serde_json::json;
         use std::time::Duration;
@@ -464,7 +464,7 @@ mod tests {
 
         #[test]
         fn maybe_schedule_retry_emits_next_attempt_when_allowed() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("retry-success");
             let job_id = JobId::new();
             let latest_window = schedule_window(now, elapsed_just_under_reset());
@@ -482,7 +482,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(time::now(), 1, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(Clock::now(), 1, &retry_policy, "boom".to_string())
                 .expect("retry expected");
 
             assert_eq!(next_attempt, 2);
@@ -499,7 +499,7 @@ mod tests {
 
         #[test]
         fn maybe_schedule_retry_handles_zero_attempt_index() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("retry-zero");
             let job_id = JobId::new();
             let events = vec![(
@@ -515,7 +515,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(time::now(), 0, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(Clock::now(), 0, &retry_policy, "boom".to_string())
                 .expect("retry expected when attempt starts at zero");
 
             assert_eq!(next_attempt, 2);
@@ -532,7 +532,7 @@ mod tests {
 
         #[test]
         fn maybe_schedule_retry_records_terminal_failure_when_limit_hit() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("retry-terminal");
             let job_id = JobId::new();
             let first_window = schedule_window(now, ChronoDuration::minutes(5));
@@ -552,7 +552,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(2));
 
             assert!(
-                job.maybe_schedule_retry(time::now(), 2, &retry_policy, "boom".to_string())
+                job.maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string())
                     .is_none(),
                 "should stop retrying when attempts exhausted"
             );
@@ -567,7 +567,7 @@ mod tests {
 
         #[test]
         fn maybe_schedule_retry_resets_attempt_after_healthy_gap() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("retry-reset");
             let job_id = JobId::new();
             let first_window = schedule_window(now, ChronoDuration::minutes(15));
@@ -587,7 +587,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(5));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(time::now(), 2, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string())
                 .expect("retry expected");
 
             assert_eq!(
@@ -611,7 +611,7 @@ mod tests {
 
         #[test]
         fn maybe_schedule_retry_allows_retry_when_next_attempt_hits_limit() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("retry-max-boundary");
             let job_id = JobId::new();
             let first_window = schedule_window(now, ChronoDuration::minutes(5));
@@ -631,7 +631,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(time::now(), 2, &retry_policy, "second failure".to_string())
+                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "second failure".to_string())
                 .expect("final retry should still be scheduled");
 
             assert_eq!(next_attempt, 3);
@@ -648,7 +648,7 @@ mod tests {
 
         #[test]
         fn maybe_schedule_retry_resets_even_when_retry_limit_reached() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("retry-reset-limit");
             let job_id = JobId::new();
             let first_window = schedule_window(now, ChronoDuration::minutes(20));
@@ -670,7 +670,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(time::now(), 3, &retry_policy, "third failure".to_string())
+                .maybe_schedule_retry(Clock::now(), 3, &retry_policy, "third failure".to_string())
                 .expect("a healthy gap should reset attempt even at limit");
 
             assert_eq!(next_attempt, 2);
@@ -691,7 +691,7 @@ mod tests {
 
         #[test]
         fn maybe_schedule_retry_with_unbounded_limit_handles_saturation() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("retry-unbounded");
             let job_id = JobId::new();
             let attempt = u32::MAX;
@@ -710,7 +710,7 @@ mod tests {
             let retry_policy = build_retry_policy(None);
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(time::now(), attempt, &retry_policy, "overflow".to_string())
+                .maybe_schedule_retry(Clock::now(), attempt, &retry_policy, "overflow".to_string())
                 .expect("unbounded retries should permit another schedule");
 
             assert_eq!(next_attempt, u32::MAX);
@@ -729,7 +729,7 @@ mod tests {
 
         #[test]
         fn latest_retry_window_returns_retry_window() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("latest-retry");
             let job_id = JobId::new();
             let first_window = schedule_window(now, ChronoDuration::minutes(5));
@@ -761,7 +761,7 @@ mod tests {
 
         #[test]
         fn latest_retry_window_returns_none_for_initial_attempt() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("latest-no-retry");
             let job_id = JobId::new();
             let initial_window = schedule_window(now, ChronoDuration::minutes(2));
@@ -785,7 +785,7 @@ mod tests {
 
         #[test]
         fn latest_retry_window_ignores_older_retries_when_latest_is_initial() {
-            let now = time::now();
+            let now = Clock::now();
             let job_type = JobType::new("latest-reset-to-initial");
             let job_id = JobId::new();
             let first_window = schedule_window(now, ChronoDuration::minutes(30));
@@ -818,13 +818,13 @@ mod tests {
 
     mod retry_window {
         use super::*;
-        use crate::time;
         use chrono::Duration as ChronoDuration;
+        use es_entity::clock::Clock;
         use std::time::Duration;
 
         #[test]
         fn allows_future_windows() {
-            let now = time::now();
+            let now = Clock::now();
             let future_failure = now + ChronoDuration::minutes(5);
             let further_future = future_failure + ChronoDuration::minutes(1);
 
@@ -836,7 +836,7 @@ mod tests {
 
         #[test]
         fn rejects_inverted_ranges() {
-            let now = time::now();
+            let now = Clock::now();
             let later_failure = now + ChronoDuration::minutes(1);
             let earlier_run = now;
 
@@ -848,7 +848,7 @@ mod tests {
 
         #[test]
         fn reports_durations() {
-            let now = time::now();
+            let now = Clock::now();
             let last_failure_at = now - ChronoDuration::minutes(30);
             let planned_run_at = now - ChronoDuration::minutes(20);
             let window =
@@ -868,7 +868,7 @@ mod tests {
 
         #[test]
         fn elapsed_since_retry_schedule_requires_past() {
-            let now = time::now();
+            let now = Clock::now();
             let last_failure_at = now - ChronoDuration::minutes(1);
             let planned_run_at = now + ChronoDuration::minutes(1);
             let window =
@@ -883,8 +883,8 @@ mod tests {
 
     mod retry_policy {
         use super::*;
-        use crate::time;
         use chrono::Duration as ChronoDuration;
+        use es_entity::clock::Clock;
         use std::time::Duration;
 
         const MAX_BACKOFF_MS: u64 = 60_000;
@@ -930,7 +930,7 @@ mod tests {
             backoff_secs: i64,
             elapsed_since_schedule_secs: i64,
         ) -> (RetryWindow, DateTime<Utc>) {
-            let now = time::now();
+            let now = Clock::now();
             let scheduled_at = now - ChronoDuration::seconds(elapsed_since_schedule_secs);
             let failure_at = scheduled_at - ChronoDuration::seconds(backoff_secs);
             let window = RetryWindow::new(failure_at, scheduled_at).expect("valid window");

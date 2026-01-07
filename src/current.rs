@@ -1,5 +1,6 @@
 //! Execution-time helpers available to running jobs.
 
+use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
@@ -14,6 +15,7 @@ pub struct CurrentJob {
     shutdown_rx: tokio::sync::broadcast::Receiver<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
+    clock: ClockHandle,
 }
 
 impl CurrentJob {
@@ -25,6 +27,7 @@ impl CurrentJob {
         shutdown_rx: tokio::sync::broadcast::Receiver<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
+        clock: ClockHandle,
     ) -> Self {
         Self {
             id,
@@ -32,6 +35,7 @@ impl CurrentJob {
             pool,
             execution_state_json: execution_state,
             shutdown_rx,
+            clock,
         }
     }
 
@@ -98,6 +102,14 @@ impl CurrentJob {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Returns a reference to the clock handle used by this job.
+    ///
+    /// Use this to get the current time or perform time-related operations
+    /// that are consistent with the job service's configured clock.
+    pub fn clock(&self) -> &ClockHandle {
+        &self.clock
     }
 
     /// Wait for a shutdown signal. Returns `true` if shutdown was requested.
