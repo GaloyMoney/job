@@ -112,6 +112,16 @@ impl CurrentJob {
         &self.clock
     }
 
+    /// Begin a new database operation using the job's configured clock.
+    ///
+    /// The returned `DbOp` will use the same clock as the job service,
+    /// ensuring consistent time handling in tests with artificial clocks.
+    #[cfg(feature = "es-entity")]
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobError> {
+        let ret = es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?;
+        Ok(ret)
+    }
+
     /// Wait for a shutdown signal. Returns `true` if shutdown was requested.
     ///
     /// Job runners can use this to detect when the application is shutting down
