@@ -1,3 +1,10 @@
+# [job release v0.6.2](https://github.com/GaloyMoney/job/releases/tag/0.6.2)
+
+
+### Miscellaneous Tasks
+
+- Add begin_op to CurrentJob
+
 # [job release v0.6.1](https://github.com/GaloyMoney/job/releases/tag/0.6.1)
 
 
