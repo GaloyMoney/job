@@ -177,8 +177,24 @@ async fn test_scheduled_job_with_artificial_clock() -> anyhow::Result<()> {
     // Advance the clock past the scheduled time
     controller.advance(std::time::Duration::from_secs(61)).await;
 
-    // Give the poller time to pick up and execute the job
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    // Poll until the job completes (with timeout)
+    let mut attempts = 0;
+    let max_attempts = 50;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let job = jobs.find(job.id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        if attempts >= max_attempts {
+            panic!(
+                "Job did not complete within {} attempts ({}ms)",
+                max_attempts,
+                max_attempts * 100
+            );
+        }
+    }
 
     // Verify the job ran and recorded the correct time
     let execution_time = recorded_time
@@ -193,10 +209,6 @@ async fn test_scheduled_job_with_artificial_clock() -> anyhow::Result<()> {
         execution_time,
         schedule_at
     );
-
-    // Verify the job is completed
-    let job = jobs.find(job.id).await?;
-    assert!(job.completed(), "Job should be completed");
 
     Ok(())
 }
