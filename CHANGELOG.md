@@ -1,3 +1,14 @@
+# [job release v0.6.3](https://github.com/GaloyMoney/job/releases/tag/0.6.3)
+
+
+### Miscellaneous Tasks
+
+- Expose clock
+
+### Testing
+
+- More resilient clock check
+
 # [job release v0.6.2](https://github.com/GaloyMoney/job/releases/tag/0.6.2)
 
 
