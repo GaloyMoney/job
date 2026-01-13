@@ -480,6 +480,11 @@ impl Jobs {
         self.repo.find_by_id(id).await
     }
 
+    /// Returns a reference to the clock used by this job service.
+    pub fn clock(&self) -> &ClockHandle {
+        &self.clock
+    }
+
     /// Gracefully shut down the job poller.
     ///
     /// This method is idempotent and can be called multiple times safely.
