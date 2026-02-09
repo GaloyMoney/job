@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
-use rand::{Rng, rng};
+use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
 
 use std::{borrow::Cow, time::Duration};
