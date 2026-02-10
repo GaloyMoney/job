@@ -1,3 +1,15 @@
+# [job release v0.6.4](https://github.com/GaloyMoney/job/releases/tag/0.6.4)
+
+
+
+### Bug Fixes
+
+- Update rand import for 0.10 API rename (#38)
+
+### Miscellaneous Tasks
+
+- Bump flake (#36)
+
 # [job release v0.6.3](https://github.com/GaloyMoney/job/releases/tag/0.6.3)
 
 
