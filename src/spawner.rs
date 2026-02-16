@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use serde::Serialize;
 use std::{marker::PhantomData, sync::Arc};
-use tracing::{Span, instrument};
+use tracing::instrument;
 
 use super::{
     Job, JobId,
@@ -123,7 +123,7 @@ where
         config: Config,
         schedule_at: DateTime<Utc>,
     ) -> Result<Job, JobError> {
-        self.create_job_internal(op, id.into(), &self.job_type, config, schedule_at, false, None)
+        self.create_job_internal(op, id.into(), config, schedule_at, None)
             .await
     }
 
@@ -213,16 +213,8 @@ where
         schedule_at: DateTime<Utc>,
         queue_id: impl Into<String> + Send,
     ) -> Result<Job, JobError> {
-        self.create_job_internal(
-            op,
-            id.into(),
-            &self.job_type,
-            config,
-            schedule_at,
-            false,
-            Some(queue_id.into()),
-        )
-        .await
+        self.create_job_internal(op, id.into(), config, schedule_at, Some(queue_id.into()))
+            .await
     }
 
     /// Create and spawn a unique job.
@@ -264,23 +256,19 @@ where
         Ok(())
     }
 
-    #[instrument(name = "job.create_internal", skip(self, op, config), fields(job_type = %job_type), err)]
+    #[instrument(name = "job.create_internal", skip(self, op, config), fields(job_type = %self.job_type), err)]
     async fn create_job_internal<C: Serialize + Send>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
-        job_type: &JobType,
         config: C,
         schedule_at: DateTime<Utc>,
-        unique_per_type: bool,
         queue_id: Option<String>,
     ) -> Result<Job, JobError> {
-        Span::current().record("job_type", tracing::field::display(job_type));
-
         let new_job = NewJob::builder()
             .id(id)
-            .unique_per_type(unique_per_type)
-            .job_type(job_type.clone())
+            .unique_per_type(false)
+            .job_type(self.job_type.clone())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
             .build()

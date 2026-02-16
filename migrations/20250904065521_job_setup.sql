@@ -76,3 +76,17 @@ CREATE TRIGGER job_executions_notify_update_trigger
 AFTER UPDATE ON job_executions
 FOR EACH ROW
 EXECUTE FUNCTION notify_job_execution_update();
+
+CREATE OR REPLACE FUNCTION notify_job_execution_delete() RETURNS TRIGGER AS $$
+BEGIN
+  IF OLD.queue_id IS NOT NULL THEN
+    PERFORM pg_notify('job_execution', OLD.job_type);
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER job_executions_notify_delete_trigger
+AFTER DELETE ON job_executions
+FOR EACH ROW
+EXECUTE FUNCTION notify_job_execution_delete();

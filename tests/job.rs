@@ -222,6 +222,7 @@ struct QueueJobConfig {
 }
 
 struct QueueJobInitializer {
+    job_type: JobType,
     started: Arc<Mutex<Vec<String>>>,
     completed: Arc<Mutex<Vec<String>>>,
     release: Arc<Notify>,
@@ -231,7 +232,7 @@ impl JobInitializer for QueueJobInitializer {
     type Config = QueueJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("queue-job")
+        self.job_type.clone()
     }
 
     fn init(
@@ -284,6 +285,7 @@ async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
     let release = Arc::new(Notify::new());
 
     let spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("queue-serial"),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
@@ -367,6 +369,7 @@ async fn test_different_queue_ids_run_concurrently() -> anyhow::Result<()> {
     let release = Arc::new(Notify::new());
 
     let spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("queue-concurrent"),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
@@ -431,6 +434,7 @@ async fn test_non_queued_jobs_unaffected() -> anyhow::Result<()> {
     let release = Arc::new(Notify::new());
 
     let spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("queue-noqueue"),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
