@@ -297,10 +297,18 @@ async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
 
     // Spawn two jobs with the same queue_id
     spawner
-        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "A".into() }, "serial-queue")
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "A".into() },
+            "serial-queue",
+        )
         .await?;
     spawner
-        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "B".into() }, "serial-queue")
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "B".into() },
+            "serial-queue",
+        )
         .await?;
 
     // Wait for job A to start
@@ -318,7 +326,11 @@ async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     // Only one job should have started
-    assert_eq!(started.lock().await.len(), 1, "Only 1 job should be running");
+    assert_eq!(
+        started.lock().await.len(),
+        1,
+        "Only 1 job should be running"
+    );
     assert_eq!(started.lock().await[0], "A");
 
     // Release A
@@ -381,10 +393,18 @@ async fn test_different_queue_ids_run_concurrently() -> anyhow::Result<()> {
 
     // Spawn jobs with different queue_ids
     spawner
-        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "Q1".into() }, "queue-1")
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "Q1".into() },
+            "queue-1",
+        )
         .await?;
     spawner
-        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "Q2".into() }, "queue-2")
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "Q2".into() },
+            "queue-2",
+        )
         .await?;
 
     // Both should start concurrently
