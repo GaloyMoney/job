@@ -27,7 +27,8 @@ CREATE TABLE job_executions (
   execution_state_json JSONB,
   execute_at TIMESTAMPTZ,
   alive_at TIMESTAMPTZ NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL
+  created_at TIMESTAMPTZ NOT NULL,
+  queue_id VARCHAR
 );
 
 CREATE INDEX idx_job_executions_poller_instance
@@ -45,6 +46,10 @@ CREATE INDEX idx_job_executions_pending_execute_at
 CREATE INDEX idx_job_executions_pending_job_type_execute_at
   ON job_executions(job_type, execute_at)
   WHERE state = 'pending';
+
+CREATE INDEX idx_job_executions_running_queue_id
+  ON job_executions(queue_id)
+  WHERE state = 'running' AND queue_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION notify_job_execution_insert() RETURNS TRIGGER AS $$
 BEGIN

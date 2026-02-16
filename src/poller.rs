@@ -452,16 +452,38 @@ async fn poll_jobs(
             WHERE state = 'pending'
             AND execute_at > $2::timestamptz
             AND job_type = ANY($4)
+            AND NOT EXISTS (
+                SELECT 1 FROM job_executions AS running
+                WHERE running.state = 'running'
+                AND running.queue_id IS NOT NULL
+                AND running.queue_id = job_executions.queue_id
+            )
         ),
-        selected_jobs AS (
-            SELECT id, execution_state_json AS data_json, attempt_index
+        candidates AS (
+            SELECT id, execution_state_json AS data_json, attempt_index,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY COALESCE(queue_id, id::text)
+                       ORDER BY execute_at
+                   ) AS rn
             FROM job_executions
             WHERE execute_at <= $2::timestamptz
             AND state = 'pending'
             AND job_type = ANY($4)
-            ORDER BY execute_at ASC
+            AND NOT EXISTS (
+                SELECT 1 FROM job_executions AS running
+                WHERE running.state = 'running'
+                AND running.queue_id IS NOT NULL
+                AND running.queue_id = job_executions.queue_id
+            )
+        ),
+        selected_jobs AS (
+            SELECT je.id, c.data_json, c.attempt_index
+            FROM candidates c
+            JOIN job_executions je ON je.id = c.id
+            WHERE c.rn = 1
+            ORDER BY je.execute_at ASC
             LIMIT $1
-            FOR UPDATE
+            FOR UPDATE OF je
         ),
         updated AS (
             UPDATE job_executions AS je

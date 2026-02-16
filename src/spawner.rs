@@ -32,6 +32,7 @@ pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
     job_type: JobType,
     clock: ClockHandle,
+    queue_id: Option<String>,
     _phantom: PhantomData<Config>,
 }
 
@@ -44,6 +45,21 @@ where
             repo,
             job_type,
             clock,
+            queue_id: None,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Returns a new spawner that assigns the given `queue_id` to every job it creates.
+    ///
+    /// At most one job per `queue_id` will run globally at any time. Jobs without
+    /// a `queue_id` continue to run with full concurrency.
+    pub fn with_queue_id(&self, queue_id: impl Into<String>) -> Self {
+        Self {
+            repo: Arc::clone(&self.repo),
+            job_type: self.job_type.clone(),
+            clock: self.clock.clone(),
+            queue_id: Some(queue_id.into()),
             _phantom: PhantomData,
         }
     }
@@ -201,13 +217,14 @@ where
     ) -> Result<(), JobError> {
         sqlx::query!(
             r#"
-          INSERT INTO job_executions (id, job_type, execute_at, alive_at, created_at)
-          VALUES ($1, $2, $3, COALESCE($4, NOW()), COALESCE($4, NOW()))
+          INSERT INTO job_executions (id, job_type, execute_at, alive_at, created_at, queue_id)
+          VALUES ($1, $2, $3, COALESCE($4, NOW()), COALESCE($4, NOW()), $5)
         "#,
             job.id as JobId,
             &job.job_type as &JobType,
             schedule_at,
-            op.maybe_now()
+            op.maybe_now(),
+            self.queue_id.as_deref()
         )
         .execute(op.as_executor())
         .await?;
