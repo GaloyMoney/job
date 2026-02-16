@@ -293,14 +293,12 @@ async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
         .await
         .expect("Failed to start job polling");
 
-    let queued = spawner.with_queue_id("serial-queue");
-
     // Spawn two jobs with the same queue_id
-    queued
-        .spawn(JobId::new(), QueueJobConfig { label: "A".into() })
+    spawner
+        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "A".into() }, "serial-queue")
         .await?;
-    queued
-        .spawn(JobId::new(), QueueJobConfig { label: "B".into() })
+    spawner
+        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "B".into() }, "serial-queue")
         .await?;
 
     // Wait for job A to start
@@ -379,12 +377,11 @@ async fn test_different_queue_ids_run_concurrently() -> anyhow::Result<()> {
         .expect("Failed to start job polling");
 
     // Spawn jobs with different queue_ids
-    let q1 = spawner.with_queue_id("queue-1");
-    let q2 = spawner.with_queue_id("queue-2");
-
-    q1.spawn(JobId::new(), QueueJobConfig { label: "Q1".into() })
+    spawner
+        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "Q1".into() }, "queue-1")
         .await?;
-    q2.spawn(JobId::new(), QueueJobConfig { label: "Q2".into() })
+    spawner
+        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "Q2".into() }, "queue-2")
         .await?;
 
     // Both should start concurrently

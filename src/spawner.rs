@@ -32,7 +32,6 @@ pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
     job_type: JobType,
     clock: ClockHandle,
-    queue_id: Option<String>,
     _phantom: PhantomData<Config>,
 }
 
@@ -45,21 +44,6 @@ where
             repo,
             job_type,
             clock,
-            queue_id: None,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Returns a new spawner that assigns the given `queue_id` to every job it creates.
-    ///
-    /// At most one job per `queue_id` will run globally at any time. Jobs without
-    /// a `queue_id` continue to run with full concurrency.
-    pub fn with_queue_id(&self, queue_id: impl Into<String>) -> Self {
-        Self {
-            repo: Arc::clone(&self.repo),
-            job_type: self.job_type.clone(),
-            clock: self.clock.clone(),
-            queue_id: Some(queue_id.into()),
             _phantom: PhantomData,
         }
     }
@@ -139,8 +123,106 @@ where
         config: Config,
         schedule_at: DateTime<Utc>,
     ) -> Result<Job, JobError> {
-        self.create_job_internal(op, id.into(), &self.job_type, config, schedule_at, false)
+        self.create_job_internal(op, id.into(), &self.job_type, config, schedule_at, false, None)
             .await
+    }
+
+    /// Create and spawn a job for immediate execution within a queue.
+    ///
+    /// At most one job per `queue_id` will run globally at any time.
+    #[instrument(
+        name = "job_spawner.spawn_with_queue_id",
+        skip(self, config, queue_id),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_with_queue_id(
+        &self,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        queue_id: impl Into<String> + Send,
+    ) -> Result<Job, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let job = self
+            .spawn_with_queue_id_in_op(&mut op, id, config, queue_id)
+            .await?;
+        op.commit().await?;
+        Ok(job)
+    }
+
+    /// Create and spawn a job within a queue as part of an existing atomic operation.
+    ///
+    /// At most one job per `queue_id` will run globally at any time.
+    #[instrument(
+        name = "job_spawner.spawn_with_queue_id_in_op",
+        skip(self, op, config, queue_id),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_with_queue_id_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        queue_id: impl Into<String> + Send,
+    ) -> Result<Job, JobError> {
+        let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        self.spawn_at_with_queue_id_in_op(op, id, config, schedule_at, queue_id)
+            .await
+    }
+
+    /// Create and spawn a job for execution at a specific time within a queue.
+    ///
+    /// At most one job per `queue_id` will run globally at any time.
+    #[instrument(
+        name = "job_spawner.spawn_at_with_queue_id",
+        skip(self, config, queue_id),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_at_with_queue_id(
+        &self,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        schedule_at: DateTime<Utc>,
+        queue_id: impl Into<String> + Send,
+    ) -> Result<Job, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let job = self
+            .spawn_at_with_queue_id_in_op(&mut op, id, config, schedule_at, queue_id)
+            .await?;
+        op.commit().await?;
+        Ok(job)
+    }
+
+    /// Create and spawn a job for execution at a specific time within a queue,
+    /// as part of an existing atomic operation.
+    ///
+    /// At most one job per `queue_id` will run globally at any time.
+    #[instrument(
+        name = "job_spawner.spawn_at_with_queue_id_in_op",
+        skip(self, op, config, queue_id),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_at_with_queue_id_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        schedule_at: DateTime<Utc>,
+        queue_id: impl Into<String> + Send,
+    ) -> Result<Job, JobError> {
+        self.create_job_internal(
+            op,
+            id.into(),
+            &self.job_type,
+            config,
+            schedule_at,
+            false,
+            Some(queue_id.into()),
+        )
+        .await
     }
 
     /// Create and spawn a unique job.
@@ -174,7 +256,7 @@ where
             Err(e) => return Err(e),
             Ok(mut job) => {
                 let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                self.insert_execution(&mut op, &mut job, schedule_at)
+                self.insert_execution(&mut op, &mut job, schedule_at, None)
                     .await?;
                 op.commit().await?;
             }
@@ -191,6 +273,7 @@ where
         config: C,
         schedule_at: DateTime<Utc>,
         unique_per_type: bool,
+        queue_id: Option<String>,
     ) -> Result<Job, JobError> {
         Span::current().record("job_type", tracing::field::display(job_type));
 
@@ -204,7 +287,8 @@ where
             .expect("Could not build new job");
 
         let mut job = self.repo.create_in_op(op, new_job).await?;
-        self.insert_execution(op, &mut job, schedule_at).await?;
+        self.insert_execution(op, &mut job, schedule_at, queue_id.as_deref())
+            .await?;
         Ok(job)
     }
 
@@ -214,6 +298,7 @@ where
         op: &mut impl es_entity::AtomicOperation,
         job: &mut Job,
         schedule_at: DateTime<Utc>,
+        queue_id: Option<&str>,
     ) -> Result<(), JobError> {
         sqlx::query!(
             r#"
@@ -224,7 +309,7 @@ where
             &job.job_type as &JobType,
             schedule_at,
             op.maybe_now(),
-            self.queue_id.as_deref()
+            queue_id
         )
         .execute(op.as_executor())
         .await?;
