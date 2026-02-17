@@ -21,14 +21,14 @@ CREATE TYPE JobExecutionState AS ENUM ('pending', 'running');
 CREATE TABLE job_executions (
   id UUID REFERENCES jobs(id) NOT NULL UNIQUE,
   job_type VARCHAR NOT NULL,
+  queue_id VARCHAR,
   poller_instance_id UUID,
   attempt_index INT NOT NULL DEFAULT 1,
   state JobExecutionState NOT NULL DEFAULT 'pending',
   execution_state_json JSONB,
   execute_at TIMESTAMPTZ,
   alive_at TIMESTAMPTZ NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL,
-  queue_id VARCHAR
+  created_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX idx_job_executions_poller_instance

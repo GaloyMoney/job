@@ -290,14 +290,14 @@ where
     ) -> Result<(), JobError> {
         sqlx::query!(
             r#"
-          INSERT INTO job_executions (id, job_type, execute_at, alive_at, created_at, queue_id)
-          VALUES ($1, $2, $3, COALESCE($4, NOW()), COALESCE($4, NOW()), $5)
+          INSERT INTO job_executions (id, job_type, queue_id, execute_at, alive_at, created_at)
+          VALUES ($1, $2, $3, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
         "#,
             job.id as JobId,
             &job.job_type as &JobType,
+            queue_id,
             schedule_at,
-            op.maybe_now(),
-            queue_id
+            op.maybe_now()
         )
         .execute(op.as_executor())
         .await?;
