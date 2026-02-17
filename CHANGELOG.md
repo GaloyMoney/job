@@ -1,3 +1,11 @@
+# [job release v0.6.5](https://github.com/GaloyMoney/job/releases/tag/0.6.5)
+
+
+
+### Features
+
+- 1-at-a-time queue_id (#39)
+
 # [job release v0.6.4](https://github.com/GaloyMoney/job/releases/tag/0.6.4)
 
 
