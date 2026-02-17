@@ -446,11 +446,10 @@ async fn poll_jobs(
     let rows = sqlx::query_as!(
         JobPollRow,
         r#"
-        WITH min_wait AS (
-            SELECT MIN(execute_at) - $2::timestamptz AS wait_time
+        WITH eligible AS (
+            SELECT id, queue_id, execute_at, execution_state_json, attempt_index
             FROM job_executions
             WHERE state = 'pending'
-            AND execute_at > $2::timestamptz
             AND job_type = ANY($4)
             AND NOT EXISTS (
                 SELECT 1 FROM job_executions AS running
@@ -459,22 +458,19 @@ async fn poll_jobs(
                 AND running.queue_id = job_executions.queue_id
             )
         ),
+        min_wait AS (
+            SELECT MIN(execute_at) - $2::timestamptz AS wait_time
+            FROM eligible
+            WHERE execute_at > $2::timestamptz
+        ),
         candidates AS (
             SELECT id, execution_state_json AS data_json, attempt_index,
                    ROW_NUMBER() OVER (
                        PARTITION BY COALESCE(queue_id, id::text)
                        ORDER BY execute_at
                    ) AS rn
-            FROM job_executions
+            FROM eligible
             WHERE execute_at <= $2::timestamptz
-            AND state = 'pending'
-            AND job_type = ANY($4)
-            AND NOT EXISTS (
-                SELECT 1 FROM job_executions AS running
-                WHERE running.state = 'running'
-                AND running.queue_id IS NOT NULL
-                AND running.queue_id = job_executions.queue_id
-            )
         ),
         selected_jobs AS (
             SELECT je.id, c.data_json, c.attempt_index
