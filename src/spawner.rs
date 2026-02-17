@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use serde::Serialize;
 use std::{marker::PhantomData, sync::Arc};
-use tracing::{Span, instrument};
+use tracing::instrument;
 
 use super::{
     Job, JobId,
@@ -123,7 +123,97 @@ where
         config: Config,
         schedule_at: DateTime<Utc>,
     ) -> Result<Job, JobError> {
-        self.create_job_internal(op, id.into(), &self.job_type, config, schedule_at, false)
+        self.create_job_internal(op, id.into(), config, schedule_at, None)
+            .await
+    }
+
+    /// Create and spawn a job for immediate execution within a queue.
+    ///
+    /// At most one job per `queue_id` will run globally at any time.
+    #[instrument(
+        name = "job_spawner.spawn_with_queue_id",
+        skip(self, config, queue_id),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_with_queue_id(
+        &self,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        queue_id: impl Into<String> + Send,
+    ) -> Result<Job, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let job = self
+            .spawn_with_queue_id_in_op(&mut op, id, config, queue_id)
+            .await?;
+        op.commit().await?;
+        Ok(job)
+    }
+
+    /// Create and spawn a job within a queue as part of an existing atomic operation.
+    ///
+    /// At most one job per `queue_id` will run globally at any time.
+    #[instrument(
+        name = "job_spawner.spawn_with_queue_id_in_op",
+        skip(self, op, config, queue_id),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_with_queue_id_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        queue_id: impl Into<String> + Send,
+    ) -> Result<Job, JobError> {
+        let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        self.spawn_at_with_queue_id_in_op(op, id, config, schedule_at, queue_id)
+            .await
+    }
+
+    /// Create and spawn a job for execution at a specific time within a queue.
+    ///
+    /// At most one job per `queue_id` will run globally at any time.
+    #[instrument(
+        name = "job_spawner.spawn_at_with_queue_id",
+        skip(self, config, queue_id),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_at_with_queue_id(
+        &self,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        schedule_at: DateTime<Utc>,
+        queue_id: impl Into<String> + Send,
+    ) -> Result<Job, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let job = self
+            .spawn_at_with_queue_id_in_op(&mut op, id, config, schedule_at, queue_id)
+            .await?;
+        op.commit().await?;
+        Ok(job)
+    }
+
+    /// Create and spawn a job for execution at a specific time within a queue,
+    /// as part of an existing atomic operation.
+    ///
+    /// At most one job per `queue_id` will run globally at any time.
+    #[instrument(
+        name = "job_spawner.spawn_at_with_queue_id_in_op",
+        skip(self, op, config, queue_id),
+        fields(job_type = %self.job_type),
+        err
+    )]
+    pub async fn spawn_at_with_queue_id_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: impl Into<JobId> + std::fmt::Debug,
+        config: Config,
+        schedule_at: DateTime<Utc>,
+        queue_id: impl Into<String> + Send,
+    ) -> Result<Job, JobError> {
+        self.create_job_internal(op, id.into(), config, schedule_at, Some(queue_id.into()))
             .await
     }
 
@@ -158,7 +248,7 @@ where
             Err(e) => return Err(e),
             Ok(mut job) => {
                 let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                self.insert_execution(&mut op, &mut job, schedule_at)
+                self.insert_execution(&mut op, &mut job, schedule_at, None)
                     .await?;
                 op.commit().await?;
             }
@@ -166,29 +256,27 @@ where
         Ok(())
     }
 
-    #[instrument(name = "job.create_internal", skip(self, op, config), fields(job_type = %job_type), err)]
+    #[instrument(name = "job.create_internal", skip(self, op, config), fields(job_type = %self.job_type), err)]
     async fn create_job_internal<C: Serialize + Send>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
-        job_type: &JobType,
         config: C,
         schedule_at: DateTime<Utc>,
-        unique_per_type: bool,
+        queue_id: Option<String>,
     ) -> Result<Job, JobError> {
-        Span::current().record("job_type", tracing::field::display(job_type));
-
         let new_job = NewJob::builder()
             .id(id)
-            .unique_per_type(unique_per_type)
-            .job_type(job_type.clone())
+            .unique_per_type(false)
+            .job_type(self.job_type.clone())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
             .build()
             .expect("Could not build new job");
 
         let mut job = self.repo.create_in_op(op, new_job).await?;
-        self.insert_execution(op, &mut job, schedule_at).await?;
+        self.insert_execution(op, &mut job, schedule_at, queue_id.as_deref())
+            .await?;
         Ok(job)
     }
 
@@ -198,14 +286,16 @@ where
         op: &mut impl es_entity::AtomicOperation,
         job: &mut Job,
         schedule_at: DateTime<Utc>,
+        queue_id: Option<&str>,
     ) -> Result<(), JobError> {
         sqlx::query!(
             r#"
-          INSERT INTO job_executions (id, job_type, execute_at, alive_at, created_at)
-          VALUES ($1, $2, $3, COALESCE($4, NOW()), COALESCE($4, NOW()))
+          INSERT INTO job_executions (id, job_type, queue_id, execute_at, alive_at, created_at)
+          VALUES ($1, $2, $3, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
         "#,
             job.id as JobId,
             &job.job_type as &JobType,
+            queue_id,
             schedule_at,
             op.maybe_now()
         )

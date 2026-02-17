@@ -8,7 +8,7 @@ use job::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TestJobConfig {
@@ -209,6 +209,307 @@ async fn test_scheduled_job_with_artificial_clock() -> anyhow::Result<()> {
         execution_time,
         schedule_at
     );
+
+    Ok(())
+}
+
+// -- Queue ID tests --
+
+/// A job that signals when it starts, then waits for an external release before completing.
+#[derive(Debug, Serialize, Deserialize)]
+struct QueueJobConfig {
+    label: String,
+}
+
+struct QueueJobInitializer {
+    job_type: JobType,
+    started: Arc<Mutex<Vec<String>>>,
+    completed: Arc<Mutex<Vec<String>>>,
+    release: Arc<Notify>,
+}
+
+impl JobInitializer for QueueJobInitializer {
+    type Config = QueueJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: QueueJobConfig = job.config()?;
+        Ok(Box::new(QueueJobRunner {
+            label: config.label,
+            started: Arc::clone(&self.started),
+            completed: Arc::clone(&self.completed),
+            release: Arc::clone(&self.release),
+        }))
+    }
+}
+
+struct QueueJobRunner {
+    label: String,
+    started: Arc<Mutex<Vec<String>>>,
+    completed: Arc<Mutex<Vec<String>>>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl JobRunner for QueueJobRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        self.started.lock().await.push(self.label.clone());
+        self.release.notified().await;
+        self.completed.lock().await.push(self.label.clone());
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let release = Arc::new(Notify::new());
+
+    let spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("queue-serial"),
+        started: Arc::clone(&started),
+        completed: Arc::clone(&completed),
+        release: Arc::clone(&release),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    // Spawn two jobs with the same queue_id
+    spawner
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "A".into() },
+            "serial-queue",
+        )
+        .await?;
+    spawner
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "B".into() },
+            "serial-queue",
+        )
+        .await?;
+
+    // Wait for job A to start
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if !started.lock().await.is_empty() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job A never started");
+    }
+
+    // Give the poller time to pick up B (if it incorrectly would)
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Only one job should have started
+    assert_eq!(
+        started.lock().await.len(),
+        1,
+        "Only 1 job should be running"
+    );
+    assert_eq!(started.lock().await[0], "A");
+
+    // Release A
+    release.notify_one();
+
+    // Wait for A to complete and B to start
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if started.lock().await.len() == 2 {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job B never started after A completed");
+    }
+
+    // Release B
+    release.notify_one();
+
+    // Wait for B to complete
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if completed.lock().await.len() == 2 {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job B never completed");
+    }
+
+    assert_eq!(completed.lock().await.as_slice(), &["A", "B"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_different_queue_ids_run_concurrently() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let release = Arc::new(Notify::new());
+
+    let spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("queue-concurrent"),
+        started: Arc::clone(&started),
+        completed: Arc::clone(&completed),
+        release: Arc::clone(&release),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    // Spawn jobs with different queue_ids
+    spawner
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "Q1".into() },
+            "queue-1",
+        )
+        .await?;
+    spawner
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "Q2".into() },
+            "queue-2",
+        )
+        .await?;
+
+    // Both should start concurrently
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if started.lock().await.len() == 2 {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "Both jobs should start concurrently, started: {:?}",
+            started.lock().await
+        );
+    }
+
+    // Release both
+    release.notify_waiters();
+
+    // Wait for both to complete
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if completed.lock().await.len() == 2 {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Both jobs should complete");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_non_queued_jobs_unaffected() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let release = Arc::new(Notify::new());
+
+    let spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("queue-noqueue"),
+        started: Arc::clone(&started),
+        completed: Arc::clone(&completed),
+        release: Arc::clone(&release),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    // Spawn two jobs WITHOUT queue_id — they should run concurrently
+    spawner
+        .spawn(
+            JobId::new(),
+            QueueJobConfig {
+                label: "NO_Q1".into(),
+            },
+        )
+        .await?;
+    spawner
+        .spawn(
+            JobId::new(),
+            QueueJobConfig {
+                label: "NO_Q2".into(),
+            },
+        )
+        .await?;
+
+    // Both should start concurrently
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if started.lock().await.len() == 2 {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "Non-queued jobs should start concurrently, started: {:?}",
+            started.lock().await
+        );
+    }
+
+    // Release both
+    release.notify_waiters();
+
+    // Wait for completion
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if completed.lock().await.len() == 2 {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Non-queued jobs should complete");
+    }
 
     Ok(())
 }
