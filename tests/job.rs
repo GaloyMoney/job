@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
     ArtificialClockConfig, ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer,
-    JobRunner, JobSpawner, JobSvcConfig, JobType, Jobs,
+    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -510,6 +510,118 @@ async fn test_non_queued_jobs_unaffected() -> anyhow::Result<()> {
         attempts += 1;
         assert!(attempts < 100, "Non-queued jobs should complete");
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bulk_spawn_creates_and_runs_all_jobs() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let specs: Vec<JobSpec<TestJobConfig>> = (0..5)
+        .map(|i| JobSpec::new(JobId::new(), TestJobConfig { delay_ms: 10 + i }))
+        .collect();
+    let ids: Vec<JobId> = specs.iter().map(|s| s.id).collect();
+
+    let spawned = spawner.spawn_all(specs).await?;
+    assert_eq!(spawned.len(), 5);
+
+    // Wait for all jobs to complete
+    let mut attempts = 0;
+    let max_attempts = 100;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let mut all_done = true;
+        for id in &ids {
+            let job = jobs.find(*id).await?;
+            if !job.completed() {
+                all_done = false;
+                break;
+            }
+        }
+        if all_done {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < max_attempts,
+            "Not all bulk-spawned jobs completed in time"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let duplicate_id = JobId::new();
+    let specs = vec![
+        JobSpec::new(duplicate_id, TestJobConfig { delay_ms: 10 }),
+        JobSpec::new(JobId::new(), TestJobConfig { delay_ms: 10 }),
+        JobSpec::new(duplicate_id, TestJobConfig { delay_ms: 10 }),
+    ];
+
+    let result = spawner.spawn_all(specs).await;
+    assert!(
+        matches!(result, Err(JobError::DuplicateId)),
+        "Expected DuplicateId error, got err: {:?}",
+        result.as_ref().err(),
+    );
+
+    // The first job should also not be persisted (transaction rolled back)
+    let find_result = jobs.find(duplicate_id).await;
+    assert!(
+        find_result.is_err(),
+        "No jobs should be persisted after rollback"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bulk_spawn_empty_batch() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let result = spawner.spawn_all(vec![]).await?;
+    assert!(result.is_empty());
 
     Ok(())
 }
