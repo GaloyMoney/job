@@ -1,3 +1,11 @@
+# [job release v0.6.6](https://github.com/GaloyMoney/job/releases/tag/0.6.6)
+
+
+
+### Features
+
+- Add bulk spawn_all with batch inserts (#40)
+
 # [job release v0.6.5](https://github.com/GaloyMoney/job/releases/tag/0.6.5)
 
 
