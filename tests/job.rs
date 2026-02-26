@@ -75,10 +75,23 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
         .await
         .expect("Failed to create and spawn job");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms * 2)).await;
-
-    let job = jobs.find(job.id).await?;
-    assert!(job.completed());
+    let mut attempts = 0;
+    let max_attempts = 50;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let job = jobs.find(job.id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        if attempts >= max_attempts {
+            panic!(
+                "Job did not complete within {} attempts ({}ms)",
+                max_attempts,
+                max_attempts * 100
+            );
+        }
+    }
 
     Ok(())
 }
