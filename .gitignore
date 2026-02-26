@@ -15,5 +15,3 @@ target/
 .env
 .bacon-locations
 .claude/settings.local.json
-
-Cargo.lock
