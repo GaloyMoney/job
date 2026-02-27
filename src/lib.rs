@@ -477,7 +477,7 @@ impl Jobs {
     /// Fetch the current snapshot of a job entity by identifier.
     #[instrument(name = "job.find", skip(self))]
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
-        self.repo.find_by_id(id).await
+        Ok(self.repo.find_by_id(id).await?)
     }
 
     /// Returns a reference to the clock used by this job service.

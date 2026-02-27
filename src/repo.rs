@@ -2,13 +2,12 @@ use sqlx::PgPool;
 
 use es_entity::*;
 
-use super::{entity::*, error::*};
+use super::entity::*;
 use crate::JobId;
 
 #[derive(EsRepo, Clone)]
 #[es_repo(
     entity = "Job",
-    err = "JobError",
     columns(
         job_type(ty = "JobType", update(persist = false)),
         unique_per_type(ty = "bool", update(persist = false)),
@@ -28,6 +27,7 @@ impl JobRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::JobError;
 
     pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
         let pg_con = std::env::var("PG_CON").unwrap();
@@ -61,8 +61,8 @@ mod tests {
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
-        let res = repo.create(new_job).await;
-        assert!(matches!(res, Err(JobError::DuplicateUniqueJobType)));
+        let err: JobError = repo.create(new_job).await.err().expect("expected error").into();
+        assert!(matches!(err, JobError::DuplicateUniqueJobType));
 
         // Same type same id
         let new_job = NewJob::builder()
@@ -72,8 +72,8 @@ mod tests {
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
-        let res = repo.create(new_job).await;
-        assert!(matches!(res, Err(JobError::DuplicateId)));
+        let err: JobError = repo.create(new_job).await.err().expect("expected error").into();
+        assert!(matches!(err, JobError::DuplicateId));
 
         let new_job = NewJob::builder()
             .id(JobId::new())
@@ -104,8 +104,8 @@ mod tests {
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
-        let res = repo.create(new_job).await;
-        assert!(matches!(res, Err(JobError::DuplicateId)));
+        let err: JobError = repo.create(new_job).await.err().expect("expected error").into();
+        assert!(matches!(err, JobError::DuplicateId));
 
         Ok(())
     }

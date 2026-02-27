@@ -374,13 +374,17 @@ where
             .expect("Could not build new job");
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         match self.repo.create_in_op(&mut op, new_job).await {
-            Err(JobError::DuplicateUniqueJobType) => (),
-            Err(e) => return Err(e),
             Ok(mut job) => {
                 let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 self.insert_execution(&mut op, &mut job, schedule_at, None)
                     .await?;
                 op.commit().await?;
+            }
+            Err(e) => {
+                let e: JobError = e.into();
+                if !matches!(e, JobError::DuplicateUniqueJobType) {
+                    return Err(e);
+                }
             }
         }
         Ok(())
