@@ -9,11 +9,15 @@ use super::repo::{JobCreateError, JobFindError, JobModifyError, JobQueryError};
 /// Exhaustive list of failures the job service can report.
 pub enum JobError {
     #[error("JobError - Sqlx: {0}")]
-    Sqlx(sqlx::Error),
-    #[error("JobError - EntityHydrationError: {0}")]
-    EntityHydrationError(es_entity::EntityHydrationError),
-    #[error("JobError - CursorDestructureError: {0}")]
-    CursorDestructureError(#[from] es_entity::CursorDestructureError),
+    Sqlx(#[from] sqlx::Error),
+    #[error("JobError - Create: {0}")]
+    Create(JobCreateError),
+    #[error("JobError - Modify: {0}")]
+    Modify(#[from] JobModifyError),
+    #[error("JobError - Find: {0}")]
+    Find(#[from] JobFindError),
+    #[error("JobError - Query: {0}")]
+    Query(#[from] JobQueryError),
     #[error("JobError - InvalidPollInterval: {0}")]
     InvalidPollInterval(String),
     #[error("JobError - InvalidJobType: expected '{0}' but initializer was '{1}'")]
@@ -44,66 +48,21 @@ impl From<Box<dyn std::error::Error>> for JobError {
     }
 }
 
-impl From<sqlx::Error> for JobError {
-    fn from(error: sqlx::Error) -> Self {
-        Self::Sqlx(error)
-    }
-}
-
 impl From<JobCreateError> for JobError {
     fn from(error: JobCreateError) -> Self {
-        match error {
-            JobCreateError::ConstraintViolation { inner, .. } => {
-                if let Some(err) = inner.as_database_error() {
-                    if let Some(constraint) = err.constraint() {
-                        if constraint.contains("type") {
-                            return Self::DuplicateUniqueJobType;
-                        }
-                        if constraint.contains("jobs_pkey") {
-                            return Self::DuplicateId;
-                        }
-                    }
+        // jobs_pkey maps to JobColumn::Id automatically
+        if error.was_duplicate(super::repo::JobColumn::Id) {
+            return Self::DuplicateId;
+        }
+        // idx_unique_job_type needs the constraint attr on es-entity
+        // to map to JobColumn::JobType — until then, inspect the raw name
+        if let JobCreateError::ConstraintViolation { ref inner, .. } = error {
+            if let Some(db_err) = inner.as_database_error() {
+                if db_err.constraint().is_some_and(|c| c.contains("type")) {
+                    return Self::DuplicateUniqueJobType;
                 }
-                Self::Sqlx(inner)
-            }
-            JobCreateError::Sqlx(e) | JobCreateError::PostPersistHookError(e) => Self::Sqlx(e),
-            JobCreateError::HydrationError(e) => Self::EntityHydrationError(e),
-            JobCreateError::ConcurrentModification => {
-                Self::Sqlx(sqlx::Error::Protocol("ConcurrentModification".into()))
             }
         }
-    }
-}
-
-impl From<JobModifyError> for JobError {
-    fn from(error: JobModifyError) -> Self {
-        match error {
-            JobModifyError::Sqlx(e)
-            | JobModifyError::ConstraintViolation { inner: e, .. }
-            | JobModifyError::PostPersistHookError(e) => Self::Sqlx(e),
-            JobModifyError::ConcurrentModification => {
-                Self::Sqlx(sqlx::Error::Protocol("ConcurrentModification".into()))
-            }
-        }
-    }
-}
-
-impl From<JobFindError> for JobError {
-    fn from(error: JobFindError) -> Self {
-        match error {
-            JobFindError::Sqlx(e) => Self::Sqlx(e),
-            JobFindError::NotFound { .. } => Self::Sqlx(sqlx::Error::RowNotFound),
-            JobFindError::HydrationError(e) => Self::EntityHydrationError(e),
-        }
-    }
-}
-
-impl From<JobQueryError> for JobError {
-    fn from(error: JobQueryError) -> Self {
-        match error {
-            JobQueryError::Sqlx(e) => Self::Sqlx(e),
-            JobQueryError::HydrationError(e) => Self::EntityHydrationError(e),
-            JobQueryError::CursorDestructureError(e) => Self::CursorDestructureError(e),
-        }
+        Self::Create(error)
     }
 }
