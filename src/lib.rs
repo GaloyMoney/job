@@ -262,7 +262,7 @@ impl Jobs {
                 if let Some(max_connections) = config.max_connections {
                     pool_opts = pool_opts.max_connections(max_connections);
                 }
-                pool_opts.connect(&pg_con).await.map_err(JobError::Sqlx)?
+                pool_opts.connect(&pg_con).await?
             }
             _ => {
                 return Err(JobError::Config(

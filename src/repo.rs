@@ -9,7 +9,11 @@ use crate::JobId;
 #[es_repo(
     entity = "Job",
     columns(
-        job_type(ty = "JobType", update(persist = false)),
+        job_type(
+            ty = "JobType",
+            update(persist = false),
+            constraint = "idx_unique_job_type"
+        ),
         unique_per_type(ty = "bool", update(persist = false)),
     ),
     persist_event_context = false
@@ -61,8 +65,13 @@ mod tests {
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
-        let err: JobError = repo.create(new_job).await.err().expect("expected error").into();
-        assert!(matches!(err, JobError::DuplicateUniqueJobType));
+        let err: JobError = repo
+            .create(new_job)
+            .await
+            .err()
+            .expect("expected error")
+            .into();
+        assert!(matches!(err, JobError::DuplicateUniqueJobType(_)));
 
         // Same type same id
         let new_job = NewJob::builder()
@@ -72,8 +81,13 @@ mod tests {
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
-        let err: JobError = repo.create(new_job).await.err().expect("expected error").into();
-        assert!(matches!(err, JobError::DuplicateId));
+        let err: JobError = repo
+            .create(new_job)
+            .await
+            .err()
+            .expect("expected error")
+            .into();
+        assert!(matches!(err, JobError::DuplicateId(_)));
 
         let new_job = NewJob::builder()
             .id(JobId::new())
@@ -104,8 +118,13 @@ mod tests {
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
-        let err: JobError = repo.create(new_job).await.err().expect("expected error").into();
-        assert!(matches!(err, JobError::DuplicateId));
+        let err: JobError = repo
+            .create(new_job)
+            .await
+            .err()
+            .expect("expected error")
+            .into();
+        assert!(matches!(err, JobError::DuplicateId(_)));
 
         Ok(())
     }

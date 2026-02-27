@@ -32,10 +32,10 @@ pub enum JobError {
     NoInitializerPresent,
     #[error("JobError - JobExecutionError: {0}")]
     JobExecutionError(String),
-    #[error("JobError - DuplicateId")]
-    DuplicateId,
-    #[error("JobError - DuplicateUniqueJobType")]
-    DuplicateUniqueJobType,
+    #[error("JobError - DuplicateId: {0:?}")]
+    DuplicateId(Option<String>),
+    #[error("JobError - DuplicateUniqueJobType: {0:?}")]
+    DuplicateUniqueJobType(Option<String>),
     #[error("JobError - Config: {0}")]
     Config(String),
     #[error("JobError - Migration: {0}")]
@@ -50,19 +50,18 @@ impl From<Box<dyn std::error::Error>> for JobError {
 
 impl From<JobCreateError> for JobError {
     fn from(error: JobCreateError) -> Self {
-        // jobs_pkey maps to JobColumn::Id automatically
-        if error.was_duplicate(super::repo::JobColumn::Id) {
-            return Self::DuplicateId;
+        match error {
+            JobCreateError::ConstraintViolation {
+                column: Some(super::repo::JobColumn::Id),
+                value,
+                ..
+            } => Self::DuplicateId(value),
+            JobCreateError::ConstraintViolation {
+                column: Some(super::repo::JobColumn::JobType),
+                value,
+                ..
+            } => Self::DuplicateUniqueJobType(value),
+            other => Self::Create(other),
         }
-        // idx_unique_job_type needs the constraint attr on es-entity
-        // to map to JobColumn::JobType — until then, inspect the raw name
-        if let JobCreateError::ConstraintViolation { ref inner, .. } = error {
-            if let Some(db_err) = inner.as_database_error() {
-                if db_err.constraint().is_some_and(|c| c.contains("type")) {
-                    return Self::DuplicateUniqueJobType;
-                }
-            }
-        }
-        Self::Create(error)
     }
 }
