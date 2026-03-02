@@ -161,7 +161,7 @@ impl RetryWindow {
 }
 
 #[derive(EsEntity, Builder)]
-#[builder(pattern = "owned", build_fn(error = "EsEntityError"))]
+#[builder(pattern = "owned", build_fn(error = "EntityHydrationError"))]
 /// Entity capturing immutable job metadata and lifecycle events.
 pub struct Job {
     pub id: JobId,
@@ -296,7 +296,7 @@ impl Job {
 }
 
 impl TryFromEvents<JobEvent> for Job {
-    fn try_from_events(events: EntityEvents<JobEvent>) -> Result<Self, EsEntityError> {
+    fn try_from_events(events: EntityEvents<JobEvent>) -> Result<Self, EntityHydrationError> {
         let mut builder = JobBuilder::default();
         for event in events.iter_all() {
             match event {
@@ -449,7 +449,9 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            EntityEvents::<JobEvent>::load_first::<Job>(generic_events).expect("load job")
+            EntityEvents::<JobEvent>::load_first::<Job>(generic_events)
+                .expect("load job")
+                .expect("no events")
         }
 
         fn build_retry_policy(max_attempts: Option<u32>) -> RetryPolicy {

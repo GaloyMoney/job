@@ -3,16 +3,21 @@
 use thiserror::Error;
 
 use super::entity::JobType;
+use super::repo::{JobCreateError, JobFindError, JobModifyError, JobQueryError};
 
 #[derive(Error, Debug)]
 /// Exhaustive list of failures the job service can report.
 pub enum JobError {
     #[error("JobError - Sqlx: {0}")]
-    Sqlx(sqlx::Error),
-    #[error("JobError - EsEntityError: {0}")]
-    EsEntityError(es_entity::EsEntityError),
-    #[error("JobError - CursorDestructureError: {0}")]
-    CursorDestructureError(#[from] es_entity::CursorDestructureError),
+    Sqlx(#[from] sqlx::Error),
+    #[error("JobError - Create: {0}")]
+    Create(JobCreateError),
+    #[error("JobError - Modify: {0}")]
+    Modify(#[from] JobModifyError),
+    #[error("JobError - Find: {0}")]
+    Find(#[from] JobFindError),
+    #[error("JobError - Query: {0}")]
+    Query(#[from] JobQueryError),
     #[error("JobError - InvalidPollInterval: {0}")]
     InvalidPollInterval(String),
     #[error("JobError - InvalidJobType: expected '{0}' but initializer was '{1}'")]
@@ -27,17 +32,15 @@ pub enum JobError {
     NoInitializerPresent,
     #[error("JobError - JobExecutionError: {0}")]
     JobExecutionError(String),
-    #[error("JobError - DuplicateId")]
-    DuplicateId,
-    #[error("JobError - DuplicateUniqueJobType")]
-    DuplicateUniqueJobType,
+    #[error("JobError - DuplicateId: {0:?}")]
+    DuplicateId(Option<String>),
+    #[error("JobError - DuplicateUniqueJobType: {0:?}")]
+    DuplicateUniqueJobType(Option<String>),
     #[error("JobError - Config: {0}")]
     Config(String),
     #[error("JobError - Migration: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
 }
-
-es_entity::from_es_entity_error!(JobError);
 
 impl From<Box<dyn std::error::Error>> for JobError {
     fn from(error: Box<dyn std::error::Error>) -> Self {
@@ -45,18 +48,20 @@ impl From<Box<dyn std::error::Error>> for JobError {
     }
 }
 
-impl From<sqlx::Error> for JobError {
-    fn from(error: sqlx::Error) -> Self {
-        if let Some(err) = error.as_database_error()
-            && let Some(constraint) = err.constraint()
-        {
-            if constraint.contains("type") {
-                return Self::DuplicateUniqueJobType;
-            }
-            if constraint.contains("jobs_pkey") {
-                return Self::DuplicateId;
-            }
+impl From<JobCreateError> for JobError {
+    fn from(error: JobCreateError) -> Self {
+        match error {
+            JobCreateError::ConstraintViolation {
+                column: Some(super::repo::JobColumn::Id),
+                value,
+                ..
+            } => Self::DuplicateId(value),
+            JobCreateError::ConstraintViolation {
+                column: Some(super::repo::JobColumn::JobType),
+                value,
+                ..
+            } => Self::DuplicateUniqueJobType(value),
+            other => Self::Create(other),
         }
-        Self::Sqlx(error)
     }
 }

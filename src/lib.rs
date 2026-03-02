@@ -262,7 +262,7 @@ impl Jobs {
                 if let Some(max_connections) = config.max_connections {
                     pool_opts = pool_opts.max_connections(max_connections);
                 }
-                pool_opts.connect(&pg_con).await.map_err(JobError::Sqlx)?
+                pool_opts.connect(&pg_con).await?
             }
             _ => {
                 return Err(JobError::Config(
@@ -477,7 +477,7 @@ impl Jobs {
     /// Fetch the current snapshot of a job entity by identifier.
     #[instrument(name = "job.find", skip(self))]
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
-        self.repo.find_by_id(id).await
+        Ok(self.repo.find_by_id(id).await?)
     }
 
     /// Returns a reference to the clock used by this job service.

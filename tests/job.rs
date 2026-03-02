@@ -602,7 +602,7 @@ async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
 
     let result = spawner.spawn_all(specs).await;
     assert!(
-        matches!(result, Err(JobError::DuplicateId)),
+        matches!(result, Err(JobError::DuplicateId(_))),
         "Expected DuplicateId error, got err: {:?}",
         result.as_ref().err(),
     );
