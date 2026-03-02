@@ -1,3 +1,11 @@
+# [job release v0.6.7](https://github.com/GaloyMoney/job/releases/tag/0.6.7)
+
+
+
+### Features
+
+- Adopt es-entity per-operation error types (#42)
+
 # [job release v0.6.6](https://github.com/GaloyMoney/job/releases/tag/0.6.6)
 
 
