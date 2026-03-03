@@ -380,7 +380,7 @@ where
                     .await?;
                 op.commit().await?;
             }
-            Err(e) if e.was_duplicate(super::repo::JobColumn::JobType) => {}
+            Err(e) if e.was_duplicate() => {}
             Err(e) => return Err(e.into()),
         }
         Ok(())
