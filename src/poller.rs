@@ -1,7 +1,8 @@
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
+use es_entity::db;
 use serde_json::Value as JsonValue;
-use sqlx::postgres::{PgListener, PgPool, types::PgInterval};
+use sqlx::Row;
 use tracing::{Span, instrument};
 
 use std::{
@@ -64,7 +65,9 @@ pub(crate) struct JobPollerHandle {
     clock: ClockHandle,
 }
 
-const MAX_WAIT: Duration = Duration::from_secs(60);
+// Without PgListener (LISTEN/NOTIFY), the poller relies on periodic
+// polling. Keep this short so newly inserted jobs are picked up promptly.
+const MAX_WAIT: Duration = Duration::from_secs(1);
 
 impl JobPoller {
     pub fn new(
@@ -91,7 +94,6 @@ impl JobPoller {
     }
 
     pub async fn start(self) -> Result<JobPollerHandle, sqlx::Error> {
-        let listener_handle = self.start_listener().await?;
         let lost_handle = self.start_lost_handler();
         let keep_alive_handle = self.start_keep_alive_handler();
         let shutdown_tx = self.shutdown_tx.clone();
@@ -103,12 +105,7 @@ impl JobPoller {
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-main-loop",
-            Self::main_loop(
-                Arc::clone(&executor),
-                listener_handle,
-                lost_handle,
-                keep_alive_handle,
-            )
+            Self::main_loop(Arc::clone(&executor), lost_handle, keep_alive_handle,)
         ));
         Ok(JobPollerHandle {
             poller: executor,
@@ -125,7 +122,6 @@ impl JobPoller {
 
     async fn main_loop(
         self: Arc<Self>,
-        _listener_task: OwnedTaskHandle,
         _lost_task: OwnedTaskHandle,
         _keep_alive_task: OwnedTaskHandle,
     ) {
@@ -154,6 +150,12 @@ impl JobPoller {
                 }
                 result = self.clock.timeout(timeout, self.tracker.notified()) => {
                     woken_up = result.is_ok();
+                }
+                // Real-time fallback: ensures the poller wakes even when an
+                // artificial (manual) clock has already been advanced past
+                // the timeout target before it was registered.
+                _ = tokio::time::sleep(MAX_WAIT) => {
+                    woken_up = false;
                 }
             }
         }
@@ -202,32 +204,6 @@ impl JobPoller {
         Ok(Duration::ZERO)
     }
 
-    async fn start_listener(&self) -> Result<OwnedTaskHandle, sqlx::Error> {
-        let mut listener = PgListener::connect_with(self.repo.pool()).await?;
-        listener.listen("job_execution").await?;
-        let tracker = self.tracker.clone();
-        let supported_job_types = self.registry.registered_job_types();
-        Ok(OwnedTaskHandle::new(spawn_named_task!(
-            "job-poller-listener",
-            async move {
-                loop {
-                    match listener.recv().await {
-                        Ok(notification) => {
-                            let job_type = notification.payload();
-                            // Only wake the tracker if this is a job type we support
-                            if supported_job_types.iter().any(|jt| jt.as_str() == job_type) {
-                                tracker.job_execution_inserted();
-                            }
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            }
-        )))
-    }
-
     fn start_lost_handler(&self) -> OwnedTaskHandle {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
@@ -246,26 +222,30 @@ impl JobPoller {
                 );
                 let _guard = span.enter();
 
-                if let Ok(rows) = sqlx::query!(
-                        r#"
-                        UPDATE job_executions
-                        SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1, poller_instance_id = NULL
-                        WHERE state = 'running' AND alive_at < $1::timestamptz
-                        RETURNING id as id
-                        "#,
-                        check_time,
-                    )
-                    .fetch_all(&pool)
-                    .await
-                        && !rows.is_empty()
-                    {
+                if let Ok(rows) = sqlx::query(
+                    r#"
+                    UPDATE job_executions
+                    SET state = 'pending', execute_at = ?1, attempt_index = attempt_index + 1, poller_instance_id = NULL
+                    WHERE state = 'running' AND alive_at < ?1
+                    RETURNING id
+                    "#,
+                )
+                .bind(check_time)
+                .fetch_all(&pool)
+                .await
+                {
+                    if !rows.is_empty() {
                         Span::current().record("n_lost_jobs", rows.len());
-                        for row in rows {
-                            tracing::error!(job_id = %row.id, "lost job");
+                        for row in &rows {
+                            let id: String = row.get("id");
+                            tracing::error!(job_id = %id, "lost job");
                         }
                     } else {
                         Span::current().record("n_lost_jobs", 0);
                     }
+                } else {
+                    Span::current().record("n_lost_jobs", 0);
+                }
             }
         }))
     }
@@ -290,15 +270,15 @@ impl JobPoller {
                     );
                     let _guard = span.enter();
 
-                    let timeout = match sqlx::query!(
+                    let timeout = match sqlx::query(
                         r#"
                         UPDATE job_executions
-                        SET alive_at = $1
-                        WHERE poller_instance_id = $2 AND state = 'running'
+                        SET alive_at = ?1
+                        WHERE poller_instance_id = ?2 AND state = 'running'
                         "#,
-                        now,
-                        instance_id,
                     )
+                    .bind(now)
+                    .bind(instance_id.to_string())
                     .execute(&pool)
                     .await
                     {
@@ -434,7 +414,7 @@ impl JobPoller {
 
 #[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
 async fn poll_jobs(
-    pool: &PgPool,
+    pool: &db::Pool,
     n_jobs_to_poll: usize,
     instance_id: uuid::Uuid,
     supported_job_types: &[super::entity::JobType],
@@ -443,78 +423,114 @@ async fn poll_jobs(
     let now = clock.now();
     Span::current().record("now", tracing::field::display(now));
 
-    let rows = sqlx::query_as!(
-        JobPollRow,
+    if supported_job_types.is_empty() {
+        return Ok(JobPollResult::WaitTillNextJob(MAX_WAIT));
+    }
+
+    // Build dynamic IN clause placeholders for supported job types
+    // Parameters: ?1 = now, ?2 = instance_id, ?3 = limit, ?4.. = job_types
+    let type_placeholders: Vec<String> = (0..supported_job_types.len())
+        .map(|i| format!("?{}", i + 4))
+        .collect();
+    let in_clause = type_placeholders.join(", ");
+
+    // Step 1: Select and update eligible jobs atomically
+    let update_query = format!(
         r#"
-        WITH eligible AS (
-            SELECT id, queue_id, execute_at, execution_state_json, attempt_index
+        UPDATE job_executions
+        SET state = 'running', alive_at = ?1, execute_at = NULL, poller_instance_id = ?2
+        WHERE id IN (
+            SELECT e.id FROM (
+                SELECT id, execute_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(queue_id, CAST(id AS TEXT))
+                        ORDER BY execute_at
+                    ) AS rn
+                FROM job_executions
+                WHERE state = 'pending'
+                    AND execute_at <= ?1
+                    AND job_type IN ({in_clause})
+                    AND NOT EXISTS (
+                        SELECT 1 FROM job_executions AS running
+                        WHERE running.state = 'running'
+                            AND running.queue_id IS NOT NULL
+                            AND running.queue_id = job_executions.queue_id
+                    )
+            ) e WHERE e.rn = 1
+            ORDER BY e.execute_at ASC
+            LIMIT ?3
+        )
+        RETURNING id, execution_state_json, attempt_index
+        "#
+    );
+
+    let mut q = sqlx::query(&update_query)
+        .bind(now)
+        .bind(instance_id.to_string())
+        .bind(n_jobs_to_poll as i32);
+    for jt in supported_job_types {
+        q = q.bind(jt.as_str());
+    }
+    let rows = q.fetch_all(pool).await?;
+
+    if rows.is_empty() {
+        // Step 2: No jobs ready now — find the wait time to the next eligible job
+        let wait_type_placeholders: Vec<String> = (0..supported_job_types.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect();
+        let wait_in_clause = wait_type_placeholders.join(", ");
+        let wait_query = format!(
+            r#"
+            SELECT MIN(execute_at) as next_execute_at
             FROM job_executions
             WHERE state = 'pending'
-            AND job_type = ANY($4)
-            AND NOT EXISTS (
-                SELECT 1 FROM job_executions AS running
-                WHERE running.state = 'running'
-                AND running.queue_id IS NOT NULL
-                AND running.queue_id = job_executions.queue_id
-            )
-        ),
-        min_wait AS (
-            SELECT MIN(execute_at) - $2::timestamptz AS wait_time
-            FROM eligible
-            WHERE execute_at > $2::timestamptz
-        ),
-        candidates AS (
-            SELECT id, execution_state_json AS data_json, attempt_index,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY COALESCE(queue_id, id::text)
-                       ORDER BY execute_at
-                   ) AS rn
-            FROM eligible
-            WHERE execute_at <= $2::timestamptz
-        ),
-        selected_jobs AS (
-            SELECT je.id, c.data_json, c.attempt_index
-            FROM candidates c
-            JOIN job_executions je ON je.id = c.id
-            WHERE c.rn = 1
-            ORDER BY je.execute_at ASC
-            LIMIT $1
-            FOR UPDATE OF je
-        ),
-        updated AS (
-            UPDATE job_executions AS je
-            SET state = 'running', alive_at = $2, execute_at = NULL, poller_instance_id = $3
-            FROM selected_jobs
-            WHERE je.id = selected_jobs.id
-            RETURNING je.id, selected_jobs.data_json, je.attempt_index
-        )
-        SELECT * FROM (
-            SELECT
-                u.id AS "id?: JobId",
-                u.data_json AS "data_json?: JsonValue",
-                u.attempt_index AS "attempt_index?",
-                NULL::INTERVAL AS "max_wait?: PgInterval"
-            FROM updated u
-            UNION ALL
-            SELECT
-                NULL::UUID AS "id?: JobId",
-                NULL::JSONB AS "data_json?: JsonValue",
-                NULL::INT AS "attempt_index?",
-                mw.wait_time AS "max_wait?: PgInterval"
-            FROM min_wait mw
-            WHERE NOT EXISTS (SELECT 1 FROM updated)
-        ) AS result
-        "#,
-        n_jobs_to_poll as i32,
-        now,
-        instance_id,
-        supported_job_types as _,
-    )
-    .fetch_all(pool)
-    .await?;
+                AND job_type IN ({wait_in_clause})
+                AND execute_at > ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM job_executions AS running
+                    WHERE running.state = 'running'
+                        AND running.queue_id IS NOT NULL
+                        AND running.queue_id = job_executions.queue_id
+                )
+            "#
+        );
+        let mut wq = sqlx::query(&wait_query).bind(now);
+        for jt in supported_job_types {
+            wq = wq.bind(jt.as_str());
+        }
+        let wait_row = wq.fetch_optional(pool).await?;
+
+        let wait = wait_row
+            .and_then(|row| {
+                let next: Option<chrono::DateTime<chrono::Utc>> = row.get("next_execute_at");
+                next.and_then(|t| (t - now).to_std().ok())
+            })
+            .unwrap_or(MAX_WAIT);
+
+        Span::current().record("n_jobs_found", 0);
+        return Ok(JobPollResult::WaitTillNextJob(wait));
+    }
 
     Span::current().record("n_jobs_found", rows.len());
-    Ok(JobPollResult::from_rows(rows))
+
+    let jobs = rows
+        .iter()
+        .map(|row| {
+            let id: JobId = row.get("id");
+            let data_json_str: Option<String> = row.get("execution_state_json");
+            let data_json = data_json_str
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<JsonValue>(s).ok());
+            let attempt_index: i32 = row.get("attempt_index");
+            PolledJob {
+                id,
+                data_json,
+                attempt: attempt_index as u32,
+            }
+        })
+        .collect();
+
+    Ok(JobPollResult::Jobs(jobs))
 }
 
 #[derive(Debug)]
@@ -523,66 +539,8 @@ enum JobPollResult {
     WaitTillNextJob(Duration),
 }
 
-#[derive(Debug)]
-struct JobPollRow {
-    id: Option<JobId>,
-    data_json: Option<JsonValue>,
-    attempt_index: Option<i32>,
-    max_wait: Option<PgInterval>,
-}
-
-impl JobPollResult {
-    /// Convert raw query rows into a JobPollResult
-    pub fn from_rows(rows: Vec<JobPollRow>) -> Self {
-        if rows.is_empty() {
-            JobPollResult::WaitTillNextJob(MAX_WAIT)
-        } else if rows.len() == 1 && rows[0].id.is_none() {
-            if let Some(interval) = &rows[0].max_wait {
-                JobPollResult::WaitTillNextJob(pg_interval_to_duration(interval))
-            } else {
-                JobPollResult::WaitTillNextJob(MAX_WAIT)
-            }
-        } else {
-            let jobs = rows
-                .into_iter()
-                .filter_map(|row| {
-                    if let (Some(id), Some(attempt_index)) = (row.id, row.attempt_index) {
-                        Some(PolledJob {
-                            id,
-                            data_json: row.data_json,
-                            attempt: attempt_index as u32,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            JobPollResult::Jobs(jobs)
-        }
-    }
-}
-
-fn pg_interval_to_duration(interval: &PgInterval) -> Duration {
-    const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
-    if interval.microseconds < 0 || interval.days < 0 || interval.months < 0 {
-        Duration::default()
-    } else {
-        let days = (interval.days as u64) + (interval.months as u64) * 30;
-        Duration::from_micros(interval.microseconds as u64)
-            + Duration::from_secs(days * SECONDS_PER_DAY)
-    }
-}
-
 impl JobPollerHandle {
     /// Gracefully shut down the job poller.
-    ///
-    /// This method is idempotent and can be called multiple times safely.
-    /// It will:
-    /// 1. Send shutdown signal to all running job tasks
-    /// 2. Wait briefly for tasks to complete naturally
-    /// 3. Reschedule any jobs still running for this instance
-    ///
-    /// If not called manually, it will be called automatically when the handle is dropped.
     pub async fn shutdown(&self) -> Result<(), JobError> {
         perform_shutdown(
             self.shutdown_tx.clone(),
@@ -700,7 +658,6 @@ async fn perform_shutdown(
         }
     } else {
         // No active subscribers - wait for the shutdown timeout anyway
-        // to give jobs a chance to complete gracefully
         tracing::warn!("No active shutdown subscribers, waiting for shutdown timeout");
         tokio::time::sleep(shutdown_timeout).await;
     }
@@ -716,18 +673,18 @@ async fn kill_remaining_jobs(
 ) -> Result<(), JobError> {
     let mut op = repo.begin_op_with_clock(&clock).await?;
     let now = clock.now();
-    let rows = sqlx::query!(
+    let rows = sqlx::query(
         r#"
         UPDATE job_executions
         SET state = 'pending',
-            execute_at = $1,
+            execute_at = ?1,
             poller_instance_id = NULL
-        WHERE poller_instance_id = $2 AND state = 'running'
-        RETURNING id as "id!: JobId", attempt_index
+        WHERE poller_instance_id = ?2 AND state = 'running'
+        RETURNING id, attempt_index
         "#,
-        now,
-        instance_id
     )
+    .bind(now)
+    .bind(instance_id.to_string())
     .fetch_all(op.as_executor())
     .await?;
 
@@ -739,8 +696,12 @@ async fn kill_remaining_jobs(
     }
 
     let attempt_map: std::collections::HashMap<JobId, u32> = rows
-        .into_iter()
-        .map(|r| (r.id, r.attempt_index as u32))
+        .iter()
+        .map(|r| {
+            let id: JobId = r.get("id");
+            let attempt_index: i32 = r.get("attempt_index");
+            (id, attempt_index as u32)
+        })
         .collect();
 
     let ids: Vec<JobId> = attempt_map.keys().copied().collect();

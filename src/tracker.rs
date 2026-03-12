@@ -37,14 +37,10 @@ impl JobTracker {
         self.notify.notified()
     }
 
-    pub fn job_execution_inserted(&self) {
-        self.notify.notify_one()
-    }
-
-    pub fn job_completed(&self, rescheduled: bool) {
-        let n_running_jobs = self.running_jobs.fetch_sub(1, Ordering::SeqCst);
-        if rescheduled || n_running_jobs == self.min_jobs {
-            self.notify.notify_one();
-        }
+    pub fn job_completed(&self, _rescheduled: bool) {
+        self.running_jobs.fetch_sub(1, Ordering::SeqCst);
+        // Without PgListener (LISTEN/NOTIFY), always wake the poller so it
+        // can pick up queued jobs that may have been blocked by this one.
+        self.notify.notify_one();
     }
 }

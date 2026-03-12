@@ -272,17 +272,17 @@ impl JobDispatcher {
             self.rescheduled = true;
             span.record("will_retry", true);
 
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 UPDATE job_executions
-                SET state = 'pending', execute_at = $2, attempt_index = $3, poller_instance_id = NULL
-                WHERE id = $1 AND poller_instance_id = $4
+                SET state = 'pending', execute_at = ?1, attempt_index = ?2, poller_instance_id = NULL
+                WHERE id = ?3 AND poller_instance_id = ?4
               "#,
-                id as JobId,
-                reschedule_at,
-                next_attempt as i32,
-                self.instance_id
             )
+            .bind(reschedule_at)
+            .bind(next_attempt as i32)
+            .bind(id)
+            .bind(self.instance_id.to_string())
             .execute(op.as_executor())
             .await?;
         } else {
@@ -292,14 +292,14 @@ impl JobDispatcher {
             );
             span.record("will_retry", false);
 
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 DELETE FROM job_executions
-                WHERE id = $1 AND poller_instance_id = $2
+                WHERE id = ?1 AND poller_instance_id = ?2
               "#,
-                id as JobId,
-                self.instance_id
             )
+            .bind(id)
+            .bind(self.instance_id.to_string())
             .execute(op.as_executor())
             .await?;
         }
@@ -316,14 +316,14 @@ impl JobDispatcher {
         id: JobId,
     ) -> Result<(), JobError> {
         let mut job = self.repo.find_by_id(&id).await?;
-        sqlx::query!(
+        sqlx::query(
             r#"
           DELETE FROM job_executions
-          WHERE id = $1 AND poller_instance_id = $2
+          WHERE id = ?1 AND poller_instance_id = ?2
         "#,
-            id as JobId,
-            self.instance_id
         )
+        .bind(id)
+        .bind(self.instance_id.to_string())
         .execute(op.as_executor())
         .await?;
         job.complete_job();
@@ -340,16 +340,16 @@ impl JobDispatcher {
     ) -> Result<(), JobError> {
         self.rescheduled = true;
         let mut job = self.repo.find_by_id(&id).await?;
-        sqlx::query!(
+        sqlx::query(
             r#"
           UPDATE job_executions
-          SET state = 'pending', execute_at = $2, attempt_index = 1, poller_instance_id = NULL
-          WHERE id = $1 AND poller_instance_id = $3
+          SET state = 'pending', execute_at = ?1, attempt_index = 1, poller_instance_id = NULL
+          WHERE id = ?2 AND poller_instance_id = ?3
         "#,
-            id as JobId,
-            reschedule_at,
-            self.instance_id
         )
+        .bind(reschedule_at)
+        .bind(id)
+        .bind(self.instance_id.to_string())
         .execute(op.as_executor())
         .await?;
         job.reschedule_execution(reschedule_at);

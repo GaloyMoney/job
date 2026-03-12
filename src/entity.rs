@@ -5,7 +5,7 @@ use derive_builder::Builder;
 use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
 
-use std::{borrow::Cow, time::Duration};
+use std::time::Duration;
 
 use es_entity::{context::TracingContext, *};
 
@@ -16,19 +16,19 @@ use crate::{JobId, error::JobError};
 #[serde(transparent)]
 /// Identifier describing a job type or class of work.
 ///
-/// Use `JobType::new` for static name registration.
+/// Use `JobType::new` for name registration.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use job::JobType;
 ///
-/// const CLEANUP_JOB: JobType = JobType::new("cleanup-job");
+/// let cleanup_job = JobType::new("cleanup-job");
 /// ```
-pub struct JobType(Cow<'static, str>);
+pub struct JobType(String);
 impl JobType {
-    pub const fn new(job_type: &'static str) -> Self {
-        JobType(Cow::Borrowed(job_type))
+    pub fn new(job_type: &str) -> Self {
+        JobType(job_type.to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -37,7 +37,7 @@ impl JobType {
 
     #[cfg(test)]
     pub(crate) fn from_owned(job_type: String) -> Self {
-        JobType(Cow::Owned(job_type))
+        JobType(job_type)
     }
 }
 

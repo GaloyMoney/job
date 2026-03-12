@@ -1,34 +1,32 @@
 CREATE TABLE jobs (
-  id UUID PRIMARY KEY,
-  unique_per_type BOOLEAN NOT NULL,
-  job_type VARCHAR NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id TEXT PRIMARY KEY NOT NULL,
+  unique_per_type INTEGER NOT NULL DEFAULT 0,
+  job_type TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE UNIQUE INDEX idx_unique_job_type ON jobs (job_type) WHERE unique_per_type = TRUE;
+CREATE UNIQUE INDEX idx_unique_job_type ON jobs (job_type) WHERE unique_per_type = 1;
 
 CREATE TABLE job_events (
-  id UUID NOT NULL REFERENCES jobs(id),
-  sequence INT NOT NULL,
-  event_type VARCHAR NOT NULL,
-  event JSONB NOT NULL,
-  context JSONB DEFAULT NULL,
-  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  id TEXT NOT NULL REFERENCES jobs(id),
+  sequence INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  event TEXT NOT NULL,
+  context TEXT DEFAULT NULL,
+  recorded_at TEXT NOT NULL,
   UNIQUE(id, sequence)
 );
 
-CREATE TYPE JobExecutionState AS ENUM ('pending', 'running');
-
 CREATE TABLE job_executions (
-  id UUID REFERENCES jobs(id) NOT NULL UNIQUE,
-  job_type VARCHAR NOT NULL,
-  queue_id VARCHAR,
-  poller_instance_id UUID,
-  attempt_index INT NOT NULL DEFAULT 1,
-  state JobExecutionState NOT NULL DEFAULT 'pending',
-  execution_state_json JSONB,
-  execute_at TIMESTAMPTZ,
-  alive_at TIMESTAMPTZ NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL
+  id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+  job_type TEXT NOT NULL,
+  queue_id TEXT,
+  poller_instance_id TEXT,
+  attempt_index INTEGER NOT NULL DEFAULT 1,
+  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'running')),
+  execution_state_json TEXT,
+  execute_at TEXT,
+  alive_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 
 CREATE INDEX idx_job_executions_poller_instance
@@ -50,43 +48,3 @@ CREATE INDEX idx_job_executions_pending_job_type_execute_at
 CREATE INDEX idx_job_executions_running_queue_id
   ON job_executions(queue_id)
   WHERE state = 'running' AND queue_id IS NOT NULL;
-
-CREATE OR REPLACE FUNCTION notify_job_execution_insert() RETURNS TRIGGER AS $$
-BEGIN
-  PERFORM pg_notify('job_execution', NEW.job_type);
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION notify_job_execution_update() RETURNS TRIGGER AS $$
-BEGIN
-  IF NEW.execute_at IS DISTINCT FROM OLD.execute_at THEN
-    PERFORM pg_notify('job_execution', NEW.job_type);
-  END IF;
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER job_executions_notify_insert_trigger
-AFTER INSERT ON job_executions
-FOR EACH ROW
-EXECUTE FUNCTION notify_job_execution_insert();
-
-CREATE TRIGGER job_executions_notify_update_trigger
-AFTER UPDATE ON job_executions
-FOR EACH ROW
-EXECUTE FUNCTION notify_job_execution_update();
-
-CREATE OR REPLACE FUNCTION notify_job_execution_delete() RETURNS TRIGGER AS $$
-BEGIN
-  IF OLD.queue_id IS NOT NULL THEN
-    PERFORM pg_notify('job_execution', OLD.job_type);
-  END IF;
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER job_executions_notify_delete_trigger
-AFTER DELETE ON job_executions
-FOR EACH ROW
-EXECUTE FUNCTION notify_job_execution_delete();

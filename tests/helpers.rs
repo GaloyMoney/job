@@ -1,6 +1,7 @@
-pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
-    let pg_host = std::env::var("PG_HOST").unwrap_or("localhost".to_string());
-    let pg_con = format!("postgres://user:password@{pg_host}:5432/pg");
-    let pool = sqlx::PgPool::connect(&pg_con).await?;
+pub async fn init_pool() -> anyhow::Result<es_entity::db::Pool> {
+    let db_name = uuid::Uuid::now_v7();
+    let url = format!("sqlite:file:{db_name}?mode=memory&cache=shared");
+    let pool = es_entity::db::Pool::connect(&url).await?;
+    sqlx::migrate!().run(&pool).await?;
     Ok(pool)
 }

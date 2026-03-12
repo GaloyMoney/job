@@ -19,7 +19,7 @@ json-schema = ["dep:schemars", "es-entity/json-schema"]
 tokio-task-names = ["tokio/tracing"]
 
 [dependencies]
-es-entity = { workspace = true, features = ["tracing-context"] }
+es-entity = { path = "/Users/jcarter/projects/galoymoney/es-entity/.claude/worktrees/sqlite-backend-019cdf3d", default-features = false, features = ["sqlite", "tracing-context"] }
 
 async-trait = { workspace = true }
 derive_builder = { workspace = true }
@@ -42,14 +42,12 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.10.27"
-
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
 derive_builder = "0.20"
 tracing = { version = "0.1" }
-sqlx = { version = "0.8", features = ["macros", "runtime-tokio-rustls", "postgres", "uuid", "chrono", "json" ] }
+sqlx = { version = "0.8", features = ["macros", "runtime-tokio-rustls", "sqlite", "uuid", "chrono", "json" ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3.14"

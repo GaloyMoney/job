@@ -14,21 +14,6 @@ use super::{
 };
 
 /// Describes a job to be created as part of a bulk [`JobSpawner::spawn_all`] call.
-///
-/// Use [`JobSpec::new`] to create a spec with just an id and config, then
-/// chain [`JobSpec::schedule_at`] or [`JobSpec::queue_id`] for optional overrides.
-///
-/// # Examples
-///
-/// ```ignore
-/// let specs = vec![
-///     JobSpec::new(JobId::new(), MyConfig { value: 1 }),
-///     JobSpec::new(JobId::new(), MyConfig { value: 2 })
-///         .schedule_at(future_time)
-///         .queue_id("my-queue"),
-/// ];
-/// spawner.spawn_all(specs).await?;
-/// ```
 pub struct JobSpec<Config> {
     pub id: JobId,
     pub config: Config,
@@ -61,16 +46,6 @@ impl<Config> JobSpec<Config> {
 ///
 /// Returned by [`crate::Jobs::add_initializer`]. The spawner encapsulates the job type
 /// and provides type-safe job creation methods.
-///
-/// # Examples
-///
-/// ```ignore
-/// // Registration returns a spawner
-/// let spawner = jobs.add_initializer(MyInitializer);
-///
-/// // Use the spawner to create jobs
-/// spawner.spawn(JobId::new(), MyConfig { value: 42 }).await?;
-/// ```
 #[derive(Clone)]
 pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
@@ -195,8 +170,6 @@ where
     }
 
     /// Create and spawn a job within a queue as part of an existing atomic operation.
-    ///
-    /// At most one job per `queue_id` will run globally at any time.
     #[instrument(
         name = "job_spawner.spawn_with_queue_id_in_op",
         skip(self, op, config, queue_id),
@@ -216,8 +189,6 @@ where
     }
 
     /// Create and spawn a job for execution at a specific time within a queue.
-    ///
-    /// At most one job per `queue_id` will run globally at any time.
     #[instrument(
         name = "job_spawner.spawn_at_with_queue_id",
         skip(self, config, queue_id),
@@ -241,8 +212,6 @@ where
 
     /// Create and spawn a job for execution at a specific time within a queue,
     /// as part of an existing atomic operation.
-    ///
-    /// At most one job per `queue_id` will run globally at any time.
     #[instrument(
         name = "job_spawner.spawn_at_with_queue_id_in_op",
         skip(self, op, config, queue_id),
@@ -264,7 +233,6 @@ where
     /// Create and spawn multiple jobs in a single atomic operation.
     ///
     /// All jobs are created within a single transaction — either all succeed or all roll back.
-    /// Each [`JobSpec`] can independently specify `schedule_at` and `queue_id`.
     #[instrument(
         name = "job_spawner.spawn_all",
         skip(self, specs),
@@ -279,9 +247,6 @@ where
     }
 
     /// Create and spawn multiple jobs as part of an existing atomic operation.
-    ///
-    /// Each [`JobSpec`] can independently specify `schedule_at` and `queue_id`.
-    /// Internally uses batch inserts for both the job entities and `job_executions` rows.
     #[instrument(
         name = "job_spawner.spawn_all_in_op",
         skip(self, op, specs),
@@ -321,23 +286,24 @@ where
 
         let mut jobs = self.repo.create_all_in_op(op, new_jobs).await?;
 
-        let ids: Vec<JobId> = jobs.iter().map(|j| j.id).collect();
-        sqlx::query(
-            r#"
-            INSERT INTO job_executions (id, job_type, queue_id, execute_at, alive_at, created_at)
-            SELECT unnested.id, $2, unnested.queue_id, unnested.execute_at,
-                   COALESCE($5, NOW()), COALESCE($5, NOW())
-            FROM UNNEST($1::uuid[], $3::text[], $4::timestamptz[])
-                AS unnested(id, queue_id, execute_at)
-            "#,
-        )
-        .bind(&ids)
-        .bind(&self.job_type)
-        .bind(&queue_ids)
-        .bind(&schedule_times)
-        .bind(op.maybe_now())
-        .execute(op.as_executor())
-        .await?;
+        // Insert execution rows one at a time (SQLite doesn't support UNNEST)
+        let now_val = op.maybe_now();
+        for (i, job) in jobs.iter().enumerate() {
+            let now_or_default = now_val.unwrap_or_else(chrono::Utc::now);
+            sqlx::query(
+                r#"
+                INSERT INTO job_executions (id, job_type, queue_id, execute_at, alive_at, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                "#,
+            )
+            .bind(job.id)
+            .bind(self.job_type.as_str())
+            .bind(queue_ids[i].as_deref())
+            .bind(schedule_times[i])
+            .bind(now_or_default)
+            .execute(op.as_executor())
+            .await?;
+        }
 
         for (job, schedule_at) in jobs.iter_mut().zip(&schedule_times) {
             job.schedule_execution(*schedule_at);
@@ -418,17 +384,18 @@ where
         schedule_at: DateTime<Utc>,
         queue_id: Option<&str>,
     ) -> Result<(), JobError> {
-        sqlx::query!(
+        let now_or_default = op.maybe_now().unwrap_or_else(chrono::Utc::now);
+        sqlx::query(
             r#"
           INSERT INTO job_executions (id, job_type, queue_id, execute_at, alive_at, created_at)
-          VALUES ($1, $2, $3, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
+          VALUES (?1, ?2, ?3, ?4, ?5, ?5)
         "#,
-            job.id as JobId,
-            &job.job_type as &JobType,
-            queue_id,
-            schedule_at,
-            op.maybe_now()
         )
+        .bind(job.id)
+        .bind(job.job_type.as_str())
+        .bind(queue_id)
+        .bind(schedule_at)
+        .bind(now_or_default)
         .execute(op.as_executor())
         .await?;
         job.schedule_execution(schedule_at);

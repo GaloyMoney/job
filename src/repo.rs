@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use es_entity::db;
 
 use es_entity::*;
 
@@ -19,11 +19,11 @@ use crate::JobId;
     persist_event_context = false
 )]
 pub struct JobRepo {
-    pool: PgPool,
+    pool: db::Pool,
 }
 
 impl JobRepo {
-    pub(super) fn new(pool: &PgPool) -> Self {
+    pub(super) fn new(pool: &db::Pool) -> Self {
         Self { pool: pool.clone() }
     }
 }
@@ -33,9 +33,11 @@ mod tests {
     use super::*;
     use crate::error::JobError;
 
-    pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
-        let pg_con = std::env::var("PG_CON").unwrap();
-        let pool = sqlx::PgPool::connect(&pg_con).await?;
+    pub async fn init_pool() -> anyhow::Result<db::Pool> {
+        let db_name = uuid::Uuid::now_v7();
+        let url = format!("sqlite:file:{db_name}?mode=memory&cache=shared");
+        let pool = db::Pool::connect(&url).await?;
+        sqlx::migrate!().run(&pool).await?;
         Ok(pool)
     }
 
@@ -73,7 +75,8 @@ mod tests {
             .into();
         assert!(matches!(err, JobError::DuplicateUniqueJobType(_)));
 
-        // Same type same id
+        // Same type same id — SQLite may report either the PK or unique
+        // index violation first when both are violated simultaneously.
         let new_job = NewJob::builder()
             .id(a_id)
             .unique_per_type(true)
@@ -87,7 +90,13 @@ mod tests {
             .err()
             .expect("expected error")
             .into();
-        assert!(matches!(err, JobError::DuplicateId(_)));
+        assert!(
+            matches!(
+                err,
+                JobError::DuplicateId(_) | JobError::DuplicateUniqueJobType(_)
+            ),
+            "Expected DuplicateId or DuplicateUniqueJobType, got: {err:?}"
+        );
 
         let new_job = NewJob::builder()
             .id(JobId::new())

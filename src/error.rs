@@ -54,18 +54,40 @@ impl From<Box<dyn std::error::Error>> for JobError {
 
 impl From<JobCreateError> for JobError {
     fn from(error: JobCreateError) -> Self {
-        match error {
+        match &error {
             JobCreateError::ConstraintViolation {
                 column: Some(super::repo::JobColumn::Id),
                 value,
                 ..
-            } => Self::DuplicateId(value),
+            } => Self::DuplicateId(value.clone()),
             JobCreateError::ConstraintViolation {
                 column: Some(super::repo::JobColumn::JobType),
                 value,
                 ..
-            } => Self::DuplicateUniqueJobType(value),
-            other => Self::Create(other),
+            } => Self::DuplicateUniqueJobType(value.clone()),
+            // SQLite does not return structured constraint names, so we
+            // use the extended error code and error message to classify.
+            JobCreateError::ConstraintViolation {
+                column: None,
+                inner,
+                ..
+            } => {
+                // Extended error code 1555 = SQLITE_CONSTRAINT_PRIMARYKEY
+                let is_pk = matches!(inner, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("1555"));
+                if is_pk {
+                    Self::DuplicateId(None)
+                } else {
+                    let msg = inner.to_string();
+                    if msg.contains("jobs.id") {
+                        Self::DuplicateId(None)
+                    } else if msg.contains("jobs.job_type") {
+                        Self::DuplicateUniqueJobType(None)
+                    } else {
+                        Self::Create(error)
+                    }
+                }
+            }
+            _ => Self::Create(error),
         }
     }
 }

@@ -46,13 +46,11 @@
       rustSource = pkgs.lib.cleanSourceWith {
         src = craneLib.path ./.;
         filter = path: type:
-          (builtins.match ".*\.sqlx/.*" path != null)
-          || (builtins.match ".*deny\.toml$" path != null)
+          (builtins.match ".*deny\.toml$" path != null)
           || (craneLib.filterCargoSources path type);
       };
       commonArgs = {
         src = rustSource;
-        SQLX_OFFLINE = "true";
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
@@ -65,60 +63,20 @@
         cargo-deny
         mdbook
         bacon
-        postgresql
-        docker-compose
         ytt
-        podman
-        podman-compose
         curl
       ];
-      devEnvVars = rec {
-        PGDATABASE = "pg";
-        PGUSER = "user";
-        PGPASSWORD = "password";
-        PGHOST = "127.0.0.1";
-        DATABASE_URL = "postgres://${PGUSER}:${PGPASSWORD}@${PGHOST}:5432/pg?sslmode=disable";
-        PG_CON = "${DATABASE_URL}";
-      };
-
-      podman-runner = pkgs.callPackage ./nix/podman-runner.nix {};
+      devEnvVars = {};
 
       nextest-runner = pkgs.writeShellScriptBin "nextest-runner" ''
         set -e
 
         export PATH="${pkgs.lib.makeBinPath [
-          podman-runner.podman-compose-runner
-          pkgs.wait4x
-          pkgs.sqlx-cli
           pkgs.cargo-nextest
           pkgs.coreutils
-          pkgs.gnumake
           rustToolchain
           pkgs.stdenv.cc
         ]}:$PATH"
-
-        export DATABASE_URL="${devEnvVars.DATABASE_URL}"
-        export PG_CON="${devEnvVars.PG_CON}"
-        export PGDATABASE="${devEnvVars.PGDATABASE}"
-        export PGUSER="${devEnvVars.PGUSER}"
-        export PGPASSWORD="${devEnvVars.PGPASSWORD}"
-        export PGHOST="${devEnvVars.PGHOST}"
-
-        cleanup() {
-          echo "Stopping deps..."
-          ${podman-runner.podman-compose-runner}/bin/podman-compose-runner down || true
-        }
-
-        trap cleanup EXIT
-
-        echo "Starting PostgreSQL..."
-        ${podman-runner.podman-compose-runner}/bin/podman-compose-runner up -d
-
-        echo "Waiting for PostgreSQL to be ready..."
-        ${pkgs.wait4x}/bin/wait4x postgresql "$DATABASE_URL" --timeout 120s
-
-        echo "Running database migrations..."
-        ${pkgs.sqlx-cli}/bin/sqlx migrate run
 
         echo "Running nextest..."
         cargo nextest run --workspace --verbose

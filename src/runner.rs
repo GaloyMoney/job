@@ -16,20 +16,6 @@ pub trait JobInitializer: Send + Sync + 'static {
     type Config: Serialize + DeserializeOwned + Send + Sync;
 
     /// Returns the job type identifier.
-    ///
-    /// For simple cases, return a constant:
-    /// ```ignore
-    /// fn job_type(&self) -> JobType {
-    ///     JobType::new("my-job")
-    /// }
-    /// ```
-    ///
-    /// For configured/parameterized initializers, return from instance:
-    /// ```ignore
-    /// fn job_type(&self) -> JobType {
-    ///     self.job_type.clone()
-    /// }
-    /// ```
     fn job_type(&self) -> JobType;
 
     /// Retry settings to use when the runner returns an error.
@@ -56,14 +42,14 @@ pub enum JobCompletion {
     /// Job finished and returns an `EsEntity` operation that the job service will commit.
     CompleteWithOp(es_entity::DbOp<'static>),
     /// Job finished and returns a transaction that the job service will commit.
-    CompleteWithTx(sqlx::Transaction<'static, sqlx::Postgres>),
+    CompleteWithTx(sqlx::Transaction<'static, es_entity::db::Db>),
     /// Schedule a new run immediately.
     RescheduleNow,
     #[cfg(feature = "es-entity")]
     /// Schedule a new run immediately and return an `EsEntity` operation that the job service will commit.
     RescheduleNowWithOp(es_entity::DbOp<'static>),
     /// Schedule a new run immediately and return a transaction that the job service will commit.
-    RescheduleNowWithTx(sqlx::Transaction<'static, sqlx::Postgres>),
+    RescheduleNowWithTx(sqlx::Transaction<'static, es_entity::db::Db>),
     /// Schedule the next run after a delay.
     RescheduleIn(std::time::Duration),
     #[cfg(feature = "es-entity")]
@@ -71,7 +57,7 @@ pub enum JobCompletion {
     RescheduleInWithOp(es_entity::DbOp<'static>, std::time::Duration),
     /// Schedule the next run after a delay and return a transaction that the job service will commit.
     RescheduleInWithTx(
-        sqlx::Transaction<'static, sqlx::Postgres>,
+        sqlx::Transaction<'static, es_entity::db::Db>,
         std::time::Duration,
     ),
     /// Schedule the next run at an exact timestamp.
@@ -80,7 +66,7 @@ pub enum JobCompletion {
     /// Schedule the next run at an exact timestamp and return an `EsEntity` operation that the job service will commit.
     RescheduleAtWithOp(es_entity::DbOp<'static>, DateTime<Utc>),
     /// Schedule the next run at an exact timestamp and return a transaction that the job service will commit.
-    RescheduleAtWithTx(sqlx::Transaction<'static, sqlx::Postgres>, DateTime<Utc>),
+    RescheduleAtWithTx(sqlx::Transaction<'static, es_entity::db::Db>, DateTime<Utc>),
 }
 
 #[async_trait]
@@ -95,8 +81,6 @@ pub trait JobRunner: Send + Sync + 'static {
 
 #[derive(Debug, Clone)]
 /// Controls retry attempt limits, telemetry escalation thresholds, and exponential backoff behaviour.
-/// Use [`RetrySettings::n_warn_attempts`] to decide how many failures remain `WARN` events before
-/// escalation. Set it to `None` to keep every retry at `WARN`.
 pub struct RetrySettings {
     /// Maximum number of consecutive attempts before the job is failed for good. `None` retries
     /// indefinitely.
@@ -105,17 +89,13 @@ pub struct RetrySettings {
     /// promotes subsequent failures to `ERROR`. `None` disables escalation and keeps every retry
     /// at `WARN`.
     pub n_warn_attempts: Option<u32>,
-    /// Smallest backoff duration when rescheduling failures. Acts as the base for exponential
-    /// backoff growth.
+    /// Smallest backoff duration when rescheduling failures.
     pub min_backoff: std::time::Duration,
-    /// Maximum backoff duration. Once the exponentially increasing delay reaches this value it will
-    /// stop growing.
+    /// Maximum backoff duration.
     pub max_backoff: std::time::Duration,
-    /// Percentage (0-100) jitter applied to the computed backoff window to avoid thundering herds.
+    /// Percentage (0-100) jitter applied to the computed backoff window.
     pub backoff_jitter_pct: u8,
-    /// Multiplier applied to the previous backoff window. Once the elapsed time since the last
-    /// scheduled run exceeds `previous_backoff * attempt_reset_after_backoff_multiples`, the job is
-    /// treated as healthy again and the attempt counter resets to `1`.
+    /// Multiplier applied to the previous backoff window for attempt reset detection.
     pub attempt_reset_after_backoff_multiples: u32,
 }
 
