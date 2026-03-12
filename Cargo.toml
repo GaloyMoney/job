@@ -19,7 +19,7 @@ json-schema = ["dep:schemars", "es-entity/json-schema"]
 tokio-task-names = ["tokio/tracing"]
 
 [dependencies]
-es-entity = { path = "/Users/jcarter/projects/galoymoney/es-entity/.claude/worktrees/sqlite-backend-019cdf3d", default-features = false, features = ["sqlite", "tracing-context"] }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity.git", branch = "task/sqlite-backend-019cdf3d", default-features = false, features = ["sqlite", "tracing-context"] }
 
 async-trait = { workspace = true }
 derive_builder = { workspace = true }

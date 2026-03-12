@@ -457,6 +457,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "es-entity"
 version = "0.10.28-dev"
+source = "git+https://github.com/GaloyMoney/es-entity.git?branch=task%2Fsqlite-backend-019cdf3d#d9fa03e245618d86044016bfe84307ceae21123f"
 dependencies = [
  "chrono",
  "derive_builder",
@@ -480,6 +481,7 @@ dependencies = [
 [[package]]
 name = "es-entity-macros-sqlite"
 version = "0.10.28-dev"
+source = "git+https://github.com/GaloyMoney/es-entity.git?branch=task%2Fsqlite-backend-019cdf3d#d9fa03e245618d86044016bfe84307ceae21123f"
 dependencies = [
  "convert_case",
  "darling 0.23.0",
