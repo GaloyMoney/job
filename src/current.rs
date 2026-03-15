@@ -1,8 +1,8 @@
 //! Execution-time helpers available to running jobs.
 
 use es_entity::clock::ClockHandle;
+use es_entity::db;
 use serde::{Serialize, de::DeserializeOwned};
-use sqlx::PgPool;
 
 use super::{JobId, error::JobError};
 
@@ -10,7 +10,7 @@ use super::{JobId, error::JobError};
 pub struct CurrentJob {
     id: JobId,
     attempt: u32,
-    pool: PgPool,
+    pool: db::Pool,
     execution_state_json: Option<serde_json::Value>,
     shutdown_rx: tokio::sync::broadcast::Receiver<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
@@ -22,7 +22,7 @@ impl CurrentJob {
     pub(super) fn new(
         id: JobId,
         attempt: u32,
-        pool: PgPool,
+        pool: db::Pool,
         execution_state: Option<serde_json::Value>,
         shutdown_rx: tokio::sync::broadcast::Receiver<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
@@ -60,15 +60,17 @@ impl CurrentJob {
     ) -> Result<(), JobError> {
         let execution_state_json = serde_json::to_value(execution_state)
             .map_err(JobError::CouldNotSerializeExecutionState)?;
-        sqlx::query!(
+        let json_str = serde_json::to_string(&execution_state_json)
+            .map_err(JobError::CouldNotSerializeExecutionState)?;
+        sqlx::query(
             r#"
           UPDATE job_executions
-          SET execution_state_json = $1
-          WHERE id = $2
+          SET execution_state_json = ?1
+          WHERE id = ?2
         "#,
-            execution_state_json,
-            &self.id as &JobId
         )
+        .bind(&json_str)
+        .bind(self.id)
         .execute(op.as_executor())
         .await?;
         self.execution_state_json = Some(execution_state_json);
@@ -81,15 +83,17 @@ impl CurrentJob {
     ) -> Result<(), JobError> {
         let execution_state_json = serde_json::to_value(execution_state)
             .map_err(JobError::CouldNotSerializeExecutionState)?;
-        sqlx::query!(
+        let json_str = serde_json::to_string(&execution_state_json)
+            .map_err(JobError::CouldNotSerializeExecutionState)?;
+        sqlx::query(
             r#"
           UPDATE job_executions
-          SET execution_state_json = $1
-          WHERE id = $2
+          SET execution_state_json = ?1
+          WHERE id = ?2
         "#,
-            execution_state_json,
-            &self.id as &JobId
         )
+        .bind(&json_str)
+        .bind(self.id)
         .execute(&self.pool)
         .await?;
         self.execution_state_json = Some(execution_state_json);
@@ -100,7 +104,7 @@ impl CurrentJob {
         &self.id
     }
 
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &db::Pool {
         &self.pool
     }
 
@@ -126,24 +130,6 @@ impl CurrentJob {
     ///
     /// Job runners can use this to detect when the application is shutting down
     /// and perform cleanup or finish their current work gracefully.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use job::CurrentJob;
-    /// # async fn example(mut current_job: CurrentJob) {
-    /// tokio::select! {
-    ///     _ = current_job.shutdown_requested() => {
-    ///         // Shutdown requested, exit gracefully
-    ///         return;
-    ///     }
-    ///     result = do_work() => {
-    ///         // Normal work completion
-    ///     }
-    /// }
-    /// # }
-    /// # async fn do_work() {}
-    /// ```
     pub async fn shutdown_requested(&mut self) -> bool {
         self.shutdown_rx.recv().await.is_ok()
     }

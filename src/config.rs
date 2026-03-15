@@ -2,6 +2,7 @@
 
 use derive_builder::Builder;
 use es_entity::clock::{Clock, ClockHandle};
+use es_entity::db;
 use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
@@ -41,64 +42,21 @@ impl Default for JobPollerConfig {
 #[builder(build_fn(skip))]
 /// Configuration consumed by [`Jobs::init`](crate::Jobs::init).
 /// Build with [`JobSvcConfig::builder`](Self::builder).
-///
-/// # Examples
-///
-/// Build a configuration that manages its own Postgres pool from a connection string:
-///
-/// ```no_run
-/// use job::{Jobs, JobSvcConfig};
-/// use job::error::JobError;
-///
-/// # async fn run() -> Result<(), JobError> {
-/// let config = JobSvcConfig::builder()
-///     .pg_con("postgres://postgres:password@localhost/postgres")
-///     .build()
-///     .unwrap();
-///
-/// let mut jobs = Jobs::init(config).await?;
-/// jobs.start_poll().await?;
-/// # Ok(())
-/// # }
-/// # tokio::runtime::Runtime::new().unwrap().block_on(run()).unwrap();
-/// ```
-///
-/// Reuse an existing `sqlx::PgPool` instead:
-///
-/// ```no_run
-/// use job::{Jobs, JobSvcConfig};
-/// use job::error::JobError;
-/// use sqlx::postgres::PgPoolOptions;
-///
-/// # async fn run() -> Result<(), JobError> {
-/// let pool = PgPoolOptions::new()
-///     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
-///
-/// let config = JobSvcConfig::builder()
-///     .pool(pool)
-///     .exec_migrations(false) // migrations already handled elsewhere
-///     .build()
-///     .unwrap();
-///
-/// let mut jobs = Jobs::init(config).await?;
-/// jobs.start_poll().await?;
-/// # Ok(())
-/// # }
-/// # tokio::runtime::Runtime::new().unwrap().block_on(run()).unwrap();
-/// ```
 pub struct JobSvcConfig {
     #[builder(setter(into, strip_option), default)]
-    /// Provide a Postgres connection string used to build an internal pool. Mutually exclusive with `pool`. When set, `exec_migrations` defaults to `true` unless overridden.
-    pub(super) pg_con: Option<String>,
+    /// Provide a SQLite connection string used to build an internal pool. Mutually exclusive with `pool`.
+    /// When set, `exec_migrations` defaults to `true` unless overridden.
+    pub(super) db_con: Option<String>,
     #[builder(setter(into, strip_option), default)]
     /// Override the maximum number of connections the internally managed pool may open. Ignored when `pool` is supplied.
     pub(super) max_connections: Option<u32>,
     #[builder(default)]
-    /// Set to `true` to have `Jobs::init` run the embedded database migrations during startup. Defaults to `false`, unless `pg_con` is supplied without an explicit value.
+    /// Set to `true` to have `Jobs::init` run the embedded database migrations during startup.
+    /// Defaults to `false`, unless `db_con` is supplied without an explicit value.
     pub(super) exec_migrations: bool,
     #[builder(setter(into, strip_option), default)]
-    /// Inject an existing `sqlx::PgPool` instead of letting the job service build one. Mutually exclusive with `pg_con`.
-    pub(super) pool: Option<sqlx::PgPool>,
+    /// Inject an existing pool instead of letting the job service build one. Mutually exclusive with `db_con`.
+    pub(super) pool: Option<db::Pool>,
     #[builder(default)]
     /// Override the defaults that control how the background poller distributes work across processes.
     pub poller_config: JobPollerConfig,
@@ -116,24 +74,24 @@ impl JobSvcConfig {
 }
 
 impl JobSvcConfigBuilder {
-    /// Validate and construct a [`JobSvcConfig`], ensuring either `pg_con` or `pool` is set.
+    /// Validate and construct a [`JobSvcConfig`], ensuring either `db_con` or `pool` is set.
     pub fn build(&mut self) -> Result<JobSvcConfig, String> {
         // Validate configuration
-        match (self.pg_con.as_ref(), self.pool.as_ref()) {
+        match (self.db_con.as_ref(), self.pool.as_ref()) {
             (None, None) | (Some(None), None) | (None, Some(None)) => {
-                return Err("One of pg_con or pool must be set".to_string());
+                return Err("One of db_con or pool must be set".to_string());
             }
-            (Some(_), Some(_)) => return Err("Only one of pg_con or pool must be set".to_string()),
+            (Some(_), Some(_)) => return Err("Only one of db_con or pool must be set".to_string()),
             _ => (),
         }
 
-        // If pg_con is provided and exec_migrations is not explicitly set, default to true
-        if matches!(self.pg_con.as_ref(), Some(Some(_))) && self.exec_migrations.is_none() {
+        // If db_con is provided and exec_migrations is not explicitly set, default to true
+        if matches!(self.db_con.as_ref(), Some(Some(_))) && self.exec_migrations.is_none() {
             self.exec_migrations = Some(true);
         }
 
         Ok(JobSvcConfig {
-            pg_con: self.pg_con.clone().flatten(),
+            db_con: self.db_con.clone().flatten(),
             max_connections: self.max_connections.flatten(),
             exec_migrations: self.exec_migrations.unwrap_or(false),
             pool: self.pool.clone().flatten(),
