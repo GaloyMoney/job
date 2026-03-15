@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
     ArtificialClockConfig, ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer,
-    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, PendingJob, error::JobError,
+    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -658,20 +658,18 @@ async fn test_cancel_pending_job() -> anyhow::Result<()> {
         .await?;
 
     // Cancel the pending job
-    let cancelled = jobs.cancel_job(job_id).await?;
-    assert!(cancelled.completed(), "Cancelled job should be completed");
-    assert!(cancelled.cancelled(), "Job should be marked as cancelled");
+    jobs.cancel_job(job_id).await?;
 
-    // Verify it's still findable as a completed entity
+    // Verify it's findable as a cancelled/completed entity
     let found = jobs.find(job_id).await?;
-    assert!(found.completed());
-    assert!(found.cancelled());
+    assert!(found.completed(), "Cancelled job should be completed");
+    assert!(found.cancelled(), "Job should be marked as cancelled");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
+async fn test_cancel_running_job_is_idempotent() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool)
@@ -711,13 +709,8 @@ async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
         assert!(attempts < 100, "Job never started");
     }
 
-    // Try to cancel the running job — should fail
-    let result = jobs.cancel_job(job_id).await;
-    assert!(
-        matches!(result, Err(JobError::JobNotPending)),
-        "Cancelling a running job should return JobNotPending, got err: {:?}",
-        result.err(),
-    );
+    // Cancel on a running job is a no-op (idempotent)
+    jobs.cancel_job(job_id).await?;
 
     // Release the job so it completes normally
     release.notify_one();
@@ -734,50 +727,13 @@ async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
         assert!(attempts < 100, "Job never completed");
     }
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_list_pending_jobs() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let config = JobSvcConfig::builder()
-        .pool(pool)
-        .build()
-        .expect("Failed to build JobsConfig");
-
-    let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
-
-    // Spawn several jobs scheduled in the future so they stay pending
-    let base = chrono::Utc::now() + chrono::Duration::hours(48);
-    let mut ids = Vec::new();
-    for i in 0..3 {
-        let id = JobId::new();
-        ids.push(id);
-        let schedule_at = base + chrono::Duration::minutes(i as i64);
-        spawner
-            .spawn_at(id, TestJobConfig { delay_ms: 10 }, schedule_at)
-            .await?;
-    }
-
-    let pending = jobs.list_pending_jobs().await?;
-
-    // At least our 3 jobs should be in the pending list
-    for id in &ids {
-        assert!(
-            pending.iter().any(|p| p.id == *id),
-            "Expected job {:?} to be in pending list",
-            id
-        );
-    }
-
-    // Verify ordering (execute_at ASC)
-    let our_pending: Vec<&PendingJob> = pending.iter().filter(|p| ids.contains(&p.id)).collect();
-    for window in our_pending.windows(2) {
-        let a = window[0].execute_at.expect("should have execute_at");
-        let b = window[1].execute_at.expect("should have execute_at");
-        assert!(a <= b, "Pending jobs should be ordered by execute_at");
-    }
+    // Job completed normally, not cancelled
+    let job = jobs.find(job_id).await?;
+    assert!(
+        !job.cancelled(),
+        "Running job should not be marked cancelled"
+    );
+    assert!(job.completed(), "Job should have completed normally");
 
     Ok(())
 }

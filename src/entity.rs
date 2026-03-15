@@ -35,6 +35,7 @@ impl JobType {
         &self.0
     }
 
+    #[cfg(test)]
     pub(crate) fn from_owned(job_type: String) -> Self {
         JobType(Cow::Owned(job_type))
     }
@@ -235,8 +236,12 @@ impl Job {
         self.events.push(JobEvent::JobCompleted);
     }
 
-    pub(crate) fn cancel(&mut self) {
+    pub(crate) fn cancel(&mut self) -> es_entity::Idempotent<()> {
+        if self.completed() {
+            return es_entity::Idempotent::AlreadyApplied;
+        }
         self.events.push(JobEvent::Cancelled);
+        es_entity::Idempotent::Executed(())
     }
 
     pub(super) fn schedule_retry(
