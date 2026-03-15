@@ -484,22 +484,29 @@ impl Jobs {
     /// Cancel a pending job, removing it from the execution queue.
     ///
     /// This operation is idempotent — calling it on an already cancelled or
-    /// completed job is a no-op. When the job is still pending, the execution
-    /// record is deleted and a [`JobEvent::Cancelled`] event is persisted.
+    /// completed job is a no-op. If the job exists but is currently running
+    /// (not pending), returns [`JobError::CannotCancelJob`].
     #[instrument(name = "job.cancel_job", skip(self))]
     pub async fn cancel_job(&self, id: JobId) -> Result<(), JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id(id).await?;
 
         if job.cancel().did_execute() {
-            sqlx::query("DELETE FROM job_executions WHERE id = $1 AND state = 'pending'")
-                .bind(id as JobId)
-                .execute(op.as_executor())
-                .await?;
+            let result = sqlx::query!(
+                r#"DELETE FROM job_executions WHERE id = $1 AND state = 'pending'"#,
+                id as JobId,
+            )
+            .execute(op.as_executor())
+            .await?;
+
+            if result.rows_affected() == 0 {
+                return Err(JobError::CannotCancelJob);
+            }
+
+            self.repo.update_in_op(&mut op, &mut job).await?;
+            op.commit().await?;
         }
 
-        self.repo.update_in_op(&mut op, &mut job).await?;
-        op.commit().await?;
         Ok(())
     }
 

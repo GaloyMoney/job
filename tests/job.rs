@@ -669,7 +669,7 @@ async fn test_cancel_pending_job() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_cancel_running_job_is_idempotent() -> anyhow::Result<()> {
+async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool)
@@ -709,8 +709,13 @@ async fn test_cancel_running_job_is_idempotent() -> anyhow::Result<()> {
         assert!(attempts < 100, "Job never started");
     }
 
-    // Cancel on a running job is a no-op (idempotent)
-    jobs.cancel_job(job_id).await?;
+    // Cancel on a running job should fail
+    let result = jobs.cancel_job(job_id).await;
+    assert!(
+        matches!(result, Err(JobError::CannotCancelJob)),
+        "Cancelling a running job should return JobNotPending, got err: {:?}",
+        result.err(),
+    );
 
     // Release the job so it completes normally
     release.notify_one();
@@ -727,13 +732,50 @@ async fn test_cancel_running_job_is_idempotent() -> anyhow::Result<()> {
         assert!(attempts < 100, "Job never completed");
     }
 
-    // Job completed normally, not cancelled
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let job_id = JobId::new();
+    spawner
+        .spawn(job_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+
+    // Wait for the job to complete
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let job = jobs.find(job_id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job never completed");
+    }
+
+    // Cancel on an already completed job is a no-op
+    jobs.cancel_job(job_id).await?;
+
     let job = jobs.find(job_id).await?;
     assert!(
         !job.cancelled(),
-        "Running job should not be marked cancelled"
+        "Completed job should not be marked cancelled"
     );
-    assert!(job.completed(), "Job should have completed normally");
+    assert!(job.completed(), "Job should still be completed");
 
     Ok(())
 }
