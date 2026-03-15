@@ -638,3 +638,144 @@ async fn test_bulk_spawn_empty_batch() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_cancel_pending_job() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
+    // Spawn a job scheduled far in the future so it stays pending
+    let job_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(job_id, TestJobConfig { delay_ms: 50 }, schedule_at)
+        .await?;
+
+    // Cancel the pending job
+    jobs.cancel_job(job_id).await?;
+
+    // Verify it's findable as a cancelled/completed entity
+    let found = jobs.find(job_id).await?;
+    assert!(found.completed(), "Cancelled job should be completed");
+    assert!(found.cancelled(), "Job should be marked as cancelled");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let release = Arc::new(Notify::new());
+
+    let spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("cancel-running-test"),
+        started: Arc::clone(&started),
+        completed: Arc::clone(&completed),
+        release: Arc::clone(&release),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let job_id = JobId::new();
+    spawner
+        .spawn(job_id, QueueJobConfig { label: "X".into() })
+        .await?;
+
+    // Wait for the job to start running
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if !started.lock().await.is_empty() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job never started");
+    }
+
+    // Cancel on a running job should fail
+    let result = jobs.cancel_job(job_id).await;
+    assert!(
+        matches!(result, Err(JobError::CannotCancelJob)),
+        "Cancelling a running job should return JobNotPending, got err: {:?}",
+        result.err(),
+    );
+
+    // Release the job so it completes normally
+    release.notify_one();
+
+    // Wait for completion
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let job = jobs.find(job_id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job never completed");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let job_id = JobId::new();
+    spawner
+        .spawn(job_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+
+    // Wait for the job to complete
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let job = jobs.find(job_id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job never completed");
+    }
+
+    // Cancel on an already completed job is a no-op
+    jobs.cancel_job(job_id).await?;
+
+    let job = jobs.find(job_id).await?;
+    assert!(
+        !job.cancelled(),
+        "Completed job should not be marked cancelled"
+    );
+    assert!(job.completed(), "Job should still be completed");
+
+    Ok(())
+}
