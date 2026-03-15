@@ -221,6 +221,7 @@ mod tracker;
 
 pub mod error;
 
+use es_entity::AtomicOperation;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
@@ -540,24 +541,28 @@ impl Jobs {
         }
 
         // 4. Try to cancel a pending job — DELETE from job_executions where state = 'pending'
-        let pending_result = sqlx::query(
-            r#"
-            DELETE FROM job_executions
-            WHERE id = $1 AND state = 'pending'
-            "#,
-        )
-        .bind(id)
-        .execute(self.repo.pool())
-        .await?;
-
-        if pending_result.rows_affected() > 0 {
-            // Record events
+        //    Both the DELETE and event recording happen in the same transaction so
+        //    a crash between the two cannot leave the execution row gone but the
+        //    job entity un-cancelled.
+        {
             let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-            let mut job = self.repo.find_by_id(id).await?;
-            job.cancel_job();
-            self.repo.update_in_op(&mut op, &mut job).await?;
-            op.commit().await?;
-            return Ok(CancelResult::CancelledWhilePending);
+            let pending_result = sqlx::query!(
+                r#"
+                DELETE FROM job_executions
+                WHERE id = $1 AND state = 'pending'
+                "#,
+                id as JobId,
+            )
+            .execute(op.as_executor())
+            .await?;
+
+            if pending_result.rows_affected() > 0 {
+                let mut job = self.repo.find_by_id(id).await?;
+                job.cancel_job();
+                self.repo.update_in_op(&mut op, &mut job).await?;
+                op.commit().await?;
+                return Ok(CancelResult::CancelledWhilePending);
+            }
         }
 
         // 5. Try to cancel a running job — SET cancelled_at
