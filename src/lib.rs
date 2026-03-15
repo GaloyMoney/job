@@ -215,12 +215,12 @@ mod poller;
 mod registry;
 mod repo;
 mod runner;
+mod running_registry;
 mod spawner;
 mod tracker;
 
 pub mod error;
 
-use es_entity::AtomicOperation;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
@@ -239,8 +239,32 @@ pub use spawner::*;
 use error::*;
 use poller::*;
 use repo::*;
+use running_registry::RunningJobRegistry;
+
+#[derive(sqlx::FromRow)]
+struct CancelRunningRow {
+    poller_instance_id: Option<uuid::Uuid>,
+}
 
 es_entity::entity_id! { JobId }
+
+/// Outcome of a [`Jobs::cancel_job`] request.
+#[derive(Debug, Clone)]
+pub enum CancelResult {
+    /// The job was still pending and has been immediately cancelled.
+    CancelledWhilePending,
+    /// The job was running; a cancel signal has been sent via `cancelled_at` / NOTIFY.
+    CancelledWhileRunning {
+        /// The poller instance that owns the running job.
+        poller_instance_id: uuid::Uuid,
+    },
+    /// The job had already finished (successfully or with an error).
+    AlreadyCompleted,
+    /// The job was already cancelled.
+    AlreadyCancelled,
+    /// No job with this identifier exists.
+    NotFound,
+}
 
 #[derive(Clone)]
 /// Primary entry point for interacting with the Job crate. Provides APIs to register job
@@ -249,6 +273,7 @@ pub struct Jobs {
     config: JobSvcConfig,
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
+    running_registry: RunningJobRegistry,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -278,11 +303,13 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
+        let running_registry = RunningJobRegistry::new();
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
+            running_registry,
             poller_handle: None,
             clock,
         })
@@ -444,6 +471,7 @@ impl Jobs {
                 self.config.poller_config.clone(),
                 Arc::clone(&self.repo),
                 registry,
+                self.running_registry.clone(),
                 self.clock.clone(),
             )
             .start()
@@ -481,33 +509,87 @@ impl Jobs {
         Ok(self.repo.find_by_id(id).await?)
     }
 
-    /// Cancel a pending job, removing it from the execution queue.
+    /// Cancel a running or pending job.
     ///
-    /// This operation is idempotent — calling it on an already cancelled or
-    /// completed job is a no-op. If the job exists but is currently running
-    /// (not pending), returns [`JobError::CannotCancelJob`].
-    #[instrument(name = "job.cancel_job", skip(self))]
-    pub async fn cancel_job(&self, id: JobId) -> Result<(), JobError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id(id).await?;
+    /// The method is idempotent: calling it on an already-cancelled or
+    /// already-completed job returns the appropriate variant without error.
+    ///
+    /// For **pending** jobs the execution row is deleted immediately and
+    /// cancellation events are recorded.
+    ///
+    /// For **running** jobs the `cancelled_at` column is set, which fires a
+    /// Postgres NOTIFY picked up by the owning poller. The poller then
+    /// cooperatively cancels the job (with a force-abort fallback).
+    #[instrument(name = "job.cancel_job", skip(self), fields(id = %id), err)]
+    pub async fn cancel_job(&self, id: JobId) -> Result<CancelResult, JobError> {
+        // 1. Check if the job entity exists
+        let job = match self.repo.find_by_id(id).await {
+            Ok(j) => j,
+            Err(e) if e.was_not_found() => return Ok(CancelResult::NotFound),
+            Err(e) => return Err(e.into()),
+        };
 
-        if job.cancel().did_execute() {
-            let result = sqlx::query!(
-                r#"DELETE FROM job_executions WHERE id = $1 AND state = 'pending'"#,
-                id as JobId,
-            )
-            .execute(op.as_executor())
-            .await?;
-
-            if result.rows_affected() == 0 {
-                return Err(JobError::CannotCancelJob);
-            }
-
-            self.repo.update_in_op(&mut op, &mut job).await?;
-            op.commit().await?;
+        // 2. Already cancelled?
+        if job.cancelled() {
+            return Ok(CancelResult::AlreadyCancelled);
         }
 
-        Ok(())
+        // 3. Already completed?
+        if job.completed() {
+            return Ok(CancelResult::AlreadyCompleted);
+        }
+
+        // 4. Try to cancel a pending job — DELETE from job_executions where state = 'pending'
+        let pending_result = sqlx::query(
+            r#"
+            DELETE FROM job_executions
+            WHERE id = $1 AND state = 'pending'
+            "#,
+        )
+        .bind(id)
+        .execute(self.repo.pool())
+        .await?;
+
+        if pending_result.rows_affected() > 0 {
+            // Record events
+            let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+            let mut job = self.repo.find_by_id(id).await?;
+            job.cancel_job();
+            self.repo.update_in_op(&mut op, &mut job).await?;
+            op.commit().await?;
+            return Ok(CancelResult::CancelledWhilePending);
+        }
+
+        // 5. Try to cancel a running job — SET cancelled_at
+        let running_row = sqlx::query_as::<_, CancelRunningRow>(
+            r#"
+            UPDATE job_executions
+            SET cancelled_at = COALESCE(cancelled_at, NOW())
+            WHERE id = $1 AND state = 'running'
+            RETURNING poller_instance_id
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(self.repo.pool())
+        .await?;
+
+        if let Some(row) = running_row {
+            let poller_instance_id = row.poller_instance_id.unwrap_or(uuid::Uuid::nil());
+            // Also try local cancel in case we're on the same node
+            self.running_registry.cancel(&id);
+            return Ok(CancelResult::CancelledWhileRunning { poller_instance_id });
+        }
+
+        // 6. Neither pending nor running matched — re-check state
+        let job = self.repo.find_by_id(id).await?;
+        if job.cancelled() {
+            Ok(CancelResult::AlreadyCancelled)
+        } else if job.completed() {
+            Ok(CancelResult::AlreadyCompleted)
+        } else {
+            // Edge case: job might have been re-scheduled between our checks
+            Ok(CancelResult::NotFound)
+        }
     }
 
     /// Returns a reference to the clock used by this job service.

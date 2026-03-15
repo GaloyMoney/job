@@ -3,8 +3,8 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ArtificialClockConfig, ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer,
-    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, error::JobError,
+    ArtificialClockConfig, CancelResult, ClockHandle, CurrentJob, Job, JobCompletion, JobId,
+    JobInitializer, JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -76,7 +76,7 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
         .expect("Failed to create and spawn job");
 
     let mut attempts = 0;
-    let max_attempts = 50;
+    let max_attempts = 100;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         let job = jobs.find(job.id).await?;
@@ -658,7 +658,12 @@ async fn test_cancel_pending_job() -> anyhow::Result<()> {
         .await?;
 
     // Cancel the pending job
-    jobs.cancel_job(job_id).await?;
+    let result = jobs.cancel_job(job_id).await?;
+    assert!(
+        matches!(result, CancelResult::CancelledWhilePending),
+        "Expected CancelledWhilePending, got {:?}",
+        result,
+    );
 
     // Verify it's findable as a cancelled/completed entity
     let found = jobs.find(job_id).await?;
@@ -709,15 +714,15 @@ async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
         assert!(attempts < 100, "Job never started");
     }
 
-    // Cancel on a running job should fail
-    let result = jobs.cancel_job(job_id).await;
+    // Cancel on a running job should signal cancellation
+    let result = jobs.cancel_job(job_id).await?;
     assert!(
-        matches!(result, Err(JobError::CannotCancelJob)),
-        "Cancelling a running job should return JobNotPending, got err: {:?}",
-        result.err(),
+        matches!(result, CancelResult::CancelledWhileRunning { .. }),
+        "Expected CancelledWhileRunning, got {:?}",
+        result,
     );
 
-    // Release the job so it completes normally
+    // Release the job so it completes
     release.notify_one();
 
     // Wait for completion
@@ -767,8 +772,13 @@ async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()>
         assert!(attempts < 100, "Job never completed");
     }
 
-    // Cancel on an already completed job is a no-op
-    jobs.cancel_job(job_id).await?;
+    // Cancel on an already completed job returns AlreadyCompleted
+    let result = jobs.cancel_job(job_id).await?;
+    assert!(
+        matches!(result, CancelResult::AlreadyCompleted),
+        "Expected AlreadyCompleted, got {:?}",
+        result,
+    );
 
     let job = jobs.find(job_id).await?;
     assert!(

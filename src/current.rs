@@ -3,6 +3,7 @@
 use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 use super::{JobId, error::JobError};
 
@@ -15,6 +16,7 @@ pub struct CurrentJob {
     shutdown_rx: tokio::sync::broadcast::Receiver<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
+    cancel_token: CancellationToken,
     clock: ClockHandle,
 }
 
@@ -27,6 +29,7 @@ impl CurrentJob {
         shutdown_rx: tokio::sync::broadcast::Receiver<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
+        cancel_token: CancellationToken,
         clock: ClockHandle,
     ) -> Self {
         Self {
@@ -35,6 +38,7 @@ impl CurrentJob {
             pool,
             execution_state_json: execution_state,
             shutdown_rx,
+            cancel_token,
             clock,
         }
     }
@@ -154,5 +158,38 @@ impl CurrentJob {
     /// Use this for polling-style shutdown detection within loops.
     pub fn is_shutdown_requested(&mut self) -> bool {
         self.shutdown_rx.try_recv().is_ok()
+    }
+
+    /// Wait for a cancellation signal. Resolves when the job has been cancelled.
+    ///
+    /// Unlike [`shutdown_requested`](Self::shutdown_requested), this is specific
+    /// to an individual job being cancelled (e.g. via [`Jobs::cancel_job`](crate::Jobs::cancel_job)).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use job::CurrentJob;
+    /// # async fn example(current_job: CurrentJob) {
+    /// tokio::select! {
+    ///     _ = current_job.cancellation_requested() => {
+    ///         // Cancellation requested, clean up and exit
+    ///         return;
+    ///     }
+    ///     result = do_work() => {
+    ///         // Normal work completion
+    ///     }
+    /// }
+    /// # }
+    /// # async fn do_work() {}
+    /// ```
+    pub async fn cancellation_requested(&self) {
+        self.cancel_token.cancelled().await;
+    }
+
+    /// Non-blocking check if cancellation has been requested for this job.
+    ///
+    /// Returns `true` if the job's cancellation token has been triggered.
+    pub fn is_cancellation_requested(&self) -> bool {
+        self.cancel_token.is_cancelled()
     }
 }

@@ -24,6 +24,10 @@ pub struct JobPollerConfig {
     #[serde(default = "default_shutdown_timeout")]
     /// How long to wait for jobs to complete gracefully during shutdown before rescheduling them.
     pub shutdown_timeout: Duration,
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_cancel_timeout")]
+    /// How long to wait for a cancelled job to finish cooperatively before force-aborting it.
+    pub cancel_timeout: Duration,
 }
 
 impl Default for JobPollerConfig {
@@ -33,6 +37,7 @@ impl Default for JobPollerConfig {
             max_jobs_per_process: default_max_jobs_per_process(),
             min_jobs_per_process: default_min_jobs_per_process(),
             shutdown_timeout: default_shutdown_timeout(),
+            cancel_timeout: default_cancel_timeout(),
         }
     }
 }
@@ -159,5 +164,9 @@ fn default_min_jobs_per_process() -> usize {
 }
 
 fn default_shutdown_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_cancel_timeout() -> Duration {
     Duration::from_secs(5)
 }
