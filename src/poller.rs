@@ -14,7 +14,8 @@ use std::{
 
 use super::{
     JobId, config::JobPollerConfig, dispatcher::*, error::JobError, handle::OwnedTaskHandle,
-    registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
+    registry::JobRegistry, repo::JobRepo, running_registry::RunningJobRegistry,
+    tracker::JobTracker,
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -40,6 +41,7 @@ pub(crate) struct JobPoller {
     config: JobPollerConfig,
     repo: Arc<JobRepo>,
     registry: JobRegistry,
+    running_registry: RunningJobRegistry,
     tracker: Arc<JobTracker>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<
@@ -60,6 +62,8 @@ pub(crate) struct JobPollerHandle {
     shutdown_timeout: Duration,
     max_jobs_per_process: usize,
     repo: Arc<JobRepo>,
+    #[allow(dead_code)]
+    pub(crate) running_registry: RunningJobRegistry,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
 }
@@ -71,6 +75,7 @@ impl JobPoller {
         config: JobPollerConfig,
         repo: Arc<JobRepo>,
         registry: JobRegistry,
+        running_registry: RunningJobRegistry,
         clock: ClockHandle,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
@@ -84,6 +89,7 @@ impl JobPoller {
             repo,
             config,
             registry,
+            running_registry,
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
             clock,
@@ -96,6 +102,7 @@ impl JobPoller {
         let keep_alive_handle = self.start_keep_alive_handler();
         let shutdown_tx = self.shutdown_tx.clone();
         let repo = Arc::clone(&self.repo);
+        let running_registry = self.running_registry.clone();
         let instance_id = self.instance_id;
         let shutdown_timeout = self.config.shutdown_timeout;
         let max_jobs_per_process = self.config.max_jobs_per_process;
@@ -116,6 +123,7 @@ impl JobPoller {
             shutdown_tx,
             shutdown_called: Arc::new(AtomicBool::new(false)),
             repo,
+            running_registry,
             instance_id,
             shutdown_timeout,
             max_jobs_per_process,
@@ -205,7 +213,9 @@ impl JobPoller {
     async fn start_listener(&self) -> Result<OwnedTaskHandle, sqlx::Error> {
         let mut listener = PgListener::connect_with(self.repo.pool()).await?;
         listener.listen("job_execution").await?;
+        listener.listen("job_cancel").await?;
         let tracker = self.tracker.clone();
+        let running_registry = self.running_registry.clone();
         let supported_job_types = self.registry.registered_job_types();
         Ok(OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-listener",
@@ -213,10 +223,27 @@ impl JobPoller {
                 loop {
                     match listener.recv().await {
                         Ok(notification) => {
-                            let job_type = notification.payload();
-                            // Only wake the tracker if this is a job type we support
-                            if supported_job_types.iter().any(|jt| jt.as_str() == job_type) {
-                                tracker.job_execution_inserted();
+                            let channel = notification.channel();
+                            let payload = notification.payload();
+                            match channel {
+                                "job_cancel" => {
+                                    // payload is the job execution id (UUID)
+                                    if let Ok(id) = payload.parse::<uuid::Uuid>() {
+                                        let job_id = JobId::from(id);
+                                        if running_registry.cancel(&job_id) {
+                                            tracing::info!(
+                                                job_id = %job_id,
+                                                "cancelled running job via NOTIFY"
+                                            );
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // job_execution channel — wake tracker
+                                    if supported_job_types.iter().any(|jt| jt.as_str() == payload) {
+                                        tracker.job_execution_inserted();
+                                    }
+                                }
                             }
                         }
                         Err(_) => {
@@ -274,6 +301,7 @@ impl JobPoller {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
         let instance_id = self.instance_id;
+        let running_registry = self.running_registry.clone();
         let clock = self.clock.clone();
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
@@ -304,6 +332,29 @@ impl JobPoller {
                     {
                         Ok(_) => {
                             failures = 0;
+                            // Fallback: pick up missed NOTIFY by checking for cancelled jobs
+                            if let Ok(rows) = sqlx::query_as::<_, CancelledJobRow>(
+                                r#"
+                                SELECT id
+                                FROM job_executions
+                                WHERE poller_instance_id = $1
+                                  AND state = 'running'
+                                  AND cancelled_at IS NOT NULL
+                                "#,
+                            )
+                            .bind(instance_id)
+                            .fetch_all(&pool)
+                            .await
+                            {
+                                for row in rows {
+                                    if running_registry.cancel(&row.id) {
+                                        tracing::info!(
+                                            job_id = %row.id,
+                                            "cancelled running job via keep-alive fallback"
+                                        );
+                                    }
+                                }
+                            }
                             job_lost_interval / 4
                         }
                         Err(e) => {
@@ -337,6 +388,9 @@ impl JobPoller {
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = Arc::clone(&self.repo);
         let tracker = self.tracker.clone();
+        let running_registry = self.running_registry.clone();
+        let cancel_token = running_registry.register(job.id);
+        let cancel_token_for_monitor = cancel_token.clone();
         let instance_id = self.instance_id;
         let clock = self.clock.clone();
         span.record("now", tracing::field::display(clock.now()));
@@ -361,6 +415,8 @@ impl JobPoller {
                 job.id,
                 runner,
                 instance_id,
+                running_registry,
+                cancel_token,
                 clock,
             )
             .execute_job(polled_job, shutdown_rx)
@@ -371,7 +427,10 @@ impl JobPoller {
         });
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let cancel_timeout = self.config.cancel_timeout;
         let shutdown_timeout = self.config.shutdown_timeout;
+        let monitor_repo = Arc::clone(&self.repo);
+        let monitor_clock = self.clock.clone();
         #[cfg_attr(
             not(all(feature = "tokio-task-names", tokio_unstable)),
             allow(unused_variables)
@@ -385,7 +444,36 @@ impl JobPoller {
 
             tokio::select! {
                 _ = &mut job_handle => {
-                    // Job completed - no need for shutdown coordination
+                    // Job completed - no need for shutdown/cancel coordination
+                }
+                _ = cancel_token_for_monitor.cancelled() => {
+                    // Cancellation requested — give the job time to exit cooperatively,
+                    // then force-abort if it hasn't finished.
+                    async {
+                        if tokio::time::timeout(cancel_timeout, &mut job_handle).await.is_ok() {
+                            tracing::info!("Job completed cooperatively after cancel signal");
+                        } else {
+                            tracing::warn!("Job did not finish within cancel timeout, aborting");
+                            job_handle.abort();
+                            let _ = (&mut job_handle).await;
+
+                            // The dispatcher was aborted before it could record events.
+                            // Record ExecutionCancelled + JobCancelled ourselves.
+                            if let Err(e) = force_cancel_job(
+                                &monitor_repo,
+                                &monitor_clock,
+                                job_id,
+                                instance_id,
+                            ).await {
+                                tracing::error!(error = %e, "failed to record force-cancel events");
+                            }
+                        }
+                    }.instrument(tracing::info_span!(
+                        parent: None,
+                        "job.cancel_coordination",
+                        job_id = %job_id,
+                        job_type = %job_type,
+                    )).await;
                 }
                 Ok(shutdown_notifier) = shutdown_rx.recv() => {
                     let (send, recv) = tokio::sync::oneshot::channel();
@@ -432,6 +520,33 @@ impl JobPoller {
     }
 }
 
+/// Called by the monitor task after force-aborting a running job that did not
+/// cooperate within the cancel timeout. Records cancellation events and removes
+/// the execution row.
+async fn force_cancel_job(
+    repo: &JobRepo,
+    clock: &ClockHandle,
+    job_id: JobId,
+    instance_id: uuid::Uuid,
+) -> Result<(), JobError> {
+    let mut op = repo.begin_op_with_clock(clock).await?;
+    let mut job = repo.find_by_id(job_id).await?;
+    sqlx::query(
+        r#"
+        DELETE FROM job_executions
+        WHERE id = $1 AND poller_instance_id = $2
+        "#,
+    )
+    .bind(job_id)
+    .bind(instance_id)
+    .execute(op.as_executor())
+    .await?;
+    job.cancel_job();
+    repo.update_in_op(&mut op, &mut job).await?;
+    op.commit().await?;
+    Ok(())
+}
+
 #[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
 async fn poll_jobs(
     pool: &PgPool,
@@ -443,13 +558,17 @@ async fn poll_jobs(
     let now = clock.now();
     Span::current().record("now", tracing::field::display(now));
 
-    let rows = sqlx::query_as!(
-        JobPollRow,
+    let job_type_strings: Vec<String> = supported_job_types
+        .iter()
+        .map(|jt| jt.as_str().to_owned())
+        .collect();
+    let rows: Vec<JobPollRow> = sqlx::query_as(
         r#"
         WITH eligible AS (
             SELECT id, queue_id, execute_at, execution_state_json, attempt_index
             FROM job_executions
             WHERE state = 'pending'
+            AND cancelled_at IS NULL
             AND job_type = ANY($4)
             AND NOT EXISTS (
                 SELECT 1 FROM job_executions AS running
@@ -490,31 +609,36 @@ async fn poll_jobs(
         )
         SELECT * FROM (
             SELECT
-                u.id AS "id?: JobId",
-                u.data_json AS "data_json?: JsonValue",
-                u.attempt_index AS "attempt_index?",
-                NULL::INTERVAL AS "max_wait?: PgInterval"
+                u.id,
+                u.data_json,
+                u.attempt_index,
+                NULL::INTERVAL AS max_wait
             FROM updated u
             UNION ALL
             SELECT
-                NULL::UUID AS "id?: JobId",
-                NULL::JSONB AS "data_json?: JsonValue",
-                NULL::INT AS "attempt_index?",
-                mw.wait_time AS "max_wait?: PgInterval"
+                NULL::UUID,
+                NULL::JSONB,
+                NULL::INT,
+                mw.wait_time
             FROM min_wait mw
             WHERE NOT EXISTS (SELECT 1 FROM updated)
         ) AS result
         "#,
-        n_jobs_to_poll as i32,
-        now,
-        instance_id,
-        supported_job_types as _,
     )
+    .bind(n_jobs_to_poll as i32)
+    .bind(now)
+    .bind(instance_id)
+    .bind(&job_type_strings)
     .fetch_all(pool)
     .await?;
 
     Span::current().record("n_jobs_found", rows.len());
     Ok(JobPollResult::from_rows(rows))
+}
+
+#[derive(sqlx::FromRow)]
+struct CancelledJobRow {
+    id: JobId,
 }
 
 #[derive(Debug)]
@@ -523,7 +647,7 @@ enum JobPollResult {
     WaitTillNextJob(Duration),
 }
 
-#[derive(Debug)]
+#[derive(Debug, sqlx::FromRow)]
 struct JobPollRow {
     id: Option<JobId>,
     data_json: Option<JsonValue>,

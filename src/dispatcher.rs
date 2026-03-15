@@ -3,13 +3,14 @@ use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
+use tokio_util::sync::CancellationToken;
 use tracing::{Span, instrument};
 
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use super::{
     JobId, current::CurrentJob, entity::RetryPolicy, error::JobError, repo::JobRepo, runner::*,
-    tracker::JobTracker,
+    running_registry::RunningJobRegistry, tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -24,18 +25,24 @@ pub(crate) struct JobDispatcher {
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
+    running_registry: RunningJobRegistry,
+    cancel_token: CancellationToken,
+    job_id: JobId,
     rescheduled: bool,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
 }
 impl JobDispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
         retry_settings: RetrySettings,
-        _id: JobId,
+        id: JobId,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
+        running_registry: RunningJobRegistry,
+        cancel_token: CancellationToken,
         clock: ClockHandle,
     ) -> Self {
         Self {
@@ -43,6 +50,9 @@ impl JobDispatcher {
             retry_settings,
             runner: Some(runner),
             tracker,
+            running_registry,
+            cancel_token,
+            job_id: id,
             rescheduled: false,
             instance_id,
             clock,
@@ -88,6 +98,7 @@ impl JobDispatcher {
             self.repo.pool().clone(),
             polled_job.data_json,
             shutdown_rx,
+            self.cancel_token.clone(),
             self.clock.clone(),
         );
         self.tracker.dispatch_job();
@@ -95,6 +106,10 @@ impl JobDispatcher {
             Err(e) => {
                 span.record("conclusion", "Error");
                 self.fail_job(job.id, e, polled_job.attempt).await?
+            }
+            Ok(JobCompletion::Cancelled) => {
+                span.record("conclusion", "Cancelled");
+                self.cancel_and_complete_job(job.id).await?;
             }
             Ok(JobCompletion::Complete) => {
                 span.record("conclusion", "Complete");
@@ -331,6 +346,26 @@ impl JobDispatcher {
         Ok(())
     }
 
+    #[instrument(name = "job.cancel_and_complete_job", skip(self), fields(id = %id))]
+    async fn cancel_and_complete_job(&mut self, id: JobId) -> Result<(), JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let mut job = self.repo.find_by_id(&id).await?;
+        sqlx::query!(
+            r#"
+          DELETE FROM job_executions
+          WHERE id = $1 AND poller_instance_id = $2
+        "#,
+            id as JobId,
+            self.instance_id
+        )
+        .execute(op.as_executor())
+        .await?;
+        job.cancel_job();
+        self.repo.update_in_op(&mut op, &mut job).await?;
+        op.commit().await?;
+        Ok(())
+    }
+
     #[instrument(name = "job.reschedule_job", skip(self, op), fields(id = %id, reschedule_at = %reschedule_at, attempt = 1))]
     async fn reschedule_job(
         &mut self,
@@ -360,6 +395,7 @@ impl JobDispatcher {
 
 impl Drop for JobDispatcher {
     fn drop(&mut self) {
+        self.running_registry.remove(&self.job_id);
         self.tracker.job_completed(self.rescheduled)
     }
 }

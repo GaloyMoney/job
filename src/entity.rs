@@ -68,7 +68,9 @@ pub enum JobEvent {
     ExecutionErrored {
         error: String,
     },
+    ExecutionCancelled,
     JobCompleted,
+    JobCancelled,
     AttemptCounterReset,
 }
 
@@ -182,6 +184,19 @@ impl Job {
             .iter_all()
             .rev()
             .any(|event| matches!(event, JobEvent::JobCompleted))
+    }
+
+    /// Returns `true` once the job has emitted a `JobCancelled` event.
+    pub fn cancelled(&self) -> bool {
+        self.events
+            .iter_all()
+            .rev()
+            .any(|event| matches!(event, JobEvent::JobCancelled))
+    }
+
+    pub(super) fn cancel_job(&mut self) {
+        self.events.push(JobEvent::ExecutionCancelled);
+        self.events.push(JobEvent::JobCancelled);
     }
 
     pub(crate) fn inject_tracing_parent(&self) {
@@ -315,7 +330,9 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionCompleted => {}
                 JobEvent::ExecutionAborted { .. } => {}
                 JobEvent::ExecutionErrored { .. } => {}
+                JobEvent::ExecutionCancelled => {}
                 JobEvent::JobCompleted => {}
+                JobEvent::JobCancelled => {}
                 JobEvent::AttemptCounterReset => {}
             }
         }
