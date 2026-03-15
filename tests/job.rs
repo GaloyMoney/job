@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
     ArtificialClockConfig, ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer,
-    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, error::JobError,
+    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, PendingJob, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -635,6 +635,149 @@ async fn test_bulk_spawn_empty_batch() -> anyhow::Result<()> {
 
     let result = spawner.spawn_all(vec![]).await?;
     assert!(result.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cancel_pending_job() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
+    // Spawn a job scheduled far in the future so it stays pending
+    let job_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(job_id, TestJobConfig { delay_ms: 50 }, schedule_at)
+        .await?;
+
+    // Cancel the pending job
+    let cancelled = jobs.cancel_job(job_id).await?;
+    assert!(cancelled.completed(), "Cancelled job should be completed");
+    assert!(cancelled.cancelled(), "Job should be marked as cancelled");
+
+    // Verify it's still findable as a completed entity
+    let found = jobs.find(job_id).await?;
+    assert!(found.completed());
+    assert!(found.cancelled());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let release = Arc::new(Notify::new());
+
+    let spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("cancel-running-test"),
+        started: Arc::clone(&started),
+        completed: Arc::clone(&completed),
+        release: Arc::clone(&release),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let job_id = JobId::new();
+    spawner
+        .spawn(job_id, QueueJobConfig { label: "X".into() })
+        .await?;
+
+    // Wait for the job to start running
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if !started.lock().await.is_empty() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job never started");
+    }
+
+    // Try to cancel the running job — should fail
+    let result = jobs.cancel_job(job_id).await;
+    assert!(
+        matches!(result, Err(JobError::JobNotPending)),
+        "Cancelling a running job should return JobNotPending, got err: {:?}",
+        result.err(),
+    );
+
+    // Release the job so it completes normally
+    release.notify_one();
+
+    // Wait for completion
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let job = jobs.find(job_id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job never completed");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_pending_jobs() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer);
+
+    // Spawn several jobs scheduled in the future so they stay pending
+    let base = chrono::Utc::now() + chrono::Duration::hours(48);
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let id = JobId::new();
+        ids.push(id);
+        let schedule_at = base + chrono::Duration::minutes(i as i64);
+        spawner
+            .spawn_at(id, TestJobConfig { delay_ms: 10 }, schedule_at)
+            .await?;
+    }
+
+    let pending = jobs.list_pending_jobs().await?;
+
+    // At least our 3 jobs should be in the pending list
+    for id in &ids {
+        assert!(
+            pending.iter().any(|p| p.id == *id),
+            "Expected job {:?} to be in pending list",
+            id
+        );
+    }
+
+    // Verify ordering (execute_at ASC)
+    let our_pending: Vec<&PendingJob> = pending.iter().filter(|p| ids.contains(&p.id)).collect();
+    for window in our_pending.windows(2) {
+        let a = window[0].execute_at.expect("should have execute_at");
+        let b = window[1].execute_at.expect("should have execute_at");
+        assert!(a <= b, "Pending jobs should be ordered by execute_at");
+    }
 
     Ok(())
 }

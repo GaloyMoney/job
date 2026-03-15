@@ -220,6 +220,8 @@ mod tracker;
 
 pub mod error;
 
+use chrono::{DateTime, Utc};
+use es_entity::AtomicOperation;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
@@ -240,6 +242,16 @@ use poller::*;
 use repo::*;
 
 es_entity::entity_id! { JobId }
+
+/// Summary of a job execution that is waiting to be picked up by a poller.
+#[derive(Debug)]
+pub struct PendingJob {
+    pub id: JobId,
+    pub job_type: JobType,
+    pub execute_at: Option<DateTime<Utc>>,
+    pub attempt_index: i32,
+    pub created_at: DateTime<Utc>,
+}
 
 #[derive(Clone)]
 /// Primary entry point for interacting with the Job crate. Provides APIs to register job
@@ -478,6 +490,63 @@ impl Jobs {
     #[instrument(name = "job.find", skip(self))]
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
         Ok(self.repo.find_by_id(id).await?)
+    }
+
+    /// Cancel a pending job, removing it from the execution queue.
+    ///
+    /// Only jobs in the `pending` state can be cancelled. Attempting to cancel
+    /// a job that is currently running or already completed returns
+    /// [`JobError::JobNotPending`].
+    ///
+    /// This method atomically deletes the execution record and persists a
+    /// [`JobEvent::Cancelled`] event on the job entity.
+    #[instrument(name = "job.cancel_job", skip(self))]
+    pub async fn cancel_job(&self, id: JobId) -> Result<Job, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+
+        let result = sqlx::query("DELETE FROM job_executions WHERE id = $1 AND state = 'pending'")
+            .bind(id as JobId)
+            .execute(op.as_executor())
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(JobError::JobNotPending);
+        }
+
+        let mut job = self.repo.find_by_id(id).await?;
+        job.cancel();
+        self.repo.update_in_op(&mut op, &mut job).await?;
+        op.commit().await?;
+        Ok(job)
+    }
+
+    /// List all jobs whose execution is in the `pending` state, ordered by
+    /// scheduled execution time (earliest first).
+    #[instrument(name = "job.list_pending_jobs", skip(self))]
+    pub async fn list_pending_jobs(&self) -> Result<Vec<PendingJob>, JobError> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT id, job_type, execute_at, attempt_index, created_at
+            FROM job_executions
+            WHERE state = 'pending'
+            ORDER BY execute_at ASC NULLS FIRST",
+        )
+        .fetch_all(self.repo.pool())
+        .await?;
+        let pending = rows
+            .into_iter()
+            .map(|row| {
+                let job_type_str: String = row.get("job_type");
+                PendingJob {
+                    id: row.get("id"),
+                    job_type: JobType::from_owned(job_type_str),
+                    execute_at: row.get("execute_at"),
+                    attempt_index: row.get("attempt_index"),
+                    created_at: row.get("created_at"),
+                }
+            })
+            .collect();
+        Ok(pending)
     }
 
     /// Returns a reference to the clock used by this job service.

@@ -35,7 +35,6 @@ impl JobType {
         &self.0
     }
 
-    #[cfg(test)]
     pub(crate) fn from_owned(job_type: String) -> Self {
         JobType(Cow::Owned(job_type))
     }
@@ -69,6 +68,7 @@ pub enum JobEvent {
         error: String,
     },
     JobCompleted,
+    Cancelled,
     AttemptCounterReset,
 }
 
@@ -176,12 +176,20 @@ impl Job {
         serde_json::from_value(self.config.clone())
     }
 
-    /// Returns `true` once the job has emitted a `JobCompleted` event.
+    /// Returns `true` once the job has emitted a `JobCompleted` or `Cancelled` event.
     pub fn completed(&self) -> bool {
         self.events
             .iter_all()
             .rev()
-            .any(|event| matches!(event, JobEvent::JobCompleted))
+            .any(|event| matches!(event, JobEvent::JobCompleted | JobEvent::Cancelled))
+    }
+
+    /// Returns `true` if the job was cancelled.
+    pub fn cancelled(&self) -> bool {
+        self.events
+            .iter_all()
+            .rev()
+            .any(|event| matches!(event, JobEvent::Cancelled))
     }
 
     pub(crate) fn inject_tracing_parent(&self) {
@@ -225,6 +233,10 @@ impl Job {
     pub(super) fn complete_job(&mut self) {
         self.events.push(JobEvent::ExecutionCompleted);
         self.events.push(JobEvent::JobCompleted);
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.events.push(JobEvent::Cancelled);
     }
 
     pub(super) fn schedule_retry(
@@ -316,6 +328,7 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionAborted { .. } => {}
                 JobEvent::ExecutionErrored { .. } => {}
                 JobEvent::JobCompleted => {}
+                JobEvent::Cancelled => {}
                 JobEvent::AttemptCounterReset => {}
             }
         }
