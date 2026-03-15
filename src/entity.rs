@@ -195,6 +195,9 @@ impl Job {
     }
 
     pub(super) fn cancel_job(&mut self) {
+        if self.cancelled() {
+            return;
+        }
         self.events.push(JobEvent::ExecutionCancelled);
         self.events.push(JobEvent::JobCancelled);
     }
