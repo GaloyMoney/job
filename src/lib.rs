@@ -143,12 +143,11 @@ impl Jobs {
         let mut job = self.repo.find_by_id(id).await?;
 
         if job.cancel().did_execute() {
-            let result = sqlx::query!(
-                r#"DELETE FROM job_executions WHERE id = ? AND state = 'pending'"#,
-                id as JobId,
-            )
-            .execute(op.as_executor())
-            .await?;
+            let result: sqlx::sqlite::SqliteQueryResult =
+                sqlx::query("DELETE FROM job_executions WHERE id = ? AND state = 'pending'")
+                    .bind(id.to_string())
+                    .execute(op.as_executor())
+                    .await?;
 
             if result.rows_affected() == 0 {
                 return Err(JobError::CannotCancelJob);
