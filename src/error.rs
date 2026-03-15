@@ -36,10 +36,6 @@ pub enum JobError {
     DuplicateId(Option<String>),
     #[error("JobError - DuplicateUniqueJobType: {0:?}")]
     DuplicateUniqueJobType(Option<String>),
-    #[error(
-        "JobError - CannotCancelJob: job is not in pending state (may be running or already completed)"
-    )]
-    CannotCancelJob,
     #[error("JobError - Config: {0}")]
     Config(String),
     #[error("JobError - Migration: {0}")]
