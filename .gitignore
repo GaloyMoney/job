@@ -15,4 +15,3 @@ target/
 .env
 .bacon-locations
 .claude/settings.local.json
-.mcp.json
