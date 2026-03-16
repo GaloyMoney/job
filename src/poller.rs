@@ -547,7 +547,8 @@ async fn poll_jobs(
         .iter()
         .map(|jt| jt.as_str().to_owned())
         .collect();
-    let rows: Vec<JobPollRow> = sqlx::query_as(
+    let rows = sqlx::query_as!(
+        JobPollRow,
         r#"
         WITH eligible AS (
             SELECT id, queue_id, execute_at, execution_state_json, attempt_index
@@ -592,7 +593,12 @@ async fn poll_jobs(
             WHERE je.id = selected_jobs.id
             RETURNING je.id, selected_jobs.data_json, je.attempt_index
         )
-        SELECT * FROM (
+        SELECT
+            id as "id: JobId",
+            data_json,
+            attempt_index,
+            max_wait
+        FROM (
             SELECT
                 u.id,
                 u.data_json,
@@ -609,11 +615,11 @@ async fn poll_jobs(
             WHERE NOT EXISTS (SELECT 1 FROM updated)
         ) AS result
         "#,
+        n_jobs_to_poll as i32,
+        now,
+        instance_id,
+        &job_type_strings as _,
     )
-    .bind(n_jobs_to_poll as i32)
-    .bind(now)
-    .bind(instance_id)
-    .bind(&job_type_strings)
     .fetch_all(pool)
     .await?;
 
