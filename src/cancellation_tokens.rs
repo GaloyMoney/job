@@ -1,4 +1,4 @@
-//! Registry of currently running jobs and their cancellation tokens.
+//! Maps running job IDs to their cancellation tokens.
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -6,17 +6,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::JobId;
 
-/// Tracks running jobs and provides cooperative cancellation via [`CancellationToken`].
+/// Maps each running job to its [`CancellationToken`].
 ///
-/// Each running job registers a token when dispatched. Cross-node cancel
-/// signals (NOTIFY or keep-alive fallback) look up the token here and
-/// trigger cancellation.
+/// When a job is dispatched, a token is registered here. Cross-node cancel
+/// signals (NOTIFY or keep-alive fallback) look up the token and trigger
+/// cancellation.
 #[derive(Clone)]
-pub(crate) struct RunningJobRegistry {
+pub(crate) struct CancellationTokens {
     inner: Arc<DashMap<JobId, CancellationToken>>,
 }
 
-impl RunningJobRegistry {
+impl CancellationTokens {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
@@ -40,7 +40,7 @@ impl RunningJobRegistry {
         }
     }
 
-    /// Remove a job from the registry (called on completion/failure/abort).
+    /// Remove a job from the map (called on completion/failure/abort).
     pub fn remove(&self, id: &JobId) {
         self.inner.remove(id);
     }

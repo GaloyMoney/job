@@ -205,6 +205,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 #![forbid(unsafe_code)]
 
+mod cancellation_tokens;
 mod config;
 mod current;
 mod dispatcher;
@@ -215,7 +216,6 @@ mod poller;
 mod registry;
 mod repo;
 mod runner;
-mod running_registry;
 mod spawner;
 mod tracker;
 
@@ -237,10 +237,10 @@ pub use registry::*;
 pub use runner::*;
 pub use spawner::*;
 
+use cancellation_tokens::CancellationTokens;
 use error::*;
 use poller::*;
 use repo::*;
-use running_registry::RunningJobRegistry;
 
 #[derive(sqlx::FromRow)]
 struct CancelRunningRow {
@@ -274,7 +274,7 @@ pub struct Jobs {
     config: JobSvcConfig,
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
-    running_registry: RunningJobRegistry,
+    cancellation_tokens: CancellationTokens,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -304,13 +304,13 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
-        let running_registry = RunningJobRegistry::new();
+        let cancellation_tokens = CancellationTokens::new();
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
-            running_registry,
+            cancellation_tokens,
             poller_handle: None,
             clock,
         })
@@ -472,7 +472,7 @@ impl Jobs {
                 self.config.poller_config.clone(),
                 Arc::clone(&self.repo),
                 registry,
-                self.running_registry.clone(),
+                self.cancellation_tokens.clone(),
                 self.clock.clone(),
             )
             .start()
@@ -581,7 +581,7 @@ impl Jobs {
         if let Some(row) = running_row {
             let poller_instance_id = row.poller_instance_id.unwrap_or(uuid::Uuid::nil());
             // Also try local cancel in case we're on the same node
-            self.running_registry.cancel(&id);
+            self.cancellation_tokens.cancel(&id);
             return Ok(CancelResult::CancelledWhileRunning { poller_instance_id });
         }
 

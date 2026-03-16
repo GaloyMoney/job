@@ -13,8 +13,8 @@ use std::{
 };
 
 use super::{
-    JobId, config::JobPollerConfig, dispatcher::*, error::JobError, handle::OwnedTaskHandle,
-    registry::JobRegistry, repo::JobRepo, running_registry::RunningJobRegistry,
+    JobId, cancellation_tokens::CancellationTokens, config::JobPollerConfig, dispatcher::*,
+    error::JobError, handle::OwnedTaskHandle, registry::JobRegistry, repo::JobRepo,
     tracker::JobTracker,
 };
 
@@ -41,7 +41,7 @@ pub(crate) struct JobPoller {
     config: JobPollerConfig,
     repo: Arc<JobRepo>,
     registry: JobRegistry,
-    running_registry: RunningJobRegistry,
+    cancellation_tokens: CancellationTokens,
     tracker: Arc<JobTracker>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<
@@ -63,7 +63,7 @@ pub(crate) struct JobPollerHandle {
     max_jobs_per_process: usize,
     repo: Arc<JobRepo>,
     #[allow(dead_code)]
-    pub(crate) running_registry: RunningJobRegistry,
+    pub(crate) cancellation_tokens: CancellationTokens,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
 }
@@ -75,7 +75,7 @@ impl JobPoller {
         config: JobPollerConfig,
         repo: Arc<JobRepo>,
         registry: JobRegistry,
-        running_registry: RunningJobRegistry,
+        cancellation_tokens: CancellationTokens,
         clock: ClockHandle,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
@@ -89,7 +89,7 @@ impl JobPoller {
             repo,
             config,
             registry,
-            running_registry,
+            cancellation_tokens,
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
             clock,
@@ -102,7 +102,7 @@ impl JobPoller {
         let keep_alive_handle = self.start_keep_alive_handler();
         let shutdown_tx = self.shutdown_tx.clone();
         let repo = Arc::clone(&self.repo);
-        let running_registry = self.running_registry.clone();
+        let cancellation_tokens = self.cancellation_tokens.clone();
         let instance_id = self.instance_id;
         let shutdown_timeout = self.config.shutdown_timeout;
         let max_jobs_per_process = self.config.max_jobs_per_process;
@@ -123,7 +123,7 @@ impl JobPoller {
             shutdown_tx,
             shutdown_called: Arc::new(AtomicBool::new(false)),
             repo,
-            running_registry,
+            cancellation_tokens,
             instance_id,
             shutdown_timeout,
             max_jobs_per_process,
@@ -215,7 +215,7 @@ impl JobPoller {
         listener.listen("job_execution").await?;
         listener.listen("job_cancel").await?;
         let tracker = self.tracker.clone();
-        let running_registry = self.running_registry.clone();
+        let cancellation_tokens = self.cancellation_tokens.clone();
         let supported_job_types = self.registry.registered_job_types();
         Ok(OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-listener",
@@ -230,7 +230,7 @@ impl JobPoller {
                                     // payload is the job execution id (UUID)
                                     if let Ok(id) = payload.parse::<uuid::Uuid>() {
                                         let job_id = JobId::from(id);
-                                        if running_registry.cancel(&job_id) {
+                                        if cancellation_tokens.cancel(&job_id) {
                                             tracing::info!(
                                                 job_id = %job_id,
                                                 "cancelled running job via NOTIFY"
@@ -301,7 +301,7 @@ impl JobPoller {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
         let instance_id = self.instance_id;
-        let running_registry = self.running_registry.clone();
+        let cancellation_tokens = self.cancellation_tokens.clone();
         let clock = self.clock.clone();
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
@@ -347,7 +347,7 @@ impl JobPoller {
                             .await
                             {
                                 for row in rows {
-                                    if running_registry.cancel(&row.id) {
+                                    if cancellation_tokens.cancel(&row.id) {
                                         tracing::info!(
                                             job_id = %row.id,
                                             "cancelled running job via keep-alive fallback"
@@ -388,8 +388,8 @@ impl JobPoller {
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = Arc::clone(&self.repo);
         let tracker = self.tracker.clone();
-        let running_registry = self.running_registry.clone();
-        let cancel_token = running_registry.register(job.id);
+        let cancellation_tokens = self.cancellation_tokens.clone();
+        let cancel_token = cancellation_tokens.register(job.id);
         let cancel_token_for_monitor = cancel_token.clone();
         let instance_id = self.instance_id;
         let clock = self.clock.clone();
@@ -415,7 +415,7 @@ impl JobPoller {
                 job.id,
                 runner,
                 instance_id,
-                running_registry,
+                cancellation_tokens,
                 cancel_token,
                 clock,
             )

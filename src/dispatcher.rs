@@ -9,8 +9,8 @@ use tracing::{Span, instrument};
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use super::{
-    JobId, current::CurrentJob, entity::RetryPolicy, error::JobError, repo::JobRepo, runner::*,
-    running_registry::RunningJobRegistry, tracker::JobTracker,
+    JobId, cancellation_tokens::CancellationTokens, current::CurrentJob, entity::RetryPolicy,
+    error::JobError, repo::JobRepo, runner::*, tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -25,7 +25,7 @@ pub(crate) struct JobDispatcher {
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
-    running_registry: RunningJobRegistry,
+    cancellation_tokens: CancellationTokens,
     cancel_token: CancellationToken,
     job_id: JobId,
     rescheduled: bool,
@@ -41,7 +41,7 @@ impl JobDispatcher {
         id: JobId,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
-        running_registry: RunningJobRegistry,
+        cancellation_tokens: CancellationTokens,
         cancel_token: CancellationToken,
         clock: ClockHandle,
     ) -> Self {
@@ -50,7 +50,7 @@ impl JobDispatcher {
             retry_settings,
             runner: Some(runner),
             tracker,
-            running_registry,
+            cancellation_tokens,
             cancel_token,
             job_id: id,
             rescheduled: false,
@@ -380,7 +380,7 @@ impl JobDispatcher {
 
 impl Drop for JobDispatcher {
     fn drop(&mut self) {
-        self.running_registry.remove(&self.job_id);
+        self.cancellation_tokens.remove(&self.job_id);
         self.tracker.job_completed(self.rescheduled)
     }
 }
