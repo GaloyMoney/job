@@ -282,7 +282,7 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
-        let router = Arc::new(JobNotificationRouter::new());
+        let router = Arc::new(JobNotificationRouter::new(&pool));
         let clock = config.clock.clone();
         Ok(Self {
             repo,
@@ -462,16 +462,10 @@ impl Jobs {
         let job_types = poller.registered_job_types();
 
         // Start the unified notification router (replaces per-channel PgListeners)
-        let _listener_handle = self
-            .router
-            .start(self.repo.pool(), Arc::clone(&tracker), job_types)
-            .await?;
-
-        // Start the periodic sweep safety net
-        let _sweep_handle = self.router.start_sweep(self.repo.pool().clone());
+        let listener_handle = self.router.start(Arc::clone(&tracker), job_types).await?;
 
         let mut poller_handle = poller.start();
-        poller_handle.set_router_handles(_listener_handle, _sweep_handle);
+        poller_handle.set_router_handle(listener_handle);
 
         self.poller_handle = Some(Arc::new(poller_handle));
         Ok(())

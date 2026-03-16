@@ -18,22 +18,28 @@ enum JobNotification {
 }
 
 pub(crate) struct JobNotificationRouter {
+    pool: PgPool,
     terminal_tx: broadcast::Sender<JobId>,
 }
 
 impl JobNotificationRouter {
-    pub fn new() -> Self {
+    pub fn new(pool: &PgPool) -> Self {
         let (terminal_tx, _) = broadcast::channel(256);
-        Self { terminal_tx }
+        Self {
+            pool: pool.clone(),
+            terminal_tx,
+        }
     }
 
     /// Subscribe to terminal events for a specific job.
-    /// The returned future resolves when the job reaches terminal state.
-    /// Drop the future to unsubscribe — no explicit deregister needed.
+    /// The returned waiter resolves when the job reaches terminal state.
+    /// It self-heals via periodic DB checks in case a notification was lost.
+    /// Drop the waiter to unsubscribe.
     #[allow(dead_code)]
     pub fn wait_for_terminal(&self, job_id: JobId) -> JobTerminalWaiter {
         JobTerminalWaiter {
             rx: self.terminal_tx.subscribe(),
+            pool: self.pool.clone(),
             job_id,
         }
     }
@@ -42,11 +48,10 @@ impl JobNotificationRouter {
     /// aborts the listener when dropped.
     pub async fn start(
         &self,
-        pool: &PgPool,
         tracker: Arc<JobTracker>,
         job_types: Vec<JobType>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
-        let mut listener = PgListener::connect_with(pool).await?;
+        let mut listener = PgListener::connect_with(&self.pool).await?;
         listener.listen("job_events").await?;
 
         let terminal_tx = self.terminal_tx.clone();
@@ -86,75 +91,62 @@ impl JobNotificationRouter {
 
         Ok(OwnedTaskHandle::new(handle))
     }
-
-    /// Start a periodic sweep that re-broadcasts terminal events for jobs
-    /// whose execution rows have disappeared. Safety net for notifications
-    /// lost during PgListener reconnection.
-    pub fn start_sweep(&self, pool: PgPool) -> OwnedTaskHandle {
-        let terminal_tx = self.terminal_tx.clone();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-
-                // If nobody is listening, skip the DB query entirely.
-                if terminal_tx.receiver_count() == 0 {
-                    continue;
-                }
-
-                // Find all jobs that have been completed but might have
-                // had their notification lost. We query for jobs that
-                // exist in the jobs table but NOT in job_executions.
-                // However, we don't know which specific IDs waiters care
-                // about. Instead, just broadcast all recently-terminal IDs
-                // — waiters filter client-side anyway.
-                //
-                // For now, query recently completed jobs (no execution row).
-                // This is intentionally broad; the broadcast is cheap.
-                match sqlx::query_scalar::<_, uuid::Uuid>(
-                    r#"SELECT j.id FROM jobs j
-                       WHERE NOT EXISTS (
-                           SELECT 1 FROM job_executions je WHERE je.id = j.id
-                       )
-                       AND j.created_at > NOW() - INTERVAL '5 minutes'"#,
-                )
-                .fetch_all(&pool)
-                .await
-                {
-                    Ok(ids) => {
-                        for uuid in ids {
-                            let _ = terminal_tx.send(JobId::from(uuid));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "sweep: failed to check terminal jobs");
-                    }
-                }
-            }
-        });
-
-        OwnedTaskHandle::new(handle)
-    }
 }
 
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// A future that resolves when a specific job reaches terminal state.
+/// Combines broadcast notifications with periodic DB polling as a safety net.
 /// Drop to unsubscribe.
 #[allow(dead_code)]
 pub(crate) struct JobTerminalWaiter {
     rx: broadcast::Receiver<JobId>,
+    pool: PgPool,
     job_id: JobId,
 }
 
 #[allow(dead_code)]
 impl JobTerminalWaiter {
     pub async fn wait(mut self) {
+        let sweep = tokio::time::interval(SWEEP_INTERVAL);
+        tokio::pin!(sweep);
+
         loop {
-            match self.rx.recv().await {
-                Ok(id) if id == self.job_id => return,
-                Ok(_) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            tokio::select! {
+                biased;
+
+                result = self.rx.recv() => {
+                    match result {
+                        Ok(id) if id == self.job_id => return,
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // Missed messages — fall through to DB check
+                            if self.is_terminal().await {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                _ = sweep.tick() => {
+                    if self.is_terminal().await {
+                        return;
+                    }
+                }
             }
         }
+    }
+
+    async fn is_terminal(&self) -> bool {
+        matches!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT NOT EXISTS (SELECT 1 FROM job_executions WHERE id = $1)"
+            )
+            .bind(self.job_id)
+            .fetch_one(&self.pool)
+            .await,
+            Ok(true)
+        )
     }
 }

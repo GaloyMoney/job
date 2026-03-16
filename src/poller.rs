@@ -54,9 +54,7 @@ pub(crate) struct JobPollerHandle {
     #[allow(dead_code)]
     handle: OwnedTaskHandle,
     #[allow(dead_code)]
-    router_listener_handle: Option<OwnedTaskHandle>,
-    #[allow(dead_code)]
-    router_sweep_handle: Option<OwnedTaskHandle>,
+    router_handle: Option<OwnedTaskHandle>,
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
@@ -69,9 +67,8 @@ pub(crate) struct JobPollerHandle {
 }
 
 impl JobPollerHandle {
-    pub(crate) fn set_router_handles(&mut self, listener: OwnedTaskHandle, sweep: OwnedTaskHandle) {
-        self.router_listener_handle = Some(listener);
-        self.router_sweep_handle = Some(sweep);
+    pub(crate) fn set_router_handle(&mut self, handle: OwnedTaskHandle) {
+        self.router_handle = Some(handle);
     }
 }
 
@@ -120,8 +117,7 @@ impl JobPoller {
         JobPollerHandle {
             poller: executor,
             handle,
-            router_listener_handle: None,
-            router_sweep_handle: None,
+            router_handle: None,
             shutdown_tx,
             shutdown_called: Arc::new(AtomicBool::new(false)),
             repo,
