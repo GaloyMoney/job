@@ -522,29 +522,14 @@ impl JobPoller {
 
 /// Called by the monitor task after force-aborting a running job that did not
 /// cooperate within the cancel timeout. Records cancellation events and removes
-/// the execution row.
+/// the execution row. Delegates to the shared `finalize_cancelled_job` helper.
 async fn force_cancel_job(
     repo: &JobRepo,
     clock: &ClockHandle,
     job_id: JobId,
     instance_id: uuid::Uuid,
 ) -> Result<(), JobError> {
-    let mut op = repo.begin_op_with_clock(clock).await?;
-    let mut job = repo.find_by_id(job_id).await?;
-    sqlx::query(
-        r#"
-        DELETE FROM job_executions
-        WHERE id = $1 AND poller_instance_id = $2
-        "#,
-    )
-    .bind(job_id)
-    .bind(instance_id)
-    .execute(op.as_executor())
-    .await?;
-    job.cancel_job();
-    repo.update_in_op(&mut op, &mut job).await?;
-    op.commit().await?;
-    Ok(())
+    super::repo::finalize_cancelled_job(repo, clock, job_id, instance_id).await
 }
 
 #[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]

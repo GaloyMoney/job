@@ -348,22 +348,7 @@ impl JobDispatcher {
 
     #[instrument(name = "job.cancel_and_complete_job", skip(self), fields(id = %id))]
     async fn cancel_and_complete_job(&mut self, id: JobId) -> Result<(), JobError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id(&id).await?;
-        sqlx::query!(
-            r#"
-          DELETE FROM job_executions
-          WHERE id = $1 AND poller_instance_id = $2
-        "#,
-            id as JobId,
-            self.instance_id
-        )
-        .execute(op.as_executor())
-        .await?;
-        job.cancel_job();
-        self.repo.update_in_op(&mut op, &mut job).await?;
-        op.commit().await?;
-        Ok(())
+        super::repo::finalize_cancelled_job(&self.repo, &self.clock, id, self.instance_id).await
     }
 
     #[instrument(name = "job.reschedule_job", skip(self, op), fields(id = %id, reschedule_at = %reschedule_at, attempt = 1))]

@@ -1,8 +1,10 @@
+use es_entity::clock::ClockHandle;
 use sqlx::PgPool;
 
 use es_entity::*;
 
 use super::entity::*;
+use super::error::JobError;
 use crate::JobId;
 
 #[derive(EsRepo, Clone)]
@@ -26,6 +28,35 @@ impl JobRepo {
     pub(super) fn new(pool: &PgPool) -> Self {
         Self { pool: pool.clone() }
     }
+}
+
+/// Atomically delete the execution row and record cancellation events.
+///
+/// Used by both the dispatcher (cooperative cancel) and the monitor task
+/// (force-abort) to finalize a cancelled job. Runs the DELETE and event
+/// recording in a single transaction to avoid partial state.
+pub(crate) async fn finalize_cancelled_job(
+    repo: &JobRepo,
+    clock: &ClockHandle,
+    job_id: JobId,
+    instance_id: uuid::Uuid,
+) -> Result<(), JobError> {
+    let mut op = repo.begin_op_with_clock(clock).await?;
+    let mut job = repo.find_by_id(job_id).await?;
+    sqlx::query!(
+        r#"
+        DELETE FROM job_executions
+        WHERE id = $1 AND poller_instance_id = $2
+        "#,
+        job_id as JobId,
+        instance_id,
+    )
+    .execute(op.as_executor())
+    .await?;
+    job.cancel_job();
+    repo.update_in_op(&mut op, &mut job).await?;
+    op.commit().await?;
+    Ok(())
 }
 
 #[cfg(test)]
