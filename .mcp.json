@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "clat": {
+      "headers": {
+        "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIwMTljZjg1Ni1hZjNhLTc3MzMtYTJiNy1mZjVmOTA2ZTI4MTAiLCJyb2xlIjoiZW5naW5lZXIiLCJwcm9qZWN0IjoiY29tcGxldGlvbi1ub3RpZmllciIsImlhdCI6MTc3MzY5Mjk1Nn0.MKQ7_iTmVfn9XJpdJ6JUXUwoWtYFe0xZanomKgcQSsM"
+      },
+      "type": "http",
+      "url": "http://127.0.0.1:9111/mcp?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIwMTljZjg1Ni1hZjNhLTc3MzMtYTJiNy1mZjVmOTA2ZTI4MTAiLCJyb2xlIjoiZW5naW5lZXIiLCJwcm9qZWN0IjoiY29tcGxldGlvbi1ub3RpZmllciIsImlhdCI6MTc3MzY5Mjk1Nn0.MKQ7_iTmVfn9XJpdJ6JUXUwoWtYFe0xZanomKgcQSsM"
+    }
+  }
+}
