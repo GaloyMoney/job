@@ -1,9 +1,8 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::postgres::{PgListener, PgPool};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::broadcast;
 
 use crate::JobId;
 use crate::entity::JobType;
@@ -19,29 +18,24 @@ enum JobNotification {
 }
 
 pub(crate) struct JobNotificationRouter {
-    waiters: Arc<Mutex<HashMap<JobId, oneshot::Sender<()>>>>,
+    terminal_tx: broadcast::Sender<JobId>,
 }
 
 impl JobNotificationRouter {
     pub fn new() -> Self {
-        Self {
-            waiters: Arc::new(Mutex::new(HashMap::new())),
+        let (terminal_tx, _) = broadcast::channel(256);
+        Self { terminal_tx }
+    }
+
+    /// Subscribe to terminal events for a specific job.
+    /// The returned future resolves when the job reaches terminal state.
+    /// Drop the future to unsubscribe — no explicit deregister needed.
+    #[allow(dead_code)]
+    pub fn wait_for_terminal(&self, job_id: JobId) -> JobTerminalWaiter {
+        JobTerminalWaiter {
+            rx: self.terminal_tx.subscribe(),
+            job_id,
         }
-    }
-
-    /// Register interest in a job reaching terminal state.
-    /// Returns a receiver that will fire when the job completes or is cancelled.
-    #[allow(dead_code)]
-    pub async fn register_waiter(&self, job_id: JobId) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        self.waiters.lock().await.insert(job_id, tx);
-        rx
-    }
-
-    /// Remove a waiter (e.g. if caller cancels before notification).
-    #[allow(dead_code)]
-    pub async fn deregister_waiter(&self, job_id: &JobId) {
-        self.waiters.lock().await.remove(job_id);
     }
 
     /// Start the central listener task. Returns an OwnedTaskHandle that
@@ -55,7 +49,7 @@ impl JobNotificationRouter {
         let mut listener = PgListener::connect_with(pool).await?;
         listener.listen("job_events").await?;
 
-        let waiters = Arc::clone(&self.waiters);
+        let terminal_tx = self.terminal_tx.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -70,10 +64,7 @@ impl JobNotificationRouter {
                             }
                             Ok(JobNotification::JobTerminal { job_id }) => {
                                 if let Ok(uuid) = job_id.parse::<uuid::Uuid>() {
-                                    let id = JobId::from(uuid);
-                                    if let Some(tx) = waiters.lock().await.remove(&id) {
-                                        let _ = tx.send(());
-                                    }
+                                    let _ = terminal_tx.send(JobId::from(uuid));
                                 }
                             }
                             Err(e) => {
@@ -96,41 +87,43 @@ impl JobNotificationRouter {
         Ok(OwnedTaskHandle::new(handle))
     }
 
-    /// Start a periodic sweep that checks all registered waiters against the DB.
-    /// This is a safety net for notifications lost during PgListener reconnection.
+    /// Start a periodic sweep that re-broadcasts terminal events for jobs
+    /// whose execution rows have disappeared. Safety net for notifications
+    /// lost during PgListener reconnection.
     pub fn start_sweep(&self, pool: PgPool) -> OwnedTaskHandle {
-        let waiters = Arc::clone(&self.waiters);
+        let terminal_tx = self.terminal_tx.clone();
 
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
 
-                let waiter_ids: Vec<JobId> = {
-                    let guard = waiters.lock().await;
-                    if guard.is_empty() {
-                        continue;
-                    }
-                    guard.keys().copied().collect()
-                };
+                // If nobody is listening, skip the DB query entirely.
+                if terminal_tx.receiver_count() == 0 {
+                    continue;
+                }
 
-                // Check which of the waited-on jobs no longer have an execution row
-                // (meaning they reached terminal state: completed or errored out).
+                // Find all jobs that have been completed but might have
+                // had their notification lost. We query for jobs that
+                // exist in the jobs table but NOT in job_executions.
+                // However, we don't know which specific IDs waiters care
+                // about. Instead, just broadcast all recently-terminal IDs
+                // — waiters filter client-side anyway.
+                //
+                // For now, query recently completed jobs (no execution row).
+                // This is intentionally broad; the broadcast is cheap.
                 match sqlx::query_scalar::<_, uuid::Uuid>(
-                    "SELECT id FROM UNNEST($1::uuid[]) AS t(id) WHERE NOT EXISTS (SELECT 1 FROM job_executions WHERE job_executions.id = t.id)",
+                    r#"SELECT j.id FROM jobs j
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM job_executions je WHERE je.id = j.id
+                       )
+                       AND j.created_at > NOW() - INTERVAL '5 minutes'"#,
                 )
-                .bind(&waiter_ids)
                 .fetch_all(&pool)
                 .await
                 {
-                    Ok(terminal_ids) => {
-                        if !terminal_ids.is_empty() {
-                            let mut guard = waiters.lock().await;
-                            for uuid in terminal_ids {
-                                let id = JobId::from(uuid);
-                                if let Some(tx) = guard.remove(&id) {
-                                    let _ = tx.send(());
-                                }
-                            }
+                    Ok(ids) => {
+                        for uuid in ids {
+                            let _ = terminal_tx.send(JobId::from(uuid));
                         }
                     }
                     Err(e) => {
@@ -141,5 +134,27 @@ impl JobNotificationRouter {
         });
 
         OwnedTaskHandle::new(handle)
+    }
+}
+
+/// A future that resolves when a specific job reaches terminal state.
+/// Drop to unsubscribe.
+#[allow(dead_code)]
+pub(crate) struct JobTerminalWaiter {
+    rx: broadcast::Receiver<JobId>,
+    job_id: JobId,
+}
+
+#[allow(dead_code)]
+impl JobTerminalWaiter {
+    pub async fn wait(mut self) {
+        loop {
+            match self.rx.recv().await {
+                Ok(id) if id == self.job_id => return,
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
     }
 }
