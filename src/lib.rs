@@ -205,6 +205,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 #![forbid(unsafe_code)]
 
+mod cancellation_tokens;
 mod config;
 mod current;
 mod dispatcher;
@@ -215,12 +216,12 @@ mod poller;
 mod registry;
 mod repo;
 mod runner;
-mod running_registry;
 mod spawner;
 mod tracker;
 
 pub mod error;
 
+use es_entity::AtomicOperation;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
@@ -236,10 +237,10 @@ pub use registry::*;
 pub use runner::*;
 pub use spawner::*;
 
+use cancellation_tokens::CancellationTokens;
 use error::*;
 use poller::*;
 use repo::*;
-use running_registry::RunningJobRegistry;
 
 #[derive(sqlx::FromRow)]
 struct CancelRunningRow {
@@ -273,7 +274,7 @@ pub struct Jobs {
     config: JobSvcConfig,
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
-    running_registry: RunningJobRegistry,
+    cancellation_tokens: CancellationTokens,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -303,13 +304,13 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
-        let running_registry = RunningJobRegistry::new();
+        let cancellation_tokens = CancellationTokens::new();
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
-            running_registry,
+            cancellation_tokens,
             poller_handle: None,
             clock,
         })
@@ -471,7 +472,7 @@ impl Jobs {
                 self.config.poller_config.clone(),
                 Arc::clone(&self.repo),
                 registry,
-                self.running_registry.clone(),
+                self.cancellation_tokens.clone(),
                 self.clock.clone(),
             )
             .start()
@@ -540,24 +541,28 @@ impl Jobs {
         }
 
         // 4. Try to cancel a pending job — DELETE from job_executions where state = 'pending'
-        let pending_result = sqlx::query(
-            r#"
-            DELETE FROM job_executions
-            WHERE id = $1 AND state = 'pending'
-            "#,
-        )
-        .bind(id)
-        .execute(self.repo.pool())
-        .await?;
-
-        if pending_result.rows_affected() > 0 {
-            // Record events
+        //    Both the DELETE and event recording happen in the same transaction so
+        //    a crash between the two cannot leave the execution row gone but the
+        //    job entity un-cancelled.
+        {
             let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-            let mut job = self.repo.find_by_id(id).await?;
-            job.cancel_job();
-            self.repo.update_in_op(&mut op, &mut job).await?;
-            op.commit().await?;
-            return Ok(CancelResult::CancelledWhilePending);
+            let pending_result = sqlx::query!(
+                r#"
+                DELETE FROM job_executions
+                WHERE id = $1 AND state = 'pending'
+                "#,
+                id as JobId,
+            )
+            .execute(op.as_executor())
+            .await?;
+
+            if pending_result.rows_affected() > 0 {
+                let mut job = self.repo.find_by_id(id).await?;
+                job.cancel_job();
+                self.repo.update_in_op(&mut op, &mut job).await?;
+                op.commit().await?;
+                return Ok(CancelResult::CancelledWhilePending);
+            }
         }
 
         // 5. Try to cancel a running job — SET cancelled_at
@@ -576,7 +581,7 @@ impl Jobs {
         if let Some(row) = running_row {
             let poller_instance_id = row.poller_instance_id.unwrap_or(uuid::Uuid::nil());
             // Also try local cancel in case we're on the same node
-            self.running_registry.cancel(&id);
+            self.cancellation_tokens.cancel(&id);
             return Ok(CancelResult::CancelledWhileRunning { poller_instance_id });
         }
 

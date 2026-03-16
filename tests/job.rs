@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
     ArtificialClockConfig, CancelResult, ClockHandle, CurrentJob, Job, JobCompletion, JobId,
-    JobInitializer, JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, error::JobError,
+    JobInitializer, JobPollerConfig, JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs,
+    error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -786,6 +787,198 @@ async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()>
         "Completed job should not be marked cancelled"
     );
     assert!(job.completed(), "Job should still be completed");
+
+    Ok(())
+}
+
+// -- Cooperative cancellation test infrastructure --
+
+/// A job initializer whose runner detects cancellation via `select!` and
+/// returns `JobCompletion::Cancelled`.
+struct CooperativeCancelInitializer {
+    started: Arc<Notify>,
+}
+
+impl JobInitializer for CooperativeCancelInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("cooperative-cancel")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(CooperativeCancelRunner {
+            started: Arc::clone(&self.started),
+        }))
+    }
+}
+
+struct CooperativeCancelRunner {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl JobRunner for CooperativeCancelRunner {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        self.started.notify_one();
+        tokio::select! {
+            _ = current_job.cancellation_requested() => {
+                Ok(JobCompletion::Cancelled)
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
+                Ok(JobCompletion::Complete)
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_cooperative_cancel() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(CooperativeCancelInitializer {
+        started: Arc::clone(&started),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, TestJobConfig { delay_ms: 0 }).await?;
+
+    // Wait for the job to start running
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("Job never started");
+
+    // Cancel the running job — the runner should detect it and return Cancelled
+    let result = jobs.cancel_job(job_id).await?;
+    assert!(
+        matches!(result, CancelResult::CancelledWhileRunning { .. }),
+        "Expected CancelledWhileRunning, got {:?}",
+        result,
+    );
+
+    // Wait for the job entity to be marked cancelled
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let job = jobs.find(job_id).await?;
+        if job.cancelled() && job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 50, "Job was not marked cancelled within timeout");
+    }
+
+    Ok(())
+}
+
+/// A job initializer whose runner ignores cancellation entirely (blocks forever).
+struct BlockingJobInitializer {
+    started: Arc<Notify>,
+}
+
+impl JobInitializer for BlockingJobInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("blocking-forever")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(BlockingJobRunner {
+            started: Arc::clone(&self.started),
+        }))
+    }
+}
+
+struct BlockingJobRunner {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl JobRunner for BlockingJobRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        self.started.notify_one();
+        // Block forever — ignores cancellation
+        std::future::pending::<()>().await;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_force_abort_cancel() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .poller_config(JobPollerConfig {
+            cancel_timeout: std::time::Duration::from_secs(1),
+            ..Default::default()
+        })
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(BlockingJobInitializer {
+        started: Arc::clone(&started),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, TestJobConfig { delay_ms: 0 }).await?;
+
+    // Wait for the job to start running
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("Job never started");
+
+    // Cancel the running job — the runner ignores it, so force-abort will kick in
+    let result = jobs.cancel_job(job_id).await?;
+    assert!(
+        matches!(result, CancelResult::CancelledWhileRunning { .. }),
+        "Expected CancelledWhileRunning, got {:?}",
+        result,
+    );
+
+    // Wait for the force-abort to cancel the job (cancel_timeout is 1s)
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        let job = jobs.find(job_id).await?;
+        if job.cancelled() && job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 30, "Job was not force-cancelled within timeout");
+    }
 
     Ok(())
 }
