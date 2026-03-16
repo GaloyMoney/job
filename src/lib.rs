@@ -221,13 +221,14 @@ mod tracker;
 pub mod error;
 
 use es_entity::AtomicOperation;
+use sqlx::postgres::PgPool;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobType};
+pub use entity::{Job, JobTerminalState, JobType};
 pub use es_entity::clock::{
     ArtificialClockConfig, ArtificialMode, Clock, ClockController, ClockHandle,
 };
@@ -246,6 +247,7 @@ es_entity::entity_id! { JobId }
 /// Primary entry point for interacting with the Job crate. Provides APIs to register job
 /// handlers, manage configuration, and control scheduling and execution.
 pub struct Jobs {
+    pool: PgPool,
     config: JobSvcConfig,
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
@@ -280,6 +282,7 @@ impl Jobs {
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
         let clock = config.clock.clone();
         Ok(Self {
+            pool,
             repo,
             config,
             registry,
@@ -479,6 +482,51 @@ impl Jobs {
     #[instrument(name = "job.find", skip(self))]
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
         Ok(self.repo.find_by_id(id).await?)
+    }
+
+    /// Wait for a job to reach a terminal state and return which state it reached.
+    ///
+    /// If the job is already in a terminal state this returns immediately. Otherwise a
+    /// `PgListener` subscription on the `job_completed` channel is used to wait for the
+    /// `job_executions` row to be deleted, which happens on completion, error, or
+    /// cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Sqlx`] if the listener cannot be created and
+    /// [`JobError::Find`] if the job does not exist.
+    #[instrument(name = "job.await_completion", skip(self))]
+    pub async fn await_completion(&self, id: JobId) -> Result<JobTerminalState, JobError> {
+        // 1. Check if already terminal
+        let job = self.find(id).await?;
+        if let Some(state) = job.terminal_state() {
+            return Ok(state);
+        }
+
+        // 2. Subscribe before re-checking to close the race window
+        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool).await?;
+        listener.listen("job_completed").await?;
+
+        // 3. Re-check after subscribing
+        let job = self.find(id).await?;
+        if let Some(state) = job.terminal_state() {
+            return Ok(state);
+        }
+
+        // 4. Wait for a notification matching our job ID
+        let id_str = id.to_string();
+        loop {
+            let notification = listener.recv().await?;
+            if notification.payload() == id_str {
+                break;
+            }
+        }
+
+        // 5. Load final state
+        let job = self.find(id).await?;
+        Ok(job
+            .terminal_state()
+            .expect("job must be terminal after execution row deleted"))
     }
 
     /// Cancel a pending job, removing it from the execution queue.

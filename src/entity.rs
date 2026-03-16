@@ -11,6 +11,17 @@ use es_entity::{context::TracingContext, *};
 
 use crate::{JobId, error::JobError};
 
+/// Terminal state of a completed job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobTerminalState {
+    /// Job finished successfully via `JobCompletion::Complete`.
+    Completed,
+    /// Job exhausted all retry attempts and was marked as errored.
+    Errored,
+    /// Job was explicitly cancelled before it could run.
+    Cancelled,
+}
+
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(transparent)]
 #[serde(transparent)]
@@ -183,6 +194,45 @@ impl Job {
             .iter_all()
             .rev()
             .any(|event| matches!(event, JobEvent::JobCompleted | JobEvent::Cancelled))
+    }
+
+    /// Returns the terminal state of the job, or `None` if it has not yet
+    /// reached a terminal state.
+    ///
+    /// Terminal states are derived from the event history:
+    /// - `Cancelled` if the last relevant event is [`JobEvent::Cancelled`]
+    /// - `Errored` if [`JobEvent::ExecutionErrored`] immediately precedes
+    ///   [`JobEvent::JobCompleted`]
+    /// - `Completed` if [`JobEvent::JobCompleted`] is present (after a
+    ///   successful execution)
+    pub fn terminal_state(&self) -> Option<JobTerminalState> {
+        let mut saw_completed = false;
+        let mut last_before_completed = None;
+
+        for event in self.events.iter_all().rev() {
+            match event {
+                JobEvent::Cancelled => return Some(JobTerminalState::Cancelled),
+                JobEvent::JobCompleted => {
+                    saw_completed = true;
+                }
+                _ if saw_completed && last_before_completed.is_none() => {
+                    last_before_completed = Some(event);
+                }
+                _ => {}
+            }
+        }
+
+        if saw_completed {
+            if matches!(
+                last_before_completed,
+                Some(JobEvent::ExecutionErrored { .. })
+            ) {
+                return Some(JobTerminalState::Errored);
+            }
+            return Some(JobTerminalState::Completed);
+        }
+
+        None
     }
 
     /// Returns `true` if the job was cancelled.
