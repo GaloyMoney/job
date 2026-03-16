@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use sqlx::postgres::{PgListener, PgPool};
@@ -23,19 +23,16 @@ type WaiterRegistration = (JobId, oneshot::Sender<()>);
 pub(crate) struct JobNotificationRouter {
     pool: PgPool,
     terminal_tx: broadcast::Sender<JobId>,
-    register_tx: mpsc::UnboundedSender<WaiterRegistration>,
-    register_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<WaiterRegistration>>>,
+    register_tx: OnceLock<mpsc::UnboundedSender<WaiterRegistration>>,
 }
 
 impl JobNotificationRouter {
     pub fn new(pool: &PgPool) -> Self {
         let (terminal_tx, _) = broadcast::channel(256);
-        let (register_tx, register_rx) = mpsc::unbounded_channel();
         Self {
             pool: pool.clone(),
             terminal_tx,
-            register_tx,
-            register_rx: std::sync::Mutex::new(Some(register_rx)),
+            register_tx: OnceLock::new(),
         }
     }
 
@@ -45,7 +42,8 @@ impl JobNotificationRouter {
     #[allow(dead_code)]
     pub fn wait_for_terminal(&self, job_id: JobId) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.register_tx.send((job_id, tx));
+        let register_tx = self.register_tx.get().expect("router not started");
+        let _ = register_tx.send((job_id, tx));
         rx
     }
 
@@ -56,8 +54,17 @@ impl JobNotificationRouter {
         tracker: Arc<JobTracker>,
         job_types: Vec<JobType>,
     ) -> Result<(OwnedTaskHandle, OwnedTaskHandle), sqlx::Error> {
+        let (register_tx, register_rx) = mpsc::unbounded_channel();
+        self.register_tx
+            .set(register_tx)
+            .expect("router started more than once");
+
         let listener_handle = self.start_listener(tracker, job_types).await?;
-        let waiter_handle = self.start_waiter_manager();
+        let waiter_handle = Self::start_waiter_manager(
+            register_rx,
+            self.terminal_tx.subscribe(),
+            self.pool.clone(),
+        );
         Ok((listener_handle, waiter_handle))
     }
 
@@ -107,16 +114,11 @@ impl JobNotificationRouter {
         Ok(OwnedTaskHandle::new(handle))
     }
 
-    fn start_waiter_manager(&self) -> OwnedTaskHandle {
-        let mut register_rx = self
-            .register_rx
-            .lock()
-            .expect("Couldn't lock register_rx")
-            .take()
-            .expect("start_waiter_manager called more than once");
-        let mut terminal_rx = self.terminal_tx.subscribe();
-        let pool = self.pool.clone();
-
+    fn start_waiter_manager(
+        mut register_rx: mpsc::UnboundedReceiver<WaiterRegistration>,
+        mut terminal_rx: broadcast::Receiver<JobId>,
+        pool: PgPool,
+    ) -> OwnedTaskHandle {
         let handle = tokio::spawn(async move {
             let mut waiters: HashMap<JobId, Vec<oneshot::Sender<()>>> = HashMap::new();
             let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
