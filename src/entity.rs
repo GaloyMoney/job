@@ -11,6 +11,17 @@ use es_entity::{context::TracingContext, *};
 
 use crate::{JobId, error::JobError};
 
+/// Terminal outcome of a job lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobTerminalState {
+    /// The job completed successfully.
+    Completed,
+    /// The job exhausted its retries and was marked as errored.
+    Errored,
+    /// The job was explicitly cancelled before completion.
+    Cancelled,
+}
+
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(transparent)]
 #[serde(transparent)]
@@ -191,6 +202,45 @@ impl Job {
             .iter_all()
             .rev()
             .any(|event| matches!(event, JobEvent::Cancelled))
+    }
+
+    /// Determine the terminal state of a job, if it has reached one.
+    ///
+    /// - `Cancelled` if a `Cancelled` event exists
+    /// - `Errored` if `JobCompleted` exists and the last execution event before it was
+    ///   `ExecutionErrored`
+    /// - `Completed` if `JobCompleted` exists (normal completion)
+    /// - `None` if the job has not reached a terminal state
+    pub fn terminal_state(&self) -> Option<JobTerminalState> {
+        let mut saw_completed = false;
+        let mut last_execution_errored = false;
+
+        for event in self.events.iter_all().rev() {
+            match event {
+                JobEvent::Cancelled => return Some(JobTerminalState::Cancelled),
+                JobEvent::JobCompleted => {
+                    saw_completed = true;
+                }
+                JobEvent::ExecutionErrored { .. } if saw_completed => {
+                    last_execution_errored = true;
+                    break;
+                }
+                JobEvent::ExecutionCompleted if saw_completed => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if saw_completed {
+            if last_execution_errored {
+                Some(JobTerminalState::Errored)
+            } else {
+                Some(JobTerminalState::Completed)
+            }
+        } else {
+            None
+        }
     }
 
     pub(crate) fn inject_tracing_parent(&self) {

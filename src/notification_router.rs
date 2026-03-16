@@ -39,7 +39,6 @@ impl JobNotificationRouter {
     /// Register interest in a job reaching terminal state.
     /// Returns a oneshot receiver that fires when the job completes/errors/cancels.
     /// Drop the receiver to unsubscribe.
-    #[allow(dead_code)]
     pub fn wait_for_terminal(&self, job_id: JobId) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         let register_tx = self.register_tx.get().expect("router not started");

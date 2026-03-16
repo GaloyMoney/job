@@ -228,7 +228,7 @@ use std::sync::{Arc, Mutex};
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobType};
+pub use entity::{Job, JobTerminalState, JobType};
 pub use es_entity::clock::{
     ArtificialClockConfig, ArtificialMode, Clock, ClockController, ClockHandle,
 };
@@ -535,11 +535,42 @@ impl Jobs {
         &self.clock
     }
 
-    /// Returns a reference to the notification router.
-    /// Used internally for future `await_completion` support.
-    #[allow(dead_code)]
-    pub(crate) fn router(&self) -> &Arc<JobNotificationRouter> {
-        &self.router
+    /// Block until the given job reaches a terminal state (completed, errored, or
+    /// cancelled) and return the outcome.
+    ///
+    /// The method first checks whether the job is already terminal before
+    /// subscribing to notifications, closing the race window between spawn and
+    /// subscribe by re-checking after registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Find`] if the job does not exist.
+    #[instrument(name = "job.await_completion", skip(self))]
+    pub async fn await_completion(&self, id: JobId) -> Result<JobTerminalState, JobError> {
+        // 1. Fast path — already terminal
+        let job = self.find(id).await?;
+        if let Some(state) = job.terminal_state() {
+            return Ok(state);
+        }
+
+        // 2. Register waiter BEFORE re-checking (closes race window)
+        let rx = self.router.wait_for_terminal(id);
+
+        // 3. Re-check after registering
+        let job = self.find(id).await?;
+        if let Some(state) = job.terminal_state() {
+            // Receiver will be dropped, which unsubscribes automatically
+            return Ok(state);
+        }
+
+        // 4. Wait for notification
+        let _ = rx.await;
+
+        // 5. Load final state
+        let job = self.find(id).await?;
+        Ok(job
+            .terminal_state()
+            .expect("job must be terminal after notification"))
     }
 
     /// Gracefully shut down the job poller.
