@@ -462,10 +462,11 @@ impl Jobs {
         let job_types = poller.registered_job_types();
 
         // Start the unified notification router (replaces per-channel PgListeners)
-        let listener_handle = self.router.start(Arc::clone(&tracker), job_types).await?;
+        let (listener_handle, waiter_handle) =
+            self.router.start(Arc::clone(&tracker), job_types).await?;
 
         let mut poller_handle = poller.start();
-        poller_handle.set_router_handle(listener_handle);
+        poller_handle.set_router_handles(listener_handle, waiter_handle);
 
         self.poller_handle = Some(Arc::new(poller_handle));
         Ok(())

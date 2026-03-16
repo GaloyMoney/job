@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::postgres::{PgListener, PgPool};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::JobId;
 use crate::entity::JobType;
@@ -17,36 +18,50 @@ enum JobNotification {
     JobTerminal { job_id: String },
 }
 
+type WaiterRegistration = (JobId, oneshot::Sender<()>);
+
 pub(crate) struct JobNotificationRouter {
     pool: PgPool,
     terminal_tx: broadcast::Sender<JobId>,
+    register_tx: mpsc::UnboundedSender<WaiterRegistration>,
+    register_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<WaiterRegistration>>>,
 }
 
 impl JobNotificationRouter {
     pub fn new(pool: &PgPool) -> Self {
         let (terminal_tx, _) = broadcast::channel(256);
+        let (register_tx, register_rx) = mpsc::unbounded_channel();
         Self {
             pool: pool.clone(),
             terminal_tx,
+            register_tx,
+            register_rx: std::sync::Mutex::new(Some(register_rx)),
         }
     }
 
-    /// Subscribe to terminal events for a specific job.
-    /// The returned waiter resolves when the job reaches terminal state.
-    /// It self-heals via periodic DB checks in case a notification was lost.
-    /// Drop the waiter to unsubscribe.
+    /// Register interest in a job reaching terminal state.
+    /// Returns a oneshot receiver that fires when the job completes/errors/cancels.
+    /// Drop the receiver to unsubscribe.
     #[allow(dead_code)]
-    pub fn wait_for_terminal(&self, job_id: JobId) -> JobTerminalWaiter {
-        JobTerminalWaiter {
-            rx: self.terminal_tx.subscribe(),
-            pool: self.pool.clone(),
-            job_id,
-        }
+    pub fn wait_for_terminal(&self, job_id: JobId) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.register_tx.send((job_id, tx));
+        rx
     }
 
-    /// Start the central listener task. Returns an OwnedTaskHandle that
-    /// aborts the listener when dropped.
+    /// Start the PG NOTIFY listener and waiter-manager tasks.
+    /// Returns handles that abort both tasks when dropped.
     pub async fn start(
+        &self,
+        tracker: Arc<JobTracker>,
+        job_types: Vec<JobType>,
+    ) -> Result<(OwnedTaskHandle, OwnedTaskHandle), sqlx::Error> {
+        let listener_handle = self.start_listener(tracker, job_types).await?;
+        let waiter_handle = self.start_waiter_manager();
+        Ok((listener_handle, waiter_handle))
+    }
+
+    async fn start_listener(
         &self,
         tracker: Arc<JobTracker>,
         job_types: Vec<JobType>,
@@ -91,62 +106,83 @@ impl JobNotificationRouter {
 
         Ok(OwnedTaskHandle::new(handle))
     }
-}
 
-const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+    fn start_waiter_manager(&self) -> OwnedTaskHandle {
+        let mut register_rx = self
+            .register_rx
+            .lock()
+            .expect("Couldn't lock register_rx")
+            .take()
+            .expect("start_waiter_manager called more than once");
+        let mut terminal_rx = self.terminal_tx.subscribe();
+        let pool = self.pool.clone();
 
-/// A future that resolves when a specific job reaches terminal state.
-/// Combines broadcast notifications with periodic DB polling as a safety net.
-/// Drop to unsubscribe.
-#[allow(dead_code)]
-pub(crate) struct JobTerminalWaiter {
-    rx: broadcast::Receiver<JobId>,
-    pool: PgPool,
-    job_id: JobId,
-}
+        let handle = tokio::spawn(async move {
+            let mut waiters: HashMap<JobId, Vec<oneshot::Sender<()>>> = HashMap::new();
+            let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
 
-#[allow(dead_code)]
-impl JobTerminalWaiter {
-    pub async fn wait(mut self) {
-        let sweep = tokio::time::interval(SWEEP_INTERVAL);
-        tokio::pin!(sweep);
+            loop {
+                tokio::select! {
+                    biased;
 
-        loop {
-            tokio::select! {
-                biased;
+                    Some((job_id, tx)) = register_rx.recv() => {
+                        waiters.entry(job_id).or_default().push(tx);
+                    }
 
-                result = self.rx.recv() => {
-                    match result {
-                        Ok(id) if id == self.job_id => return,
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Missed messages — fall through to DB check
-                            if self.is_terminal().await {
-                                return;
+                    result = terminal_rx.recv() => {
+                        match result {
+                            Ok(job_id) => notify_waiters(&mut waiters, job_id),
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                // Missed notifications — sweep will catch them
+                            }
+                        }
+                    }
+
+                    _ = sweep.tick() => {
+                        // Prune dropped receivers
+                        waiters.retain(|_, senders| {
+                            senders.retain(|tx| !tx.is_closed());
+                            !senders.is_empty()
+                        });
+
+                        if waiters.is_empty() {
+                            continue;
+                        }
+
+                        let ids: Vec<JobId> = waiters.keys().copied().collect();
+                        match sqlx::query_scalar::<_, uuid::Uuid>(
+                            "SELECT id FROM UNNEST($1::uuid[]) AS t(id) \
+                             WHERE NOT EXISTS (SELECT 1 FROM job_executions WHERE job_executions.id = t.id)",
+                        )
+                        .bind(&ids)
+                        .fetch_all(&pool)
+                        .await
+                        {
+                            Ok(terminal_ids) => {
+                                for uuid in terminal_ids {
+                                    notify_waiters(&mut waiters, JobId::from(uuid));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "sweep: failed to check terminal jobs");
                             }
                         }
                     }
                 }
-
-                _ = sweep.tick() => {
-                    if self.is_terminal().await {
-                        return;
-                    }
-                }
             }
-        }
-    }
+        });
 
-    async fn is_terminal(&self) -> bool {
-        matches!(
-            sqlx::query_scalar::<_, bool>(
-                "SELECT NOT EXISTS (SELECT 1 FROM job_executions WHERE id = $1)"
-            )
-            .bind(self.job_id)
-            .fetch_one(&self.pool)
-            .await,
-            Ok(true)
-        )
+        OwnedTaskHandle::new(handle)
+    }
+}
+
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+fn notify_waiters(waiters: &mut HashMap<JobId, Vec<oneshot::Sender<()>>>, job_id: JobId) {
+    if let Some(senders) = waiters.remove(&job_id) {
+        for tx in senders {
+            let _ = tx.send(());
+        }
     }
 }
