@@ -211,6 +211,7 @@ mod dispatcher;
 mod entity;
 mod handle;
 mod migrate;
+mod notification_router;
 mod poller;
 mod registry;
 mod repo;
@@ -237,8 +238,10 @@ pub use runner::*;
 pub use spawner::*;
 
 use error::*;
+use notification_router::*;
 use poller::*;
 use repo::*;
+use tracker::*;
 
 es_entity::entity_id! { JobId }
 
@@ -249,6 +252,7 @@ pub struct Jobs {
     config: JobSvcConfig,
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
+    router: Arc<JobNotificationRouter>,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -278,11 +282,13 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
+        let router = Arc::new(JobNotificationRouter::new());
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
+            router,
             poller_handle: None,
             clock,
         })
@@ -439,16 +445,35 @@ impl Jobs {
             .expect("Couldn't lock Registry Mutex")
             .take()
             .expect("Registry has been consumed by executor");
-        self.poller_handle = Some(Arc::new(
-            JobPoller::new(
-                self.config.poller_config.clone(),
-                Arc::clone(&self.repo),
-                registry,
-                self.clock.clone(),
-            )
-            .start()
-            .await?,
+
+        let tracker = Arc::new(JobTracker::new(
+            self.config.poller_config.min_jobs_per_process,
+            self.config.poller_config.max_jobs_per_process,
         ));
+
+        let poller = JobPoller::new(
+            self.config.poller_config.clone(),
+            Arc::clone(&self.repo),
+            registry,
+            Arc::clone(&tracker),
+            self.clock.clone(),
+        );
+
+        let job_types = poller.registered_job_types();
+
+        // Start the unified notification router (replaces per-channel PgListeners)
+        let _listener_handle = self
+            .router
+            .start(self.repo.pool(), Arc::clone(&tracker), job_types)
+            .await?;
+
+        // Start the periodic sweep safety net
+        let _sweep_handle = self.router.start_sweep(self.repo.pool().clone());
+
+        let mut poller_handle = poller.start();
+        poller_handle.set_router_handles(_listener_handle, _sweep_handle);
+
+        self.poller_handle = Some(Arc::new(poller_handle));
         Ok(())
     }
 
@@ -513,6 +538,13 @@ impl Jobs {
     /// Returns a reference to the clock used by this job service.
     pub fn clock(&self) -> &ClockHandle {
         &self.clock
+    }
+
+    /// Returns a reference to the notification router.
+    /// Used internally for future `await_completion` support.
+    #[allow(dead_code)]
+    pub(crate) fn router(&self) -> &Arc<JobNotificationRouter> {
+        &self.router
     }
 
     /// Gracefully shut down the job poller.
