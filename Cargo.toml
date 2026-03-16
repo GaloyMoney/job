@@ -7,6 +7,7 @@ version = "0.6.9"
 license = "Apache-2.0"
 edition = "2024"
 categories = ["database"]
+include = ["src/**/*", "migrations/**/*", ".sqlx/**/*", "Cargo.toml", "LICENSE", "README.md"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
