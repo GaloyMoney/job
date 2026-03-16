@@ -456,9 +456,8 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "es-entity"
-version = "0.10.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d99d307ef96f2d79218c8d39a1da3fb5e8f1439a509558fb87aef0721547b416"
+version = "0.10.28"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=635fe3daffcfddbc1e62aace816c01e3e3b00967#635fe3daffcfddbc1e62aace816c01e3e3b00967"
 dependencies = [
  "chrono",
  "derive_builder",
@@ -481,9 +480,8 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.10.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffe53aed1d1a568b4a487be142eb084eeb5e36f6375671a64af02340a09a5654"
+version = "0.10.28"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=635fe3daffcfddbc1e62aace816c01e3e3b00967#635fe3daffcfddbc1e62aace816c01e3e3b00967"
 dependencies = [
  "convert_case",
  "darling 0.23.0",
@@ -955,7 +953,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "job"
-version = "0.6.9-dev"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "async-trait",

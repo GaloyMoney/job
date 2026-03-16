@@ -3,7 +3,7 @@ name = "job"
 description = "Async / distributed job runner"
 repository = "https://github.com/GaloyMoney/job"
 documentation = "https://docs.rs/job"
-version = "0.6.9-dev"
+version = "0.6.9"
 license = "Apache-2.0"
 edition = "2024"
 categories = ["database"]
@@ -42,7 +42,7 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.10.27"
+es-entity = "0.10.28"
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -59,3 +59,7 @@ uuid = { version = "1.22", features = ["serde", "v7"] }
 futures = "0.3"
 rand = "0.10"
 schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"] }
+
+[patch.crates-io]
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "635fe3daffcfddbc1e62aace816c01e3e3b00967" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "635fe3daffcfddbc1e62aace816c01e3e3b00967" }
