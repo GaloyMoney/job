@@ -536,15 +536,16 @@ impl Jobs {
     /// Block until the given job reaches a terminal state (completed, errored, or
     /// cancelled) and return the outcome.
     ///
-    /// The notification router loads the job entity and sends the terminal state
-    /// directly through the channel, so no additional DB round trip is needed here.
-    ///
     /// # Errors
     ///
+    /// Returns [`JobError::Find`] if the job does not exist.
     /// Returns [`JobError::AwaitCompletionShutdown`] if the notification channel is
     /// dropped (e.g., during shutdown) before delivering the terminal state.
     #[instrument(name = "job.await_completion", skip(self))]
     pub async fn await_completion(&self, id: JobId) -> Result<JobTerminalState, JobError> {
+        // Fail fast if the job doesn't exist — avoids a 5-minute silent hang
+        // in the waiter manager for a JobId that will never resolve.
+        self.find(id).await?;
         let rx = self.router.wait_for_terminal(id);
         rx.await
             .map_err(|_| JobError::AwaitCompletionShutdown(id))
