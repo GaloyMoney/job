@@ -696,7 +696,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(5));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string(), None)
                 .expect("retry expected");
 
             assert_eq!(
