@@ -49,6 +49,10 @@ pub enum JobError {
         "JobError - AwaitCompletionShutdown: notification channel closed while awaiting job {0}"
     )]
     AwaitCompletionShutdown(JobId),
+    #[error(
+        "JobError - TimedOut: job {0} did not reach terminal state within the specified timeout"
+    )]
+    TimedOut(JobId),
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {
