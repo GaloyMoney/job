@@ -964,6 +964,60 @@ async fn test_await_completion_already_completed() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_poll_completion() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("poll-completion-job"),
+    });
+    jobs.start_poll().await?;
+
+    // Spawn a job scheduled far in the future so it stays pending
+    let job_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(job_id, TestJobConfig { delay_ms: 10 }, schedule_at)
+        .await?;
+
+    // Poll immediately — job hasn't completed yet
+    let state = jobs.poll_completion(job_id).await?;
+    assert_eq!(state, None, "Pending job should return None");
+
+    // Now spawn a quick job that will complete fast
+    let quick_id = JobId::new();
+    spawner
+        .spawn(quick_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+
+    // Wait for the quick job to finish
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let job = jobs.find(quick_id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Quick job never completed");
+    }
+
+    // Poll the completed job — should return terminal state
+    let state = jobs.poll_completion(quick_id).await?;
+    assert_eq!(
+        state,
+        Some(JobTerminalState::Completed),
+        "Completed job should return Some(Completed)"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_await_completion_timeout() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()

@@ -566,6 +566,16 @@ impl Jobs {
         }
     }
 
+    /// Non-blocking check for job completion.
+    ///
+    /// Returns the terminal state immediately if the job has reached one,
+    /// or `None` if it is still running.
+    #[instrument(name = "job.poll_completion", skip(self))]
+    pub async fn poll_completion(&self, id: JobId) -> Result<Option<JobTerminalState>, JobError> {
+        let job = self.find(id).await?;
+        Ok(job.terminal_state())
+    }
+
     /// Gracefully shut down the job poller.
     ///
     /// This method is idempotent and can be called multiple times safely.
