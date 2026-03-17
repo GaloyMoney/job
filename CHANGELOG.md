@@ -1,3 +1,20 @@
+# [job release v0.6.9](https://github.com/GaloyMoney/job/releases/tag/0.6.9)
+
+
+
+### Features
+
+- Add await_completion for job terminal state notification (#59)
+- Add cancel_job and list_pending_jobs API (#50)
+
+### Miscellaneous Tasks
+
+- Bump es-entity and serde_with (#63)
+- Bump es-entity from 0.10.25 to 0.10.27 (#49)
+- Bump tokio from 1.49.0 to 1.50.0 (#43)
+- Bump uuid from 1.21.0 to 1.22.0 (#47)
+- Bump es-entity from 0.10.22 to 0.10.25 (#46)
+
 # [job release v0.6.8](https://github.com/GaloyMoney/job/releases/tag/0.6.8)
 
 
