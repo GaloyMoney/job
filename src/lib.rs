@@ -189,9 +189,9 @@
 //! inject an artificial clock via [`JobSvcConfig::clock`]:
 //!
 //! ```ignore
-//! use job::{JobSvcConfig, ClockHandle, ArtificialClockConfig};
+//! use job::{JobSvcConfig, ClockHandle};
 //!
-//! let (clock, controller) = ClockHandle::artificial(ArtificialClockConfig::manual());
+//! let (clock, controller) = ClockHandle::manual();
 //! let config = JobSvcConfig::builder()
 //!     .pool(pool)
 //!     .clock(clock)
@@ -229,9 +229,7 @@ use std::sync::{Arc, Mutex};
 pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobTerminalState, JobType};
-pub use es_entity::clock::{
-    ArtificialClockConfig, ArtificialMode, Clock, ClockController, ClockHandle,
-};
+pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use migrate::*;
 pub use registry::*;
 pub use runner::*;
