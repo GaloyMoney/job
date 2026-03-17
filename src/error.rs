@@ -53,8 +53,6 @@ pub enum JobError {
         "JobError - TimedOut: job {0} did not reach terminal state within the specified timeout"
     )]
     TimedOut(JobId),
-    #[error("JobError - ResultAlreadySet: a job result has already been set")]
-    ResultAlreadySet,
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {

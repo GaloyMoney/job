@@ -4,7 +4,7 @@ use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use super::{JobId, error::JobError};
 
@@ -18,7 +18,7 @@ pub struct CurrentJob {
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
     clock: ClockHandle,
-    result: Arc<OnceLock<serde_json::Value>>,
+    result: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
 impl CurrentJob {
@@ -31,7 +31,7 @@ impl CurrentJob {
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
         clock: ClockHandle,
-        result: Arc<OnceLock<serde_json::Value>>,
+        result: Arc<Mutex<Option<serde_json::Value>>>,
     ) -> Self {
         Self {
             id,
@@ -127,17 +127,20 @@ impl CurrentJob {
         Ok(ret)
     }
 
-    /// Attach a result value to this job execution.
+    /// Attach or update the result value for this job execution.
     ///
     /// The result is serialized to JSON and will be available to callers via
-    /// [`Jobs::await_completion`](crate::Jobs::await_completion). Can only be called once
-    /// per execution — subsequent calls return [`JobError::ResultAlreadySet`].
+    /// [`Jobs::await_completion`](crate::Jobs::await_completion). Each call
+    /// overwrites the previous value — the **last** value set before the job
+    /// completes (or errors) is what gets persisted. This allows incremental
+    /// progress updates; for example, a batch job can call `set_result` after
+    /// each chunk so that partial progress is preserved even on failure.
     pub fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
         let json =
             serde_json::to_value(result).map_err(JobError::CouldNotSerializeExecutionState)?;
-        self.result
-            .set(json)
-            .map_err(|_| JobError::ResultAlreadySet)
+        let mut guard = self.result.lock().expect("result mutex poisoned");
+        *guard = Some(json);
+        Ok(())
     }
 
     /// Wait for a shutdown signal. Returns `true` if shutdown was requested.
