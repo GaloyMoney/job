@@ -3,9 +3,8 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ArtificialClockConfig, ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer,
-    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
-    error::JobError,
+    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
+    JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -150,8 +149,8 @@ impl JobRunner for ScheduledJobRunner {
 async fn test_scheduled_job_with_artificial_clock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
 
-    // Create an artificial clock for deterministic testing
-    let (clock, controller) = ClockHandle::artificial(ArtificialClockConfig::manual());
+    // Create a manual clock for deterministic testing
+    let (clock, controller) = ClockHandle::manual();
     let initial_time = clock.now();
 
     let config = JobSvcConfig::builder()
