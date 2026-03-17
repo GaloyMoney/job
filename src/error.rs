@@ -45,8 +45,8 @@ pub enum JobError {
     Config(String),
     #[error("JobError - Migration: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
-    #[error("JobError - NotTerminal: job {0} has not reached a terminal state")]
-    NotTerminal(JobId),
+    #[error("JobError - AwaitCompletionShutdown: notification channel closed while awaiting job {0}")]
+    AwaitCompletionShutdown(JobId),
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {

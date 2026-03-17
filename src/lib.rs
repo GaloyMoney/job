@@ -541,19 +541,13 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Find`] if the router channel is dropped before delivering
-    /// the terminal state (e.g., during shutdown) and a fallback DB load also fails.
+    /// Returns [`JobError::AwaitCompletionShutdown`] if the notification channel is
+    /// dropped (e.g., during shutdown) before delivering the terminal state.
     #[instrument(name = "job.await_completion", skip(self))]
     pub async fn await_completion(&self, id: JobId) -> Result<JobTerminalState, JobError> {
         let rx = self.router.wait_for_terminal(id);
-        match rx.await {
-            Ok(state) => Ok(state),
-            Err(_) => {
-                // Channel dropped (router shutdown) — fall back to DB
-                let job = self.find(id).await?;
-                job.terminal_state().ok_or(JobError::NotTerminal(id))
-            }
-        }
+        rx.await
+            .map_err(|_| JobError::AwaitCompletionShutdown(id))
     }
 
     /// Gracefully shut down the job poller.
