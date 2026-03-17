@@ -4,6 +4,8 @@ use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
+use std::sync::{Arc, OnceLock};
+
 use super::{JobId, error::JobError};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
@@ -16,6 +18,7 @@ pub struct CurrentJob {
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
     clock: ClockHandle,
+    result: Arc<OnceLock<serde_json::Value>>,
 }
 
 impl CurrentJob {
@@ -28,6 +31,7 @@ impl CurrentJob {
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
         clock: ClockHandle,
+        result: Arc<OnceLock<serde_json::Value>>,
     ) -> Self {
         Self {
             id,
@@ -36,6 +40,7 @@ impl CurrentJob {
             execution_state_json: execution_state,
             shutdown_rx,
             clock,
+            result,
         }
     }
 
@@ -120,6 +125,19 @@ impl CurrentJob {
     pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobError> {
         let ret = es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?;
         Ok(ret)
+    }
+
+    /// Attach a result value to this job execution.
+    ///
+    /// The result is serialized to JSON and will be available to callers via
+    /// [`Jobs::await_completion`](crate::Jobs::await_completion). Can only be called once
+    /// per execution — subsequent calls return [`JobError::ResultAlreadySet`].
+    pub fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
+        let json =
+            serde_json::to_value(result).map_err(JobError::CouldNotSerializeExecutionState)?;
+        self.result
+            .set(json)
+            .map_err(|_| JobError::ResultAlreadySet)
     }
 
     /// Wait for a shutdown signal. Returns `true` if shutdown was requested.

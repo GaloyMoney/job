@@ -11,6 +11,40 @@ use es_entity::{context::TracingContext, *};
 
 use crate::{JobId, error::JobError};
 
+/// Outcome returned by [`Jobs::await_completion`](crate::Jobs::await_completion),
+/// carrying both the terminal state and an optional result value.
+#[derive(Debug, Clone)]
+pub struct JobCompletionResult {
+    state: JobTerminalState,
+    result: Option<serde_json::Value>,
+}
+
+impl JobCompletionResult {
+    pub(crate) fn new(state: JobTerminalState, result: Option<serde_json::Value>) -> Self {
+        Self { state, result }
+    }
+
+    /// The terminal state the job reached.
+    pub fn state(&self) -> JobTerminalState {
+        self.state
+    }
+
+    /// Returns the raw JSON result value, if any.
+    pub fn result(&self) -> Option<&serde_json::Value> {
+        self.result.as_ref()
+    }
+
+    /// Deserialize the result value into a typed struct.
+    pub fn typed_result<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<Option<T>, serde_json::Error> {
+        match &self.result {
+            Some(v) => serde_json::from_value(v.clone()).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Terminal outcome of a job lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobTerminalState {
@@ -79,7 +113,10 @@ pub enum JobEvent {
     ExecutionErrored {
         error: String,
     },
-    JobCompleted,
+    JobCompleted {
+        #[serde(default)]
+        result: Option<serde_json::Value>,
+    },
     Cancelled,
     AttemptCounterReset,
 }
@@ -193,7 +230,7 @@ impl Job {
         self.events
             .iter_all()
             .rev()
-            .any(|event| matches!(event, JobEvent::JobCompleted | JobEvent::Cancelled))
+            .any(|event| matches!(event, JobEvent::JobCompleted { .. } | JobEvent::Cancelled))
     }
 
     /// Returns `true` if the job was cancelled.
@@ -215,11 +252,32 @@ impl Job {
         let mut rev = self.events.iter_all().rev();
         match rev.next()? {
             JobEvent::Cancelled => Some(JobTerminalState::Cancelled),
-            JobEvent::JobCompleted => match rev.next() {
+            JobEvent::JobCompleted { .. } => match rev.next() {
                 Some(JobEvent::ExecutionErrored { .. }) => Some(JobTerminalState::Errored),
                 _ => Some(JobTerminalState::Completed),
             },
             _ => None,
+        }
+    }
+
+    /// Returns the result value attached to this job, if any.
+    pub fn result(&self) -> Option<&serde_json::Value> {
+        self.events.iter_all().rev().find_map(|event| {
+            if let JobEvent::JobCompleted { result } = event {
+                result.as_ref()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Deserialize the result value into a typed struct.
+    pub fn typed_result<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<Option<T>, serde_json::Error> {
+        match self.result() {
+            Some(v) => serde_json::from_value(v.clone()).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -261,9 +319,9 @@ impl Job {
         });
     }
 
-    pub(super) fn complete_job(&mut self) {
+    pub(super) fn complete_job(&mut self, result: Option<serde_json::Value>) {
         self.events.push(JobEvent::ExecutionCompleted);
-        self.events.push(JobEvent::JobCompleted);
+        self.events.push(JobEvent::JobCompleted { result });
     }
 
     pub(crate) fn cancel(&mut self) -> es_entity::Idempotent<()> {
@@ -287,9 +345,9 @@ impl Job {
         });
     }
 
-    pub(super) fn error_job(&mut self, error: String) {
+    pub(super) fn error_job(&mut self, error: String, result: Option<serde_json::Value>) {
         self.events.push(JobEvent::ExecutionErrored { error });
-        self.events.push(JobEvent::JobCompleted);
+        self.events.push(JobEvent::JobCompleted { result });
     }
 
     pub(super) fn maybe_schedule_retry(
@@ -298,6 +356,7 @@ impl Job {
         attempt: u32,
         retry_policy: &RetryPolicy,
         error: String,
+        result: Option<serde_json::Value>,
     ) -> Option<(DateTime<Utc>, u32)> {
         let mut current_attempt = attempt.max(1);
         if self
@@ -312,7 +371,7 @@ impl Job {
         let next_attempt = current_attempt.saturating_add(1);
         let max_attempts = retry_policy.max_attempts.unwrap_or(u32::MAX);
         if next_attempt > max_attempts {
-            self.error_job(error);
+            self.error_job(error, result);
             return None;
         }
 
@@ -362,7 +421,7 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionCompleted => {}
                 JobEvent::ExecutionAborted { .. } => {}
                 JobEvent::ExecutionErrored { .. } => {}
-                JobEvent::JobCompleted => {}
+                JobEvent::JobCompleted { .. } => {}
                 JobEvent::Cancelled => {}
                 JobEvent::AttemptCounterReset => {}
             }
@@ -532,7 +591,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 1, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(Clock::now(), 1, &retry_policy, "boom".to_string(), None)
                 .expect("retry expected");
 
             assert_eq!(next_attempt, 2);
@@ -565,7 +624,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 0, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(Clock::now(), 0, &retry_policy, "boom".to_string(), None)
                 .expect("retry expected when attempt starts at zero");
 
             assert_eq!(next_attempt, 2);
@@ -602,7 +661,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(2));
 
             assert!(
-                job.maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string())
+                job.maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string(), None)
                     .is_none(),
                 "should stop retrying when attempts exhausted"
             );
@@ -612,7 +671,7 @@ mod tests {
                 events[events.len() - 2],
                 JobEvent::ExecutionErrored { .. }
             ));
-            assert!(matches!(events.last(), Some(JobEvent::JobCompleted)));
+            assert!(matches!(events.last(), Some(JobEvent::JobCompleted { .. })));
         }
 
         #[test]
@@ -681,7 +740,13 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "second failure".to_string())
+                .maybe_schedule_retry(
+                    Clock::now(),
+                    2,
+                    &retry_policy,
+                    "second failure".to_string(),
+                    None,
+                )
                 .expect("final retry should still be scheduled");
 
             assert_eq!(next_attempt, 3);
@@ -720,7 +785,13 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 3, &retry_policy, "third failure".to_string())
+                .maybe_schedule_retry(
+                    Clock::now(),
+                    3,
+                    &retry_policy,
+                    "third failure".to_string(),
+                    None,
+                )
                 .expect("a healthy gap should reset attempt even at limit");
 
             assert_eq!(next_attempt, 2);
@@ -760,7 +831,13 @@ mod tests {
             let retry_policy = build_retry_policy(None);
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), attempt, &retry_policy, "overflow".to_string())
+                .maybe_schedule_retry(
+                    Clock::now(),
+                    attempt,
+                    &retry_policy,
+                    "overflow".to_string(),
+                    None,
+                )
                 .expect("unbounded retries should permit another schedule");
 
             assert_eq!(next_attempt, u32::MAX);
