@@ -783,6 +783,30 @@ async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()>
 
 // -- await_completion tests --
 
+/// A [`TestJobInitializer`] variant that accepts a custom job type so each
+/// `await_completion` test gets its own type and pollers in parallel nextest
+/// processes don't steal each other's jobs.
+struct AwaitTestJobInitializer {
+    job_type: JobType,
+}
+
+impl JobInitializer for AwaitTestJobInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: TestJobConfig = job.config()?;
+        Ok(Box::new(TestJobRunner { config }))
+    }
+}
+
 /// An initializer whose runner always returns an error.
 struct FailingJobInitializer;
 
@@ -833,7 +857,9 @@ async fn test_await_completion_on_success() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(AwaitTestJobInitializer {
+        job_type: JobType::new("await-success-job"),
+    });
     jobs.start_poll().await?;
 
     let job_id = JobId::new();
@@ -883,7 +909,9 @@ async fn test_await_completion_on_cancel() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(AwaitTestJobInitializer {
+        job_type: JobType::new("await-cancel-job"),
+    });
     jobs.start_poll().await?;
 
     // Spawn a job scheduled far in the future so it stays pending
@@ -915,7 +943,9 @@ async fn test_await_completion_already_completed() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(AwaitTestJobInitializer {
+        job_type: JobType::new("await-already-job"),
+    });
     jobs.start_poll().await?;
 
     let job_id = JobId::new();
