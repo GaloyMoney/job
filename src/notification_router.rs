@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::JobId;
+use crate::cancellation_tokens::CancellationTokens;
 use crate::entity::{JobTerminalState, JobType};
 use crate::handle::OwnedTaskHandle;
 use crate::repo::JobRepo;
@@ -16,6 +17,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 enum JobNotification {
     ExecutionReady { job_type: String },
     JobTerminal { job_id: JobId },
+    JobCancel { execution_id: String },
 }
 
 type WaiterRegistration = (JobId, oneshot::Sender<JobTerminalState>);
@@ -54,13 +56,16 @@ impl JobNotificationRouter {
         &self,
         tracker: Arc<JobTracker>,
         job_types: Vec<JobType>,
+        cancellation_tokens: Arc<CancellationTokens>,
     ) -> Result<(OwnedTaskHandle, OwnedTaskHandle), sqlx::Error> {
         let (register_tx, register_rx) = mpsc::unbounded_channel();
         self.register_tx
             .set(register_tx)
             .expect("router started more than once");
 
-        let listener_handle = self.start_listener(tracker, job_types).await?;
+        let listener_handle = self
+            .start_listener(tracker, job_types, cancellation_tokens)
+            .await?;
         let waiter_handle = Self::start_waiter_manager(
             register_rx,
             self.terminal_tx.subscribe(),
@@ -74,6 +79,7 @@ impl JobNotificationRouter {
         &self,
         tracker: Arc<JobTracker>,
         job_types: Vec<JobType>,
+        cancellation_tokens: Arc<CancellationTokens>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let mut listener = PgListener::connect_with(&self.pool).await?;
         listener.listen("job_events").await?;
@@ -93,6 +99,11 @@ impl JobNotificationRouter {
                             }
                             Ok(JobNotification::JobTerminal { job_id }) => {
                                 let _ = terminal_tx.send(job_id);
+                            }
+                            Ok(JobNotification::JobCancel { execution_id }) => {
+                                if let Ok(uuid) = execution_id.parse::<uuid::Uuid>() {
+                                    cancellation_tokens.cancel(&JobId::from(uuid));
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(

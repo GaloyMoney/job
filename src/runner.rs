@@ -52,6 +52,8 @@ pub trait JobInitializer: Send + Sync + 'static {
 pub enum JobCompletion {
     /// Job finished successfully; mark the record as completed.
     Complete,
+    /// Job was cancelled cooperatively; mark the record as cancelled.
+    Cancelled,
     #[cfg(feature = "es-entity")]
     /// Job finished and returns an `EsEntity` operation that the job service will commit.
     CompleteWithOp(es_entity::DbOp<'static>),

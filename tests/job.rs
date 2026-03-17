@@ -3,9 +3,9 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ArtificialClockConfig, ClockHandle, CurrentJob, Job, JobCompletion, JobCompletionResult, JobId,
-    JobInitializer, JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs,
-    RetrySettings, error::JobError,
+    ArtificialClockConfig, CancelResult, ClockHandle, CurrentJob, Job, JobCompletion,
+    JobCompletionResult, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec, JobSvcConfig,
+    JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -671,7 +671,8 @@ async fn test_cancel_pending_job() -> anyhow::Result<()> {
         .await?;
 
     // Cancel the pending job
-    jobs.cancel_job(job_id).await?;
+    let result = jobs.cancel_job(job_id).await?;
+    assert_eq!(result, CancelResult::Cancelled);
 
     // Verify it's findable as a cancelled/completed entity
     let found = jobs.find(job_id).await?;
@@ -682,7 +683,7 @@ async fn test_cancel_pending_job() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
+async fn test_cancel_running_job_succeeds() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool)
@@ -722,15 +723,11 @@ async fn test_cancel_running_job_fails() -> anyhow::Result<()> {
         assert!(attempts < 100, "Job never started");
     }
 
-    // Cancel on a running job should fail
-    let result = jobs.cancel_job(job_id).await;
-    assert!(
-        matches!(result, Err(JobError::CannotCancelJob)),
-        "Cancelling a running job should return JobNotPending, got err: {:?}",
-        result.err(),
-    );
+    // Cancel on a running job should succeed (sets cancelled_at)
+    let result = jobs.cancel_job(job_id).await?;
+    assert_eq!(result, CancelResult::Cancelled);
 
-    // Release the job so it completes normally
+    // Release the job so the force-cancel monitor can clean up
     release.notify_one();
 
     // Wait for completion
@@ -782,8 +779,9 @@ async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()>
         assert!(attempts < 100, "Job never completed");
     }
 
-    // Cancel on an already completed job is a no-op
-    jobs.cancel_job(job_id).await?;
+    // Cancel on an already completed job returns AlreadyCompleted
+    let result = jobs.cancel_job(job_id).await?;
+    assert_eq!(result, CancelResult::AlreadyCompleted);
 
     let job = jobs.find(job_id).await?;
     assert!(

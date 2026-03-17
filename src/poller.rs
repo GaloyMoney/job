@@ -13,8 +13,9 @@ use std::{
 };
 
 use super::{
-    JobId, config::JobPollerConfig, dispatcher::*, entity::JobType, error::JobError,
-    handle::OwnedTaskHandle, registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
+    JobId, cancellation_tokens::CancellationTokens, config::JobPollerConfig, dispatcher::*,
+    entity::JobType, error::JobError, handle::OwnedTaskHandle, registry::JobRegistry,
+    repo::JobRepo, tracker::JobTracker,
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -41,6 +42,7 @@ pub(crate) struct JobPoller {
     repo: Arc<JobRepo>,
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
+    cancellation_tokens: Arc<CancellationTokens>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
@@ -76,6 +78,7 @@ impl JobPoller {
         repo: Arc<JobRepo>,
         registry: JobRegistry,
         tracker: Arc<JobTracker>,
+        cancellation_tokens: Arc<CancellationTokens>,
         clock: ClockHandle,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
@@ -86,6 +89,7 @@ impl JobPoller {
             repo,
             config,
             registry,
+            cancellation_tokens,
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
             clock,
@@ -254,6 +258,7 @@ impl JobPoller {
         let pool = self.repo.pool().clone();
         let instance_id = self.instance_id;
         let clock = self.clock.clone();
+        let cancellation_tokens = Arc::clone(&self.cancellation_tokens);
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
             async move {
@@ -291,6 +296,25 @@ impl JobPoller {
                             Duration::from_millis(50 << failures)
                         }
                     };
+
+                    // Safety net: cancel tokens for jobs whose cancelled_at is set
+                    // but the NOTIFY may have been missed.
+                    if let Ok(rows) = sqlx::query_scalar::<_, uuid::Uuid>(
+                        "SELECT je.id FROM job_executions je \
+                         JOIN jobs j ON je.id = j.id \
+                         WHERE je.poller_instance_id = $1 \
+                         AND je.state = 'running' \
+                         AND j.cancelled_at IS NOT NULL",
+                    )
+                    .bind(instance_id)
+                    .fetch_all(&pool)
+                    .await
+                    {
+                        for uuid in rows {
+                            cancellation_tokens.cancel(&JobId::from(uuid));
+                        }
+                    }
+
                     drop(_guard);
                     clock.sleep(timeout).await;
                 }
@@ -321,6 +345,11 @@ impl JobPoller {
         span.record("now", tracing::field::display(clock.now()));
         span.record("poller_id", tracing::field::display(instance_id));
 
+        // Create a cancellation token for this job
+        let cancel_token = self.cancellation_tokens.insert(polled_job.id);
+        let cancel_monitor_token = cancel_token.clone();
+        let cancellation_tokens = Arc::clone(&self.cancellation_tokens);
+
         let shutdown_rx = self.shutdown_tx.subscribe();
         let job_id = job.id;
         let job_type = job.job_type.clone();
@@ -341,6 +370,8 @@ impl JobPoller {
                 runner,
                 instance_id,
                 clock,
+                cancellation_tokens,
+                cancel_token,
             )
             .execute_job(polled_job, shutdown_rx)
             .await
@@ -351,6 +382,10 @@ impl JobPoller {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_timeout = self.config.shutdown_timeout;
+        let cancel_timeout = self.config.cancel_timeout;
+        let cancel_monitor_repo = Arc::clone(&self.repo);
+        let cancel_monitor_clock = self.clock.clone();
+        let cancel_monitor_tokens = Arc::clone(&self.cancellation_tokens);
         #[cfg_attr(
             not(all(feature = "tokio-task-names", tokio_unstable)),
             allow(unused_variables)
@@ -364,7 +399,7 @@ impl JobPoller {
 
             tokio::select! {
                 _ = &mut job_handle => {
-                    // Job completed - no need for shutdown coordination
+                    // Job completed - no need for shutdown or cancel coordination
                 }
                 Ok(shutdown_notifier) = shutdown_rx.recv() => {
                     let (send, recv) = tokio::sync::oneshot::channel();
@@ -404,11 +439,68 @@ impl JobPoller {
                         )
                     ).await;
                 }
+                _ = cancel_monitor_token.cancelled() => {
+                    // Cancellation requested — give the runner a grace period
+                    async {
+                        if tokio::time::timeout(cancel_timeout, &mut job_handle).await.is_err() {
+                            tracing::warn!("Job exceeded cancel timeout, force-aborting");
+                            job_handle.abort();
+                            let _ = job_handle.await;
+                            // Clean up: delete execution, record cancel events
+                            let _ = force_cancel_cleanup(
+                                &cancel_monitor_repo,
+                                job_id,
+                                instance_id,
+                                &cancel_monitor_clock,
+                            ).await;
+                        }
+                        cancel_monitor_tokens.remove(&job_id);
+                    }.instrument(tracing::info_span!(
+                            parent: None,
+                            "job.cancel_coordination",
+                            job_id = %job_id,
+                            job_type = %job_type,
+                        )
+                    ).await;
+                }
             }
         });
 
         Ok(())
     }
+}
+
+/// Clean up a force-cancelled job: delete its execution row and record cancel events.
+///
+/// Called by the monitor task after aborting a job that didn't finish within
+/// the cancel timeout.
+#[instrument(name = "job.force_cancel_cleanup", skip(repo, clock), fields(job_id = %job_id))]
+async fn force_cancel_cleanup(
+    repo: &JobRepo,
+    job_id: JobId,
+    instance_id: uuid::Uuid,
+    clock: &ClockHandle,
+) -> Result<(), JobError> {
+    let mut op = repo.begin_op_with_clock(clock).await?;
+    let mut job = repo.find_by_id(job_id).await?;
+
+    sqlx::query!(
+        r#"
+        DELETE FROM job_executions
+        WHERE id = $1 AND poller_instance_id = $2
+        "#,
+        job_id as JobId,
+        instance_id
+    )
+    .execute(op.as_executor())
+    .await?;
+
+    job.cancel_execution();
+    repo.update_in_op(&mut op, &mut job).await?;
+    op.commit().await?;
+
+    tracing::info!("Force-cancelled job cleaned up");
+    Ok(())
 }
 
 #[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]

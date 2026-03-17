@@ -205,6 +205,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 #![forbid(unsafe_code)]
 
+mod cancellation_tokens;
 mod config;
 mod current;
 mod dispatcher;
@@ -237,6 +238,7 @@ pub use registry::*;
 pub use runner::*;
 pub use spawner::*;
 
+use cancellation_tokens::*;
 use error::*;
 use notification_router::*;
 use poller::*;
@@ -244,6 +246,17 @@ use repo::*;
 use tracker::*;
 
 es_entity::entity_id! { JobId }
+
+/// Outcome of a [`Jobs::cancel_job`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelResult {
+    /// The job was successfully cancelled (pending or running).
+    Cancelled,
+    /// The job had already reached a terminal state.
+    AlreadyCompleted,
+    /// No job with the given id was found.
+    NotFound,
+}
 
 #[derive(Clone)]
 /// Primary entry point for interacting with the Job crate. Provides APIs to register job
@@ -253,6 +266,7 @@ pub struct Jobs {
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     router: Arc<JobNotificationRouter>,
+    cancellation_tokens: Arc<CancellationTokens>,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -283,12 +297,14 @@ impl Jobs {
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
         let router = Arc::new(JobNotificationRouter::new(&pool, Arc::clone(&repo)));
+        let cancellation_tokens = Arc::new(CancellationTokens::new());
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
             router,
+            cancellation_tokens,
             poller_handle: None,
             clock,
         })
@@ -456,13 +472,20 @@ impl Jobs {
             Arc::clone(&self.repo),
             registry,
             Arc::clone(&tracker),
+            Arc::clone(&self.cancellation_tokens),
             self.clock.clone(),
         );
 
         let job_types = poller.registered_job_types();
 
-        let (listener_handle, waiter_handle) =
-            self.router.start(Arc::clone(&tracker), job_types).await?;
+        let (listener_handle, waiter_handle) = self
+            .router
+            .start(
+                Arc::clone(&tracker),
+                job_types,
+                Arc::clone(&self.cancellation_tokens),
+            )
+            .await?;
 
         let poller_handle = poller.start(listener_handle, waiter_handle);
         self.poller_handle = Some(Arc::new(poller_handle));
@@ -498,33 +521,72 @@ impl Jobs {
         Ok(self.repo.find_by_id(id).await?)
     }
 
-    /// Cancel a pending job, removing it from the execution queue.
+    /// Cancel a job, whether it is pending or currently running.
+    ///
+    /// - **Pending jobs** are cancelled atomically: the execution row is deleted
+    ///   and cancel events are recorded in the same transaction.
+    /// - **Running jobs** have their `cancelled_at` column set, which triggers a
+    ///   PG NOTIFY that routes through the unified router to signal the job's
+    ///   cancellation token. The runner can observe this via
+    ///   [`CurrentJob::cancellation_requested`] and return
+    ///   [`JobCompletion::Cancelled`]. If the runner does not cooperate within
+    ///   the configured `cancel_timeout`, the task is force-aborted.
     ///
     /// This operation is idempotent — calling it on an already cancelled or
-    /// completed job is a no-op. If the job exists but is currently running
-    /// (not pending), returns [`JobError::CannotCancelJob`].
+    /// completed job returns [`CancelResult::AlreadyCompleted`].
     #[instrument(name = "job.cancel_job", skip(self))]
-    pub async fn cancel_job(&self, id: JobId) -> Result<(), JobError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id(id).await?;
+    pub async fn cancel_job(&self, id: JobId) -> Result<CancelResult, JobError> {
+        let job = match self.repo.find_by_id(id).await {
+            Ok(j) => j,
+            Err(_) => return Ok(CancelResult::NotFound),
+        };
 
-        if job.cancel().did_execute() {
-            let result = sqlx::query!(
-                r#"DELETE FROM job_executions WHERE id = $1 AND state = 'pending'"#,
-                id as JobId,
-            )
+        // Already in a terminal state — nothing to do.
+        if job.completed() {
+            return Ok(CancelResult::AlreadyCompleted);
+        }
+
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+
+        // Try to cancel a pending execution atomically.
+        let result = sqlx::query!(
+            r#"DELETE FROM job_executions WHERE id = $1 AND state = 'pending'"#,
+            id as JobId,
+        )
+        .execute(op.as_executor())
+        .await?;
+
+        if result.rows_affected() > 0 {
+            // Pending job — record cancel events in the same transaction.
+            let mut job = job;
+            let _ = job.cancel();
+            self.repo.update_in_op(&mut op, &mut job).await?;
+            op.commit().await?;
+            return Ok(CancelResult::Cancelled);
+        }
+
+        // Job is running — set cancelled_at and send application-level NOTIFY
+        // to signal the cancellation token via the unified router.
+        let now = self.clock.now();
+        sqlx::query!(
+            r#"UPDATE jobs SET cancelled_at = $2 WHERE id = $1 AND cancelled_at IS NULL"#,
+            id as JobId,
+            now,
+        )
+        .execute(op.as_executor())
+        .await?;
+
+        let payload = serde_json::json!({
+            "type": "job_cancel",
+            "execution_id": id.to_string()
+        });
+        sqlx::query("SELECT pg_notify('job_events', $1)")
+            .bind(payload.to_string())
             .execute(op.as_executor())
             .await?;
 
-            if result.rows_affected() == 0 {
-                return Err(JobError::CannotCancelJob);
-            }
-
-            self.repo.update_in_op(&mut op, &mut job).await?;
-            op.commit().await?;
-        }
-
-        Ok(())
+        op.commit().await?;
+        Ok(CancelResult::Cancelled)
     }
 
     /// Returns a reference to the clock used by this job service.

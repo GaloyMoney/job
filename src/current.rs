@@ -3,6 +3,7 @@
 use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 use std::sync::{Arc, Mutex};
 
@@ -19,9 +20,11 @@ pub struct CurrentJob {
     >,
     clock: ClockHandle,
     result: Arc<Mutex<Option<serde_json::Value>>>,
+    cancel_token: CancellationToken,
 }
 
 impl CurrentJob {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         id: JobId,
         attempt: u32,
@@ -32,6 +35,7 @@ impl CurrentJob {
         >,
         clock: ClockHandle,
         result: Arc<Mutex<Option<serde_json::Value>>>,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             id,
@@ -41,6 +45,7 @@ impl CurrentJob {
             shutdown_rx,
             clock,
             result,
+            cancel_token,
         }
     }
 
@@ -175,5 +180,21 @@ impl CurrentJob {
     /// Use this for polling-style shutdown detection within loops.
     pub fn is_shutdown_requested(&mut self) -> bool {
         self.shutdown_rx.try_recv().is_ok()
+    }
+
+    /// Non-blocking check if cancellation has been requested for this job.
+    ///
+    /// Returns `true` once the job has been cancelled via [`Jobs::cancel_job`](crate::Jobs::cancel_job).
+    /// Job runners should check this periodically and return
+    /// [`JobCompletion::Cancelled`](crate::JobCompletion::Cancelled) when `true`.
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancel_token.is_cancelled()
+    }
+
+    /// Returns a future that resolves when cancellation is requested.
+    ///
+    /// Useful in `tokio::select!` branches for cooperative cancellation.
+    pub async fn cancellation_notified(&self) {
+        self.cancel_token.cancelled().await;
     }
 }

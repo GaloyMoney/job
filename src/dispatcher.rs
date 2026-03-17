@@ -11,8 +11,8 @@ use std::{
 };
 
 use super::{
-    JobId, current::CurrentJob, entity::RetryPolicy, error::JobError, repo::JobRepo, runner::*,
-    tracker::JobTracker,
+    JobId, cancellation_tokens::CancellationTokens, current::CurrentJob, entity::RetryPolicy,
+    error::JobError, repo::JobRepo, runner::*, tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -27,11 +27,14 @@ pub(crate) struct JobDispatcher {
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
+    cancellation_tokens: Arc<CancellationTokens>,
+    cancel_token: tokio_util::sync::CancellationToken,
     rescheduled: bool,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
 }
 impl JobDispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
@@ -40,12 +43,16 @@ impl JobDispatcher {
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
+        cancellation_tokens: Arc<CancellationTokens>,
+        cancel_token: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
             repo,
             retry_settings,
             runner: Some(runner),
             tracker,
+            cancellation_tokens,
+            cancel_token,
             rescheduled: false,
             instance_id,
             clock,
@@ -94,6 +101,7 @@ impl JobDispatcher {
             shutdown_rx,
             self.clock.clone(),
             Arc::clone(&result_holder),
+            self.cancel_token.clone(),
         );
         self.tracker.dispatch_job();
         let extract_result =
@@ -111,6 +119,12 @@ impl JobDispatcher {
                 let result = extract_result(result_holder);
                 let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
                 self.complete_job(&mut op, job.id, result).await?;
+                op.commit().await?;
+            }
+            Ok(JobCompletion::Cancelled) => {
+                span.record("conclusion", "Cancelled");
+                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                self.cancel_running_job(&mut op, job.id).await?;
                 op.commit().await?;
             }
             #[cfg(feature = "es-entity")]
@@ -328,6 +342,29 @@ impl JobDispatcher {
         Ok(())
     }
 
+    #[instrument(name = "job.cancel_running_job", skip(self, op), fields(id = %id))]
+    async fn cancel_running_job(
+        &mut self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: JobId,
+    ) -> Result<(), JobError> {
+        let mut job = self.repo.find_by_id(&id).await?;
+        sqlx::query!(
+            r#"
+          DELETE FROM job_executions
+          WHERE id = $1 AND poller_instance_id = $2
+        "#,
+            id as JobId,
+            self.instance_id
+        )
+        .execute(op.as_executor())
+        .await?;
+        job.cancel_execution();
+        self.repo.update_in_op(op, &mut job).await?;
+        self.cancellation_tokens.remove(&id);
+        Ok(())
+    }
+
     #[instrument(name = "job.complete_job", skip(self, op, result), fields(id = %id))]
     async fn complete_job(
         &mut self,
@@ -348,6 +385,7 @@ impl JobDispatcher {
         .await?;
         job.complete_job(result);
         self.repo.update_in_op(op, &mut job).await?;
+        self.cancellation_tokens.remove(&id);
         Ok(())
     }
 

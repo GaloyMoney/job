@@ -2,6 +2,7 @@ CREATE TABLE jobs (
   id UUID PRIMARY KEY,
   unique_per_type BOOLEAN NOT NULL,
   job_type VARCHAR NOT NULL,
+  cancelled_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE UNIQUE INDEX idx_unique_job_type ON jobs (job_type) WHERE unique_per_type = TRUE;

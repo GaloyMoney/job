@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM job_executions\n        WHERE id = $1 AND poller_instance_id = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0816823ba7784f105d62568db8496a39a8470041474201d1fde1ba9def30b6d1"
+}

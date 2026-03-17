@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs SET cancelled_at = $2 WHERE id = $1 AND cancelled_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3dd7b8b5f00c51b3a39204d396c7c218894f26cf6aede055be3ae92a43bcb0ba"
+}

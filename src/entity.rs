@@ -113,6 +113,7 @@ pub enum JobEvent {
     ExecutionErrored {
         error: String,
     },
+    ExecutionCancelled,
     JobCompleted {
         #[serde(default)]
         result: Option<serde_json::Value>,
@@ -332,6 +333,15 @@ impl Job {
         es_entity::Idempotent::Executed(())
     }
 
+    /// Record cancellation of a running execution and mark the job as cancelled.
+    ///
+    /// Used by the dispatcher when a running job is cooperatively or forcibly
+    /// cancelled. Pushes both `ExecutionCancelled` and `Cancelled` events.
+    pub(super) fn cancel_execution(&mut self) {
+        self.events.push(JobEvent::ExecutionCancelled);
+        self.events.push(JobEvent::Cancelled);
+    }
+
     pub(super) fn schedule_retry(
         &mut self,
         error: String,
@@ -421,6 +431,7 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionCompleted => {}
                 JobEvent::ExecutionAborted { .. } => {}
                 JobEvent::ExecutionErrored { .. } => {}
+                JobEvent::ExecutionCancelled => {}
                 JobEvent::JobCompleted { .. } => {}
                 JobEvent::Cancelled => {}
                 JobEvent::AttemptCounterReset => {}
