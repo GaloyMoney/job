@@ -211,6 +211,7 @@ mod dispatcher;
 mod entity;
 mod handle;
 mod migrate;
+mod notification_router;
 mod poller;
 mod registry;
 mod repo;
@@ -227,7 +228,7 @@ use std::sync::{Arc, Mutex};
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobType};
+pub use entity::{Job, JobTerminalState, JobType};
 pub use es_entity::clock::{
     ArtificialClockConfig, ArtificialMode, Clock, ClockController, ClockHandle,
 };
@@ -237,8 +238,10 @@ pub use runner::*;
 pub use spawner::*;
 
 use error::*;
+use notification_router::*;
 use poller::*;
 use repo::*;
+use tracker::*;
 
 es_entity::entity_id! { JobId }
 
@@ -249,6 +252,7 @@ pub struct Jobs {
     config: JobSvcConfig,
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
+    router: Arc<JobNotificationRouter>,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -278,11 +282,13 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
+        let router = Arc::new(JobNotificationRouter::new(&pool, Arc::clone(&repo)));
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
+            router,
             poller_handle: None,
             clock,
         })
@@ -439,16 +445,27 @@ impl Jobs {
             .expect("Couldn't lock Registry Mutex")
             .take()
             .expect("Registry has been consumed by executor");
-        self.poller_handle = Some(Arc::new(
-            JobPoller::new(
-                self.config.poller_config.clone(),
-                Arc::clone(&self.repo),
-                registry,
-                self.clock.clone(),
-            )
-            .start()
-            .await?,
+
+        let tracker = Arc::new(JobTracker::new(
+            self.config.poller_config.min_jobs_per_process,
+            self.config.poller_config.max_jobs_per_process,
         ));
+
+        let poller = JobPoller::new(
+            self.config.poller_config.clone(),
+            Arc::clone(&self.repo),
+            registry,
+            Arc::clone(&tracker),
+            self.clock.clone(),
+        );
+
+        let job_types = poller.registered_job_types();
+
+        let (listener_handle, waiter_handle) =
+            self.router.start(Arc::clone(&tracker), job_types).await?;
+
+        let poller_handle = poller.start(listener_handle, waiter_handle);
+        self.poller_handle = Some(Arc::new(poller_handle));
         Ok(())
     }
 
@@ -513,6 +530,23 @@ impl Jobs {
     /// Returns a reference to the clock used by this job service.
     pub fn clock(&self) -> &ClockHandle {
         &self.clock
+    }
+
+    /// Block until the given job reaches a terminal state (completed, errored, or
+    /// cancelled) and return the outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Find`] if the job does not exist.
+    /// Returns [`JobError::AwaitCompletionShutdown`] if the notification channel is
+    /// dropped (e.g., during shutdown) before delivering the terminal state.
+    #[instrument(name = "job.await_completion", skip(self))]
+    pub async fn await_completion(&self, id: JobId) -> Result<JobTerminalState, JobError> {
+        // Fail fast if the job doesn't exist — avoids a 5-minute silent hang
+        // in the waiter manager for a JobId that will never resolve.
+        self.find(id).await?;
+        let rx = self.router.wait_for_terminal(id);
+        rx.await.map_err(|_| JobError::AwaitCompletionShutdown(id))
     }
 
     /// Gracefully shut down the job poller.

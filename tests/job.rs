@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
     ArtificialClockConfig, ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer,
-    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, error::JobError,
+    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
+    error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -15,13 +16,15 @@ struct TestJobConfig {
     delay_ms: u64,
 }
 
-struct TestJobInitializer;
+struct TestJobInitializer {
+    job_type: JobType,
+}
 
 impl JobInitializer for TestJobInitializer {
     type Config = TestJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("test-job")
+        self.job_type.clone()
     }
 
     fn init(
@@ -60,7 +63,9 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("create-and-run-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -537,7 +542,9 @@ async fn test_bulk_spawn_creates_and_runs_all_jobs() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("bulk-spawn-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -587,7 +594,9 @@ async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("bulk-spawn-dup-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -627,7 +636,9 @@ async fn test_bulk_spawn_empty_batch() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("bulk-spawn-empty-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -648,7 +659,9 @@ async fn test_cancel_pending_job() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("cancel-pending-job"),
+    });
 
     // Spawn a job scheduled far in the future so it stays pending
     let job_id = JobId::new();
@@ -744,7 +757,9 @@ async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()>
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("cancel-completed-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -776,6 +791,173 @@ async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()>
         "Completed job should not be marked cancelled"
     );
     assert!(job.completed(), "Job should still be completed");
+
+    Ok(())
+}
+
+// -- await_completion tests --
+
+/// An initializer whose runner always returns an error.
+struct FailingJobInitializer;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FailingJobConfig;
+
+impl JobInitializer for FailingJobInitializer {
+    type Config = FailingJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("failing-job")
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(FailingJobRunner))
+    }
+}
+
+struct FailingJobRunner;
+
+#[async_trait]
+impl JobRunner for FailingJobRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        Err("intentional failure".into())
+    }
+}
+
+#[tokio::test]
+async fn test_await_completion_on_success() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-success-job"),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner
+        .spawn(job_id, TestJobConfig { delay_ms: 50 })
+        .await?;
+
+    let jobs_clone = jobs.clone();
+    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id).await });
+
+    let state = handle.await??;
+    assert_eq!(state, JobTerminalState::Completed);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completion_on_error() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(FailingJobInitializer);
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, FailingJobConfig).await?;
+
+    let jobs_clone = jobs.clone();
+    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id).await });
+
+    let state = handle.await??;
+    assert_eq!(state, JobTerminalState::Errored);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completion_on_cancel() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-cancel-job"),
+    });
+    jobs.start_poll().await?;
+
+    // Spawn a job scheduled far in the future so it stays pending
+    let job_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(job_id, TestJobConfig { delay_ms: 50 }, schedule_at)
+        .await?;
+
+    let jobs_clone = jobs.clone();
+    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id).await });
+
+    // Give the waiter time to register before cancelling
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    jobs.cancel_job(job_id).await?;
+
+    let state = handle.await??;
+    assert_eq!(state, JobTerminalState::Cancelled);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completion_already_completed() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-already-job"),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner
+        .spawn(job_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+
+    // Wait for the job to complete via polling first
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let job = jobs.find(job_id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job never completed");
+    }
+
+    // Now call await_completion — should return immediately
+    let state = jobs.await_completion(job_id).await?;
+    assert_eq!(state, JobTerminalState::Completed);
 
     Ok(())
 }

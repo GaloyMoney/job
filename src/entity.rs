@@ -11,6 +11,17 @@ use es_entity::{context::TracingContext, *};
 
 use crate::{JobId, error::JobError};
 
+/// Terminal outcome of a job lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobTerminalState {
+    /// The job completed successfully.
+    Completed,
+    /// The job exhausted its retries and was marked as errored.
+    Errored,
+    /// The job was explicitly cancelled before completion.
+    Cancelled,
+}
+
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(transparent)]
 #[serde(transparent)]
@@ -191,6 +202,25 @@ impl Job {
             .iter_all()
             .rev()
             .any(|event| matches!(event, JobEvent::Cancelled))
+    }
+
+    /// Determine the terminal state of a job, if it has reached one.
+    ///
+    /// - `Cancelled` if a `Cancelled` event exists
+    /// - `Errored` if `JobCompleted` exists and the last execution event before it was
+    ///   `ExecutionErrored`
+    /// - `Completed` if `JobCompleted` exists (normal completion)
+    /// - `None` if the job has not reached a terminal state
+    pub fn terminal_state(&self) -> Option<JobTerminalState> {
+        let mut rev = self.events.iter_all().rev();
+        match rev.next()? {
+            JobEvent::Cancelled => Some(JobTerminalState::Cancelled),
+            JobEvent::JobCompleted => match rev.next() {
+                Some(JobEvent::ExecutionErrored { .. }) => Some(JobTerminalState::Errored),
+                _ => Some(JobTerminalState::Completed),
+            },
+            _ => None,
+        }
     }
 
     pub(crate) fn inject_tracing_parent(&self) {

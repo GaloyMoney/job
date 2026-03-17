@@ -1,7 +1,7 @@
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use serde_json::Value as JsonValue;
-use sqlx::postgres::{PgListener, PgPool, types::PgInterval};
+use sqlx::postgres::{PgPool, types::PgInterval};
 use tracing::{Span, instrument};
 
 use std::{
@@ -13,8 +13,8 @@ use std::{
 };
 
 use super::{
-    JobId, config::JobPollerConfig, dispatcher::*, error::JobError, handle::OwnedTaskHandle,
-    registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
+    JobId, config::JobPollerConfig, dispatcher::*, entity::JobType, error::JobError,
+    handle::OwnedTaskHandle, registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -53,6 +53,10 @@ pub(crate) struct JobPollerHandle {
     poller: Arc<JobPoller>,
     #[allow(dead_code)]
     handle: OwnedTaskHandle,
+    #[allow(dead_code)]
+    router_listener_handle: OwnedTaskHandle,
+    #[allow(dead_code)]
+    router_waiter_handle: OwnedTaskHandle,
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
@@ -71,16 +75,14 @@ impl JobPoller {
         config: JobPollerConfig,
         repo: Arc<JobRepo>,
         registry: JobRegistry,
+        tracker: Arc<JobTracker>,
         clock: ClockHandle,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >(1);
         Self {
-            tracker: Arc::new(JobTracker::new(
-                config.min_jobs_per_process,
-                config.max_jobs_per_process,
-            )),
+            tracker,
             repo,
             config,
             registry,
@@ -90,8 +92,15 @@ impl JobPoller {
         }
     }
 
-    pub async fn start(self) -> Result<JobPollerHandle, sqlx::Error> {
-        let listener_handle = self.start_listener().await?;
+    pub fn registered_job_types(&self) -> Vec<JobType> {
+        self.registry.registered_job_types()
+    }
+
+    pub fn start(
+        self,
+        router_listener_handle: OwnedTaskHandle,
+        router_waiter_handle: OwnedTaskHandle,
+    ) -> JobPollerHandle {
         let lost_handle = self.start_lost_handler();
         let keep_alive_handle = self.start_keep_alive_handler();
         let shutdown_tx = self.shutdown_tx.clone();
@@ -103,16 +112,13 @@ impl JobPoller {
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-main-loop",
-            Self::main_loop(
-                Arc::clone(&executor),
-                listener_handle,
-                lost_handle,
-                keep_alive_handle,
-            )
+            Self::main_loop(Arc::clone(&executor), lost_handle, keep_alive_handle,)
         ));
-        Ok(JobPollerHandle {
+        JobPollerHandle {
             poller: executor,
             handle,
+            router_listener_handle,
+            router_waiter_handle,
             shutdown_tx,
             shutdown_called: Arc::new(AtomicBool::new(false)),
             repo,
@@ -120,12 +126,11 @@ impl JobPoller {
             shutdown_timeout,
             max_jobs_per_process,
             clock,
-        })
+        }
     }
 
     async fn main_loop(
         self: Arc<Self>,
-        _listener_task: OwnedTaskHandle,
         _lost_task: OwnedTaskHandle,
         _keep_alive_task: OwnedTaskHandle,
     ) {
@@ -200,32 +205,6 @@ impl JobPoller {
 
         span.record("next_poll_in", tracing::field::debug(Duration::ZERO));
         Ok(Duration::ZERO)
-    }
-
-    async fn start_listener(&self) -> Result<OwnedTaskHandle, sqlx::Error> {
-        let mut listener = PgListener::connect_with(self.repo.pool()).await?;
-        listener.listen("job_execution").await?;
-        let tracker = self.tracker.clone();
-        let supported_job_types = self.registry.registered_job_types();
-        Ok(OwnedTaskHandle::new(spawn_named_task!(
-            "job-poller-listener",
-            async move {
-                loop {
-                    match listener.recv().await {
-                        Ok(notification) => {
-                            let job_type = notification.payload();
-                            // Only wake the tracker if this is a job type we support
-                            if supported_job_types.iter().any(|jt| jt.as_str() == job_type) {
-                                tracker.job_execution_inserted();
-                            }
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            }
-        )))
     }
 
     fn start_lost_handler(&self) -> OwnedTaskHandle {
