@@ -127,7 +127,29 @@ impl JobNotificationRouter {
                     biased;
 
                     Some((job_id, tx)) = register_rx.recv() => {
-                        waiters.entry(job_id).or_default().push(tx);
+                        // Immediate DB check: no execution row means the job is terminal
+                        match sqlx::query!(
+                            "SELECT id FROM job_executions WHERE id = $1",
+                            job_id as JobId,
+                        )
+                        .fetch_optional(&pool)
+                        .await
+                        {
+                            Ok(None) => {
+                                let _ = tx.send(());
+                            }
+                            Ok(Some(_)) => {
+                                waiters.entry(job_id).or_default().push(tx);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "register_waiter: failed to check execution row"
+                                );
+                                // Register anyway — sweep will catch it
+                                waiters.entry(job_id).or_default().push(tx);
+                            }
+                        }
                     }
 
                     result = terminal_rx.recv() => {
@@ -152,21 +174,22 @@ impl JobNotificationRouter {
                         }
 
                         let ids: Vec<JobId> = waiters.keys().copied().collect();
-                        match sqlx::query_scalar::<_, uuid::Uuid>(
-                            "SELECT id FROM UNNEST($1::uuid[]) AS t(id) \
-                             WHERE NOT EXISTS (SELECT 1 FROM job_executions WHERE job_executions.id = t.id)",
-                        )
-                        .bind(&ids)
-                        .fetch_all(&pool)
-                        .await
-                        {
-                            Ok(terminal_ids) => {
-                                for uuid in terminal_ids {
-                                    notify_waiters(&mut waiters, JobId::from(uuid));
+                        for id in ids {
+                            match sqlx::query!(
+                                "SELECT id FROM job_executions WHERE id = $1",
+                                id as JobId,
+                            )
+                            .fetch_optional(&pool)
+                            .await
+                            {
+                                Ok(None) => notify_waiters(&mut waiters, id),
+                                Ok(Some(_)) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "sweep: failed to check terminal job"
+                                    );
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "sweep: failed to check terminal jobs");
                             }
                         }
                     }
