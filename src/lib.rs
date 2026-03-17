@@ -229,7 +229,7 @@ use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobCompletionResult, JobTerminalState, JobType};
+pub use entity::{Job, JobCompletionResult, JobResult, JobTerminalState, JobType};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use migrate::*;
 pub use registry::*;

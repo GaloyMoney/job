@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use std::sync::{Arc, Mutex};
 
-use super::{JobId, error::JobError};
+use super::{JobId, entity::JobResult, error::JobError};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
@@ -18,7 +18,7 @@ pub struct CurrentJob {
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
     clock: ClockHandle,
-    result: Arc<Mutex<Option<serde_json::Value>>>,
+    result: Arc<Mutex<Option<JobResult>>>,
 }
 
 impl CurrentJob {
@@ -31,7 +31,7 @@ impl CurrentJob {
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
         clock: ClockHandle,
-        result: Arc<Mutex<Option<serde_json::Value>>>,
+        result: Arc<Mutex<Option<JobResult>>>,
     ) -> Self {
         Self {
             id,
@@ -136,10 +136,9 @@ impl CurrentJob {
     /// progress updates; for example, a batch job can call `set_result` after
     /// each chunk so that partial progress is preserved even on failure.
     pub fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
-        let json =
-            serde_json::to_value(result).map_err(JobError::CouldNotSerializeExecutionState)?;
+        let json = serde_json::to_value(result).map_err(JobError::CouldNotSerializeResult)?;
         let mut guard = self.result.lock().expect("result mutex poisoned");
-        *guard = Some(json);
+        *guard = Some(JobResult::new(json));
         Ok(())
     }
 

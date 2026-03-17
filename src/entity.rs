@@ -11,16 +11,48 @@ use es_entity::{context::TracingContext, *};
 
 use crate::{JobId, error::JobError};
 
+/// Newtype wrapper around a raw JSON value representing the result produced by a
+/// job runner via [`CurrentJob::set_result`](crate::CurrentJob::set_result).
+///
+/// Using a dedicated type instead of bare `serde_json::Value` gives call sites
+/// semantic clarity and prevents accidental mix-ups with other JSON payloads
+/// (config, execution state, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobResult(serde_json::Value);
+
+impl JobResult {
+    /// Wrap a raw JSON value.
+    pub(crate) fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    /// Return a reference to the inner JSON value.
+    pub fn into_inner(self) -> serde_json::Value {
+        self.0
+    }
+
+    /// Return a reference to the inner JSON value.
+    pub fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
+    /// Deserialize the result into a typed struct.
+    pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_value(self.0.clone())
+    }
+}
+
 /// Outcome returned by [`Jobs::await_completion`](crate::Jobs::await_completion),
 /// carrying both the terminal state and an optional result value.
 #[derive(Debug, Clone)]
 pub struct JobCompletionResult {
     state: JobTerminalState,
-    result: Option<serde_json::Value>,
+    result: Option<JobResult>,
 }
 
 impl JobCompletionResult {
-    pub(crate) fn new(state: JobTerminalState, result: Option<serde_json::Value>) -> Self {
+    pub(crate) fn new(state: JobTerminalState, result: Option<JobResult>) -> Self {
         Self { state, result }
     }
 
@@ -29,8 +61,8 @@ impl JobCompletionResult {
         self.state
     }
 
-    /// Returns the raw JSON result value, if any.
-    pub fn result(&self) -> Option<&serde_json::Value> {
+    /// Returns the result wrapper, if any.
+    pub fn result(&self) -> Option<&JobResult> {
         self.result.as_ref()
     }
 
@@ -39,7 +71,7 @@ impl JobCompletionResult {
         &self,
     ) -> Result<Option<T>, serde_json::Error> {
         match &self.result {
-            Some(v) => serde_json::from_value(v.clone()).map(Some),
+            Some(r) => r.deserialize().map(Some),
             None => Ok(None),
         }
     }
@@ -115,7 +147,7 @@ pub enum JobEvent {
     },
     JobCompleted {
         #[serde(default)]
-        result: Option<serde_json::Value>,
+        result: Option<JobResult>,
     },
     Cancelled,
     AttemptCounterReset,
@@ -261,7 +293,7 @@ impl Job {
     }
 
     /// Returns the result value attached to this job, if any.
-    pub fn result(&self) -> Option<&serde_json::Value> {
+    pub fn result(&self) -> Option<&JobResult> {
         self.events.iter_all().rev().find_map(|event| {
             if let JobEvent::JobCompleted { result } = event {
                 result.as_ref()
@@ -276,7 +308,7 @@ impl Job {
         &self,
     ) -> Result<Option<T>, serde_json::Error> {
         match self.result() {
-            Some(v) => serde_json::from_value(v.clone()).map(Some),
+            Some(r) => r.deserialize().map(Some),
             None => Ok(None),
         }
     }
@@ -319,7 +351,7 @@ impl Job {
         });
     }
 
-    pub(super) fn complete_job(&mut self, result: Option<serde_json::Value>) {
+    pub(super) fn complete_job(&mut self, result: Option<JobResult>) {
         self.events.push(JobEvent::ExecutionCompleted);
         self.events.push(JobEvent::JobCompleted { result });
     }
@@ -345,7 +377,7 @@ impl Job {
         });
     }
 
-    pub(super) fn error_job(&mut self, error: String, result: Option<serde_json::Value>) {
+    pub(super) fn error_job(&mut self, error: String, result: Option<JobResult>) {
         self.events.push(JobEvent::ExecutionErrored { error });
         self.events.push(JobEvent::JobCompleted { result });
     }
@@ -356,7 +388,7 @@ impl Job {
         attempt: u32,
         retry_policy: &RetryPolicy,
         error: String,
-        result: Option<serde_json::Value>,
+        result: Option<JobResult>,
     ) -> Option<(DateTime<Utc>, u32)> {
         let mut current_attempt = attempt.max(1);
         if self

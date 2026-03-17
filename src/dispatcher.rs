@@ -11,8 +11,8 @@ use std::{
 };
 
 use super::{
-    JobId, current::CurrentJob, entity::RetryPolicy, error::JobError, repo::JobRepo, runner::*,
-    tracker::JobTracker,
+    JobId, current::CurrentJob, entity::JobResult, entity::RetryPolicy, error::JobError,
+    repo::JobRepo, runner::*, tracker::JobTracker,
 };
 
 #[derive(Debug)]
@@ -85,7 +85,7 @@ impl JobDispatcher {
             )
             .expect("EventContext insert job data");
         }
-        let result_holder = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let result_holder = Arc::new(Mutex::new(None::<JobResult>));
         let current_job = CurrentJob::new(
             polled_job.id,
             polled_job.attempt,
@@ -96,10 +96,9 @@ impl JobDispatcher {
             Arc::clone(&result_holder),
         );
         self.tracker.dispatch_job();
-        let extract_result =
-            |holder: Arc<Mutex<Option<serde_json::Value>>>| -> Option<serde_json::Value> {
-                holder.lock().expect("result mutex poisoned").take()
-            };
+        let extract_result = |holder: Arc<Mutex<Option<JobResult>>>| -> Option<JobResult> {
+            holder.lock().expect("result mutex poisoned").take()
+        };
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
                 span.record("conclusion", "Error");
@@ -259,7 +258,7 @@ impl JobDispatcher {
         id: JobId,
         error: JobError,
         attempt: u32,
-        result: Option<serde_json::Value>,
+        result: Option<JobResult>,
     ) -> Result<(), JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id(id).await?;
@@ -333,7 +332,7 @@ impl JobDispatcher {
         &mut self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
-        result: Option<serde_json::Value>,
+        result: Option<JobResult>,
     ) -> Result<(), JobError> {
         let mut job = self.repo.find_by_id(&id).await?;
         sqlx::query!(
