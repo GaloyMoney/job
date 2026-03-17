@@ -3,8 +3,9 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
+    ClockHandle, CurrentJob, Job, JobCompletion, JobCompletionResult, JobId, JobInitializer,
+    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
+    error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -860,8 +861,8 @@ async fn test_await_completion_on_success() -> anyhow::Result<()> {
     let jobs_clone = jobs.clone();
     let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id, None).await });
 
-    let state = handle.await??;
-    assert_eq!(state, JobTerminalState::Completed);
+    let outcome = handle.await??;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
 
     Ok(())
 }
@@ -884,8 +885,8 @@ async fn test_await_completion_on_error() -> anyhow::Result<()> {
     let jobs_clone = jobs.clone();
     let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id, None).await });
 
-    let state = handle.await??;
-    assert_eq!(state, JobTerminalState::Errored);
+    let outcome = handle.await??;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
 
     Ok(())
 }
@@ -918,8 +919,8 @@ async fn test_await_completion_on_cancel() -> anyhow::Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     jobs.cancel_job(job_id).await?;
 
-    let state = handle.await??;
-    assert_eq!(state, JobTerminalState::Cancelled);
+    let outcome = handle.await??;
+    assert_eq!(outcome.state(), JobTerminalState::Cancelled);
 
     Ok(())
 }
@@ -956,8 +957,191 @@ async fn test_await_completion_already_completed() -> anyhow::Result<()> {
     }
 
     // Now call await_completion — should return immediately
-    let state = jobs.await_completion(job_id, None).await?;
-    assert_eq!(state, JobTerminalState::Completed);
+    let outcome = jobs.await_completion(job_id, None).await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+
+    Ok(())
+}
+
+// -- Result passing tests --
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct MyResult {
+    value: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResultJobConfig;
+
+struct ResultJobInitializer;
+
+impl JobInitializer for ResultJobInitializer {
+    type Config = ResultJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("result-job")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(ResultJobRunner))
+    }
+}
+
+struct ResultJobRunner;
+
+#[async_trait]
+impl JobRunner for ResultJobRunner {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        current_job.set_result(&MyResult { value: 42 })?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_await_completion_returns_result() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(ResultJobInitializer);
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+
+    let outcome = jobs.await_completion(job_id, None).await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+    let result: MyResult = outcome
+        .typed_result()
+        .expect("deserialize result")
+        .expect("result should be Some");
+    assert_eq!(result, MyResult { value: 42 });
+
+    Ok(())
+}
+
+struct PartialResultThenErrorInitializer;
+
+impl JobInitializer for PartialResultThenErrorInitializer {
+    type Config = ResultJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("partial-result-error-job")
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(PartialResultThenErrorRunner))
+    }
+}
+
+struct PartialResultThenErrorRunner;
+
+#[async_trait]
+impl JobRunner for PartialResultThenErrorRunner {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        current_job.set_result(&MyResult { value: 99 })?;
+        Err("intentional failure after setting result".into())
+    }
+}
+
+#[tokio::test]
+async fn test_await_completion_returns_partial_result_on_error() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(PartialResultThenErrorInitializer);
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+
+    let outcome = jobs.await_completion(job_id, None).await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    let result: MyResult = outcome
+        .typed_result()
+        .expect("deserialize result")
+        .expect("partial result should be Some");
+    assert_eq!(result, MyResult { value: 99 });
+
+    Ok(())
+}
+
+struct NoResultJobInitializer;
+
+impl JobInitializer for NoResultJobInitializer {
+    type Config = ResultJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("no-result-job")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(NoResultJobRunner))
+    }
+}
+
+struct NoResultJobRunner;
+
+#[async_trait]
+impl JobRunner for NoResultJobRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_await_completion_no_result() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(NoResultJobInitializer);
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+
+    let outcome = jobs.await_completion(job_id, None).await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+    assert!(outcome.result().is_none());
 
     Ok(())
 }

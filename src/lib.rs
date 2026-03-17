@@ -229,7 +229,7 @@ use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobTerminalState, JobType};
+pub use entity::{Job, JobCompletionResult, JobTerminalState, JobType};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use migrate::*;
 pub use registry::*;
@@ -532,7 +532,8 @@ impl Jobs {
     }
 
     /// Block until the given job reaches a terminal state (completed, errored, or
-    /// cancelled) and return the outcome.
+    /// cancelled) and return the outcome together with any result value the
+    /// runner attached via [`CurrentJob::set_result`].
     ///
     /// When `timeout` is `Some(duration)`, the call returns
     /// [`JobError::TimedOut`] if the job has not reached a terminal state
@@ -550,18 +551,23 @@ impl Jobs {
         &self,
         id: JobId,
         timeout: Option<Duration>,
-    ) -> Result<JobTerminalState, JobError> {
+    ) -> Result<JobCompletionResult, JobError> {
         // Fail fast if the job doesn't exist — avoids a 5-minute silent hang
         // in the waiter manager for a JobId that will never resolve.
         self.find(id).await?;
         let rx = self.router.wait_for_terminal(id);
-        match timeout {
+        let state = match timeout {
             Some(duration) => tokio::time::timeout(duration, rx)
                 .await
                 .map_err(|_| JobError::TimedOut(id))?
-                .map_err(|_| JobError::AwaitCompletionShutdown(id)),
-            None => rx.await.map_err(|_| JobError::AwaitCompletionShutdown(id)),
-        }
+                .map_err(|_| JobError::AwaitCompletionShutdown(id))?,
+            None => rx
+                .await
+                .map_err(|_| JobError::AwaitCompletionShutdown(id))?,
+        };
+        // Load job to retrieve any result value set by the runner
+        let job = self.find(id).await?;
+        Ok(JobCompletionResult::new(state, job.result().cloned()))
     }
 
     /// Non-blocking check for job completion.

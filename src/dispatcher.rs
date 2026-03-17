@@ -5,7 +5,10 @@ use futures::FutureExt;
 use serde_json::Value as JsonValue;
 use tracing::{Span, instrument};
 
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{Arc, OnceLock},
+};
 
 use super::{
     JobId, current::CurrentJob, entity::RetryPolicy, error::JobError, repo::JobRepo, runner::*,
@@ -82,6 +85,7 @@ impl JobDispatcher {
             )
             .expect("EventContext insert job data");
         }
+        let result_holder = Arc::new(OnceLock::<serde_json::Value>::new());
         let current_job = CurrentJob::new(
             polled_job.id,
             polled_job.attempt,
@@ -89,28 +93,39 @@ impl JobDispatcher {
             polled_job.data_json,
             shutdown_rx,
             self.clock.clone(),
+            Arc::clone(&result_holder),
         );
         self.tracker.dispatch_job();
+        let extract_result =
+            |holder: Arc<OnceLock<serde_json::Value>>| -> Option<serde_json::Value> {
+                Arc::try_unwrap(holder)
+                    .ok()
+                    .and_then(|cell| cell.into_inner())
+            };
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
                 span.record("conclusion", "Error");
-                self.fail_job(job.id, e, polled_job.attempt).await?
+                let result = extract_result(result_holder);
+                self.fail_job(job.id, e, polled_job.attempt, result).await?
             }
             Ok(JobCompletion::Complete) => {
                 span.record("conclusion", "Complete");
+                let result = extract_result(result_holder);
                 let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                self.complete_job(&mut op, job.id).await?;
+                self.complete_job(&mut op, job.id, result).await?;
                 op.commit().await?;
             }
             #[cfg(feature = "es-entity")]
             Ok(JobCompletion::CompleteWithOp(mut op)) => {
                 span.record("conclusion", "CompleteWithOp");
-                self.complete_job(&mut op, job.id).await?;
+                let result = extract_result(result_holder);
+                self.complete_job(&mut op, job.id, result).await?;
                 op.commit().await?;
             }
             Ok(JobCompletion::CompleteWithTx(mut tx)) => {
                 span.record("conclusion", "CompleteWithTx");
-                self.complete_job(&mut tx, job.id).await?;
+                let result = extract_result(result_holder);
+                self.complete_job(&mut tx, job.id, result).await?;
                 tx.commit().await?;
             }
             Ok(JobCompletion::RescheduleNow) => {
@@ -241,7 +256,13 @@ impl JobDispatcher {
             error.message = tracing::field::Empty
         )
     )]
-    async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
+    async fn fail_job(
+        &mut self,
+        id: JobId,
+        error: JobError,
+        attempt: u32,
+        result: Option<serde_json::Value>,
+    ) -> Result<(), JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id(id).await?;
 
@@ -256,7 +277,7 @@ impl JobDispatcher {
         let retry_policy = RetryPolicy::from(&self.retry_settings);
 
         if let Some((reschedule_at, next_attempt)) =
-            job.maybe_schedule_retry(self.clock.now(), attempt, &retry_policy, error_str)
+            job.maybe_schedule_retry(self.clock.now(), attempt, &retry_policy, error_str, result)
         {
             let exceeded_warn_attempts = self
                 .retry_settings
@@ -309,11 +330,12 @@ impl JobDispatcher {
         Ok(())
     }
 
-    #[instrument(name = "job.complete_job", skip(self, op), fields(id = %id))]
+    #[instrument(name = "job.complete_job", skip(self, op, result), fields(id = %id))]
     async fn complete_job(
         &mut self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
+        result: Option<serde_json::Value>,
     ) -> Result<(), JobError> {
         let mut job = self.repo.find_by_id(&id).await?;
         sqlx::query!(
@@ -326,7 +348,7 @@ impl JobDispatcher {
         )
         .execute(op.as_executor())
         .await?;
-        job.complete_job();
+        job.complete_job(result);
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())
     }
