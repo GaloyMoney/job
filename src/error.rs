@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+use crate::JobId;
 use super::entity::JobType;
 use super::repo::{JobCreateError, JobFindError, JobModifyError, JobQueryError};
 
@@ -44,8 +45,8 @@ pub enum JobError {
     Config(String),
     #[error("JobError - Migration: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
-    #[error("JobError - NotTerminal: job has not reached a terminal state")]
-    NotTerminal,
+    #[error("JobError - NotTerminal: job {0} has not reached a terminal state")]
+    NotTerminal(JobId),
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {

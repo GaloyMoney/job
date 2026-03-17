@@ -465,9 +465,7 @@ impl Jobs {
         let (listener_handle, waiter_handle) =
             self.router.start(Arc::clone(&tracker), job_types).await?;
 
-        let mut poller_handle = poller.start();
-        poller_handle.set_router_handles(listener_handle, waiter_handle);
-
+        let poller_handle = poller.start(listener_handle, waiter_handle);
         self.poller_handle = Some(Arc::new(poller_handle));
         Ok(())
     }
@@ -553,7 +551,7 @@ impl Jobs {
             Err(_) => {
                 // Channel dropped (router shutdown) — fall back to DB
                 let job = self.find(id).await?;
-                job.terminal_state().ok_or(JobError::NotTerminal)
+                job.terminal_state().ok_or(JobError::NotTerminal(id))
             }
         }
     }

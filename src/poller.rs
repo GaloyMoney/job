@@ -54,9 +54,9 @@ pub(crate) struct JobPollerHandle {
     #[allow(dead_code)]
     handle: OwnedTaskHandle,
     #[allow(dead_code)]
-    router_listener_handle: Option<OwnedTaskHandle>,
+    router_listener_handle: OwnedTaskHandle,
     #[allow(dead_code)]
-    router_waiter_handle: Option<OwnedTaskHandle>,
+    router_waiter_handle: OwnedTaskHandle,
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
@@ -66,17 +66,6 @@ pub(crate) struct JobPollerHandle {
     repo: Arc<JobRepo>,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
-}
-
-impl JobPollerHandle {
-    pub(crate) fn set_router_handles(
-        &mut self,
-        listener: OwnedTaskHandle,
-        waiter: OwnedTaskHandle,
-    ) {
-        self.router_listener_handle = Some(listener);
-        self.router_waiter_handle = Some(waiter);
-    }
 }
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -107,7 +96,11 @@ impl JobPoller {
         self.registry.registered_job_types()
     }
 
-    pub fn start(self) -> JobPollerHandle {
+    pub fn start(
+        self,
+        router_listener_handle: OwnedTaskHandle,
+        router_waiter_handle: OwnedTaskHandle,
+    ) -> JobPollerHandle {
         let lost_handle = self.start_lost_handler();
         let keep_alive_handle = self.start_keep_alive_handler();
         let shutdown_tx = self.shutdown_tx.clone();
@@ -124,8 +117,8 @@ impl JobPoller {
         JobPollerHandle {
             poller: executor,
             handle,
-            router_listener_handle: None,
-            router_waiter_handle: None,
+            router_listener_handle,
+            router_waiter_handle,
             shutdown_tx,
             shutdown_called: Arc::new(AtomicBool::new(false)),
             repo,
