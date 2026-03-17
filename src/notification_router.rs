@@ -141,14 +141,17 @@ impl JobNotificationRouter {
                         // Immediate DB check: no execution row means the job is terminal
                         match has_execution_row(&pool, job_id).await {
                             Ok(false) => {
-                                // Job is terminal — load entity for the state
+                                // No execution row → job is terminal, but the caller
+                                // needs to know *how* it ended (Completed vs Errored
+                                // vs Cancelled), so we load the entity's event history.
+                                // On transient DB failure the waiter is parked for the
+                                // sweep to retry.
                                 match load_terminal_state(&repo, job_id).await {
                                     Some(state) => {
                                         let _ = tx.send(state);
                                         send_to_waiters(&mut waiters, job_id, state);
                                     }
                                     None => {
-                                        // Could not determine state — register for later
                                         add_waiter(&mut waiters, job_id, tx);
                                     }
                                 }
@@ -199,12 +202,9 @@ const MAX_WAITER_AGE: Duration = Duration::from_secs(300);
 
 /// Check whether a `job_executions` row exists for the given ID.
 async fn has_execution_row(pool: &PgPool, id: JobId) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT id FROM job_executions WHERE id = $1",
-        id as JobId,
-    )
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query!("SELECT id FROM job_executions WHERE id = $1", id as JobId,)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.is_some())
 }
 
@@ -225,11 +225,7 @@ fn add_waiter(
 }
 
 /// Sweep all waiters: prune closed receivers, check terminal status, expire stale entries.
-async fn sweep_waiters(
-    waiters: &mut HashMap<JobId, WaiterEntry>,
-    pool: &PgPool,
-    repo: &JobRepo,
-) {
+async fn sweep_waiters(waiters: &mut HashMap<JobId, WaiterEntry>, pool: &PgPool, repo: &JobRepo) {
     // Prune dropped receivers
     waiters.retain(|_, entry| {
         entry.senders.retain(|tx| !tx.is_closed());
@@ -289,11 +285,7 @@ async fn load_terminal_state(repo: &JobRepo, job_id: JobId) -> Option<JobTermina
 
 /// Load the job entity and send the terminal state to all registered waiters.
 /// On failure, waiters remain registered so the sweep can retry.
-async fn load_and_notify(
-    waiters: &mut HashMap<JobId, WaiterEntry>,
-    repo: &JobRepo,
-    job_id: JobId,
-) {
+async fn load_and_notify(waiters: &mut HashMap<JobId, WaiterEntry>, repo: &JobRepo, job_id: JobId) {
     if !waiters.contains_key(&job_id) {
         return;
     }
