@@ -2,9 +2,9 @@
 
 use thiserror::Error;
 
-use crate::JobId;
 use super::entity::JobType;
 use super::repo::{JobCreateError, JobFindError, JobModifyError, JobQueryError};
+use crate::JobId;
 
 #[derive(Error, Debug)]
 /// Exhaustive list of failures the job service can report.
@@ -45,7 +45,9 @@ pub enum JobError {
     Config(String),
     #[error("JobError - Migration: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
-    #[error("JobError - AwaitCompletionShutdown: notification channel closed while awaiting job {0}")]
+    #[error(
+        "JobError - AwaitCompletionShutdown: notification channel closed while awaiting job {0}"
+    )]
     AwaitCompletionShutdown(JobId),
 }
 

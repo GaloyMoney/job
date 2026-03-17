@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use sqlx::postgres::{PgListener, PgPool};
-use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::JobId;
 use crate::entity::{JobTerminalState, JobType};
 use crate::handle::OwnedTaskHandle;
 use crate::repo::JobRepo;
 use crate::tracker::JobTracker;
+use sqlx::postgres::{PgListener, PgPool};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// Notification types from the unified `job_events` channel.
 #[derive(Debug, serde::Deserialize)]

@@ -547,8 +547,7 @@ impl Jobs {
         // in the waiter manager for a JobId that will never resolve.
         self.find(id).await?;
         let rx = self.router.wait_for_terminal(id);
-        rx.await
-            .map_err(|_| JobError::AwaitCompletionShutdown(id))
+        rx.await.map_err(|_| JobError::AwaitCompletionShutdown(id))
     }
 
     /// Gracefully shut down the job poller.
