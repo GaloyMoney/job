@@ -282,7 +282,7 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
-        let router = Arc::new(JobNotificationRouter::new(&pool, repo.as_ref().clone()));
+        let router = Arc::new(JobNotificationRouter::new(&pool, Arc::clone(&repo)));
         let clock = config.clock.clone();
         Ok(Self {
             repo,
@@ -553,9 +553,7 @@ impl Jobs {
             Err(_) => {
                 // Channel dropped (router shutdown) — fall back to DB
                 let job = self.find(id).await?;
-                Ok(job
-                    .terminal_state()
-                    .expect("job must be terminal after notification"))
+                job.terminal_state().ok_or(JobError::NotTerminal)
             }
         }
     }

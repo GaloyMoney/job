@@ -23,13 +23,13 @@ type WaiterRegistration = (JobId, oneshot::Sender<JobTerminalState>);
 
 pub(crate) struct JobNotificationRouter {
     pool: PgPool,
-    repo: JobRepo,
+    repo: Arc<JobRepo>,
     terminal_tx: broadcast::Sender<JobId>,
     register_tx: OnceLock<mpsc::UnboundedSender<WaiterRegistration>>,
 }
 
 impl JobNotificationRouter {
-    pub fn new(pool: &PgPool, repo: JobRepo) -> Self {
+    pub fn new(pool: &PgPool, repo: Arc<JobRepo>) -> Self {
         let (terminal_tx, _) = broadcast::channel(256);
         Self {
             pool: pool.clone(),
@@ -121,7 +121,7 @@ impl JobNotificationRouter {
         mut register_rx: mpsc::UnboundedReceiver<WaiterRegistration>,
         mut terminal_rx: broadcast::Receiver<JobId>,
         pool: PgPool,
-        repo: JobRepo,
+        repo: Arc<JobRepo>,
     ) -> OwnedTaskHandle {
         let handle = tokio::spawn(async move {
             let mut waiters: HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>> =
