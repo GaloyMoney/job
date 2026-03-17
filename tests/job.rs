@@ -9,6 +9,7 @@ use job::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -858,7 +859,7 @@ async fn test_await_completion_on_success() -> anyhow::Result<()> {
         .await?;
 
     let jobs_clone = jobs.clone();
-    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id).await });
+    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id, None).await });
 
     let state = handle.await??;
     assert_eq!(state, JobTerminalState::Completed);
@@ -882,7 +883,7 @@ async fn test_await_completion_on_error() -> anyhow::Result<()> {
     spawner.spawn(job_id, FailingJobConfig).await?;
 
     let jobs_clone = jobs.clone();
-    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id).await });
+    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id, None).await });
 
     let state = handle.await??;
     assert_eq!(state, JobTerminalState::Errored);
@@ -912,7 +913,7 @@ async fn test_await_completion_on_cancel() -> anyhow::Result<()> {
         .await?;
 
     let jobs_clone = jobs.clone();
-    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id).await });
+    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id, None).await });
 
     // Give the waiter time to register before cancelling
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -956,8 +957,43 @@ async fn test_await_completion_already_completed() -> anyhow::Result<()> {
     }
 
     // Now call await_completion — should return immediately
-    let state = jobs.await_completion(job_id).await?;
+    let state = jobs.await_completion(job_id, None).await?;
     assert_eq!(state, JobTerminalState::Completed);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completion_timeout() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-timeout-job"),
+    });
+    jobs.start_poll().await?;
+
+    // Spawn a job scheduled far in the future so it never completes during the test
+    let job_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(job_id, TestJobConfig { delay_ms: 50 }, schedule_at)
+        .await?;
+
+    // Call await_completion with a short timeout
+    let result = jobs
+        .await_completion(job_id, Some(Duration::from_millis(200)))
+        .await;
+
+    assert!(
+        matches!(result, Err(JobError::TimedOut(id)) if id == job_id),
+        "Expected TimedOut error, got: {:?}",
+        result,
+    );
 
     Ok(())
 }

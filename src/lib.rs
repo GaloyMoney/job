@@ -225,6 +225,7 @@ use es_entity::AtomicOperation;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
@@ -535,18 +536,34 @@ impl Jobs {
     /// Block until the given job reaches a terminal state (completed, errored, or
     /// cancelled) and return the outcome.
     ///
+    /// When `timeout` is `Some(duration)`, the call returns
+    /// [`JobError::TimedOut`] if the job has not reached a terminal state
+    /// within the specified duration. Pass `None` to wait indefinitely.
+    ///
     /// # Errors
     ///
     /// Returns [`JobError::Find`] if the job does not exist.
+    /// Returns [`JobError::TimedOut`] if the timeout elapses before the job
+    /// reaches a terminal state.
     /// Returns [`JobError::AwaitCompletionShutdown`] if the notification channel is
     /// dropped (e.g., during shutdown) before delivering the terminal state.
     #[instrument(name = "job.await_completion", skip(self))]
-    pub async fn await_completion(&self, id: JobId) -> Result<JobTerminalState, JobError> {
+    pub async fn await_completion(
+        &self,
+        id: JobId,
+        timeout: Option<Duration>,
+    ) -> Result<JobTerminalState, JobError> {
         // Fail fast if the job doesn't exist — avoids a 5-minute silent hang
         // in the waiter manager for a JobId that will never resolve.
         self.find(id).await?;
         let rx = self.router.wait_for_terminal(id);
-        rx.await.map_err(|_| JobError::AwaitCompletionShutdown(id))
+        match timeout {
+            Some(duration) => tokio::time::timeout(duration, rx)
+                .await
+                .map_err(|_| JobError::TimedOut(id))?
+                .map_err(|_| JobError::AwaitCompletionShutdown(id)),
+            None => rx.await.map_err(|_| JobError::AwaitCompletionShutdown(id)),
+        }
     }
 
     /// Gracefully shut down the job poller.
