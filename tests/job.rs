@@ -998,6 +998,8 @@ impl JobRunner for ResultJobRunner {
         &self,
         current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        // Incremental updates — only the last value is persisted
+        current_job.set_result(&MyResult { value: 1 })?;
         current_job.set_result(&MyResult { value: 42 })?;
         Ok(JobCompletion::Complete)
     }
@@ -1062,6 +1064,8 @@ impl JobRunner for PartialResultThenErrorRunner {
         &self,
         current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        // Simulate processing 50 items then failing — partial progress preserved
+        current_job.set_result(&MyResult { value: 50 })?;
         current_job.set_result(&MyResult { value: 99 })?;
         Err("intentional failure after setting result".into())
     }
@@ -1141,6 +1145,160 @@ async fn test_await_completion_no_result() -> anyhow::Result<()> {
     let outcome = jobs.await_completion(job_id).await?;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
     assert!(outcome.result().is_none());
+
+    Ok(())
+}
+
+// -- Incremental set_result tests --
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct BatchProgress {
+    processed: u32,
+    total: u32,
+}
+
+struct IncrementalResultInitializer;
+
+impl JobInitializer for IncrementalResultInitializer {
+    type Config = ResultJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("incremental-result-job")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(IncrementalResultRunner))
+    }
+}
+
+struct IncrementalResultRunner;
+
+#[async_trait]
+impl JobRunner for IncrementalResultRunner {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let total = 5;
+        for i in 1..=total {
+            current_job.set_result(&BatchProgress {
+                processed: i,
+                total,
+            })?;
+        }
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_set_result_multiple_calls_keeps_last() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(IncrementalResultInitializer);
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+
+    let outcome = jobs.await_completion(job_id).await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+    let progress: BatchProgress = outcome
+        .typed_result()
+        .expect("deserialize result")
+        .expect("result should be Some");
+    assert_eq!(
+        progress,
+        BatchProgress {
+            processed: 5,
+            total: 5
+        }
+    );
+
+    Ok(())
+}
+
+struct IncrementalResultThenErrorInitializer;
+
+impl JobInitializer for IncrementalResultThenErrorInitializer {
+    type Config = ResultJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("incremental-error-result-job")
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(IncrementalResultThenErrorRunner))
+    }
+}
+
+struct IncrementalResultThenErrorRunner;
+
+#[async_trait]
+impl JobRunner for IncrementalResultThenErrorRunner {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let total = 100;
+        for i in 1..=50 {
+            current_job.set_result(&BatchProgress {
+                processed: i,
+                total,
+            })?;
+        }
+        Err("failed at item 51".into())
+    }
+}
+
+#[tokio::test]
+async fn test_set_result_partial_progress_preserved_on_error() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(IncrementalResultThenErrorInitializer);
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+
+    let outcome = jobs.await_completion(job_id).await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    let progress: BatchProgress = outcome
+        .typed_result()
+        .expect("deserialize result")
+        .expect("partial result should be Some");
+    assert_eq!(
+        progress,
+        BatchProgress {
+            processed: 50,
+            total: 100
+        },
+        "partial progress from before the error should be preserved"
+    );
 
     Ok(())
 }

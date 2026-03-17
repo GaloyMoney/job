@@ -49,8 +49,6 @@ pub enum JobError {
         "JobError - AwaitCompletionShutdown: notification channel closed while awaiting job {0}"
     )]
     AwaitCompletionShutdown(JobId),
-    #[error("JobError - ResultAlreadySet: a job result has already been set")]
-    ResultAlreadySet,
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {

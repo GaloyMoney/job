@@ -7,7 +7,7 @@ use tracing::{Span, instrument};
 
 use std::{
     panic::AssertUnwindSafe,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use super::{
@@ -85,7 +85,7 @@ impl JobDispatcher {
             )
             .expect("EventContext insert job data");
         }
-        let result_holder = Arc::new(OnceLock::<serde_json::Value>::new());
+        let result_holder = Arc::new(Mutex::new(None::<serde_json::Value>));
         let current_job = CurrentJob::new(
             polled_job.id,
             polled_job.attempt,
@@ -97,10 +97,8 @@ impl JobDispatcher {
         );
         self.tracker.dispatch_job();
         let extract_result =
-            |holder: Arc<OnceLock<serde_json::Value>>| -> Option<serde_json::Value> {
-                Arc::try_unwrap(holder)
-                    .ok()
-                    .and_then(|cell| cell.into_inner())
+            |holder: Arc<Mutex<Option<serde_json::Value>>>| -> Option<serde_json::Value> {
+                holder.lock().expect("result mutex poisoned").take()
             };
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
