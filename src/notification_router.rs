@@ -4,8 +4,6 @@ use std::time::Duration;
 
 use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::time::Instant;
-
 use crate::JobId;
 use crate::entity::{JobTerminalState, JobType};
 use crate::handle::OwnedTaskHandle;
@@ -21,13 +19,6 @@ enum JobNotification {
 }
 
 type WaiterRegistration = (JobId, oneshot::Sender<JobTerminalState>);
-
-/// A set of oneshot senders waiting for a single job to reach terminal state,
-/// along with the wall-clock time the first waiter was registered.
-struct WaiterEntry {
-    registered_at: Instant,
-    senders: Vec<oneshot::Sender<JobTerminalState>>,
-}
 
 pub(crate) struct JobNotificationRouter {
     pool: PgPool,
@@ -130,7 +121,8 @@ impl JobNotificationRouter {
         repo: Arc<JobRepo>,
     ) -> OwnedTaskHandle {
         let handle = tokio::spawn(async move {
-            let mut waiters: HashMap<JobId, WaiterEntry> = HashMap::new();
+            let mut waiters: HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>> =
+                HashMap::new();
             let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
 
             loop {
@@ -152,12 +144,12 @@ impl JobNotificationRouter {
                                         send_to_waiters(&mut waiters, job_id, state);
                                     }
                                     None => {
-                                        add_waiter(&mut waiters, job_id, tx);
+                                        waiters.entry(job_id).or_default().push(tx);
                                     }
                                 }
                             }
                             Ok(true) => {
-                                add_waiter(&mut waiters, job_id, tx);
+                                waiters.entry(job_id).or_default().push(tx);
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -165,7 +157,7 @@ impl JobNotificationRouter {
                                     "register_waiter: failed to check execution row"
                                 );
                                 // Register anyway — sweep will catch it
-                                add_waiter(&mut waiters, job_id, tx);
+                                waiters.entry(job_id).or_default().push(tx);
                             }
                         }
                     }
@@ -198,7 +190,6 @@ impl JobNotificationRouter {
 }
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-const MAX_WAITER_AGE: Duration = Duration::from_secs(300);
 
 /// Check whether a `job_executions` row exists for the given ID.
 async fn has_execution_row(pool: &PgPool, id: JobId) -> Result<bool, sqlx::Error> {
@@ -208,28 +199,16 @@ async fn has_execution_row(pool: &PgPool, id: JobId) -> Result<bool, sqlx::Error
     Ok(row.is_some())
 }
 
-/// Add a waiter sender to the map, creating a new entry if needed.
-fn add_waiter(
-    waiters: &mut HashMap<JobId, WaiterEntry>,
-    job_id: JobId,
-    tx: oneshot::Sender<JobTerminalState>,
+/// Sweep all waiters: prune closed receivers and check for newly-terminal jobs.
+async fn sweep_waiters(
+    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
+    pool: &PgPool,
+    repo: &JobRepo,
 ) {
-    waiters
-        .entry(job_id)
-        .or_insert_with(|| WaiterEntry {
-            registered_at: Instant::now(),
-            senders: Vec::new(),
-        })
-        .senders
-        .push(tx);
-}
-
-/// Sweep all waiters: prune closed receivers, check terminal status, expire stale entries.
-async fn sweep_waiters(waiters: &mut HashMap<JobId, WaiterEntry>, pool: &PgPool, repo: &JobRepo) {
     // Prune dropped receivers
-    waiters.retain(|_, entry| {
-        entry.senders.retain(|tx| !tx.is_closed());
-        !entry.senders.is_empty()
+    waiters.retain(|_, senders| {
+        senders.retain(|tx| !tx.is_closed());
+        !senders.is_empty()
     });
 
     if waiters.is_empty() {
@@ -237,22 +216,10 @@ async fn sweep_waiters(waiters: &mut HashMap<JobId, WaiterEntry>, pool: &PgPool,
     }
 
     let ids: Vec<JobId> = waiters.keys().copied().collect();
-    let now = Instant::now();
-
     for id in ids {
         match has_execution_row(pool, id).await {
             Ok(false) => {
                 load_and_notify(waiters, repo, id).await;
-                // If still present, load_terminal_state failed — check for expiry
-                if let Some(entry) = waiters.get(&id) {
-                    if now.duration_since(entry.registered_at) > MAX_WAITER_AGE {
-                        tracing::warn!(
-                            %id,
-                            "expiring stale waiter: unable to resolve terminal state"
-                        );
-                        waiters.remove(&id);
-                    }
-                }
             }
             Ok(true) => {}
             Err(e) => {
@@ -285,7 +252,11 @@ async fn load_terminal_state(repo: &JobRepo, job_id: JobId) -> Option<JobTermina
 
 /// Load the job entity and send the terminal state to all registered waiters.
 /// On failure, waiters remain registered so the sweep can retry.
-async fn load_and_notify(waiters: &mut HashMap<JobId, WaiterEntry>, repo: &JobRepo, job_id: JobId) {
+async fn load_and_notify(
+    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
+    repo: &JobRepo,
+    job_id: JobId,
+) {
     if !waiters.contains_key(&job_id) {
         return;
     }
@@ -297,12 +268,12 @@ async fn load_and_notify(waiters: &mut HashMap<JobId, WaiterEntry>, repo: &JobRe
 
 /// Deliver a known terminal state to all waiters for a job.
 fn send_to_waiters(
-    waiters: &mut HashMap<JobId, WaiterEntry>,
+    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
     job_id: JobId,
     state: JobTerminalState,
 ) {
-    if let Some(entry) = waiters.remove(&job_id) {
-        for tx in entry.senders {
+    if let Some(senders) = waiters.remove(&job_id) {
+        for tx in senders {
             let _ = tx.send(state);
         }
     }
