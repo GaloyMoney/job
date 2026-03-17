@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -200,6 +200,9 @@ async fn has_execution_row(pool: &PgPool, id: JobId) -> Result<bool, sqlx::Error
 }
 
 /// Sweep all waiters: prune closed receivers and check for newly-terminal jobs.
+///
+/// Uses a single batched query instead of N sequential queries to determine
+/// which waited-on jobs have reached terminal state.
 async fn sweep_waiters(
     waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
     pool: &PgPool,
@@ -216,18 +219,27 @@ async fn sweep_waiters(
     }
 
     let ids: Vec<JobId> = waiters.keys().copied().collect();
+
+    // Single batched query: returns the subset of IDs that still have execution rows
+    // (i.e. are still running). Any ID NOT in the result set is terminal.
+    let still_running: HashSet<JobId> = match sqlx::query_scalar!(
+        "SELECT id FROM job_executions WHERE id = ANY($1)",
+        &ids as &[JobId],
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.into_iter().map(JobId::from).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "sweep: failed to batch-check execution rows");
+            return;
+        }
+    };
+
+    // Notify waiters for jobs that no longer have an execution row
     for id in ids {
-        match has_execution_row(pool, id).await {
-            Ok(false) => {
-                load_and_notify(waiters, repo, id).await;
-            }
-            Ok(true) => {}
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "sweep: failed to check terminal job"
-                );
-            }
+        if !still_running.contains(&id) {
+            load_and_notify(waiters, repo, id).await;
         }
     }
 }
