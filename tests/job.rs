@@ -16,13 +16,15 @@ struct TestJobConfig {
     delay_ms: u64,
 }
 
-struct TestJobInitializer;
+struct TestJobInitializer {
+    job_type: JobType,
+}
 
 impl JobInitializer for TestJobInitializer {
     type Config = TestJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("test-job")
+        self.job_type.clone()
     }
 
     fn init(
@@ -61,7 +63,9 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("create-and-run-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -538,7 +542,9 @@ async fn test_bulk_spawn_creates_and_runs_all_jobs() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("bulk-spawn-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -588,7 +594,9 @@ async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("bulk-spawn-dup-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -628,7 +636,9 @@ async fn test_bulk_spawn_empty_batch() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("bulk-spawn-empty-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -649,7 +659,9 @@ async fn test_cancel_pending_job() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("cancel-pending-job"),
+    });
 
     // Spawn a job scheduled far in the future so it stays pending
     let job_id = JobId::new();
@@ -745,7 +757,9 @@ async fn test_cancel_already_completed_job_is_idempotent() -> anyhow::Result<()>
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("cancel-completed-job"),
+    });
 
     jobs.start_poll()
         .await
@@ -833,7 +847,9 @@ async fn test_await_completion_on_success() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-success-job"),
+    });
     jobs.start_poll().await?;
 
     let job_id = JobId::new();
@@ -883,7 +899,9 @@ async fn test_await_completion_on_cancel() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-cancel-job"),
+    });
     jobs.start_poll().await?;
 
     // Spawn a job scheduled far in the future so it stays pending
@@ -915,7 +933,9 @@ async fn test_await_completion_already_completed() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(TestJobInitializer);
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-already-job"),
+    });
     jobs.start_poll().await?;
 
     let job_id = JobId::new();

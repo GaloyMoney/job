@@ -137,6 +137,8 @@ impl JobNotificationRouter {
                         {
                             Ok(None) => {
                                 let _ = tx.send(());
+                                // Also notify any previously registered waiters
+                                notify_waiters(&mut waiters, job_id);
                             }
                             Ok(Some(_)) => {
                                 waiters.entry(job_id).or_default().push(tx);

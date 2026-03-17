@@ -538,29 +538,22 @@ impl Jobs {
     /// Block until the given job reaches a terminal state (completed, errored, or
     /// cancelled) and return the outcome.
     ///
-    /// The method subscribes to notifications first and then checks the current
-    /// state, closing the race window where a completion could fire between the
-    /// check and the subscribe.
+    /// The notification router checks the DB on waiter registration and signals
+    /// immediately if the job is already terminal, so no separate pre-check is
+    /// needed here.
     ///
     /// # Errors
     ///
     /// Returns [`JobError::Find`] if the job does not exist.
     #[instrument(name = "job.await_completion", skip(self))]
     pub async fn await_completion(&self, id: JobId) -> Result<JobTerminalState, JobError> {
-        // 1. Subscribe FIRST so no notification is missed
+        // 1. Register waiter — router checks DB and signals immediately if already terminal
         let rx = self.router.wait_for_terminal(id);
 
-        // 2. Check current state — if already terminal, return immediately
-        let job = self.find(id).await?;
-        if let Some(state) = job.terminal_state() {
-            // Receiver is dropped, which unsubscribes automatically
-            return Ok(state);
-        }
-
-        // 3. Wait for notification
+        // 2. Wait for notification
         let _ = rx.await;
 
-        // 4. Load final state
+        // 3. Load final state
         let job = self.find(id).await?;
         Ok(job
             .terminal_state()
