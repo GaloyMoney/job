@@ -212,34 +212,14 @@ impl Job {
     /// - `Completed` if `JobCompleted` exists (normal completion)
     /// - `None` if the job has not reached a terminal state
     pub fn terminal_state(&self) -> Option<JobTerminalState> {
-        let mut saw_completed = false;
-        let mut last_execution_errored = false;
-
-        for event in self.events.iter_all().rev() {
-            match event {
-                JobEvent::Cancelled => return Some(JobTerminalState::Cancelled),
-                JobEvent::JobCompleted => {
-                    saw_completed = true;
-                }
-                JobEvent::ExecutionErrored { .. } if saw_completed => {
-                    last_execution_errored = true;
-                    break;
-                }
-                JobEvent::ExecutionCompleted if saw_completed => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        if saw_completed {
-            if last_execution_errored {
-                Some(JobTerminalState::Errored)
-            } else {
-                Some(JobTerminalState::Completed)
-            }
-        } else {
-            None
+        let mut rev = self.events.iter_all().rev();
+        match rev.next()? {
+            JobEvent::Cancelled => Some(JobTerminalState::Cancelled),
+            JobEvent::JobCompleted => match rev.next() {
+                Some(JobEvent::ExecutionErrored { .. }) => Some(JobTerminalState::Errored),
+                _ => Some(JobTerminalState::Completed),
+            },
+            _ => None,
         }
     }
 
