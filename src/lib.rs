@@ -282,7 +282,7 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
-        let router = Arc::new(JobNotificationRouter::new(&pool));
+        let router = Arc::new(JobNotificationRouter::new(&pool, repo.as_ref().clone()));
         let clock = config.clock.clone();
         Ok(Self {
             repo,
@@ -538,26 +538,26 @@ impl Jobs {
     /// Block until the given job reaches a terminal state (completed, errored, or
     /// cancelled) and return the outcome.
     ///
-    /// The notification router checks the DB on waiter registration and signals
-    /// immediately if the job is already terminal, so no separate pre-check is
-    /// needed here.
+    /// The notification router loads the job entity and sends the terminal state
+    /// directly through the channel, so no additional DB round trip is needed here.
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Find`] if the job does not exist.
+    /// Returns [`JobError::Find`] if the router channel is dropped before delivering
+    /// the terminal state (e.g., during shutdown) and a fallback DB load also fails.
     #[instrument(name = "job.await_completion", skip(self))]
     pub async fn await_completion(&self, id: JobId) -> Result<JobTerminalState, JobError> {
-        // 1. Register waiter — router checks DB and signals immediately if already terminal
         let rx = self.router.wait_for_terminal(id);
-
-        // 2. Wait for notification
-        let _ = rx.await;
-
-        // 3. Load final state
-        let job = self.find(id).await?;
-        Ok(job
-            .terminal_state()
-            .expect("job must be terminal after notification"))
+        match rx.await {
+            Ok(state) => Ok(state),
+            Err(_) => {
+                // Channel dropped (router shutdown) — fall back to DB
+                let job = self.find(id).await?;
+                Ok(job
+                    .terminal_state()
+                    .expect("job must be terminal after notification"))
+            }
+        }
     }
 
     /// Gracefully shut down the job poller.

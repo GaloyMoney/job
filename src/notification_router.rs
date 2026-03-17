@@ -6,8 +6,9 @@ use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::JobId;
-use crate::entity::JobType;
+use crate::entity::{JobTerminalState, JobType};
 use crate::handle::OwnedTaskHandle;
+use crate::repo::JobRepo;
 use crate::tracker::JobTracker;
 
 /// Notification types from the unified `job_events` channel.
@@ -18,28 +19,30 @@ enum JobNotification {
     JobTerminal { job_id: String },
 }
 
-type WaiterRegistration = (JobId, oneshot::Sender<()>);
+type WaiterRegistration = (JobId, oneshot::Sender<JobTerminalState>);
 
 pub(crate) struct JobNotificationRouter {
     pool: PgPool,
+    repo: JobRepo,
     terminal_tx: broadcast::Sender<JobId>,
     register_tx: OnceLock<mpsc::UnboundedSender<WaiterRegistration>>,
 }
 
 impl JobNotificationRouter {
-    pub fn new(pool: &PgPool) -> Self {
+    pub fn new(pool: &PgPool, repo: JobRepo) -> Self {
         let (terminal_tx, _) = broadcast::channel(256);
         Self {
             pool: pool.clone(),
+            repo,
             terminal_tx,
             register_tx: OnceLock::new(),
         }
     }
 
     /// Register interest in a job reaching terminal state.
-    /// Returns a oneshot receiver that fires when the job completes/errors/cancels.
+    /// Returns a oneshot receiver that delivers the terminal state.
     /// Drop the receiver to unsubscribe.
-    pub fn wait_for_terminal(&self, job_id: JobId) -> oneshot::Receiver<()> {
+    pub fn wait_for_terminal(&self, job_id: JobId) -> oneshot::Receiver<JobTerminalState> {
         let (tx, rx) = oneshot::channel();
         let register_tx = self.register_tx.get().expect("router not started");
         let _ = register_tx.send((job_id, tx));
@@ -63,6 +66,7 @@ impl JobNotificationRouter {
             register_rx,
             self.terminal_tx.subscribe(),
             self.pool.clone(),
+            self.repo.clone(),
         );
         Ok((listener_handle, waiter_handle))
     }
@@ -117,9 +121,11 @@ impl JobNotificationRouter {
         mut register_rx: mpsc::UnboundedReceiver<WaiterRegistration>,
         mut terminal_rx: broadcast::Receiver<JobId>,
         pool: PgPool,
+        repo: JobRepo,
     ) -> OwnedTaskHandle {
         let handle = tokio::spawn(async move {
-            let mut waiters: HashMap<JobId, Vec<oneshot::Sender<()>>> = HashMap::new();
+            let mut waiters: HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>> =
+                HashMap::new();
             let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
 
             loop {
@@ -136,9 +142,17 @@ impl JobNotificationRouter {
                         .await
                         {
                             Ok(None) => {
-                                let _ = tx.send(());
-                                // Also notify any previously registered waiters
-                                notify_waiters(&mut waiters, job_id);
+                                // Job is terminal — load entity for the state
+                                match load_terminal_state(&repo, job_id).await {
+                                    Some(state) => {
+                                        let _ = tx.send(state);
+                                        send_to_waiters(&mut waiters, job_id, state);
+                                    }
+                                    None => {
+                                        // Could not determine state — register for later
+                                        waiters.entry(job_id).or_default().push(tx);
+                                    }
+                                }
                             }
                             Ok(Some(_)) => {
                                 waiters.entry(job_id).or_default().push(tx);
@@ -156,7 +170,9 @@ impl JobNotificationRouter {
 
                     result = terminal_rx.recv() => {
                         match result {
-                            Ok(job_id) => notify_waiters(&mut waiters, job_id),
+                            Ok(job_id) => {
+                                load_and_notify(&mut waiters, &repo, job_id).await;
+                            }
                             Err(broadcast::error::RecvError::Closed) => break,
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 // Missed notifications — sweep will catch them
@@ -184,7 +200,9 @@ impl JobNotificationRouter {
                             .fetch_optional(&pool)
                             .await
                             {
-                                Ok(None) => notify_waiters(&mut waiters, id),
+                                Ok(None) => {
+                                    load_and_notify(&mut waiters, &repo, id).await;
+                                }
                                 Ok(Some(_)) => {}
                                 Err(e) => {
                                     tracing::warn!(
@@ -205,10 +223,49 @@ impl JobNotificationRouter {
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-fn notify_waiters(waiters: &mut HashMap<JobId, Vec<oneshot::Sender<()>>>, job_id: JobId) {
+/// Load a job entity and extract its terminal state.
+/// Returns `None` and logs a warning on failure.
+async fn load_terminal_state(repo: &JobRepo, job_id: JobId) -> Option<JobTerminalState> {
+    match repo.find_by_id(job_id).await {
+        Ok(job) => match job.terminal_state() {
+            Some(state) => Some(state),
+            None => {
+                tracing::warn!(%job_id, "no execution row but job entity is not terminal");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, %job_id, "failed to load job entity for notification");
+            None
+        }
+    }
+}
+
+/// Load the job entity and send the terminal state to all registered waiters.
+/// On failure, waiters remain registered so the sweep can retry.
+async fn load_and_notify(
+    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
+    repo: &JobRepo,
+    job_id: JobId,
+) {
+    if !waiters.contains_key(&job_id) {
+        return;
+    }
+
+    if let Some(state) = load_terminal_state(repo, job_id).await {
+        send_to_waiters(waiters, job_id, state);
+    }
+}
+
+/// Deliver a known terminal state to all waiters for a job.
+fn send_to_waiters(
+    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
+    job_id: JobId,
+    state: JobTerminalState,
+) {
     if let Some(senders) = waiters.remove(&job_id) {
         for tx in senders {
-            let _ = tx.send(());
+            let _ = tx.send(state);
         }
     }
 }
