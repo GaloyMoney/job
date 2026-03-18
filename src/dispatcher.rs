@@ -89,6 +89,7 @@ impl JobDispatcher {
             polled_job.data_json,
             shutdown_rx,
             self.clock.clone(),
+            Arc::clone(&self.repo),
         );
         self.tracker.dispatch_job();
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
