@@ -1000,8 +1000,8 @@ impl JobRunner for ResultJobRunner {
         current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         // Incremental updates — only the last value is persisted
-        current_job.set_result(&MyResult { value: 1 })?;
-        current_job.set_result(&MyResult { value: 42 })?;
+        current_job.set_result(&MyResult { value: 1 }).await?;
+        current_job.set_result(&MyResult { value: 42 }).await?;
         Ok(JobCompletion::Complete)
     }
 }
@@ -1066,8 +1066,8 @@ impl JobRunner for PartialResultThenErrorRunner {
         current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         // Simulate processing 50 items then failing — partial progress preserved
-        current_job.set_result(&MyResult { value: 50 })?;
-        current_job.set_result(&MyResult { value: 99 })?;
+        current_job.set_result(&MyResult { value: 50 }).await?;
+        current_job.set_result(&MyResult { value: 99 }).await?;
         Err("intentional failure after setting result".into())
     }
 }
@@ -1186,10 +1186,12 @@ impl JobRunner for IncrementalResultRunner {
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         let total = 5;
         for i in 1..=total {
-            current_job.set_result(&BatchProgress {
-                processed: i,
-                total,
-            })?;
+            current_job
+                .set_result(&BatchProgress {
+                    processed: i,
+                    total,
+                })
+                .await?;
         }
         Ok(JobCompletion::Complete)
     }
@@ -1262,10 +1264,12 @@ impl JobRunner for IncrementalResultThenErrorRunner {
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         let total = 100;
         for i in 1..=50 {
-            current_job.set_result(&BatchProgress {
-                processed: i,
-                total,
-            })?;
+            current_job
+                .set_result(&BatchProgress {
+                    processed: i,
+                    total,
+                })
+                .await?;
         }
         Err("failed at item 51".into())
     }

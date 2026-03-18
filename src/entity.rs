@@ -145,10 +145,10 @@ pub enum JobEvent {
     ExecutionErrored {
         error: String,
     },
-    JobCompleted {
-        #[serde(default)]
-        result: Option<JobResult>,
+    ResultUpdated {
+        result: JobResult,
     },
+    JobCompleted,
     Cancelled,
     AttemptCounterReset,
 }
@@ -262,7 +262,7 @@ impl Job {
         self.events
             .iter_all()
             .rev()
-            .any(|event| matches!(event, JobEvent::JobCompleted { .. } | JobEvent::Cancelled))
+            .any(|event| matches!(event, JobEvent::JobCompleted | JobEvent::Cancelled))
     }
 
     /// Returns `true` if the job was cancelled.
@@ -284,7 +284,7 @@ impl Job {
         let mut rev = self.events.iter_all().rev();
         match rev.next()? {
             JobEvent::Cancelled => Some(JobTerminalState::Cancelled),
-            JobEvent::JobCompleted { .. } => match rev.next() {
+            JobEvent::JobCompleted => match rev.next() {
                 Some(JobEvent::ExecutionErrored { .. }) => Some(JobTerminalState::Errored),
                 _ => Some(JobTerminalState::Completed),
             },
@@ -293,10 +293,12 @@ impl Job {
     }
 
     /// Returns the result value attached to this job, if any.
+    ///
+    /// Scans for the latest `ResultUpdated` event (last write wins).
     pub fn result(&self) -> Option<&JobResult> {
         self.events.iter_all().rev().find_map(|event| {
-            if let JobEvent::JobCompleted { result } = event {
-                result.as_ref()
+            if let JobEvent::ResultUpdated { result } = event {
+                Some(result)
             } else {
                 None
             }
@@ -351,9 +353,9 @@ impl Job {
         });
     }
 
-    pub(super) fn complete_job(&mut self, result: Option<JobResult>) {
+    pub(super) fn complete_job(&mut self) {
         self.events.push(JobEvent::ExecutionCompleted);
-        self.events.push(JobEvent::JobCompleted { result });
+        self.events.push(JobEvent::JobCompleted);
     }
 
     pub(crate) fn cancel(&mut self) -> es_entity::Idempotent<()> {
@@ -377,9 +379,14 @@ impl Job {
         });
     }
 
-    pub(super) fn error_job(&mut self, error: String, result: Option<JobResult>) {
+    pub(super) fn error_job(&mut self, error: String) {
         self.events.push(JobEvent::ExecutionErrored { error });
-        self.events.push(JobEvent::JobCompleted { result });
+        self.events.push(JobEvent::JobCompleted);
+    }
+
+    /// Attach or overwrite the result value for this job.
+    pub(crate) fn update_result(&mut self, result: JobResult) {
+        self.events.push(JobEvent::ResultUpdated { result });
     }
 
     pub(super) fn maybe_schedule_retry(
@@ -388,7 +395,6 @@ impl Job {
         attempt: u32,
         retry_policy: &RetryPolicy,
         error: String,
-        result: Option<JobResult>,
     ) -> Option<(DateTime<Utc>, u32)> {
         let mut current_attempt = attempt.max(1);
         if self
@@ -403,7 +409,7 @@ impl Job {
         let next_attempt = current_attempt.saturating_add(1);
         let max_attempts = retry_policy.max_attempts.unwrap_or(u32::MAX);
         if next_attempt > max_attempts {
-            self.error_job(error, result);
+            self.error_job(error);
             return None;
         }
 
@@ -453,7 +459,8 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionCompleted => {}
                 JobEvent::ExecutionAborted { .. } => {}
                 JobEvent::ExecutionErrored { .. } => {}
-                JobEvent::JobCompleted { .. } => {}
+                JobEvent::ResultUpdated { .. } => {}
+                JobEvent::JobCompleted => {}
                 JobEvent::Cancelled => {}
                 JobEvent::AttemptCounterReset => {}
             }
@@ -623,7 +630,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 1, &retry_policy, "boom".to_string(), None)
+                .maybe_schedule_retry(Clock::now(), 1, &retry_policy, "boom".to_string())
                 .expect("retry expected");
 
             assert_eq!(next_attempt, 2);
@@ -656,7 +663,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 0, &retry_policy, "boom".to_string(), None)
+                .maybe_schedule_retry(Clock::now(), 0, &retry_policy, "boom".to_string())
                 .expect("retry expected when attempt starts at zero");
 
             assert_eq!(next_attempt, 2);
@@ -693,7 +700,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(2));
 
             assert!(
-                job.maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string(), None)
+                job.maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string())
                     .is_none(),
                 "should stop retrying when attempts exhausted"
             );
@@ -703,7 +710,7 @@ mod tests {
                 events[events.len() - 2],
                 JobEvent::ExecutionErrored { .. }
             ));
-            assert!(matches!(events.last(), Some(JobEvent::JobCompleted { .. })));
+            assert!(matches!(events.last(), Some(JobEvent::JobCompleted)));
         }
 
         #[test]
@@ -728,7 +735,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(5));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string(), None)
+                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string())
                 .expect("retry expected");
 
             assert_eq!(
@@ -772,13 +779,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(
-                    Clock::now(),
-                    2,
-                    &retry_policy,
-                    "second failure".to_string(),
-                    None,
-                )
+                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "second failure".to_string())
                 .expect("final retry should still be scheduled");
 
             assert_eq!(next_attempt, 3);
@@ -817,13 +818,7 @@ mod tests {
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(
-                    Clock::now(),
-                    3,
-                    &retry_policy,
-                    "third failure".to_string(),
-                    None,
-                )
+                .maybe_schedule_retry(Clock::now(), 3, &retry_policy, "third failure".to_string())
                 .expect("a healthy gap should reset attempt even at limit");
 
             assert_eq!(next_attempt, 2);
@@ -863,13 +858,7 @@ mod tests {
             let retry_policy = build_retry_policy(None);
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(
-                    Clock::now(),
-                    attempt,
-                    &retry_policy,
-                    "overflow".to_string(),
-                    None,
-                )
+                .maybe_schedule_retry(Clock::now(), attempt, &retry_policy, "overflow".to_string())
                 .expect("unbounded retries should permit another schedule");
 
             assert_eq!(next_attempt, u32::MAX);

@@ -4,9 +4,9 @@ use es_entity::clock::ClockHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use super::{JobId, entity::JobResult, error::JobError};
+use super::{JobId, entity::JobResult, error::JobError, repo::JobRepo};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
@@ -18,7 +18,7 @@ pub struct CurrentJob {
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
     clock: ClockHandle,
-    result: Arc<Mutex<Option<JobResult>>>,
+    repo: Arc<JobRepo>,
 }
 
 impl CurrentJob {
@@ -31,7 +31,7 @@ impl CurrentJob {
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
         clock: ClockHandle,
-        result: Arc<Mutex<Option<JobResult>>>,
+        repo: Arc<JobRepo>,
     ) -> Self {
         Self {
             id,
@@ -40,7 +40,7 @@ impl CurrentJob {
             execution_state_json: execution_state,
             shutdown_rx,
             clock,
-            result,
+            repo,
         }
     }
 
@@ -129,16 +129,40 @@ impl CurrentJob {
 
     /// Attach or update the result value for this job execution.
     ///
-    /// The result is serialized to JSON and will be available to callers via
+    /// The result is serialized to JSON and persisted to the database
+    /// immediately. It will be available to callers via
     /// [`Jobs::await_completion`](crate::Jobs::await_completion). Each call
-    /// overwrites the previous value — the **last** value set before the job
-    /// completes (or errors) is what gets persisted. This allows incremental
-    /// progress updates; for example, a batch job can call `set_result` after
-    /// each chunk so that partial progress is preserved even on failure.
-    pub fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
+    /// overwrites the previous value — the **last** value set is what callers
+    /// see. This allows incremental progress updates; for example, a batch job
+    /// can call `set_result` after each chunk so that partial progress is
+    /// preserved even on failure.
+    pub async fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
         let json = serde_json::to_value(result).map_err(JobError::CouldNotSerializeResult)?;
-        let mut guard = self.result.lock().expect("result mutex poisoned");
-        *guard = Some(JobResult::new(json));
+        let job_result = JobResult::new(json);
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let mut job = self.repo.find_by_id(self.id).await?;
+        job.update_result(job_result);
+        self.repo.update_in_op(&mut op, &mut job).await?;
+        op.commit().await?;
+        Ok(())
+    }
+
+    /// Attach or update the result value as part of an existing database
+    /// operation.
+    ///
+    /// This is the composable variant of [`set_result`](Self::set_result) —
+    /// callers provide an open atomic operation so the result write participates
+    /// in a larger transaction.
+    pub async fn set_result_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        result: &impl Serialize,
+    ) -> Result<(), JobError> {
+        let json = serde_json::to_value(result).map_err(JobError::CouldNotSerializeResult)?;
+        let job_result = JobResult::new(json);
+        let mut job = self.repo.find_by_id(self.id).await?;
+        job.update_result(job_result);
+        self.repo.update_in_op(op, &mut job).await?;
         Ok(())
     }
 
