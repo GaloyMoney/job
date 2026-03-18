@@ -27,7 +27,7 @@ impl JobResult {
         Self(value)
     }
 
-    /// Return a reference to the inner JSON value.
+    /// Consume the wrapper and return the inner JSON value.
     pub fn into_inner(self) -> serde_json::Value {
         self.0
     }
@@ -385,8 +385,17 @@ impl Job {
     }
 
     /// Attach or overwrite the result value for this job.
-    pub(crate) fn update_result(&mut self, result: JobResult) {
+    ///
+    /// Returns [`Idempotent::AlreadyApplied`] when the new value is identical
+    /// to the current one, allowing callers to skip the DB round-trip.
+    pub(crate) fn update_result(&mut self, result: JobResult) -> es_entity::Idempotent<()> {
+        if let Some(existing) = self.result()
+            && *existing.as_value() == *result.as_value()
+        {
+            return es_entity::Idempotent::AlreadyApplied;
+        }
         self.events.push(JobEvent::ResultUpdated { result });
+        es_entity::Idempotent::Executed(())
     }
 
     pub(super) fn maybe_schedule_retry(

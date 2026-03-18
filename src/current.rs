@@ -140,10 +140,11 @@ impl CurrentJob {
         let json = serde_json::to_value(result).map_err(JobError::CouldNotSerializeResult)?;
         let job_result = JobResult::new(json);
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id(self.id).await?;
-        job.update_result(job_result);
-        self.repo.update_in_op(&mut op, &mut job).await?;
-        op.commit().await?;
+        let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
+        if job.update_result(job_result).did_execute() {
+            self.repo.update_in_op(&mut op, &mut job).await?;
+            op.commit().await?;
+        }
         Ok(())
     }
 
@@ -160,9 +161,10 @@ impl CurrentJob {
     ) -> Result<(), JobError> {
         let json = serde_json::to_value(result).map_err(JobError::CouldNotSerializeResult)?;
         let job_result = JobResult::new(json);
-        let mut job = self.repo.find_by_id(self.id).await?;
-        job.update_result(job_result);
-        self.repo.update_in_op(op, &mut job).await?;
+        let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
+        if job.update_result(job_result).did_execute() {
+            self.repo.update_in_op(op, &mut job).await?;
+        }
         Ok(())
     }
 
