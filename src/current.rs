@@ -137,8 +137,7 @@ impl CurrentJob {
     /// can call `set_result` after each chunk so that partial progress is
     /// preserved even on failure.
     pub async fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
-        let json = serde_json::to_value(result).map_err(JobError::CouldNotSerializeResult)?;
-        let job_result = JobResult::new(json);
+        let job_result = JobResult::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
         if job.update_result(job_result).did_execute() {
@@ -159,8 +158,7 @@ impl CurrentJob {
         op: &mut impl es_entity::AtomicOperation,
         result: &impl Serialize,
     ) -> Result<(), JobError> {
-        let json = serde_json::to_value(result).map_err(JobError::CouldNotSerializeResult)?;
-        let job_result = JobResult::new(json);
+        let job_result = JobResult::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
         let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
         if job.update_result(job_result).did_execute() {
             self.repo.update_in_op(op, &mut job).await?;

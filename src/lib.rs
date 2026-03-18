@@ -567,7 +567,7 @@ impl Jobs {
         };
         // Load job to retrieve any result value set by the runner
         let job = self.find(id).await?;
-        Ok(JobCompletionResult::new(state, job.result().cloned()))
+        Ok(JobCompletionResult::new(state, job.raw_result().cloned()))
     }
 
     /// Non-blocking check for job completion.

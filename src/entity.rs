@@ -22,11 +22,6 @@ use crate::{JobId, error::JobError};
 pub struct JobResult(serde_json::Value);
 
 impl JobResult {
-    /// Wrap a raw JSON value.
-    pub(crate) fn new(value: serde_json::Value) -> Self {
-        Self(value)
-    }
-
     /// Consume the wrapper and return the inner JSON value.
     pub fn into_inner(self) -> serde_json::Value {
         self.0
@@ -40,6 +35,11 @@ impl JobResult {
     /// Deserialize the result into a typed struct.
     pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_value(self.0.clone())
+    }
+
+    /// Serialize a value into a `JobResult`.
+    pub fn try_from<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> {
+        serde_json::to_value(value).map(Self)
     }
 }
 
@@ -61,15 +61,8 @@ impl JobCompletionResult {
         self.state
     }
 
-    /// Returns the result wrapper, if any.
-    pub fn result(&self) -> Option<&JobResult> {
-        self.result.as_ref()
-    }
-
     /// Deserialize the result value into a typed struct.
-    pub fn typed_result<T: serde::de::DeserializeOwned>(
-        &self,
-    ) -> Result<Option<T>, serde_json::Error> {
+    pub fn result<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
         match &self.result {
             Some(r) => r.deserialize().map(Some),
             None => Ok(None),
@@ -292,10 +285,10 @@ impl Job {
         }
     }
 
-    /// Returns the result value attached to this job, if any.
+    /// Returns the raw result value attached to this job, if any.
     ///
     /// Scans for the latest `ResultUpdated` event (last write wins).
-    pub fn result(&self) -> Option<&JobResult> {
+    pub(crate) fn raw_result(&self) -> Option<&JobResult> {
         self.events.iter_all().rev().find_map(|event| {
             if let JobEvent::ResultUpdated { result } = event {
                 Some(result)
@@ -306,10 +299,8 @@ impl Job {
     }
 
     /// Deserialize the result value into a typed struct.
-    pub fn typed_result<T: serde::de::DeserializeOwned>(
-        &self,
-    ) -> Result<Option<T>, serde_json::Error> {
-        match self.result() {
+    pub fn result<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
+        match self.raw_result() {
             Some(r) => r.deserialize().map(Some),
             None => Ok(None),
         }
@@ -389,11 +380,10 @@ impl Job {
     /// Returns [`Idempotent::AlreadyApplied`] when the new value is identical
     /// to the current one, allowing callers to skip the DB round-trip.
     pub(crate) fn update_result(&mut self, result: JobResult) -> es_entity::Idempotent<()> {
-        if let Some(existing) = self.result()
-            && *existing.as_value() == *result.as_value()
-        {
-            return es_entity::Idempotent::AlreadyApplied;
-        }
+        idempotency_guard!(
+            self.events.iter_all().rev(),
+            already_applied: JobEvent::ResultUpdated { result: existing } if *existing.as_value() == *result.as_value()
+        );
         self.events.push(JobEvent::ResultUpdated { result });
         es_entity::Idempotent::Executed(())
     }

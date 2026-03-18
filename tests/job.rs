@@ -1024,7 +1024,7 @@ async fn test_await_completion_returns_result() -> anyhow::Result<()> {
     let outcome = jobs.await_completion(job_id, None).await?;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
     let result: MyResult = outcome
-        .typed_result()
+        .result()
         .expect("deserialize result")
         .expect("result should be Some");
     assert_eq!(result, MyResult { value: 42 });
@@ -1090,7 +1090,7 @@ async fn test_await_completion_returns_partial_result_on_error() -> anyhow::Resu
     let outcome = jobs.await_completion(job_id, None).await?;
     assert_eq!(outcome.state(), JobTerminalState::Errored);
     let result: MyResult = outcome
-        .typed_result()
+        .result()
         .expect("deserialize result")
         .expect("partial result should be Some");
     assert_eq!(result, MyResult { value: 99 });
@@ -1145,7 +1145,12 @@ async fn test_await_completion_no_result() -> anyhow::Result<()> {
 
     let outcome = jobs.await_completion(job_id, None).await?;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
-    assert!(outcome.result().is_none());
+    assert!(
+        outcome
+            .result::<serde_json::Value>()
+            .expect("deserialize")
+            .is_none()
+    );
 
     Ok(())
 }
@@ -1215,7 +1220,7 @@ async fn test_set_result_multiple_calls_keeps_last() -> anyhow::Result<()> {
     let outcome = jobs.await_completion(job_id, None).await?;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
     let progress: BatchProgress = outcome
-        .typed_result()
+        .result()
         .expect("deserialize result")
         .expect("result should be Some");
     assert_eq!(
@@ -1293,7 +1298,7 @@ async fn test_set_result_partial_progress_preserved_on_error() -> anyhow::Result
     let outcome = jobs.await_completion(job_id, None).await?;
     assert_eq!(outcome.state(), JobTerminalState::Errored);
     let progress: BatchProgress = outcome
-        .typed_result()
+        .result()
         .expect("deserialize result")
         .expect("partial result should be Some");
     assert_eq!(
