@@ -1,3 +1,13 @@
+# [job release v0.6.10](https://github.com/GaloyMoney/job/releases/tag/0.6.10)
+
+
+
+### Features
+
+- Add Serialize/Deserialize to JobTerminalState (#64)
+- Add result passing and unified notification router (#60)
+- Add optional timeout and poll_completion to await_completion (#62)
+
 # [job release v0.6.9](https://github.com/GaloyMoney/job/releases/tag/0.6.9)
 
 
