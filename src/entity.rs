@@ -72,7 +72,7 @@ impl JobCompletionResult {
 
 /// Terminal outcome of a job lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum JobTerminalState {
     /// The job completed successfully.
     Completed,
