@@ -1,3 +1,7 @@
+# [job release v0.6.11](https://github.com/GaloyMoney/job/releases/tag/0.6.11)
+
+
+
 # [job release v0.6.10](https://github.com/GaloyMoney/job/releases/tag/0.6.10)
 
 
