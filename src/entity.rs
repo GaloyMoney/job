@@ -78,8 +78,6 @@ pub enum JobTerminalState {
     Completed,
     /// The job exhausted its retries and was marked as errored.
     Errored,
-    /// The job was explicitly cancelled before completion.
-    Cancelled,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
@@ -143,7 +141,6 @@ pub enum JobEvent {
         result: JobResult,
     },
     JobCompleted,
-    Cancelled,
     AttemptCounterReset,
 }
 
@@ -251,25 +248,16 @@ impl Job {
         serde_json::from_value(self.config.clone())
     }
 
-    /// Returns `true` once the job has emitted a `JobCompleted` or `Cancelled` event.
+    /// Returns `true` once the job has emitted a `JobCompleted` event.
     pub fn completed(&self) -> bool {
         self.events
             .iter_all()
             .rev()
-            .any(|event| matches!(event, JobEvent::JobCompleted | JobEvent::Cancelled))
-    }
-
-    /// Returns `true` if the job was cancelled.
-    pub fn cancelled(&self) -> bool {
-        self.events
-            .iter_all()
-            .rev()
-            .any(|event| matches!(event, JobEvent::Cancelled))
+            .any(|event| matches!(event, JobEvent::JobCompleted))
     }
 
     /// Determine the terminal state of a job, if it has reached one.
     ///
-    /// - `Cancelled` if a `Cancelled` event exists
     /// - `Errored` if `JobCompleted` exists and the last execution event before it was
     ///   `ExecutionErrored`
     /// - `Completed` if `JobCompleted` exists (normal completion)
@@ -277,7 +265,6 @@ impl Job {
     pub fn terminal_state(&self) -> Option<JobTerminalState> {
         let mut rev = self.events.iter_all().rev();
         match rev.next()? {
-            JobEvent::Cancelled => Some(JobTerminalState::Cancelled),
             JobEvent::JobCompleted => match rev.next() {
                 Some(JobEvent::ExecutionErrored { .. }) => Some(JobTerminalState::Errored),
                 _ => Some(JobTerminalState::Completed),
@@ -348,14 +335,6 @@ impl Job {
     pub(super) fn complete_job(&mut self) {
         self.events.push(JobEvent::ExecutionCompleted);
         self.events.push(JobEvent::JobCompleted);
-    }
-
-    pub(crate) fn cancel(&mut self) -> es_entity::Idempotent<()> {
-        if self.completed() {
-            return es_entity::Idempotent::AlreadyApplied;
-        }
-        self.events.push(JobEvent::Cancelled);
-        es_entity::Idempotent::Executed(())
     }
 
     pub(super) fn schedule_retry(
@@ -461,7 +440,6 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionErrored { .. } => {}
                 JobEvent::ResultUpdated { .. } => {}
                 JobEvent::JobCompleted => {}
-                JobEvent::Cancelled => {}
                 JobEvent::AttemptCounterReset => {}
             }
         }

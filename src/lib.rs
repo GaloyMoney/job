@@ -221,7 +221,6 @@ mod tracker;
 
 pub mod error;
 
-use es_entity::AtomicOperation;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
@@ -497,42 +496,13 @@ impl Jobs {
         Ok(self.repo.find_by_id(id).await?)
     }
 
-    /// Cancel a pending job, removing it from the execution queue.
-    ///
-    /// This operation is idempotent — calling it on an already cancelled or
-    /// completed job is a no-op. If the job exists but is currently running
-    /// (not pending), returns [`JobError::CannotCancelJob`].
-    #[instrument(name = "job.cancel_job", skip(self))]
-    pub async fn cancel_job(&self, id: JobId) -> Result<(), JobError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id(id).await?;
-
-        if job.cancel().did_execute() {
-            let result = sqlx::query!(
-                r#"DELETE FROM job_executions WHERE id = $1 AND state = 'pending'"#,
-                id as JobId,
-            )
-            .execute(op.as_executor())
-            .await?;
-
-            if result.rows_affected() == 0 {
-                return Err(JobError::CannotCancelJob);
-            }
-
-            self.repo.update_in_op(&mut op, &mut job).await?;
-            op.commit().await?;
-        }
-
-        Ok(())
-    }
-
     /// Returns a reference to the clock used by this job service.
     pub fn clock(&self) -> &ClockHandle {
         &self.clock
     }
 
-    /// Block until the given job reaches a terminal state (completed, errored, or
-    /// cancelled) and return the outcome together with any result value the
+    /// Block until the given job reaches a terminal state (completed or errored)
+    /// and return the outcome together with any result value the
     /// runner attached via [`CurrentJob::set_result`].
     ///
     /// When `timeout` is `Some(duration)`, the call returns
