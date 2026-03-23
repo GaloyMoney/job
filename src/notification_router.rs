@@ -134,8 +134,8 @@ impl JobNotificationRouter {
                         match has_execution_row(&pool, job_id).await {
                             Ok(false) => {
                                 // No execution row → job is terminal, but the caller
-                                // needs to know *how* it ended (Completed vs Errored
-                                // vs Cancelled), so we load the entity's event history.
+                                // needs to know *how* it ended (Completed vs Errored),
+                                // so we load the entity's event history.
                                 // On transient DB failure the waiter is parked for the
                                 // sweep to retry.
                                 match load_terminal_state(&repo, job_id).await {
