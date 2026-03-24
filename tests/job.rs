@@ -8,6 +8,7 @@ use job::{
     error::JobError,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -1219,6 +1220,272 @@ async fn test_await_completion_timeout() -> anyhow::Result<()> {
         "Expected TimedOut error, got: {:?}",
         result,
     );
+
+    Ok(())
+}
+
+// -- Multi-day scheduling tests --
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MultiDayJobConfig {
+    label: String,
+}
+
+struct MultiDayJobInitializer {
+    execution_times: Arc<Mutex<HashMap<JobId, DateTime<Utc>>>>,
+}
+
+impl JobInitializer for MultiDayJobInitializer {
+    type Config = MultiDayJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("multi-day-job")
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(MultiDayJobRunner {
+            job_id: job.id,
+            execution_times: Arc::clone(&self.execution_times),
+        }))
+    }
+}
+
+struct MultiDayJobRunner {
+    job_id: JobId,
+    execution_times: Arc<Mutex<HashMap<JobId, DateTime<Utc>>>>,
+}
+
+#[async_trait]
+impl JobRunner for MultiDayJobRunner {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let now = current_job.clock().now();
+        self.execution_times.lock().await.insert(self.job_id, now);
+        Ok(JobCompletion::Complete)
+    }
+}
+
+/// Polls until all specified jobs are marked completed in the database.
+async fn wait_for_jobs_completed(jobs: &Jobs, ids: &[JobId]) {
+    let mut attempts = 0;
+    let max_attempts = 100;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let mut all_done = true;
+        for id in ids {
+            let job = jobs.find(*id).await.expect("job should exist");
+            if !job.completed() {
+                all_done = false;
+                break;
+            }
+        }
+        if all_done {
+            return;
+        }
+        attempts += 1;
+        if attempts >= max_attempts {
+            panic!(
+                "Jobs {:?} did not all complete within {} attempts ({}ms)",
+                ids,
+                max_attempts,
+                max_attempts * 100,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+
+    let (clock, controller) = ClockHandle::artificial(ArtificialClockConfig::manual());
+    let initial_time = clock.now();
+
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .clock(clock.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let execution_times: Arc<Mutex<HashMap<JobId, DateTime<Utc>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let spawner = jobs.add_initializer(MultiDayJobInitializer {
+        execution_times: Arc::clone(&execution_times),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    // Schedule 5 jobs at various future times
+    let job_2h_a = JobId::new();
+    let job_2h_b = JobId::new();
+    let job_2d = JobId::new();
+    let job_4d = JobId::new();
+    let job_7d = JobId::new();
+
+    let at_2h = initial_time + chrono::Duration::hours(2);
+    let at_2d = initial_time + chrono::Duration::days(2);
+    let at_4d = initial_time + chrono::Duration::days(4);
+    let at_7d = initial_time + chrono::Duration::days(7);
+
+    spawner
+        .spawn_at(
+            job_2h_a,
+            MultiDayJobConfig {
+                label: "2h-a".into(),
+            },
+            at_2h,
+        )
+        .await?;
+    spawner
+        .spawn_at(
+            job_2h_b,
+            MultiDayJobConfig {
+                label: "2h-b".into(),
+            },
+            at_2h,
+        )
+        .await?;
+    spawner
+        .spawn_at(job_2d, MultiDayJobConfig { label: "2d".into() }, at_2d)
+        .await?;
+    spawner
+        .spawn_at(job_4d, MultiDayJobConfig { label: "4d".into() }, at_4d)
+        .await?;
+    spawner
+        .spawn_at(job_7d, MultiDayJobConfig { label: "7d".into() }, at_7d)
+        .await?;
+
+    // No jobs should have run yet
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    assert!(
+        execution_times.lock().await.is_empty(),
+        "No jobs should run before clock advances"
+    );
+
+    let one_day = std::time::Duration::from_secs(86_400);
+
+    // --- Day 1: the two 2-hour jobs should fire ---
+    controller.advance(one_day).await;
+    wait_for_jobs_completed(&jobs, &[job_2h_a, job_2h_b]).await;
+    {
+        let times = execution_times.lock().await;
+        assert!(
+            times.contains_key(&job_2h_a),
+            "2h-a should have run after day 1"
+        );
+        assert!(
+            times.contains_key(&job_2h_b),
+            "2h-b should have run after day 1"
+        );
+        assert!(
+            !times.contains_key(&job_2d),
+            "2d should NOT have run after day 1"
+        );
+        assert!(
+            !times.contains_key(&job_4d),
+            "4d should NOT have run after day 1"
+        );
+        assert!(
+            !times.contains_key(&job_7d),
+            "7d should NOT have run after day 1"
+        );
+    }
+
+    // --- Day 2: the 2-day job should fire ---
+    controller.advance(one_day).await;
+    wait_for_jobs_completed(&jobs, &[job_2d]).await;
+    {
+        let times = execution_times.lock().await;
+        assert!(
+            times.contains_key(&job_2d),
+            "2d should have run after day 2"
+        );
+        assert!(
+            !times.contains_key(&job_4d),
+            "4d should NOT have run after day 2"
+        );
+        assert!(
+            !times.contains_key(&job_7d),
+            "7d should NOT have run after day 2"
+        );
+    }
+
+    // --- Day 3: no new jobs ---
+    controller.advance(one_day).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    {
+        let times = execution_times.lock().await;
+        assert_eq!(times.len(), 3, "Only 3 jobs should have run by day 3");
+    }
+
+    // --- Day 4: the 4-day job should fire ---
+    controller.advance(one_day).await;
+    wait_for_jobs_completed(&jobs, &[job_4d]).await;
+    {
+        let times = execution_times.lock().await;
+        assert!(
+            times.contains_key(&job_4d),
+            "4d should have run after day 4"
+        );
+        assert!(
+            !times.contains_key(&job_7d),
+            "7d should NOT have run after day 4"
+        );
+    }
+
+    // --- Days 5 and 6: no new jobs ---
+    controller.advance(one_day).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    controller.advance(one_day).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    {
+        let times = execution_times.lock().await;
+        assert_eq!(times.len(), 4, "Only 4 jobs should have run by day 6");
+    }
+
+    // --- Day 7: the 7-day job should fire ---
+    controller.advance(one_day).await;
+    wait_for_jobs_completed(&jobs, &[job_7d]).await;
+
+    // All 5 jobs should now be recorded
+    {
+        let times = execution_times.lock().await;
+        assert_eq!(times.len(), 5, "All 5 jobs should have run by day 7");
+    }
+
+    // Verify every job is completed in the database
+    for id in [job_2h_a, job_2h_b, job_2d, job_4d, job_7d] {
+        let job = jobs.find(id).await?;
+        assert!(job.completed(), "Job {id} should be completed");
+    }
+
+    // Verify execution times are at or after their scheduled times
+    {
+        let times = execution_times.lock().await;
+        for (label, id, scheduled) in [
+            ("2h-a", job_2h_a, at_2h),
+            ("2h-b", job_2h_b, at_2h),
+            ("2d", job_2d, at_2d),
+            ("4d", job_4d, at_4d),
+            ("7d", job_7d, at_7d),
+        ] {
+            let exec_time = times[&id];
+            assert!(
+                exec_time >= scheduled,
+                "Job {label} executed at {exec_time} but was scheduled for {scheduled}",
+            );
+        }
+    }
 
     Ok(())
 }
