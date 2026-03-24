@@ -213,7 +213,7 @@ impl JobPoller {
         let clock = self.clock.clone();
         OwnedTaskHandle::new(spawn_named_task!("job-poller-lost-handler", async move {
             loop {
-                clock.sleep(job_lost_interval / 2).await;
+                clock.sleep_coalesce(job_lost_interval / 2).await;
                 let now = clock.now();
                 let check_time = now - job_lost_interval;
 
@@ -292,7 +292,7 @@ impl JobPoller {
                         }
                     };
                     drop(_guard);
-                    clock.sleep(timeout).await;
+                    clock.sleep_coalesce(timeout).await;
                 }
             }
         ))
