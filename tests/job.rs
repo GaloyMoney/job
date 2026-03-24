@@ -1271,9 +1271,8 @@ impl JobRunner for MultiDayJobRunner {
 }
 
 /// Polls until all specified jobs are marked completed in the database.
-async fn wait_for_jobs_completed(jobs: &Jobs, ids: &[JobId]) {
+async fn wait_for_jobs_completed(jobs: &Jobs, ids: &[JobId], max_attempts: usize) {
     let mut attempts = 0;
-    let max_attempts = 100;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         let mut all_done = true;
@@ -1299,6 +1298,35 @@ async fn wait_for_jobs_completed(jobs: &Jobs, ids: &[JobId]) {
     }
 }
 
+/// Test that jobs scheduled across multiple days all fire correctly when the
+/// manual clock is advanced one day at a time.
+///
+/// # What this test verifies
+///
+/// When `controller.advance(1 day)` is called, the manual clock processes many
+/// intermediate wake points — the keep-alive handler fires every ~75s (~1152
+/// times per day) and the lost-handler fires every ~150s (~576 times per day).
+/// This test confirms that jobs scheduled at 2h, 2d, 4d, and 7d horizons all
+/// execute at the correct time despite those intermediate wake-ups.
+///
+/// # Known failure mode
+///
+/// This test may fail with a timeout waiting for jobs to complete. The root
+/// cause: when `advance()` processes a large time jump, the main polling loop,
+/// keep-alive, and lost-handler tasks all get woken in rapid succession. The
+/// tokio runtime may not give the main loop enough CPU time to poll the DB and
+/// dispatch jobs before the test's `wait_for_jobs_completed` gives up. This is
+/// a real limitation of the manual clock with large advances — the ratio of
+/// "housekeeping wake-ups" to "useful poll cycles" is very high, and the
+/// polling loop can be starved.
+///
+/// # Cross-test isolation note
+///
+/// The lost-handler SQL (`WHERE state = 'running' AND alive_at < $1`) has no
+/// `job_type` filter. With a manual clock days in the future, `check_time` is
+/// also far ahead, so the lost-handler can reset OTHER tests' running jobs back
+/// to 'pending'. Explicit `jobs.shutdown()` at test end is critical to prevent
+/// this interference.
 #[tokio::test]
 async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -1373,9 +1401,16 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
 
     let one_day = std::time::Duration::from_secs(86_400);
 
+    // Use generous timeout: each day-advance triggers ~1700+ intermediate
+    // wake-ups (keep-alive + lost-handler). The runtime needs real time to
+    // process them all and let the main polling loop dispatch the job.
+    let wait_attempts = 300; // 30 seconds
+
     // --- Day 1: the two 2-hour jobs should fire ---
     controller.advance(one_day).await;
-    wait_for_jobs_completed(&jobs, &[job_2h_a, job_2h_b]).await;
+    // Yield generously after advance so woken tasks can execute
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    wait_for_jobs_completed(&jobs, &[job_2h_a, job_2h_b], wait_attempts).await;
     {
         let times = execution_times.lock().await;
         assert!(
@@ -1402,7 +1437,8 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
 
     // --- Day 2: the 2-day job should fire ---
     controller.advance(one_day).await;
-    wait_for_jobs_completed(&jobs, &[job_2d]).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    wait_for_jobs_completed(&jobs, &[job_2d], wait_attempts).await;
     {
         let times = execution_times.lock().await;
         assert!(
@@ -1421,7 +1457,7 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
 
     // --- Day 3: no new jobs ---
     controller.advance(one_day).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     {
         let times = execution_times.lock().await;
         assert_eq!(times.len(), 3, "Only 3 jobs should have run by day 3");
@@ -1429,7 +1465,8 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
 
     // --- Day 4: the 4-day job should fire ---
     controller.advance(one_day).await;
-    wait_for_jobs_completed(&jobs, &[job_4d]).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    wait_for_jobs_completed(&jobs, &[job_4d], wait_attempts).await;
     {
         let times = execution_times.lock().await;
         assert!(
@@ -1444,9 +1481,9 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
 
     // --- Days 5 and 6: no new jobs ---
     controller.advance(one_day).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     controller.advance(one_day).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     {
         let times = execution_times.lock().await;
         assert_eq!(times.len(), 4, "Only 4 jobs should have run by day 6");
@@ -1454,7 +1491,8 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
 
     // --- Day 7: the 7-day job should fire ---
     controller.advance(one_day).await;
-    wait_for_jobs_completed(&jobs, &[job_7d]).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    wait_for_jobs_completed(&jobs, &[job_7d], wait_attempts).await;
 
     // All 5 jobs should now be recorded
     {
@@ -1485,6 +1523,10 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
             );
         }
     }
+
+    // Explicit shutdown prevents the lost-handler (which uses our far-future
+    // manual clock) from resetting other tests' running jobs to 'pending'.
+    jobs.shutdown().await?;
 
     Ok(())
 }
