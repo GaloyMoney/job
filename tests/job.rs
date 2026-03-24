@@ -3,9 +3,8 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobCompletionResult, JobId, JobInitializer,
-    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
-    error::JobError,
+    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
+    JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1304,7 +1303,7 @@ async fn wait_for_jobs_completed(jobs: &Jobs, ids: &[JobId]) {
 async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
 
-    let (clock, controller) = ClockHandle::artificial(ArtificialClockConfig::manual());
+    let (clock, controller) = ClockHandle::manual();
     let initial_time = clock.now();
 
     let config = JobSvcConfig::builder()
