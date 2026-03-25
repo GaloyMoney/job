@@ -1,3 +1,19 @@
+# [job release v0.6.12](https://github.com/GaloyMoney/job/releases/tag/0.6.12)
+
+
+
+### Bug Fixes
+
+- Pin es-entity
+
+### Refactor
+
+- Remove cancel_job API (#67)
+
+### Testing
+
+- Add multi-day scheduling integration test (#68)
+
 # [job release v0.6.11](https://github.com/GaloyMoney/job/releases/tag/0.6.11)
 
 
