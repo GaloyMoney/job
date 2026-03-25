@@ -7,7 +7,6 @@ use job::{
     JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
 };
 use serde::{Deserialize, Serialize};
-use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -291,7 +290,6 @@ impl JobRunner for QueueJobRunner {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
@@ -1311,15 +1309,12 @@ async fn wait_for_jobs_completed(jobs: &Jobs, ids: &[JobId], max_attempts: usize
 /// means the polling loop can dispatch jobs promptly without being starved by
 /// ~1700 housekeeping wake-ups per day-advance.
 ///
-/// # Cross-test isolation note
+/// # Cross-test isolation
 ///
-/// The lost-handler SQL (`WHERE state = 'running' AND alive_at < $1`) has no
-/// `job_type` filter. With a manual clock days in the future, `check_time` is
-/// also far ahead, so the lost-handler can reset OTHER tests' running jobs back
-/// to 'pending'. Explicit `jobs.shutdown()` at test end is critical to prevent
-/// this interference.
+/// The lost-handler SQL is scoped to `job_type = ANY(registered_types)`, so a
+/// poller with a far-future manual clock only resets its own job types. This
+/// prevents cross-test interference when multiple pollers share the same DB.
 #[tokio::test]
-#[serial]
 async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
 

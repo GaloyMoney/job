@@ -211,6 +211,7 @@ impl JobPoller {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
         let clock = self.clock.clone();
+        let supported_job_types = self.registry.registered_job_types();
         OwnedTaskHandle::new(spawn_named_task!("job-poller-lost-handler", async move {
             loop {
                 clock.sleep_coalesce(job_lost_interval / 2).await;
@@ -230,9 +231,11 @@ impl JobPoller {
                         UPDATE job_executions
                         SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1, poller_instance_id = NULL
                         WHERE state = 'running' AND alive_at < $1::timestamptz
+                        AND job_type = ANY($2)
                         RETURNING id as id
                         "#,
                         check_time,
+                        &supported_job_types as _,
                     )
                     .fetch_all(&pool)
                     .await
