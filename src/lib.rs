@@ -325,10 +325,10 @@ impl Jobs {
             .expect("Could not build new job");
         let mut op = self.repo.begin_op().await?;
         match self.repo.create_in_op(&mut op, new_job).await {
-            Err(JobError::DuplicateUniqueJobType) => (),
-            Err(e) => return Err(e),
+            Err(e) if e.was_duplicate() => (),
+            Err(e) => return Err(e.into()),
             Ok(mut job) => {
-                let schedule_at = op.now().unwrap_or_else(crate::time::now);
+                let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
                 self.insert_execution::<<C as JobConfig>::Initializer>(
                     &mut op,
                     &mut job,
@@ -380,7 +380,7 @@ impl Jobs {
             .build()
             .expect("Could not build new job");
         let mut job = self.repo.create_in_op(op, new_job).await?;
-        let schedule_at = op.now().unwrap_or_else(crate::time::now);
+        let schedule_at = op.maybe_now().unwrap_or_else(crate::time::now);
         self.insert_execution::<<C as JobConfig>::Initializer>(op, &mut job, schedule_at)
             .await?;
         Ok(job)
@@ -417,7 +417,7 @@ impl Jobs {
     #[instrument(name = "job.find", skip(self))]
     /// Fetch the current snapshot of a job entity by identifier.
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
-        self.repo.find_by_id(id).await
+        self.repo.find_by_id(id).await.map_err(Into::into)
     }
 
     /// Gracefully shut down the job poller.
@@ -457,7 +457,7 @@ impl Jobs {
             job.id as JobId,
             &job.job_type as &JobType,
             schedule_at,
-            op.now()
+            op.maybe_now()
         )
         .execute(op.as_executor())
         .await?;

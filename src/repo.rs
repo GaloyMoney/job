@@ -2,16 +2,19 @@ use sqlx::PgPool;
 
 use es_entity::*;
 
-use super::{entity::*, error::*};
+use super::entity::*;
 use crate::JobId;
 
 #[derive(EsRepo, Clone)]
 #[es_repo(
     entity = "Job",
-    err = "JobError",
     columns(
         job_type(ty = "JobType", update(persist = false)),
-        unique_per_type(ty = "bool", update(persist = false)),
+        unique_per_type(
+            ty = "bool",
+            update(persist = false),
+            constraint = "idx_unique_job_type"
+        ),
     ),
     persist_event_context = false
 )]
@@ -62,7 +65,8 @@ mod tests {
             .build()
             .expect("Could not build new job");
         let res = repo.create(new_job).await;
-        assert!(matches!(res, Err(JobError::DuplicateUniqueJobType)));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().was_duplicate_by(JobColumn::UniquePerType));
 
         // Same type same id
         let new_job = NewJob::builder()
@@ -73,7 +77,8 @@ mod tests {
             .build()
             .expect("Could not build new job");
         let res = repo.create(new_job).await;
-        assert!(matches!(res, Err(JobError::DuplicateId)));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().was_duplicate_by(JobColumn::Id));
 
         let new_job = NewJob::builder()
             .id(JobId::new())
@@ -105,7 +110,8 @@ mod tests {
             .build()
             .expect("Could not build new job");
         let res = repo.create(new_job).await;
-        assert!(matches!(res, Err(JobError::DuplicateId)));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().was_duplicate_by(JobColumn::Id));
 
         Ok(())
     }

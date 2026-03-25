@@ -12,7 +12,7 @@ categories = ["database"]
 
 fail-on-warnings = []
 es-entity = []
-sim-time = [ "dep:sim-time", "es-entity/sim-time" ]
+sim-time = [ "dep:sim-time" ]
 json-schema = ["dep:schemars", "es-entity/json-schema"]
 
 [dependencies]
@@ -40,7 +40,7 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.10"
+es-entity = "0.10.31"
 sim-time = "0.10"
 
 anyhow = "1.0"

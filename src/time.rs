@@ -12,12 +12,11 @@ pub(crate) fn now() -> DateTime<Utc> {
     res
 }
 
-pub(crate) fn sleep(duration: Duration) -> tokio::time::Sleep {
+pub(crate) async fn sleep_coalesce(duration: Duration) {
     #[cfg(feature = "sim-time")]
-    let res = sim_time::sleep(duration);
+    sim_time::sleep(duration).await;
     #[cfg(not(feature = "sim-time"))]
-    let res = tokio::time::sleep(duration);
-    res
+    es_entity::clock::Clock::sleep_coalesce(duration).await;
 }
 
 pub(crate) fn timeout<F>(duration: Duration, future: F) -> tokio::time::Timeout<F::IntoFuture>

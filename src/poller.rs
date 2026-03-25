@@ -180,7 +180,7 @@ impl JobPoller {
         let pool = self.repo.pool().clone();
         OwnedTaskHandle::new(tokio::task::spawn(async move {
             loop {
-                crate::time::sleep(job_lost_interval / 2).await;
+                crate::time::sleep_coalesce(job_lost_interval / 2).await;
                 let now = crate::time::now();
                 let check_time = now - job_lost_interval;
 
@@ -256,7 +256,7 @@ impl JobPoller {
                     }
                 };
                 drop(_guard);
-                crate::time::sleep(timeout).await;
+                crate::time::sleep_coalesce(timeout).await;
             }
         }))
     }
