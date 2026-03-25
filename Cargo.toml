@@ -39,6 +39,7 @@ schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+serial_test = { workspace = true }
 
 [workspace.dependencies]
 
@@ -59,3 +60,4 @@ uuid = { version = "1.22", features = ["serde", "v7"] }
 futures = "0.3"
 rand = "0.10"
 schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"] }
+serial_test = "3"

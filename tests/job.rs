@@ -7,6 +7,7 @@ use job::{
     JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
 };
 use serde::{Deserialize, Serialize};
+use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1317,6 +1318,7 @@ async fn wait_for_jobs_completed(jobs: &Jobs, ids: &[JobId], max_attempts: usize
 /// to 'pending'. Explicit `jobs.shutdown()` at test end is critical to prevent
 /// this interference.
 #[tokio::test]
+#[serial]
 async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
 
