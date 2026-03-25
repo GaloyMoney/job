@@ -291,6 +291,7 @@ impl JobRunner for QueueJobRunner {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
