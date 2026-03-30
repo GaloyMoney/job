@@ -498,6 +498,12 @@ impl Jobs {
         Ok(self.repo.find_by_id(id).await?)
     }
 
+    /// Fetch a job by its parent job id.
+    #[instrument(name = "job.find_by_parent_job_id", skip(self))]
+    pub async fn find_by_parent_job_id(&self, parent_job_id: JobId) -> Result<Job, JobError> {
+        Ok(self.repo.find_by_parent_job_id(Some(parent_job_id)).await?)
+    }
+
     /// Returns a reference to the clock used by this job service.
     pub fn clock(&self) -> &ClockHandle {
         &self.clock

@@ -1658,3 +1658,75 @@ async fn test_job_completion_results_trait() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// -- Parent job id tests --
+
+#[tokio::test]
+async fn test_spawn_with_parent_job_id() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("parent-child-job"),
+    });
+
+    jobs.start_poll().await?;
+
+    // Spawn a parent job
+    let parent_id = JobId::new();
+    let parent = spawner
+        .spawn(parent_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert!(parent.parent_job_id().is_none());
+
+    // Spawn a child job using with_parent
+    let child_id = JobId::new();
+    let child_spawner = spawner.with_parent(parent_id);
+    let child = child_spawner
+        .spawn(child_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(child.parent_job_id(), Some(parent_id));
+
+    // Verify we can read it back from the database
+    let loaded_child = jobs.find(child_id).await?;
+    assert_eq!(loaded_child.parent_job_id(), Some(parent_id));
+
+    // Query child by parent_job_id
+    let found = jobs.find_by_parent_job_id(parent_id).await?;
+    assert_eq!(found.id, child_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_spawn_without_parent_still_works() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("no-parent-job"),
+    });
+
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    let job = spawner
+        .spawn(job_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert!(job.parent_job_id().is_none());
+
+    let loaded = jobs.find(job_id).await?;
+    assert!(loaded.parent_job_id().is_none());
+
+    Ok(())
+}
