@@ -501,18 +501,25 @@ impl Jobs {
     /// List all child jobs spawned under the given parent job.
     #[instrument(name = "job.list_by_parent_job_id", skip(self))]
     pub async fn list_by_parent_job_id(&self, parent_job_id: JobId) -> Result<Vec<Job>, JobError> {
-        let ret = self
-            .repo
-            .list_for_parent_job_id_by_id(
-                Some(parent_job_id),
-                es_entity::PaginatedQueryArgs {
-                    first: 1_000_000,
-                    after: None,
-                },
-                es_entity::ListDirection::Ascending,
-            )
-            .await?;
-        Ok(ret.entities)
+        let mut all_jobs = Vec::new();
+        let mut after = None;
+        loop {
+            let ret = self
+                .repo
+                .list_for_parent_job_id_by_id(
+                    Some(parent_job_id),
+                    es_entity::PaginatedQueryArgs { first: 100, after },
+                    es_entity::ListDirection::Ascending,
+                )
+                .await?;
+            let has_next = ret.has_next_page;
+            all_jobs.extend(ret.entities);
+            if !has_next {
+                break;
+            }
+            after = ret.end_cursor;
+        }
+        Ok(all_jobs)
     }
 
     /// Returns a reference to the clock used by this job service.
