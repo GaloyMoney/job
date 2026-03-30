@@ -542,15 +542,27 @@ impl Jobs {
         Ok(JobCompletionResult::new(state, job.raw_result().cloned()))
     }
 
-    /// Block until every job in `ids` reaches a terminal state and return
-    /// all outcomes.
+    /// Block until every job in `ids` reaches a terminal state (completed or
+    /// errored) and return all outcomes together with any result values the
+    /// runners attached via [`CurrentJob::set_result`].
+    ///
+    /// This is the batch counterpart of [`await_completion`](Self::await_completion).
+    /// Each job is awaited concurrently; the call resolves once **all** jobs
+    /// have finished.
     ///
     /// When `timeout` is `Some(duration)`, the call returns
-    /// [`JobError::TimedOut`] (using the **first** id in the slice) if the
-    /// batch has not fully resolved within the specified duration. Pass
-    /// `None` to wait indefinitely.
+    /// [`JobError::TimedOut`] if the batch has not fully resolved within the
+    /// specified duration. Pass `None` to wait indefinitely.
     ///
     /// An empty `ids` slice returns an empty `Vec` immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Find`] if any job in the batch does not exist.
+    /// Returns [`JobError::TimedOut`] if the timeout elapses before every job
+    /// reaches a terminal state.
+    /// Returns [`JobError::AwaitCompletionShutdown`] if the notification channel
+    /// is dropped (e.g., during shutdown) before all jobs have resolved.
     #[instrument(name = "job.await_completions", skip(self))]
     pub async fn await_completions(
         &self,
