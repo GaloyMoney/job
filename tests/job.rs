@@ -1684,21 +1684,40 @@ async fn test_spawn_with_parent_job_id() -> anyhow::Result<()> {
         .await?;
     assert!(parent.parent_job_id().is_none());
 
-    // Spawn a child job using with_parent
-    let child_id = JobId::new();
-    let child_spawner = spawner.with_parent(parent_id);
-    let child = child_spawner
-        .spawn(child_id, TestJobConfig { delay_ms: 10 })
+    // Spawn a standalone job (no parent) to verify empty-list later
+    let orphan_id = JobId::new();
+    spawner
+        .spawn(orphan_id, TestJobConfig { delay_ms: 10 })
         .await?;
-    assert_eq!(child.parent_job_id(), Some(parent_id));
 
-    // Verify we can read it back from the database
-    let loaded_child = jobs.find(child_id).await?;
+    // Spawn multiple child jobs using with_parent (consumes spawner)
+    let child_spawner = spawner.with_parent(parent_id);
+    let child_id_1 = JobId::new();
+    let child_1 = child_spawner
+        .spawn(child_id_1, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(child_1.parent_job_id(), Some(parent_id));
+
+    let child_id_2 = JobId::new();
+    let child_2 = child_spawner
+        .spawn(child_id_2, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(child_2.parent_job_id(), Some(parent_id));
+
+    // Verify we can read them back from the database
+    let loaded_child = jobs.find(child_id_1).await?;
     assert_eq!(loaded_child.parent_job_id(), Some(parent_id));
 
-    // Query child by parent_job_id
-    let found = jobs.find_by_parent_job_id(parent_id).await?;
-    assert_eq!(found.id, child_id);
+    // List children by parent_job_id — should return both
+    let children = jobs.list_by_parent_job_id(parent_id).await?;
+    assert_eq!(children.len(), 2);
+    let child_ids: Vec<JobId> = children.iter().map(|j| j.id).collect();
+    assert!(child_ids.contains(&child_id_1));
+    assert!(child_ids.contains(&child_id_2));
+
+    // Job with no children should return empty list
+    let no_children = jobs.list_by_parent_job_id(orphan_id).await?;
+    assert!(no_children.is_empty());
 
     Ok(())
 }
