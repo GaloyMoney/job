@@ -231,9 +231,11 @@ pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobType};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
+pub use es_entity::{ListDirection, PaginatedQueryArgs, PaginatedQueryRet};
 pub use migrate::*;
 pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;
+pub use repo::job_cursor;
 pub use runner::*;
 pub use spawner::*;
 
@@ -498,9 +500,26 @@ impl Jobs {
         Ok(self.repo.find_by_id(id).await?)
     }
 
-    /// List all child jobs spawned under the given parent job.
+    /// List child jobs for a parent with cursor-based pagination.
     #[instrument(name = "job.list_by_parent_job_id", skip(self))]
-    pub async fn list_by_parent_job_id(&self, parent_job_id: JobId) -> Result<Vec<Job>, JobError> {
+    pub async fn list_by_parent_job_id(
+        &self,
+        parent_job_id: JobId,
+        query: PaginatedQueryArgs<job_cursor::JobsByIdCursor>,
+        direction: ListDirection,
+    ) -> Result<PaginatedQueryRet<Job, job_cursor::JobsByIdCursor>, JobError> {
+        Ok(self
+            .repo
+            .list_for_parent_job_id_by_id(Some(parent_job_id), query, direction)
+            .await?)
+    }
+
+    /// Convenience method that fetches all child jobs for a parent.
+    #[instrument(name = "job.list_all_by_parent_job_id", skip(self))]
+    pub async fn list_all_by_parent_job_id(
+        &self,
+        parent_job_id: JobId,
+    ) -> Result<Vec<Job>, JobError> {
         let mut all_jobs = Vec::new();
         let mut after = None;
         loop {
@@ -508,8 +527,8 @@ impl Jobs {
                 .repo
                 .list_for_parent_job_id_by_id(
                     Some(parent_job_id),
-                    es_entity::PaginatedQueryArgs { first: 100, after },
-                    es_entity::ListDirection::Ascending,
+                    PaginatedQueryArgs { first: 100, after },
+                    ListDirection::Ascending,
                 )
                 .await?;
             let has_next = ret.has_next_page;

@@ -1709,14 +1709,14 @@ async fn test_spawn_with_parent_job_id() -> anyhow::Result<()> {
     assert_eq!(loaded_child.parent_job_id(), Some(parent_id));
 
     // List children by parent_job_id — should return both
-    let children = jobs.list_by_parent_job_id(parent_id).await?;
+    let children = jobs.list_all_by_parent_job_id(parent_id).await?;
     assert_eq!(children.len(), 2);
     let child_ids: Vec<JobId> = children.iter().map(|j| j.id).collect();
     assert!(child_ids.contains(&child_id_1));
     assert!(child_ids.contains(&child_id_2));
 
     // Job with no children should return empty list
-    let no_children = jobs.list_by_parent_job_id(orphan_id).await?;
+    let no_children = jobs.list_all_by_parent_job_id(orphan_id).await?;
     assert!(no_children.is_empty());
 
     Ok(())
