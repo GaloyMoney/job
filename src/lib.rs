@@ -228,7 +228,9 @@ use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobCompletionResult, JobResult, JobTerminalState, JobType};
+pub use entity::{
+    Job, JobCompletionResult, JobCompletionResults, JobResult, JobTerminalState, JobType,
+};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use migrate::*;
 pub use registry::*;
@@ -538,6 +540,40 @@ impl Jobs {
         // Load job to retrieve any result value set by the runner
         let job = self.find(id).await?;
         Ok(JobCompletionResult::new(state, job.raw_result().cloned()))
+    }
+
+    /// Block until every job in `ids` reaches a terminal state and return
+    /// all outcomes.
+    ///
+    /// When `timeout` is `Some(duration)`, the call returns
+    /// [`JobError::TimedOut`] (using the **first** id in the slice) if the
+    /// batch has not fully resolved within the specified duration. Pass
+    /// `None` to wait indefinitely.
+    ///
+    /// An empty `ids` slice returns an empty `Vec` immediately.
+    #[instrument(name = "job.await_completions", skip(self))]
+    pub async fn await_completions(
+        &self,
+        ids: &[JobId],
+        timeout: Option<Duration>,
+    ) -> Result<Vec<JobCompletionResult>, JobError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let futs: Vec<_> = ids
+            .iter()
+            .map(|id| self.await_completion(*id, None))
+            .collect();
+        let results = match timeout {
+            Some(duration) => {
+                let first_id = ids[0];
+                tokio::time::timeout(duration, futures::future::join_all(futs))
+                    .await
+                    .map_err(|_| JobError::TimedOut(first_id))?
+            }
+            None => futures::future::join_all(futs).await,
+        };
+        results.into_iter().collect()
     }
 
     /// Non-blocking check for job completion.

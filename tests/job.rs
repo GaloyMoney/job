@@ -3,8 +3,9 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
+    ClockHandle, CurrentJob, Job, JobCompletion, JobCompletionResults, JobId, JobInitializer,
+    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
+    error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TestJobConfig {
     delay_ms: u64,
 }
@@ -1505,6 +1506,263 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
     // Explicit shutdown prevents the lost-handler (which uses our far-future
     // manual clock) from resetting other tests' running jobs to 'pending'.
     jobs.shutdown().await?;
+
+    Ok(())
+}
+
+// -- await_completions / await_jobs / JobCompletionResults tests --
+
+/// A coordinator job that spawns child jobs and awaits them using `CurrentJob::await_jobs`.
+struct CoordinatorJobInitializer {
+    child_spawner: JobSpawner<TestJobConfig>,
+    child_count: u32,
+    results: Arc<Mutex<Option<Vec<JobTerminalState>>>>,
+    /// Shared Jobs handle — the router is already started because the
+    /// `Arc<JobNotificationRouter>` is shared between all `Jobs` clones.
+    jobs_handle: Jobs,
+}
+
+impl JobInitializer for CoordinatorJobInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("coordinator-job")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(CoordinatorJobRunner {
+            child_spawner: self.child_spawner.clone(),
+            child_count: self.child_count,
+            results: Arc::clone(&self.results),
+            jobs_handle: self.jobs_handle.clone(),
+        }))
+    }
+}
+
+struct CoordinatorJobRunner {
+    child_spawner: JobSpawner<TestJobConfig>,
+    child_count: u32,
+    results: Arc<Mutex<Option<Vec<JobTerminalState>>>>,
+    jobs_handle: Jobs,
+}
+
+#[async_trait]
+impl JobRunner for CoordinatorJobRunner {
+    async fn run(
+        &self,
+        mut current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let mut child_ids = Vec::new();
+        for _ in 0..self.child_count {
+            let id = JobId::new();
+            self.child_spawner
+                .spawn(id, TestJobConfig { delay_ms: 20 })
+                .await?;
+            child_ids.push(id);
+        }
+
+        let outcomes = current_job
+            .await_jobs(&self.jobs_handle, &child_ids)
+            .await?;
+        if let Some(outcomes) = outcomes {
+            let states: Vec<_> = outcomes.iter().map(|o| o.state()).collect();
+            *self.results.lock().await = Some(states);
+        }
+
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_await_jobs_multiple_children() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let child_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-jobs-child"),
+    });
+
+    let results: Arc<Mutex<Option<Vec<JobTerminalState>>>> = Arc::new(Mutex::new(None));
+    // Pass a clone of `jobs` — since `Arc<JobNotificationRouter>` is shared,
+    // the router will already be started once `start_poll` runs on the original.
+    let coord_spawner = jobs.add_initializer(CoordinatorJobInitializer {
+        child_spawner: child_spawner.clone(),
+        child_count: 3,
+        results: Arc::clone(&results),
+        jobs_handle: jobs.clone(),
+    });
+
+    jobs.start_poll().await?;
+
+    let coord_id = JobId::new();
+    coord_spawner
+        .spawn(coord_id, TestJobConfig { delay_ms: 0 })
+        .await?;
+
+    let outcome = jobs
+        .await_completion(coord_id, Some(Duration::from_secs(10)))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+
+    let states = results.lock().await.clone().expect("should have results");
+    assert_eq!(states.len(), 3);
+    assert!(states.iter().all(|s| *s == JobTerminalState::Completed));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completions_batch() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-completions-batch"),
+    });
+    jobs.start_poll().await?;
+
+    let ids: Vec<JobId> = (0..3).map(|_| JobId::new()).collect();
+    for id in &ids {
+        spawner.spawn(*id, TestJobConfig { delay_ms: 20 }).await?;
+    }
+
+    let outcomes = jobs
+        .await_completions(&ids, Some(Duration::from_secs(10)))
+        .await?;
+    assert_eq!(outcomes.len(), 3);
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completions_empty_ids() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let _spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-completions-empty"),
+    });
+    jobs.start_poll().await?;
+
+    let outcomes = jobs.await_completions(&[], None).await?;
+    assert!(outcomes.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completions_timeout() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-completions-timeout"),
+    });
+    jobs.start_poll().await?;
+
+    // Schedule a job far in the future so it never completes
+    let job_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(job_id, TestJobConfig { delay_ms: 50 }, schedule_at)
+        .await?;
+
+    let result = jobs
+        .await_completions(&[job_id], Some(Duration::from_millis(200)))
+        .await;
+
+    assert!(
+        matches!(result, Err(JobError::TimedOut(_))),
+        "Expected TimedOut error, got: {:?}",
+        result,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_job_completion_results_trait() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let success_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("trait-success"),
+    });
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+
+    jobs.start_poll().await?;
+
+    // Spawn 2 successful + 1 failing job
+    let s1 = JobId::new();
+    let s2 = JobId::new();
+    let f1 = JobId::new();
+    success_spawner
+        .spawn(s1, TestJobConfig { delay_ms: 20 })
+        .await?;
+    success_spawner
+        .spawn(s2, TestJobConfig { delay_ms: 20 })
+        .await?;
+    fail_spawner.spawn(f1, FailingJobConfig).await?;
+
+    let outcomes = jobs
+        .await_completions(&[s1, s2, f1], Some(Duration::from_secs(10)))
+        .await?;
+
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes.failed_count(), 1);
+    assert!(!outcomes.all_succeeded());
+
+    // Also test the slice impl
+    let slice: &[_] = &outcomes;
+    assert_eq!(slice.failed_count(), 1);
+    assert!(!slice.all_succeeded());
+
+    // Test all-success case
+    let s3 = JobId::new();
+    let s4 = JobId::new();
+    success_spawner
+        .spawn(s3, TestJobConfig { delay_ms: 20 })
+        .await?;
+    success_spawner
+        .spawn(s4, TestJobConfig { delay_ms: 20 })
+        .await?;
+
+    let success_outcomes = jobs
+        .await_completions(&[s3, s4], Some(Duration::from_secs(10)))
+        .await?;
+    assert!(success_outcomes.all_succeeded());
+    assert_eq!(success_outcomes.failed_count(), 0);
 
     Ok(())
 }

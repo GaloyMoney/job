@@ -6,7 +6,9 @@ use sqlx::PgPool;
 
 use std::sync::Arc;
 
-use super::{JobId, entity::JobResult, error::JobError, repo::JobRepo};
+use super::{
+    JobId, Jobs, entity::JobCompletionResult, entity::JobResult, error::JobError, repo::JobRepo,
+};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
@@ -190,6 +192,31 @@ impl CurrentJob {
     /// ```
     pub async fn shutdown_requested(&mut self) -> bool {
         self.shutdown_rx.recv().await.is_ok()
+    }
+
+    /// Wait for all specified jobs to reach a terminal state, returning
+    /// `None` if shutdown is requested before they complete.
+    ///
+    /// An empty `job_ids` slice returns `Some(vec![])` immediately.
+    pub async fn await_jobs(
+        &mut self,
+        jobs: &Jobs,
+        job_ids: &[JobId],
+    ) -> Result<Option<Vec<JobCompletionResult>>, JobError> {
+        if job_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let futs: Vec<_> = job_ids
+            .iter()
+            .map(|id| jobs.await_completion(*id, None))
+            .collect();
+        tokio::select! {
+            results = futures::future::join_all(futs) => {
+                let terminals: Result<Vec<_>, _> = results.into_iter().collect();
+                Ok(Some(terminals?))
+            }
+            _ = self.shutdown_requested() => Ok(None),
+        }
     }
 
     /// Non-blocking check if shutdown has been requested.

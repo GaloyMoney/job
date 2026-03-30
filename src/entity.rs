@@ -68,6 +68,42 @@ impl JobCompletionResult {
             None => Ok(None),
         }
     }
+
+    /// Returns `true` if the job completed successfully.
+    pub fn is_completed(&self) -> bool {
+        matches!(self.state, JobTerminalState::Completed)
+    }
+
+    /// Returns `true` if the job exhausted retries and was marked as errored.
+    pub fn is_errored(&self) -> bool {
+        matches!(self.state, JobTerminalState::Errored)
+    }
+}
+
+/// Extension trait for inspecting a batch of [`JobCompletionResult`] values.
+pub trait JobCompletionResults {
+    /// Count how many jobs in the batch ended with an error.
+    fn failed_count(&self) -> usize;
+    /// Returns `true` when every job in the batch completed successfully.
+    fn all_succeeded(&self) -> bool;
+}
+
+impl JobCompletionResults for Vec<JobCompletionResult> {
+    fn failed_count(&self) -> usize {
+        self.iter().filter(|r| r.is_errored()).count()
+    }
+    fn all_succeeded(&self) -> bool {
+        self.iter().all(|r| r.is_completed())
+    }
+}
+
+impl JobCompletionResults for [JobCompletionResult] {
+    fn failed_count(&self) -> usize {
+        self.iter().filter(|r| r.is_errored()).count()
+    }
+    fn all_succeeded(&self) -> bool {
+        self.iter().all(|r| r.is_completed())
+    }
 }
 
 /// Terminal outcome of a job lifecycle.
