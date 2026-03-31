@@ -1,3 +1,12 @@
+# [job release v0.6.15](https://github.com/GaloyMoney/job/releases/tag/0.6.15)
+
+
+
+### Features
+
+- Add first-class parent_job_id support (#72)
+- Batch await and completion result helpers (#73)
+
 # [job release v0.6.14](https://github.com/GaloyMoney/job/releases/tag/0.6.14)
 
 
