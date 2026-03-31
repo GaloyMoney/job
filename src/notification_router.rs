@@ -338,9 +338,12 @@ async fn batch_load_and_notify(
             tracing::warn!(
                 error = %e,
                 n_jobs = unique_ids.len(),
-                "batch_load_and_notify: failed to load job entities"
+                "batch_load_and_notify: find_all failed, falling back to individual loads"
             );
-            // Waiters remain registered — sweep will retry
+            // Fall back to individual loads so one bad job doesn't block the rest
+            for job_id in unique_ids {
+                load_and_notify(waiters, repo, job_id).await;
+            }
         }
     }
 }
