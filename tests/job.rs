@@ -1749,3 +1749,108 @@ async fn test_spawn_without_parent_still_works() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// -- Automatic parent propagation tests --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ParentSpawnerConfig {
+    child_id: JobId,
+}
+
+struct ParentSpawnerInitializer;
+
+impl JobInitializer for ParentSpawnerInitializer {
+    type Config = ParentSpawnerConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("auto-parent-spawner")
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        spawner: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: ParentSpawnerConfig = job.config()?;
+        Ok(Box::new(ParentSpawnerRunner {
+            child_id: config.child_id,
+            spawner,
+        }))
+    }
+}
+
+struct ParentSpawnerRunner {
+    child_id: JobId,
+    spawner: JobSpawner<ParentSpawnerConfig>,
+}
+
+#[async_trait]
+impl JobRunner for ParentSpawnerRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        // Spawn a child using the injected spawner — parent_job_id should be set automatically
+        self.spawner
+            .spawn(
+                self.child_id,
+                ParentSpawnerConfig {
+                    child_id: JobId::new(),
+                },
+            )
+            .await?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_automatic_parent_propagation() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(ParentSpawnerInitializer);
+
+    jobs.start_poll().await?;
+
+    // Spawn parent job — its runner will spawn a child using the injected spawner
+    let parent_id = JobId::new();
+    let child_id = JobId::new();
+    spawner
+        .spawn(parent_id, ParentSpawnerConfig { child_id })
+        .await?;
+
+    // Wait for the parent job to complete
+    jobs.await_completion(parent_id, Some(Duration::from_secs(5)))
+        .await?;
+
+    // Wait for child job to complete too
+    jobs.await_completion(child_id, Some(Duration::from_secs(5)))
+        .await?;
+
+    // Verify the child job has the parent_job_id set automatically
+    let child = jobs.find(child_id).await?;
+    assert_eq!(
+        child.parent_job_id,
+        Some(parent_id),
+        "child spawned by runner should automatically get parent_job_id"
+    );
+
+    // Verify the parent itself has no parent
+    let parent = jobs.find(parent_id).await?;
+    assert!(
+        parent.parent_job_id.is_none(),
+        "externally-spawned job should have no parent"
+    );
+
+    // Verify listing children via parent_job_id works
+    let children = jobs.list_all_by_parent_job_id(parent_id).await?;
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id, child_id);
+
+    Ok(())
+}
