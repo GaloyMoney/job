@@ -1658,3 +1658,94 @@ async fn test_job_completion_results_trait() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// -- Parent job id tests --
+
+#[tokio::test]
+async fn test_spawn_with_parent_job_id() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("parent-child-job"),
+    });
+
+    jobs.start_poll().await?;
+
+    // Spawn a parent job
+    let parent_id = JobId::new();
+    let parent = spawner
+        .spawn(parent_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert!(parent.parent_job_id.is_none());
+
+    // Spawn a standalone job (no parent) to verify empty-list later
+    let orphan_id = JobId::new();
+    spawner
+        .spawn(orphan_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+
+    // Spawn multiple child jobs using with_parent (consumes spawner)
+    let child_spawner = spawner.with_parent(parent_id);
+    let child_id_1 = JobId::new();
+    let child_1 = child_spawner
+        .spawn(child_id_1, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(child_1.parent_job_id, Some(parent_id));
+
+    let child_id_2 = JobId::new();
+    let child_2 = child_spawner
+        .spawn(child_id_2, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(child_2.parent_job_id, Some(parent_id));
+
+    // Verify we can read them back from the database
+    let loaded_child = jobs.find(child_id_1).await?;
+    assert_eq!(loaded_child.parent_job_id, Some(parent_id));
+
+    // List children by parent_job_id — should return both
+    let children = jobs.list_all_by_parent_job_id(parent_id).await?;
+    assert_eq!(children.len(), 2);
+    let child_ids: Vec<JobId> = children.iter().map(|j| j.id).collect();
+    assert!(child_ids.contains(&child_id_1));
+    assert!(child_ids.contains(&child_id_2));
+
+    // Job with no children should return empty list
+    let no_children = jobs.list_all_by_parent_job_id(orphan_id).await?;
+    assert!(no_children.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_spawn_without_parent_still_works() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("no-parent-job"),
+    });
+
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    let job = spawner
+        .spawn(job_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert!(job.parent_job_id.is_none());
+
+    let loaded = jobs.find(job_id).await?;
+    assert!(loaded.parent_job_id.is_none());
+
+    Ok(())
+}

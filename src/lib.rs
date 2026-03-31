@@ -231,9 +231,11 @@ pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobType};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
+pub use es_entity::{ListDirection, PaginatedQueryArgs, PaginatedQueryRet};
 pub use migrate::*;
 pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;
+pub use repo::job_cursor;
 pub use runner::*;
 pub use spawner::*;
 
@@ -496,6 +498,39 @@ impl Jobs {
     #[instrument(name = "job.find", skip(self))]
     pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
         Ok(self.repo.find_by_id(id).await?)
+    }
+
+    /// List child jobs for a parent with cursor-based pagination.
+    #[instrument(name = "job.list_by_parent_job_id", skip(self))]
+    pub async fn list_by_parent_job_id(
+        &self,
+        parent_job_id: JobId,
+        query: PaginatedQueryArgs<job_cursor::JobByIdCursor>,
+        direction: ListDirection,
+    ) -> Result<PaginatedQueryRet<Job, job_cursor::JobByIdCursor>, JobError> {
+        Ok(self
+            .repo
+            .list_for_parent_job_id_by_id(Some(parent_job_id), query, direction)
+            .await?)
+    }
+
+    /// Convenience method that fetches all child jobs for a parent.
+    #[instrument(name = "job.list_all_by_parent_job_id", skip(self))]
+    pub async fn list_all_by_parent_job_id(
+        &self,
+        parent_job_id: JobId,
+    ) -> Result<Vec<Job>, JobError> {
+        let mut all_jobs = Vec::new();
+        let mut query = Some(PaginatedQueryArgs::default());
+        while let Some(q) = query.take() {
+            let mut ret = self
+                .repo
+                .list_for_parent_job_id_by_id(Some(parent_job_id), q, ListDirection::Ascending)
+                .await?;
+            all_jobs.append(&mut ret.entities);
+            query = ret.into_next_query();
+        }
+        Ok(all_jobs)
     }
 
     /// Returns a reference to the clock used by this job service.

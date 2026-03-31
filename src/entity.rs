@@ -60,6 +60,7 @@ pub enum JobEvent {
         job_type: JobType,
         config: serde_json::Value,
         tracing_context: Option<TracingContext>,
+        parent_job_id: Option<JobId>,
     },
     ExecutionScheduled {
         attempt: u32,
@@ -173,6 +174,7 @@ impl RetryWindow {
 pub struct Job {
     pub id: JobId,
     pub job_type: JobType,
+    pub parent_job_id: Option<JobId>,
     config: serde_json::Value,
     events: EntityEvents<JobEvent>,
 }
@@ -368,11 +370,13 @@ impl TryFromEvents<JobEvent> for Job {
                     id,
                     job_type,
                     config,
+                    parent_job_id,
                     ..
                 } => {
                     builder = builder
                         .id(*id)
                         .job_type(job_type.clone())
+                        .parent_job_id(*parent_job_id)
                         .config(config.clone())
                 }
                 JobEvent::ExecutionScheduled { .. } => {}
@@ -399,6 +403,8 @@ pub struct NewJob {
     pub(super) config: serde_json::Value,
     #[builder(default)]
     pub(super) tracing_context: Option<TracingContext>,
+    #[builder(default)]
+    pub(super) parent_job_id: Option<JobId>,
 }
 
 impl NewJob {
@@ -424,6 +430,7 @@ impl IntoEvents<JobEvent> for NewJob {
                 job_type: self.job_type,
                 config: self.config,
                 tracing_context: self.tracing_context,
+                parent_job_id: self.parent_job_id,
             }],
         )
     }
@@ -541,6 +548,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -575,6 +583,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -610,6 +619,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::minutes(10),
             )];
@@ -645,6 +655,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::minutes(30),
             )];
@@ -689,6 +700,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -727,6 +739,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::hours(4),
             )];
@@ -769,6 +782,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::minutes(1),
             )];
@@ -807,6 +821,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::minutes(20),
             )];
@@ -838,6 +853,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::minutes(10),
             )];
@@ -864,6 +880,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    parent_job_id: None,
                 },
                 now - ChronoDuration::hours(1),
             )];
@@ -1124,6 +1141,131 @@ mod tests {
                 reset,
                 "Elapsed time beyond the configured threshold should reset attempts"
             );
+        }
+    }
+
+    mod parent_job_id {
+        use super::*;
+        use es_entity::clock::Clock;
+        use es_entity::events::GenericEvent;
+        use serde_json::json;
+
+        fn job_from_events(
+            job_id: JobId,
+            events: Vec<(JobEvent, chrono::DateTime<chrono::Utc>)>,
+        ) -> Job {
+            let generic_events = events
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (event, recorded_at))| GenericEvent {
+                    entity_id: job_id,
+                    sequence: (idx as i32) + 1,
+                    event: serde_json::to_value(event).expect("serialize event"),
+                    context: None,
+                    recorded_at,
+                })
+                .collect::<Vec<_>>();
+
+            EntityEvents::<JobEvent>::load_first::<Job>(generic_events)
+                .expect("load job")
+                .expect("no events")
+        }
+
+        #[test]
+        fn job_with_parent_stores_parent_id() {
+            let now = Clock::now();
+            let job_id = JobId::new();
+            let parent_id = JobId::new();
+
+            let job = job_from_events(
+                job_id,
+                vec![(
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: JobType::new("child-job"),
+                        config: json!({}),
+                        tracing_context: None,
+                        parent_job_id: Some(parent_id),
+                    },
+                    now,
+                )],
+            );
+
+            assert_eq!(job.parent_job_id, Some(parent_id));
+            assert_eq!(job.id, job_id);
+        }
+
+        #[test]
+        fn job_without_parent_returns_none() {
+            let now = Clock::now();
+            let job_id = JobId::new();
+
+            let job = job_from_events(
+                job_id,
+                vec![(
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: JobType::new("root-job"),
+                        config: json!({}),
+                        tracing_context: None,
+                        parent_job_id: None,
+                    },
+                    now,
+                )],
+            );
+
+            assert!(job.parent_job_id.is_none());
+        }
+
+        #[test]
+        fn new_job_builder_defaults_parent_to_none() {
+            let job_id = JobId::new();
+
+            let new_job = NewJob::builder()
+                .id(job_id)
+                .job_type(JobType::new("default-parent"))
+                .config(json!({}))
+                .expect("serialize config")
+                .build()
+                .expect("build new job");
+
+            let events = IntoEvents::into_events(new_job);
+            let first = events.iter_all().next().expect("first event");
+
+            match first {
+                JobEvent::Initialized { parent_job_id, .. } => {
+                    assert!(
+                        parent_job_id.is_none(),
+                        "default parent_job_id should be None"
+                    );
+                }
+                other => panic!("expected Initialized event, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn new_job_builder_sets_parent_when_provided() {
+            let job_id = JobId::new();
+            let parent_id = JobId::new();
+
+            let new_job = NewJob::builder()
+                .id(job_id)
+                .job_type(JobType::new("with-parent"))
+                .config(json!({}))
+                .expect("serialize config")
+                .parent_job_id(Some(parent_id))
+                .build()
+                .expect("build new job");
+
+            let events = IntoEvents::into_events(new_job);
+            let first = events.iter_all().next().expect("first event");
+
+            match first {
+                JobEvent::Initialized { parent_job_id, .. } => {
+                    assert_eq!(*parent_job_id, Some(parent_id));
+                }
+                other => panic!("expected Initialized event, got {other:?}"),
+            }
         }
     }
 }
