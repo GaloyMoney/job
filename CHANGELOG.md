@@ -1,3 +1,15 @@
+# [job release v0.6.16](https://github.com/GaloyMoney/job/releases/tag/0.6.16)
+
+
+
+### Features
+
+- Auto-propagate parent_job_id to runner-injected spawners (#75)
+
+### Miscellaneous Tasks
+
+- Bump uuid from 1.22.0 to 1.23.0 (#71)
+
 # [job release v0.6.15](https://github.com/GaloyMoney/job/releases/tag/0.6.15)
 
 
