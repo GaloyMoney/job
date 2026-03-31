@@ -3,8 +3,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::JobId;
-use crate::entity::{JobTerminalState, JobType};
+use crate::entity::JobType;
 use crate::handle::OwnedTaskHandle;
+use crate::outcome::JobTerminalState;
 use crate::repo::JobRepo;
 use crate::tracker::JobTracker;
 use sqlx::postgres::{PgListener, PgPool};

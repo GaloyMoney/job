@@ -3,8 +3,8 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobCompletionResults, JobId, JobInitializer,
-    JobRunner, JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
+    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobRunner,
+    JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
     error::JobError,
 };
 use serde::{Deserialize, Serialize};
@@ -1510,7 +1510,7 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
     Ok(())
 }
 
-// -- await_completions / JobCompletionResults tests --
+// -- await_completions / JobOutcomes tests --
 
 #[tokio::test]
 async fn test_await_completions_batch() -> anyhow::Result<()> {

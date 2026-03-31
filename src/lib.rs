@@ -212,6 +212,7 @@ mod entity;
 mod handle;
 mod migrate;
 mod notification_router;
+mod outcome;
 mod poller;
 mod registry;
 mod repo;
@@ -228,11 +229,10 @@ use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
-pub use entity::{
-    Job, JobCompletionResult, JobCompletionResults, JobResult, JobTerminalState, JobType,
-};
+pub use entity::{Job, JobType};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use migrate::*;
+pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;
 pub use runner::*;
 pub use spawner::*;
@@ -523,7 +523,7 @@ impl Jobs {
         &self,
         id: JobId,
         timeout: Option<Duration>,
-    ) -> Result<JobCompletionResult, JobError> {
+    ) -> Result<JobOutcome, JobError> {
         // Fail fast if the job doesn't exist — avoids a 5-minute silent hang
         // in the waiter manager for a JobId that will never resolve.
         self.find(id).await?;
@@ -539,7 +539,7 @@ impl Jobs {
         };
         // Load job to retrieve any result value set by the runner
         let job = self.find(id).await?;
-        Ok(JobCompletionResult::new(state, job.raw_result().cloned()))
+        Ok(JobOutcome::new(state, job.raw_return_value().cloned()))
     }
 
     /// Block until every job in `ids` reaches a terminal state (completed or
@@ -568,7 +568,7 @@ impl Jobs {
         &self,
         ids: &[JobId],
         timeout: Option<Duration>,
-    ) -> Result<Vec<JobCompletionResult>, JobError> {
+    ) -> Result<Vec<JobOutcome>, JobError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
