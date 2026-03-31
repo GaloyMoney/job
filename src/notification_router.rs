@@ -30,7 +30,7 @@ pub(crate) struct JobNotificationRouter {
 
 impl JobNotificationRouter {
     pub fn new(pool: &PgPool, repo: Arc<JobRepo>, buffer_size: usize) -> Self {
-        let (terminal_tx, _) = broadcast::channel(buffer_size);
+        let (terminal_tx, _) = broadcast::channel(buffer_size.max(1));
         Self {
             pool: pool.clone(),
             repo,
