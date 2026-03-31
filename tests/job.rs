@@ -1682,7 +1682,7 @@ async fn test_spawn_with_parent_job_id() -> anyhow::Result<()> {
     let parent = spawner
         .spawn(parent_id, TestJobConfig { delay_ms: 10 })
         .await?;
-    assert!(parent.parent_job_id().is_none());
+    assert!(parent.parent_job_id.is_none());
 
     // Spawn a standalone job (no parent) to verify empty-list later
     let orphan_id = JobId::new();
@@ -1696,17 +1696,17 @@ async fn test_spawn_with_parent_job_id() -> anyhow::Result<()> {
     let child_1 = child_spawner
         .spawn(child_id_1, TestJobConfig { delay_ms: 10 })
         .await?;
-    assert_eq!(child_1.parent_job_id(), Some(parent_id));
+    assert_eq!(child_1.parent_job_id, Some(parent_id));
 
     let child_id_2 = JobId::new();
     let child_2 = child_spawner
         .spawn(child_id_2, TestJobConfig { delay_ms: 10 })
         .await?;
-    assert_eq!(child_2.parent_job_id(), Some(parent_id));
+    assert_eq!(child_2.parent_job_id, Some(parent_id));
 
     // Verify we can read them back from the database
     let loaded_child = jobs.find(child_id_1).await?;
-    assert_eq!(loaded_child.parent_job_id(), Some(parent_id));
+    assert_eq!(loaded_child.parent_job_id, Some(parent_id));
 
     // List children by parent_job_id — should return both
     let children = jobs.list_all_by_parent_job_id(parent_id).await?;
@@ -1742,10 +1742,10 @@ async fn test_spawn_without_parent_still_works() -> anyhow::Result<()> {
     let job = spawner
         .spawn(job_id, TestJobConfig { delay_ms: 10 })
         .await?;
-    assert!(job.parent_job_id().is_none());
+    assert!(job.parent_job_id.is_none());
 
     let loaded = jobs.find(job_id).await?;
-    assert!(loaded.parent_job_id().is_none());
+    assert!(loaded.parent_job_id.is_none());
 
     Ok(())
 }

@@ -60,7 +60,6 @@ pub enum JobEvent {
         job_type: JobType,
         config: serde_json::Value,
         tracing_context: Option<TracingContext>,
-        #[serde(default)]
         parent_job_id: Option<JobId>,
     },
     ExecutionScheduled {
@@ -175,18 +174,12 @@ impl RetryWindow {
 pub struct Job {
     pub id: JobId,
     pub job_type: JobType,
-    #[builder(default)]
-    pub(super) parent_job_id: Option<JobId>,
+    pub parent_job_id: Option<JobId>,
     config: serde_json::Value,
     events: EntityEvents<JobEvent>,
 }
 
 impl Job {
-    /// Returns the parent job id, if this job was spawned as a child.
-    pub fn parent_job_id(&self) -> Option<JobId> {
-        self.parent_job_id
-    }
-
     /// Decode the stored configuration payload into a typed struct.
     pub fn config<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_value(self.config.clone())
@@ -1198,7 +1191,7 @@ mod tests {
                 )],
             );
 
-            assert_eq!(job.parent_job_id(), Some(parent_id));
+            assert_eq!(job.parent_job_id, Some(parent_id));
             assert_eq!(job.id, job_id);
         }
 
@@ -1221,7 +1214,7 @@ mod tests {
                 )],
             );
 
-            assert!(job.parent_job_id().is_none());
+            assert!(job.parent_job_id.is_none());
         }
 
         #[test]
