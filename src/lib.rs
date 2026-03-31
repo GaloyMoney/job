@@ -212,6 +212,7 @@ mod entity;
 mod handle;
 mod migrate;
 mod notification_router;
+mod outcome;
 mod poller;
 mod registry;
 mod repo;
@@ -228,9 +229,10 @@ use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobCompletionResult, JobResult, JobTerminalState, JobType};
+pub use entity::{Job, JobType};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use migrate::*;
+pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;
 pub use runner::*;
 pub use spawner::*;
@@ -521,7 +523,7 @@ impl Jobs {
         &self,
         id: JobId,
         timeout: Option<Duration>,
-    ) -> Result<JobCompletionResult, JobError> {
+    ) -> Result<JobOutcome, JobError> {
         // Fail fast if the job doesn't exist — avoids a 5-minute silent hang
         // in the waiter manager for a JobId that will never resolve.
         self.find(id).await?;
@@ -537,7 +539,53 @@ impl Jobs {
         };
         // Load job to retrieve any result value set by the runner
         let job = self.find(id).await?;
-        Ok(JobCompletionResult::new(state, job.raw_result().cloned()))
+        Ok(JobOutcome::new(state, job.raw_return_value().cloned()))
+    }
+
+    /// Block until every job in `ids` reaches a terminal state (completed or
+    /// errored) and return all outcomes together with any result values the
+    /// runners attached via [`CurrentJob::set_result`].
+    ///
+    /// This is the batch counterpart of [`await_completion`](Self::await_completion).
+    /// Each job is awaited concurrently; the call resolves once **all** jobs
+    /// have finished.
+    ///
+    /// When `timeout` is `Some(duration)`, the call returns
+    /// [`JobError::TimedOut`] if the batch has not fully resolved within the
+    /// specified duration. Pass `None` to wait indefinitely.
+    ///
+    /// An empty `ids` slice returns an empty `Vec` immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Find`] if any job in the batch does not exist.
+    /// Returns [`JobError::TimedOut`] if the timeout elapses before every job
+    /// reaches a terminal state.
+    /// Returns [`JobError::AwaitCompletionShutdown`] if the notification channel
+    /// is dropped (e.g., during shutdown) before all jobs have resolved.
+    #[instrument(name = "job.await_completions", skip(self))]
+    pub async fn await_completions(
+        &self,
+        ids: &[JobId],
+        timeout: Option<Duration>,
+    ) -> Result<Vec<JobOutcome>, JobError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let futs: Vec<_> = ids
+            .iter()
+            .map(|id| self.await_completion(*id, None))
+            .collect();
+        let results = match timeout {
+            Some(duration) => {
+                let first_id = ids[0];
+                tokio::time::timeout(duration, futures::future::join_all(futs))
+                    .await
+                    .map_err(|_| JobError::TimedOut(first_id))?
+            }
+            None => futures::future::join_all(futs).await,
+        };
+        results.into_iter().collect()
     }
 
     /// Non-blocking check for job completion.

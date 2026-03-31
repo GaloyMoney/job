@@ -9,76 +9,11 @@ use std::{borrow::Cow, time::Duration};
 
 use es_entity::{context::TracingContext, *};
 
-use crate::{JobId, error::JobError};
-
-/// Newtype wrapper around a raw JSON value representing the result produced by a
-/// job runner via [`CurrentJob::set_result`](crate::CurrentJob::set_result).
-///
-/// Using a dedicated type instead of bare `serde_json::Value` gives call sites
-/// semantic clarity and prevents accidental mix-ups with other JSON payloads
-/// (config, execution state, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct JobResult(serde_json::Value);
-
-impl JobResult {
-    /// Consume the wrapper and return the inner JSON value.
-    pub fn into_inner(self) -> serde_json::Value {
-        self.0
-    }
-
-    /// Return a reference to the inner JSON value.
-    pub fn as_value(&self) -> &serde_json::Value {
-        &self.0
-    }
-
-    /// Deserialize the result into a typed struct.
-    pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_value(self.0.clone())
-    }
-
-    /// Serialize a value into a `JobResult`.
-    pub fn try_from<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> {
-        serde_json::to_value(value).map(Self)
-    }
-}
-
-/// Outcome returned by [`Jobs::await_completion`](crate::Jobs::await_completion),
-/// carrying both the terminal state and an optional result value.
-#[derive(Debug, Clone)]
-pub struct JobCompletionResult {
-    state: JobTerminalState,
-    result: Option<JobResult>,
-}
-
-impl JobCompletionResult {
-    pub(crate) fn new(state: JobTerminalState, result: Option<JobResult>) -> Self {
-        Self { state, result }
-    }
-
-    /// The terminal state the job reached.
-    pub fn state(&self) -> JobTerminalState {
-        self.state
-    }
-
-    /// Deserialize the result value into a typed struct.
-    pub fn result<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
-        match &self.result {
-            Some(r) => r.deserialize().map(Some),
-            None => Ok(None),
-        }
-    }
-}
-
-/// Terminal outcome of a job lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum JobTerminalState {
-    /// The job completed successfully.
-    Completed,
-    /// The job exhausted its retries and was marked as errored.
-    Errored,
-}
+use crate::{
+    JobId,
+    error::JobError,
+    outcome::{JobReturnValue, JobTerminalState},
+};
 
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(transparent)]
@@ -137,8 +72,8 @@ pub enum JobEvent {
     ExecutionErrored {
         error: String,
     },
-    ResultUpdated {
-        result: JobResult,
+    ReturnValueUpdated {
+        return_value: JobReturnValue,
     },
     JobCompleted,
     AttemptCounterReset,
@@ -273,22 +208,24 @@ impl Job {
         }
     }
 
-    /// Returns the raw result value attached to this job, if any.
+    /// Returns the raw return value attached to this job, if any.
     ///
-    /// Scans for the latest `ResultUpdated` event (last write wins).
-    pub(crate) fn raw_result(&self) -> Option<&JobResult> {
+    /// Scans for the latest `ReturnValueUpdated` event (last write wins).
+    pub(crate) fn raw_return_value(&self) -> Option<&JobReturnValue> {
         self.events.iter_all().rev().find_map(|event| {
-            if let JobEvent::ResultUpdated { result } = event {
-                Some(result)
+            if let JobEvent::ReturnValueUpdated { return_value } = event {
+                Some(return_value)
             } else {
                 None
             }
         })
     }
 
-    /// Deserialize the result value into a typed struct.
-    pub fn result<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
-        match self.raw_result() {
+    /// Deserialize the return value into a typed struct.
+    pub fn return_value<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<Option<T>, serde_json::Error> {
+        match self.raw_return_value() {
             Some(r) => r.deserialize().map(Some),
             None => Ok(None),
         }
@@ -355,16 +292,20 @@ impl Job {
         self.events.push(JobEvent::JobCompleted);
     }
 
-    /// Attach or overwrite the result value for this job.
+    /// Attach or overwrite the return value for this job.
     ///
     /// Returns [`Idempotent::AlreadyApplied`] when the new value is identical
     /// to the current one, allowing callers to skip the DB round-trip.
-    pub(crate) fn update_result(&mut self, result: JobResult) -> es_entity::Idempotent<()> {
+    pub(crate) fn update_return_value(
+        &mut self,
+        return_value: JobReturnValue,
+    ) -> es_entity::Idempotent<()> {
         idempotency_guard!(
             self.events.iter_all().rev(),
-            already_applied: JobEvent::ResultUpdated { result: existing } if *existing.as_value() == *result.as_value()
+            already_applied: JobEvent::ReturnValueUpdated { return_value: existing } if *existing.as_value() == *return_value.as_value()
         );
-        self.events.push(JobEvent::ResultUpdated { result });
+        self.events
+            .push(JobEvent::ReturnValueUpdated { return_value });
         es_entity::Idempotent::Executed(())
     }
 
@@ -438,7 +379,7 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionCompleted => {}
                 JobEvent::ExecutionAborted { .. } => {}
                 JobEvent::ExecutionErrored { .. } => {}
-                JobEvent::ResultUpdated { .. } => {}
+                JobEvent::ReturnValueUpdated { .. } => {}
                 JobEvent::JobCompleted => {}
                 JobEvent::AttemptCounterReset => {}
             }

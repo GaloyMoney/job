@@ -3,8 +3,9 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
+    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobRunner,
+    JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
+    error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TestJobConfig {
     delay_ms: u64,
 }
@@ -1505,6 +1506,155 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
     // Explicit shutdown prevents the lost-handler (which uses our far-future
     // manual clock) from resetting other tests' running jobs to 'pending'.
     jobs.shutdown().await?;
+
+    Ok(())
+}
+
+// -- await_completions / JobOutcomes tests --
+
+#[tokio::test]
+async fn test_await_completions_batch() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-completions-batch"),
+    });
+    jobs.start_poll().await?;
+
+    let ids: Vec<JobId> = (0..3).map(|_| JobId::new()).collect();
+    for id in &ids {
+        spawner.spawn(*id, TestJobConfig { delay_ms: 20 }).await?;
+    }
+
+    let outcomes = jobs
+        .await_completions(&ids, Some(Duration::from_secs(10)))
+        .await?;
+    assert_eq!(outcomes.len(), 3);
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completions_empty_ids() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let _spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-completions-empty"),
+    });
+    jobs.start_poll().await?;
+
+    let outcomes = jobs.await_completions(&[], None).await?;
+    assert!(outcomes.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_await_completions_timeout() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-completions-timeout"),
+    });
+    jobs.start_poll().await?;
+
+    // Schedule a job far in the future so it never completes
+    let job_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(job_id, TestJobConfig { delay_ms: 50 }, schedule_at)
+        .await?;
+
+    let result = jobs
+        .await_completions(&[job_id], Some(Duration::from_millis(200)))
+        .await;
+
+    assert!(
+        matches!(result, Err(JobError::TimedOut(_))),
+        "Expected TimedOut error, got: {:?}",
+        result,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_job_completion_results_trait() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let success_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("trait-success"),
+    });
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+
+    jobs.start_poll().await?;
+
+    // Spawn 2 successful + 1 failing job
+    let s1 = JobId::new();
+    let s2 = JobId::new();
+    let f1 = JobId::new();
+    success_spawner
+        .spawn(s1, TestJobConfig { delay_ms: 20 })
+        .await?;
+    success_spawner
+        .spawn(s2, TestJobConfig { delay_ms: 20 })
+        .await?;
+    fail_spawner.spawn(f1, FailingJobConfig).await?;
+
+    let outcomes = jobs
+        .await_completions(&[s1, s2, f1], Some(Duration::from_secs(10)))
+        .await?;
+
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes.failed_count(), 1);
+    assert!(!outcomes.all_succeeded());
+
+    // Also test the slice impl
+    let slice: &[_] = &outcomes;
+    assert_eq!(slice.failed_count(), 1);
+    assert!(!slice.all_succeeded());
+
+    // Test all-success case
+    let s3 = JobId::new();
+    let s4 = JobId::new();
+    success_spawner
+        .spawn(s3, TestJobConfig { delay_ms: 20 })
+        .await?;
+    success_spawner
+        .spawn(s4, TestJobConfig { delay_ms: 20 })
+        .await?;
+
+    let success_outcomes = jobs
+        .await_completions(&[s3, s4], Some(Duration::from_secs(10)))
+        .await?;
+    assert!(success_outcomes.all_succeeded());
+    assert_eq!(success_outcomes.failed_count(), 0);
 
     Ok(())
 }
