@@ -505,9 +505,9 @@ impl Jobs {
     pub async fn list_by_parent_job_id(
         &self,
         parent_job_id: JobId,
-        query: PaginatedQueryArgs<job_cursor::JobsByIdCursor>,
+        query: PaginatedQueryArgs<job_cursor::JobByIdCursor>,
         direction: ListDirection,
-    ) -> Result<PaginatedQueryRet<Job, job_cursor::JobsByIdCursor>, JobError> {
+    ) -> Result<PaginatedQueryRet<Job, job_cursor::JobByIdCursor>, JobError> {
         Ok(self
             .repo
             .list_for_parent_job_id_by_id(Some(parent_job_id), query, direction)
