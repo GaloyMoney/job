@@ -521,22 +521,17 @@ impl Jobs {
         parent_job_id: JobId,
     ) -> Result<Vec<Job>, JobError> {
         let mut all_jobs = Vec::new();
-        let mut after = None;
-        loop {
-            let ret = self
+        let mut query = Some(PaginatedQueryArgs {
+            first: 100,
+            after: None,
+        });
+        while let Some(q) = query.take() {
+            let mut ret = self
                 .repo
-                .list_for_parent_job_id_by_id(
-                    Some(parent_job_id),
-                    PaginatedQueryArgs { first: 100, after },
-                    ListDirection::Ascending,
-                )
+                .list_for_parent_job_id_by_id(Some(parent_job_id), q, ListDirection::Ascending)
                 .await?;
-            let has_next = ret.has_next_page;
-            all_jobs.extend(ret.entities);
-            if !has_next {
-                break;
-            }
-            after = ret.end_cursor;
+            all_jobs.append(&mut ret.entities);
+            query = ret.into_next_query();
         }
         Ok(all_jobs)
     }
