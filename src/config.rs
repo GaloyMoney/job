@@ -24,6 +24,9 @@ pub struct JobPollerConfig {
     #[serde(default = "default_shutdown_timeout")]
     /// How long to wait for jobs to complete gracefully during shutdown before rescheduling them.
     pub shutdown_timeout: Duration,
+    #[serde(default = "default_terminal_channel_size")]
+    /// Capacity of the broadcast channel used to propagate terminal-job notifications.
+    pub terminal_channel_size: usize,
 }
 
 impl Default for JobPollerConfig {
@@ -33,6 +36,7 @@ impl Default for JobPollerConfig {
             max_jobs_per_process: default_max_jobs_per_process(),
             min_jobs_per_process: default_min_jobs_per_process(),
             shutdown_timeout: default_shutdown_timeout(),
+            terminal_channel_size: default_terminal_channel_size(),
         }
     }
 }
@@ -160,4 +164,8 @@ fn default_min_jobs_per_process() -> usize {
 
 fn default_shutdown_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+fn default_terminal_channel_size() -> usize {
+    1024
 }
