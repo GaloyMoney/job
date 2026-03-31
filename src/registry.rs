@@ -25,7 +25,8 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         repo: Arc<JobRepo>,
         clock: ClockHandle,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), clock);
+        let spawner =
+            JobSpawner::<T::Config>::new(repo, self.job_type(), clock).with_parent(job.id);
         JobInitializer::init(self, job, spawner)
     }
 }
