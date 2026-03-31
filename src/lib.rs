@@ -280,7 +280,11 @@ impl Jobs {
 
         let repo = Arc::new(JobRepo::new(&pool));
         let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
-        let router = Arc::new(JobNotificationRouter::new(&pool, Arc::clone(&repo)));
+        let router = Arc::new(JobNotificationRouter::new(
+            &pool,
+            Arc::clone(&repo),
+            config.poller_config.terminal_channel_size,
+        ));
         let clock = config.clock.clone();
         Ok(Self {
             repo,

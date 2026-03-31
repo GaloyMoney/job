@@ -9,6 +9,7 @@ use crate::repo::JobRepo;
 use crate::tracker::JobTracker;
 use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tracing::instrument;
 
 /// Notification types from the unified `job_events` channel.
 #[derive(Debug, serde::Deserialize)]
@@ -28,8 +29,8 @@ pub(crate) struct JobNotificationRouter {
 }
 
 impl JobNotificationRouter {
-    pub fn new(pool: &PgPool, repo: Arc<JobRepo>) -> Self {
-        let (terminal_tx, _) = broadcast::channel(256);
+    pub fn new(pool: &PgPool, repo: Arc<JobRepo>, buffer_size: usize) -> Self {
+        let (terminal_tx, _) = broadcast::channel(buffer_size);
         Self {
             pool: pool.clone(),
             repo,
@@ -165,7 +166,28 @@ impl JobNotificationRouter {
                     result = terminal_rx.recv() => {
                         match result {
                             Ok(job_id) => {
-                                load_and_notify(&mut waiters, &repo, job_id).await;
+                                let mut ids: Vec<JobId> = vec![job_id];
+                                // Drain all buffered notifications before hitting the DB
+                                loop {
+                                    match terminal_rx.try_recv() {
+                                        Ok(id) => ids.push(id),
+                                        Err(broadcast::error::TryRecvError::Empty) => break,
+                                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                                            tracing::warn!(
+                                                missed = n,
+                                                "terminal broadcast lagged during drain, \
+                                                 running immediate sweep"
+                                            );
+                                            sweep_waiters(&mut waiters, &pool, &repo).await;
+                                            ids.clear();
+                                            break;
+                                        }
+                                        Err(broadcast::error::TryRecvError::Closed) => break,
+                                    }
+                                }
+                                if !ids.is_empty() {
+                                    batch_load_and_notify(&mut waiters, &repo, ids).await;
+                                }
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -275,6 +297,50 @@ async fn load_and_notify(
 
     if let Some(state) = load_terminal_state(repo, job_id).await {
         send_to_waiters(waiters, job_id, state);
+    }
+}
+
+/// Load multiple job entities in a single query and notify all registered waiters.
+/// Jobs that fail to load remain registered for the sweep to retry.
+#[instrument(name = "job.notification_router.batch_load_and_notify", skip_all)]
+async fn batch_load_and_notify(
+    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
+    repo: &JobRepo,
+    ids: Vec<JobId>,
+) {
+    // Deduplicate and keep only IDs with active waiters
+    let unique_ids: Vec<JobId> = ids
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|id| waiters.contains_key(id))
+        .collect();
+
+    if unique_ids.is_empty() {
+        return;
+    }
+
+    match repo.find_all::<crate::Job>(&unique_ids).await {
+        Ok(entities) => {
+            for (job_id, job) in entities {
+                if let Some(state) = job.terminal_state() {
+                    send_to_waiters(waiters, job_id, state);
+                } else {
+                    tracing::warn!(
+                        %job_id,
+                        "no execution row but job entity is not terminal"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                n_jobs = unique_ids.len(),
+                "batch_load_and_notify: failed to load job entities"
+            );
+            // Waiters remain registered — sweep will retry
+        }
     }
 }
 
