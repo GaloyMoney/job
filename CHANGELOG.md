@@ -1,3 +1,11 @@
+# [job release v0.6.17](https://github.com/GaloyMoney/job/releases/tag/0.6.17)
+
+
+
+### Bug Fixes
+
+- Drain-then-batch to prevent broadcast overflow (#76)
+
 # [job release v0.6.16](https://github.com/GaloyMoney/job/releases/tag/0.6.16)
 
 
