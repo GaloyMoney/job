@@ -521,10 +521,7 @@ impl Jobs {
         parent_job_id: JobId,
     ) -> Result<Vec<Job>, JobError> {
         let mut all_jobs = Vec::new();
-        let mut query = Some(PaginatedQueryArgs {
-            first: 100,
-            after: None,
-        });
+        let mut query = Some(PaginatedQueryArgs::default());
         while let Some(q) = query.take() {
             let mut ret = self
                 .repo
