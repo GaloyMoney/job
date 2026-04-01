@@ -1996,3 +1996,314 @@ async fn test_task_local_parent_propagation_with_external_spawner() -> anyhow::R
 
     Ok(())
 }
+
+// -- Explicit with_parent() takes priority over task-local --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExplicitParentConfig {
+    child_id: JobId,
+    explicit_parent_id: JobId,
+}
+
+struct ExplicitParentInitializer {
+    child_spawner: JobSpawner<TaskLocalChildConfig>,
+}
+
+impl JobInitializer for ExplicitParentInitializer {
+    type Config = ExplicitParentConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("explicit-parent-test")
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _spawner: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: ExplicitParentConfig = job.config()?;
+        Ok(Box::new(ExplicitParentRunner {
+            child_id: config.child_id,
+            explicit_parent_id: config.explicit_parent_id,
+            child_spawner: self.child_spawner.clone(),
+        }))
+    }
+}
+
+struct ExplicitParentRunner {
+    child_id: JobId,
+    explicit_parent_id: JobId,
+    child_spawner: JobSpawner<TaskLocalChildConfig>,
+}
+
+#[async_trait]
+impl JobRunner for ExplicitParentRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        // Call with_parent(explicit_id) on the external spawner.
+        // Even though the task-local holds this runner's job ID,
+        // the explicit value should win.
+        self.child_spawner
+            .clone()
+            .with_parent(self.explicit_parent_id)
+            .spawn(self.child_id, TaskLocalChildConfig { value: 99 })
+            .await?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_explicit_with_parent_takes_priority_over_task_local() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let child_spawner = jobs.add_initializer(TaskLocalChildInitializer);
+    let parent_spawner = jobs.add_initializer(ExplicitParentInitializer {
+        child_spawner: child_spawner.clone(),
+    });
+
+    jobs.start_poll().await?;
+
+    // Create a real "decoy" job so the FK constraint on parent_job_id is satisfied
+    let explicit_parent_id = JobId::new();
+    child_spawner
+        .spawn(explicit_parent_id, TaskLocalChildConfig { value: 0 })
+        .await?;
+
+    let parent_id = JobId::new();
+    let child_id = JobId::new();
+    parent_spawner
+        .spawn(
+            parent_id,
+            ExplicitParentConfig {
+                child_id,
+                explicit_parent_id,
+            },
+        )
+        .await?;
+
+    jobs.await_completion(parent_id, Some(Duration::from_secs(5)))
+        .await?;
+    jobs.await_completion(child_id, Some(Duration::from_secs(5)))
+        .await?;
+
+    let child = jobs.find(child_id).await?;
+    assert_eq!(
+        child.parent_job_id,
+        Some(explicit_parent_id),
+        "explicit with_parent() should take priority over task-local"
+    );
+    // Confirm it is NOT the task-local value (the running job's ID)
+    assert_ne!(
+        child.parent_job_id,
+        Some(parent_id),
+        "child should not inherit the task-local job ID when explicit parent is set"
+    );
+
+    Ok(())
+}
+
+// -- Nested A→B→C multi-level propagation test --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChainConfig {
+    child_id: JobId,
+}
+
+struct ChainLeafInitializer;
+
+impl JobInitializer for ChainLeafInitializer {
+    type Config = ChainConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("chain-leaf")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _spawner: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(ChainLeafRunner))
+    }
+}
+
+struct ChainLeafRunner;
+
+#[async_trait]
+impl JobRunner for ChainLeafRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        Ok(JobCompletion::Complete)
+    }
+}
+
+struct ChainMiddleInitializer {
+    leaf_spawner: JobSpawner<ChainConfig>,
+}
+
+impl JobInitializer for ChainMiddleInitializer {
+    type Config = ChainConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("chain-middle")
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _spawner: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: ChainConfig = job.config()?;
+        Ok(Box::new(ChainMiddleRunner {
+            child_id: config.child_id,
+            leaf_spawner: self.leaf_spawner.clone(),
+        }))
+    }
+}
+
+struct ChainMiddleRunner {
+    child_id: JobId,
+    leaf_spawner: JobSpawner<ChainConfig>,
+}
+
+#[async_trait]
+impl JobRunner for ChainMiddleRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        self.leaf_spawner
+            .spawn(
+                self.child_id,
+                ChainConfig {
+                    child_id: JobId::new(),
+                },
+            )
+            .await?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+struct ChainRootInitializer {
+    middle_spawner: JobSpawner<ChainConfig>,
+}
+
+impl JobInitializer for ChainRootInitializer {
+    type Config = ChainConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("chain-root")
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _spawner: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: ChainConfig = job.config()?;
+        Ok(Box::new(ChainRootRunner {
+            child_id: config.child_id,
+            middle_spawner: self.middle_spawner.clone(),
+        }))
+    }
+}
+
+struct ChainRootRunner {
+    child_id: JobId,
+    middle_spawner: JobSpawner<ChainConfig>,
+}
+
+#[async_trait]
+impl JobRunner for ChainRootRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        self.middle_spawner
+            .spawn(
+                self.child_id,
+                ChainConfig {
+                    child_id: JobId::new(),
+                },
+            )
+            .await?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_nested_abc_multi_level_propagation() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    // Register leaf (C), middle (B), root (A) — order matters for spawner wiring
+    let leaf_spawner = jobs.add_initializer(ChainLeafInitializer);
+    let middle_spawner = jobs.add_initializer(ChainMiddleInitializer { leaf_spawner });
+    let root_spawner = jobs.add_initializer(ChainRootInitializer { middle_spawner });
+
+    jobs.start_poll().await?;
+
+    let a_id = JobId::new();
+    let b_id = JobId::new();
+
+    // A's runner will spawn B, B's runner will spawn C
+    // We pass c_id through B's config so B knows which ID to give C
+    root_spawner
+        .spawn(a_id, ChainConfig { child_id: b_id })
+        .await?;
+
+    // Wait for A to complete (it spawns B)
+    jobs.await_completion(a_id, Some(Duration::from_secs(5)))
+        .await?;
+
+    // Now patch B's config: B needs to know c_id.
+    // Actually, B was already spawned by A with a random child_id in ChainConfig.
+    // We need to find B's actual child. Let's wait for B and then check its children.
+    jobs.await_completion(b_id, Some(Duration::from_secs(5)))
+        .await?;
+
+    // Verify A→B→C chain
+    let job_a = jobs.find(a_id).await?;
+    assert!(
+        job_a.parent_job_id.is_none(),
+        "root job A should have no parent"
+    );
+
+    let job_b = jobs.find(b_id).await?;
+    assert_eq!(
+        job_b.parent_job_id,
+        Some(a_id),
+        "B.parent_job_id should be A"
+    );
+
+    // B spawned C with a random ID — find C via parent listing
+    let b_children = jobs.list_all_by_parent_job_id(b_id).await?;
+    assert_eq!(
+        b_children.len(),
+        1,
+        "B should have spawned exactly one child"
+    );
+    let job_c = &b_children[0];
+    assert_eq!(
+        job_c.parent_job_id,
+        Some(b_id),
+        "C.parent_job_id should be B"
+    );
+
+    Ok(())
+}

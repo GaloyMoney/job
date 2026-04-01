@@ -13,6 +13,17 @@ use super::{
 };
 
 tokio::task_local! {
+    /// Holds the [`JobId`] of the currently executing job within a dispatcher
+    /// task. Set via [`CURRENT_EXECUTING_JOB_ID::scope`] before calling
+    /// `runner.run()`, so any [`JobSpawner`] used inside the runner can fall
+    /// back to this value when no explicit `parent_job_id` has been set via
+    /// [`JobSpawner::with_parent`].
+    ///
+    /// **Limitation:** standard tokio task-locals do *not* propagate into
+    /// child tasks created with [`tokio::spawn`]. If a job runner internally
+    /// calls `tokio::spawn(async { spawner.spawn(...) })`, the task-local
+    /// will not be visible and `parent_job_id` will be `None`. Use explicit
+    /// [`JobSpawner::with_parent`] in those cases.
     pub(crate) static CURRENT_EXECUTING_JOB_ID: JobId;
 }
 
