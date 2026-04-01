@@ -8,6 +8,7 @@ use tracing::instrument;
 
 use super::{
     Job, JobId,
+    dispatcher::CURRENT_EXECUTING_JOB_ID,
     entity::{JobType, NewJob},
     error::JobError,
     repo::JobRepo,
@@ -105,6 +106,11 @@ where
     /// Returns the job type this spawner creates.
     pub fn job_type(&self) -> &JobType {
         &self.job_type
+    }
+
+    fn resolve_parent_job_id(&self) -> Option<JobId> {
+        self.parent_job_id
+            .or_else(|| CURRENT_EXECUTING_JOB_ID.try_with(|id| *id).ok())
     }
 
     /// Create and spawn a job for immediate execution.
@@ -324,7 +330,7 @@ where
                 .job_type(self.job_type.clone())
                 .config(spec.config)?
                 .tracing_context(es_entity::context::TracingContext::current())
-                .parent_job_id(self.parent_job_id)
+                .parent_job_id(self.resolve_parent_job_id())
                 .build()
                 .expect("Could not build new job");
             new_jobs.push(new_job);
@@ -381,7 +387,7 @@ where
             .job_type(self.job_type.clone())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
-            .parent_job_id(self.parent_job_id)
+            .parent_job_id(self.resolve_parent_job_id())
             .build()
             .expect("Could not build new job");
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
@@ -413,7 +419,7 @@ where
             .job_type(self.job_type.clone())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
-            .parent_job_id(self.parent_job_id)
+            .parent_job_id(self.resolve_parent_job_id())
             .build()
             .expect("Could not build new job");
 

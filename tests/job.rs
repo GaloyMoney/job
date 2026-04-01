@@ -1854,3 +1854,145 @@ async fn test_automatic_parent_propagation() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// -- Task-local parent propagation tests (external spawner) --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskLocalChildConfig {
+    value: u32,
+}
+
+struct TaskLocalChildInitializer;
+
+impl JobInitializer for TaskLocalChildInitializer {
+    type Config = TaskLocalChildConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("task-local-child")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _spawner: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(TaskLocalChildRunner))
+    }
+}
+
+struct TaskLocalChildRunner;
+
+#[async_trait]
+impl JobRunner for TaskLocalChildRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskLocalParentConfig {
+    child_id: JobId,
+}
+
+struct TaskLocalParentInitializer {
+    /// External spawner for the child job type — NOT the init-injected one.
+    child_spawner: JobSpawner<TaskLocalChildConfig>,
+}
+
+impl JobInitializer for TaskLocalParentInitializer {
+    type Config = TaskLocalParentConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("task-local-parent")
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _spawner: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: TaskLocalParentConfig = job.config()?;
+        Ok(Box::new(TaskLocalParentRunner {
+            child_id: config.child_id,
+            child_spawner: self.child_spawner.clone(),
+        }))
+    }
+}
+
+struct TaskLocalParentRunner {
+    child_id: JobId,
+    child_spawner: JobSpawner<TaskLocalChildConfig>,
+}
+
+#[async_trait]
+impl JobRunner for TaskLocalParentRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        // Spawn a child using the EXTERNAL spawner (parent_job_id is None on it).
+        // The task-local should provide the parent_job_id automatically.
+        self.child_spawner
+            .spawn(self.child_id, TaskLocalChildConfig { value: 42 })
+            .await?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+#[tokio::test]
+async fn test_task_local_parent_propagation_with_external_spawner() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    // Register the child type first to get the external spawner
+    let child_spawner = jobs.add_initializer(TaskLocalChildInitializer);
+
+    // Register the parent type, passing the external child spawner
+    let parent_spawner = jobs.add_initializer(TaskLocalParentInitializer { child_spawner });
+
+    jobs.start_poll().await?;
+
+    // Spawn the parent job
+    let parent_id = JobId::new();
+    let child_id = JobId::new();
+    parent_spawner
+        .spawn(parent_id, TaskLocalParentConfig { child_id })
+        .await?;
+
+    // Wait for both to complete
+    jobs.await_completion(parent_id, Some(Duration::from_secs(5)))
+        .await?;
+    jobs.await_completion(child_id, Some(Duration::from_secs(5)))
+        .await?;
+
+    // The child was spawned by an external spawner (parent_job_id = None),
+    // but the task-local should have propagated the parent's job ID.
+    let child = jobs.find(child_id).await?;
+    assert_eq!(
+        child.parent_job_id,
+        Some(parent_id),
+        "child spawned via external spawner should get parent_job_id from task-local"
+    );
+
+    // Parent should have no parent
+    let parent = jobs.find(parent_id).await?;
+    assert!(
+        parent.parent_job_id.is_none(),
+        "externally-spawned parent job should have no parent"
+    );
+
+    // Verify listing works
+    let children = jobs.list_all_by_parent_job_id(parent_id).await?;
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id, child_id);
+
+    Ok(())
+}

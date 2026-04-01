@@ -12,6 +12,10 @@ use super::{
     tracker::JobTracker,
 };
 
+tokio::task_local! {
+    pub(crate) static CURRENT_EXECUTING_JOB_ID: JobId;
+}
+
 #[derive(Debug)]
 pub struct PolledJob {
     pub id: JobId,
@@ -92,7 +96,14 @@ impl JobDispatcher {
             Arc::clone(&self.repo),
         );
         self.tracker.dispatch_job();
-        match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
+        let job_id = polled_job.id;
+        match CURRENT_EXECUTING_JOB_ID
+            .scope(
+                job_id,
+                Self::dispatch_job(self.runner.take().expect("runner"), current_job),
+            )
+            .await
+        {
             Err(e) => {
                 span.record("conclusion", "Error");
                 self.fail_job(job.id, e, polled_job.attempt).await?
