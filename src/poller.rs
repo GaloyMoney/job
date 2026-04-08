@@ -103,6 +103,7 @@ impl JobPoller {
     ) -> JobPollerHandle {
         let lost_handle = self.start_lost_handler();
         let keep_alive_handle = self.start_keep_alive_handler();
+        let stale_jobs_handle = self.start_stale_jobs_handler();
         let shutdown_tx = self.shutdown_tx.clone();
         let repo = Arc::clone(&self.repo);
         let instance_id = self.instance_id;
@@ -112,7 +113,12 @@ impl JobPoller {
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-main-loop",
-            Self::main_loop(Arc::clone(&executor), lost_handle, keep_alive_handle,)
+            Self::main_loop(
+                Arc::clone(&executor),
+                lost_handle,
+                keep_alive_handle,
+                stale_jobs_handle,
+            )
         ));
         JobPollerHandle {
             poller: executor,
@@ -133,6 +139,7 @@ impl JobPoller {
         self: Arc<Self>,
         _lost_task: OwnedTaskHandle,
         _keep_alive_task: OwnedTaskHandle,
+        _stale_jobs_task: OwnedTaskHandle,
     ) {
         let mut failures = 0;
         let mut woken_up = false;
@@ -296,6 +303,75 @@ impl JobPoller {
                     };
                     drop(_guard);
                     clock.sleep_coalesce(timeout).await;
+                }
+            }
+        ))
+    }
+
+    fn start_stale_jobs_handler(&self) -> OwnedTaskHandle {
+        let pending_jobs_check_interval = self.config.pending_jobs_check_interval;
+        let pool = self.repo.pool().clone();
+        let clock = self.clock.clone();
+        let supported_job_types = self.registry.registered_job_types();
+        OwnedTaskHandle::new(spawn_named_task!(
+            "job-poller-stale-jobs-handler",
+            async move {
+                loop {
+                    clock.sleep_coalesce(pending_jobs_check_interval).await;
+                    let now = clock.now();
+
+                    let span = tracing::info_span!(
+                        parent: None,
+                        "job.check_stale_pending_jobs",
+                        n_stale_pending = tracing::field::Empty,
+                        max_pending_duration_secs = tracing::field::Empty,
+                    );
+                    let _guard = span.enter();
+
+                    match sqlx::query!(
+                        r#"
+                        SELECT
+                            job_type,
+                            COUNT(*)::INT4 AS "count!: i32",
+                            EXTRACT(EPOCH FROM ($1::timestamptz - MIN(execute_at)))::FLOAT8
+                                AS "max_pending_duration_secs!: f64"
+                        FROM job_executions
+                        WHERE state = 'pending'
+                        AND execute_at <= $1::timestamptz
+                        AND job_type = ANY($2)
+                        GROUP BY job_type
+                        "#,
+                        now,
+                        &supported_job_types as _,
+                    )
+                    .fetch_all(&pool)
+                    .await
+                    {
+                        Ok(rows) => {
+                            let mut total_stale: i64 = 0;
+                            let mut max_pending_secs: f64 = 0.0;
+
+                            for row in &rows {
+                                total_stale += row.count as i64;
+                                if row.max_pending_duration_secs > max_pending_secs {
+                                    max_pending_secs = row.max_pending_duration_secs;
+                                }
+                                tracing::warn!(
+                                    job_type = %row.job_type,
+                                    count = row.count,
+                                    max_pending_duration_secs = row.max_pending_duration_secs,
+                                    "stale pending jobs detected"
+                                );
+                            }
+
+                            Span::current().record("n_stale_pending", total_stale);
+                            Span::current()
+                                .record("max_pending_duration_secs", max_pending_secs);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to check stale pending jobs");
+                        }
+                    }
                 }
             }
         ))

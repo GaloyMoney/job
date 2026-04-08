@@ -27,6 +27,10 @@ pub struct JobPollerConfig {
     #[serde(default = "default_terminal_channel_size")]
     /// Capacity of the broadcast channel used to propagate terminal-job notifications.
     pub terminal_channel_size: usize,
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_pending_jobs_check_interval")]
+    /// How often to check for pending jobs that are past their scheduled execution time.
+    pub pending_jobs_check_interval: Duration,
 }
 
 impl Default for JobPollerConfig {
@@ -37,6 +41,7 @@ impl Default for JobPollerConfig {
             min_jobs_per_process: default_min_jobs_per_process(),
             shutdown_timeout: default_shutdown_timeout(),
             terminal_channel_size: default_terminal_channel_size(),
+            pending_jobs_check_interval: default_pending_jobs_check_interval(),
         }
     }
 }
@@ -168,4 +173,8 @@ fn default_shutdown_timeout() -> Duration {
 
 fn default_terminal_channel_size() -> usize {
     1024
+}
+
+fn default_pending_jobs_check_interval() -> Duration {
+    Duration::from_secs(60)
 }
