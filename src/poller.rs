@@ -365,8 +365,7 @@ impl JobPoller {
                             }
 
                             Span::current().record("n_stale_pending", total_stale);
-                            Span::current()
-                                .record("max_pending_duration_secs", max_pending_secs);
+                            Span::current().record("max_pending_duration_secs", max_pending_secs);
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "failed to check stale pending jobs");
