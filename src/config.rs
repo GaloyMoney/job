@@ -176,5 +176,5 @@ fn default_terminal_channel_size() -> usize {
 }
 
 fn default_pending_jobs_check_interval() -> Duration {
-    Duration::from_secs(60)
+    Duration::from_secs(5 * 60)
 }
