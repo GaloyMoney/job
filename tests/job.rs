@@ -2044,19 +2044,24 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
 
     jobs.start_poll().await?;
 
-    // Poll until the orphan is rescued. Each iteration advances the clock
-    // by job_lost_interval so the lost-handler gets a fresh wake even if it
-    // missed the previous advance (e.g. because it hadn't registered its
-    // coalesce sleep yet).
+    // Poll until the orphan is rescued. We check that the poller_instance_id
+    // is no longer the other instance — the lost handler resets it to NULL
+    // (pending) but the main poller may immediately re-claim it, so we can't
+    // reliably assert state='pending'. Each iteration advances the clock by
+    // job_lost_interval so the lost-handler gets a fresh wake.
     let mut attempts = 0;
     loop {
         controller.advance(Duration::from_secs(10)).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        let row: (String,) = sqlx::query_as("SELECT state::text FROM job_executions WHERE id = $1")
-            .bind(orphan_id)
-            .fetch_one(&pool)
-            .await?;
-        if row.0 == "pending" {
+        let row: (Option<uuid::Uuid>,) =
+            sqlx::query_as("SELECT poller_instance_id FROM job_executions WHERE id = $1")
+                .bind(orphan_id)
+                .fetch_one(&pool)
+                .await?;
+        // Once the lost-handler fires, the row's poller_instance_id will be
+        // either NULL (pending) or our own instance (re-dispatched). Either
+        // way it won't be other_instance any more.
+        if row.0 != Some(other_instance) {
             break;
         }
         attempts += 1;
