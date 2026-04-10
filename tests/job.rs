@@ -2044,19 +2044,29 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
 
     jobs.start_poll().await?;
 
+    // Let the lost-handler register its coalesce sleep before advancing.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
     // Advance the clock so the lost-handler fires.
     controller.advance(Duration::from_secs(20)).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // The orphan must have been reset to 'pending'.
-    let row: (String,) = sqlx::query_as("SELECT state::text FROM job_executions WHERE id = $1")
-        .bind(orphan_id)
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(
-        row.0, "pending",
-        "orphan from another instance must be rescued"
-    );
+    // Poll until the orphan is rescued (with timeout).
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let row: (String,) = sqlx::query_as("SELECT state::text FROM job_executions WHERE id = $1")
+            .bind(orphan_id)
+            .fetch_one(&pool)
+            .await?;
+        if row.0 == "pending" {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 50,
+            "orphan from another instance must be rescued"
+        );
+    }
 
     jobs.shutdown().await?;
     Ok(())
