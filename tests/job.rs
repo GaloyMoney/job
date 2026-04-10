@@ -2014,19 +2014,31 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
         job_type: JobType::new("orphan-rescue"),
     });
 
-    // Insert a row directly as if left behind by a crashed peer.
+    // Insert rows directly as if left behind by a crashed peer.
     let orphan_id = JobId::new();
     let other_instance = uuid::Uuid::now_v7();
-    let stale_alive_at = clock.now() - chrono::Duration::seconds(60);
+    let now = clock.now();
+    let stale_alive_at = now - chrono::Duration::seconds(60);
+
+    // Parent row in `jobs` (FK target for job_executions).
+    sqlx::query(
+        "INSERT INTO jobs (id, unique_per_type, job_type, created_at) VALUES ($1, false, 'orphan-rescue', $2)",
+    )
+    .bind(orphan_id)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
     sqlx::query(
         r#"
-        INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, execution_state_json, attempt_index)
-        VALUES ($1, 'orphan-rescue', 'running', $2, $3, '{}', 1)
+        INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, execution_state_json, attempt_index, created_at)
+        VALUES ($1, 'orphan-rescue', 'running', $2, $3, '{}', 1, $4)
         "#,
     )
     .bind(orphan_id)
     .bind(stale_alive_at)
     .bind(other_instance)
+    .bind(now)
     .execute(&pool)
     .await?;
 
