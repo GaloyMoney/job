@@ -1,3 +1,20 @@
+# [job release v0.6.18](https://github.com/GaloyMoney/job/releases/tag/0.6.18)
+
+
+
+### Bug Fixes
+
+- Exclude own instance from lost-handler recovery (#87)
+- Replace cachix with magic-nix-cache-action (#86)
+
+### Miscellaneous Tasks
+
+- Bump tokio from 1.50.0 to 1.51.1 (#85)
+
+### Refactor
+
+- Expose stale pending jobs check as public API (#84)
+
 # [job release v0.6.17](https://github.com/GaloyMoney/job/releases/tag/0.6.17)
 
 
