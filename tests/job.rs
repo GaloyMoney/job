@@ -1854,3 +1854,223 @@ async fn test_automatic_parent_propagation() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// -- Lost handler instance filter tests --
+
+/// A job runner that parks indefinitely until shutdown is requested,
+/// mimicking long-running listener-style jobs (e.g. outbox consumers).
+#[derive(Debug, Serialize, Deserialize)]
+struct InfiniteListenerConfig;
+
+struct InfiniteListenerInitializer;
+
+impl JobInitializer for InfiniteListenerInitializer {
+    type Config = InfiniteListenerConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("infinite-listener")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(InfiniteListenerRunner))
+    }
+}
+
+struct InfiniteListenerRunner;
+
+#[async_trait]
+impl JobRunner for InfiniteListenerRunner {
+    async fn run(
+        &self,
+        mut current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        // Park until shutdown, like an outbox listener would.
+        current_job.shutdown_requested().await;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+/// Verify that the lost-handler does NOT mark running jobs owned by its own
+/// poller instance as lost. Without the instance filter, a race between the
+/// lost-handler and the keep-alive handler can desync the in-memory job
+/// counter and permanently wedge the poller.
+#[tokio::test]
+async fn test_lost_handler_skips_own_instance_running_jobs() -> anyhow::Result<()> {
+    use job::JobPollerConfig;
+
+    let pool = helpers::init_pool().await?;
+    let (clock, controller) = ClockHandle::manual();
+
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .clock(clock.clone())
+        .poller_config(JobPollerConfig {
+            job_lost_interval: Duration::from_secs(10),
+            // Pin min == max == 2 so a single leaked counter slot would wedge
+            // the poller. This makes the assertion strict.
+            min_jobs_per_process: 2,
+            max_jobs_per_process: 2,
+            ..Default::default()
+        })
+        .build()
+        .expect("build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    // 1) Register a long-running listener job and a short canary job.
+    let listener_spawner = jobs.add_initializer(InfiniteListenerInitializer);
+    let canary_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("lost-handler-canary"),
+    });
+
+    jobs.start_poll().await?;
+
+    // 2) Spawn the listener. It will park at shutdown_requested().
+    let listener_id = JobId::new();
+    listener_spawner
+        .spawn(listener_id, InfiniteListenerConfig)
+        .await?;
+
+    // Wait for it to reach 'running' in the DB.
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let row: (String,) = sqlx::query_as("SELECT state::text FROM job_executions WHERE id = $1")
+            .bind(listener_id)
+            .fetch_one(&pool)
+            .await?;
+        if row.0 == "running" {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 50, "listener job never reached running state");
+    }
+
+    // 3) Force alive_at into the past so the lost-handler would find it stale.
+    let stale_time = clock.now() - chrono::Duration::seconds(60);
+    sqlx::query("UPDATE job_executions SET alive_at = $1 WHERE id = $2")
+        .bind(stale_time)
+        .bind(listener_id)
+        .execute(&pool)
+        .await?;
+
+    // 4) Advance the manual clock by 2 * job_lost_interval. This fires both
+    //    the keep-alive and lost-handler coalesce wakes.
+    controller.advance(Duration::from_secs(20)).await;
+
+    // Give the loops a tick.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // 5) The listener must still be 'running' — the lost-handler should have
+    //    skipped it because it belongs to our own instance.
+    let row: (String,) = sqlx::query_as("SELECT state::text FROM job_executions WHERE id = $1")
+        .bind(listener_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        row.0, "running",
+        "own-instance running job must not be marked lost"
+    );
+
+    // 6) The poller must still be healthy — spawn a canary and confirm it runs.
+    //    If the counter had leaked, the poller would be wedged and this would
+    //    time out.
+    let canary_id = JobId::new();
+    canary_spawner
+        .spawn(canary_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    wait_for_jobs_completed(&jobs, &[canary_id], 50).await;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Verify that the lost-handler still rescues jobs left behind by a crashed
+/// peer process (different poller_instance_id).
+#[tokio::test]
+async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
+    use job::JobPollerConfig;
+
+    let pool = helpers::init_pool().await?;
+    let (clock, controller) = ClockHandle::manual();
+
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .clock(clock.clone())
+        .poller_config(JobPollerConfig {
+            job_lost_interval: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .build()
+        .expect("build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let _spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("orphan-rescue"),
+    });
+
+    // Insert rows directly as if left behind by a crashed peer.
+    let orphan_id = JobId::new();
+    let other_instance = uuid::Uuid::now_v7();
+    let now = clock.now();
+    let stale_alive_at = now - chrono::Duration::seconds(60);
+
+    // Parent row in `jobs` (FK target for job_executions).
+    sqlx::query(
+        "INSERT INTO jobs (id, unique_per_type, job_type, created_at) VALUES ($1, false, 'orphan-rescue', $2)",
+    )
+    .bind(orphan_id)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, execution_state_json, attempt_index, created_at)
+        VALUES ($1, 'orphan-rescue', 'running', $2, $3, '{}', 1, $4)
+        "#,
+    )
+    .bind(orphan_id)
+    .bind(stale_alive_at)
+    .bind(other_instance)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
+    jobs.start_poll().await?;
+
+    // Poll until the orphan is rescued. We check that the poller_instance_id
+    // is no longer the other instance — the lost handler resets it to NULL
+    // (pending) but the main poller may immediately re-claim it, so we can't
+    // reliably assert state='pending'. Each iteration advances the clock by
+    // job_lost_interval so the lost-handler gets a fresh wake.
+    let mut attempts = 0;
+    loop {
+        controller.advance(Duration::from_secs(10)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        let row: (Option<uuid::Uuid>,) =
+            sqlx::query_as("SELECT poller_instance_id FROM job_executions WHERE id = $1")
+                .bind(orphan_id)
+                .fetch_one(&pool)
+                .await?;
+        // Once the lost-handler fires, the row's poller_instance_id will be
+        // either NULL (pending) or our own instance (re-dispatched). Either
+        // way it won't be other_instance any more.
+        if row.0 != Some(other_instance) {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 20,
+            "orphan from another instance must be rescued"
+        );
+    }
+
+    jobs.shutdown().await?;
+    Ok(())
+}
