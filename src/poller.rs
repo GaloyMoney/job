@@ -2,7 +2,7 @@ use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use serde_json::Value as JsonValue;
 use sqlx::postgres::{PgPool, types::PgInterval};
-use tracing::{Span, instrument};
+use tracing::{Instrument, Span, instrument};
 
 use std::{
     sync::{
@@ -233,9 +233,9 @@ impl JobPoller {
                     instance_id = %instance_id,
                     n_lost_jobs = tracing::field::Empty,
                 );
-                let _guard = span.enter();
 
-                if let Ok(rows) = sqlx::query!(
+                async {
+                    if let Ok(rows) = sqlx::query!(
                         r#"
                         UPDATE job_executions
                         SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1, poller_instance_id = NULL
@@ -259,6 +259,9 @@ impl JobPoller {
                     } else {
                         Span::current().record("n_lost_jobs", 0);
                     }
+                }
+                .instrument(span)
+                .await;
             }
         }))
     }
@@ -281,31 +284,34 @@ impl JobPoller {
                         now = %now,
                         failures
                     );
-                    let _guard = span.enter();
 
-                    let timeout = match sqlx::query!(
-                        r#"
+                    let timeout = async {
+                        match sqlx::query!(
+                            r#"
                         UPDATE job_executions
                         SET alive_at = $1
                         WHERE poller_instance_id = $2 AND state = 'running'
                         "#,
-                        now,
-                        instance_id,
-                    )
-                    .execute(&pool)
-                    .await
-                    {
-                        Ok(_) => {
-                            failures = 0;
-                            job_lost_interval / 4
+                            now,
+                            instance_id,
+                        )
+                        .execute(&pool)
+                        .await
+                        {
+                            Ok(_) => {
+                                failures = 0;
+                                job_lost_interval / 4
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                tracing::error!(instance_id = %instance_id, error = %e, "keep alive error");
+                                Duration::from_millis(50 << failures)
+                            }
                         }
-                        Err(e) => {
-                            failures += 1;
-                            tracing::error!(instance_id = %instance_id, error = %e, "keep alive error");
-                            Duration::from_millis(50 << failures)
-                        }
-                    };
-                    drop(_guard);
+                    }
+                    .instrument(span)
+                    .await;
+
                     clock.sleep_coalesce(timeout).await;
                 }
             }
@@ -330,10 +336,10 @@ impl JobPoller {
                         n_stale_pending = tracing::field::Empty,
                         max_pending_duration_secs = tracing::field::Empty,
                     );
-                    let _guard = span.enter();
 
-                    match sqlx::query!(
-                        r#"
+                    async {
+                        match sqlx::query!(
+                            r#"
                         SELECT
                             job_type,
                             COUNT(*)::INT4 AS "count!: i32",
@@ -345,36 +351,40 @@ impl JobPoller {
                         AND job_type = ANY($2)
                         GROUP BY job_type
                         "#,
-                        now,
-                        &supported_job_types as _,
-                    )
-                    .fetch_all(&pool)
-                    .await
-                    {
-                        Ok(rows) => {
-                            let mut total_stale: i64 = 0;
-                            let mut max_pending_secs: f64 = 0.0;
+                            now,
+                            &supported_job_types as _,
+                        )
+                        .fetch_all(&pool)
+                        .await
+                        {
+                            Ok(rows) => {
+                                let mut total_stale: i64 = 0;
+                                let mut max_pending_secs: f64 = 0.0;
 
-                            for row in &rows {
-                                total_stale += row.count as i64;
-                                if row.max_pending_duration_secs > max_pending_secs {
-                                    max_pending_secs = row.max_pending_duration_secs;
+                                for row in &rows {
+                                    total_stale += row.count as i64;
+                                    if row.max_pending_duration_secs > max_pending_secs {
+                                        max_pending_secs = row.max_pending_duration_secs;
+                                    }
+                                    tracing::warn!(
+                                        job_type = %row.job_type,
+                                        count = row.count,
+                                        max_pending_duration_secs = row.max_pending_duration_secs,
+                                        "stale pending jobs detected"
+                                    );
                                 }
-                                tracing::warn!(
-                                    job_type = %row.job_type,
-                                    count = row.count,
-                                    max_pending_duration_secs = row.max_pending_duration_secs,
-                                    "stale pending jobs detected"
-                                );
-                            }
 
-                            Span::current().record("n_stale_pending", total_stale);
-                            Span::current().record("max_pending_duration_secs", max_pending_secs);
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to check stale pending jobs");
+                                Span::current().record("n_stale_pending", total_stale);
+                                Span::current()
+                                    .record("max_pending_duration_secs", max_pending_secs);
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to check stale pending jobs");
+                            }
                         }
                     }
+                    .instrument(span)
+                    .await;
                 }
             }
         ))
