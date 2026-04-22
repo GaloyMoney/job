@@ -164,8 +164,21 @@ impl JobPoller {
                 _ = shutdown_rx.recv() => {
                     break;
                 }
-                result = self.clock.timeout(timeout, self.tracker.notified()) => {
-                    woken_up = result.is_ok();
+                _ = self.tracker.notified() => {
+                    woken_up = true;
+                }
+                // Clock-driven sleep honours manual-clock advance() jumps so
+                // `WaitTillNextJob` delays resolve as soon as simulated time
+                // catches up, matching prior behaviour under artificial clocks.
+                _ = self.clock.sleep(timeout) => {
+                    woken_up = false;
+                }
+                // Wall-clock safety net, capped at MAX_WAIT. Ensures the poller
+                // re-evaluates tracker/DB state at least every 60s of real time
+                // even when the application clock is simulated and frozen
+                // (e.g. manual-clock deployments between user-driven advances).
+                _ = tokio::time::sleep(std::cmp::min(timeout, MAX_WAIT)) => {
+                    woken_up = false;
                 }
             }
         }
