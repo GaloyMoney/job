@@ -1,3 +1,11 @@
+# [job release v0.6.19](https://github.com/GaloyMoney/job/releases/tag/0.6.19)
+
+
+
+### Bug Fixes
+
+- Use Instrument to avoid span.enter() across .await (#95)
+
 # [job release v0.6.18](https://github.com/GaloyMoney/job/releases/tag/0.6.18)
 
 
