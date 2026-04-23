@@ -2074,3 +2074,99 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
     jobs.shutdown().await?;
     Ok(())
 }
+
+/// Verify that the main poll loop's safety-net timeout is wall-clock driven
+/// (not application-clock driven), so a manual clock that never advances
+/// cannot wedge the dispatcher.
+///
+/// Scenario: manual clock, never advanced. A pending job row is inserted
+/// directly into `job_executions` with the NOTIFY trigger disabled — so no PG
+/// NOTIFY fires and the tracker is never notified that work exists. The only
+/// mechanism left to pick the row up is the main loop's periodic fallback
+/// poll. Under the previous `self.clock.timeout(MAX_WAIT, …)` implementation
+/// this fallback was gated on simulated time and would never fire; with the
+/// wall-clock fallback it must fire within ~MAX_WAIT seconds of real time.
+#[tokio::test]
+async fn test_main_loop_falls_back_to_wall_clock_under_frozen_manual_clock() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    // Manual clock, deliberately never advanced.
+    let (clock, _controller) = ClockHandle::manual();
+
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .clock(clock.clone())
+        .build()
+        .expect("build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = JobType::new("wall-clock-fallback");
+    let _spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: job_type.clone(),
+    });
+
+    jobs.start_poll().await?;
+
+    // Give the poller's first iteration time to complete and park. Without
+    // this, the test would pick up the new row during startup rather than
+    // exercising the parked-mid-loop fallback path.
+    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+
+    // Insert a pending job directly, with the job_events notify trigger
+    // disabled for the transaction. This simulates a lost notification (e.g.
+    // a listener reconnect gap): the row exists in the DB but the tracker is
+    // never notified, so the only way the poller can discover it is via a
+    // periodic fallback poll.
+    let job_id = JobId::new();
+    let now = clock.now();
+    let mut tx = pool.begin().await?;
+    sqlx::query("ALTER TABLE job_executions DISABLE TRIGGER job_executions_notify_event_trigger")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO jobs (id, unique_per_type, job_type, created_at) VALUES ($1, false, $2, $3)",
+    )
+    .bind(job_id)
+    .bind(job_type.as_str())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_executions
+            (id, job_type, state, alive_at, execute_at, execution_state_json, attempt_index, created_at)
+        VALUES ($1, $2, 'pending', $3, $3, '{}', 1, $3)
+        "#,
+    )
+    .bind(job_id)
+    .bind(job_type.as_str())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("ALTER TABLE job_executions ENABLE TRIGGER job_executions_notify_event_trigger")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    // Wait for the fallback poll to pick the row up. With the wall-clock
+    // fallback the main loop re-polls within MAX_WAIT (60s). We give the test
+    // a generous budget but fail fast if we blow past MAX_WAIT.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(80);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let state: (String,) =
+            sqlx::query_as("SELECT state::text FROM job_executions WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await?;
+        if state.0 != "pending" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "poller did not pick up pending job under frozen manual clock"
+        );
+    }
+
+    jobs.shutdown().await?;
+    Ok(())
+}
