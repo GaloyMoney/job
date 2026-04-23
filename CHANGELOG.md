@@ -1,3 +1,11 @@
+# [job release v0.6.20](https://github.com/GaloyMoney/job/releases/tag/0.6.20)
+
+
+
+### Bug Fixes
+
+- Recheck state = 'pending' in poll UPDATE to avoid races (#96)
+
 # [job release v0.6.19](https://github.com/GaloyMoney/job/releases/tag/0.6.19)
 
 
