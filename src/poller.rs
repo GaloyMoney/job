@@ -557,6 +557,7 @@ async fn poll_jobs(
             SET state = 'running', alive_at = $2, execute_at = NULL, poller_instance_id = $3
             FROM selected_jobs
             WHERE je.id = selected_jobs.id
+              AND je.state = 'pending'
             RETURNING je.id, selected_jobs.data_json, je.attempt_index
         )
         SELECT * FROM (
