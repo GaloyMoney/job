@@ -134,45 +134,6 @@ impl JobDispatcher {
                 self.reschedule_job(&mut tx, job.id, t).await?;
                 tx.commit().await?;
             }
-            Ok(JobCompletion::RescheduleIn(d)) => {
-                span.record("conclusion", "RescheduleIn");
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                let t = t + d;
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleInWithOp(mut op, d)) => {
-                span.record("conclusion", "RescheduleInWithOp");
-                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                let t = t + d;
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleInWithTx(mut tx, d)) => {
-                span.record("conclusion", "RescheduleInWithOp");
-                let t = self.clock.now() + d;
-                self.reschedule_job(&mut tx, job.id, t).await?;
-                tx.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleAt(t)) => {
-                span.record("conclusion", "RescheduleAt");
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleAtWithOp(mut op, t)) => {
-                span.record("conclusion", "RescheduleAtWithOp");
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleAtWithTx(mut tx, t)) => {
-                span.record("conclusion", "RescheduleAtWithTx");
-                self.reschedule_job(&mut tx, job.id, t).await?;
-                tx.commit().await?;
-            }
         }
         Ok(())
     }
