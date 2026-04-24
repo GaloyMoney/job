@@ -550,7 +550,7 @@ async fn poll_jobs(
             WHERE c.rn = 1
             ORDER BY je.execute_at ASC
             LIMIT $1
-            FOR UPDATE OF je
+            FOR UPDATE OF je SKIP LOCKED
         ),
         updated AS (
             UPDATE job_executions AS je
