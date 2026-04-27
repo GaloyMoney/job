@@ -111,8 +111,7 @@ where
     #[instrument(
         name = "job_spawner.spawn",
         skip(self, config),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn(
         &self,
@@ -129,8 +128,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_in_op",
         skip(self, op, config),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_in_op(
         &self,
@@ -146,8 +144,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_at",
         skip(self, config),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_at(
         &self,
@@ -167,8 +164,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_at_in_op",
         skip(self, op, config),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_at_in_op(
         &self,
@@ -187,8 +183,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_with_queue_id",
         skip(self, config, queue_id),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_with_queue_id(
         &self,
@@ -210,8 +205,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_with_queue_id_in_op",
         skip(self, op, config, queue_id),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_with_queue_id_in_op(
         &self,
@@ -231,8 +225,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_at_with_queue_id",
         skip(self, config, queue_id),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_at_with_queue_id(
         &self,
@@ -256,8 +249,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_at_with_queue_id_in_op",
         skip(self, op, config, queue_id),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_at_with_queue_id_in_op(
         &self,
@@ -278,8 +270,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_all",
         skip(self, specs),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_all(&self, specs: Vec<JobSpec<Config>>) -> Result<Vec<Job>, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
@@ -295,8 +286,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_all_in_op",
         skip(self, op, specs),
-        fields(job_type = %self.job_type, count),
-        err
+        fields(job_type = %self.job_type, count)
     )]
     pub async fn spawn_all_in_op(
         &self,
@@ -367,8 +357,7 @@ where
     #[instrument(
         name = "job_spawner.spawn_unique",
         skip(self, config),
-        fields(job_type = %self.job_type),
-        err
+        fields(job_type = %self.job_type)
     )]
     pub async fn spawn_unique(
         self,
@@ -398,7 +387,7 @@ where
         Ok(())
     }
 
-    #[instrument(name = "job.create_internal", skip(self, op, config), fields(job_type = %self.job_type), err)]
+    #[instrument(name = "job.create_internal", skip(self, op, config), fields(job_type = %self.job_type))]
     async fn create_job_internal<C: Serialize + Send>(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -423,7 +412,7 @@ where
         Ok(job)
     }
 
-    #[instrument(name = "job.insert_execution", skip_all, err)]
+    #[instrument(name = "job.insert_execution", skip_all)]
     async fn insert_execution(
         &self,
         op: &mut impl es_entity::AtomicOperation,
