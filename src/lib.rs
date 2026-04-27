@@ -645,7 +645,7 @@ impl Jobs {
     ///
     /// If not called manually, shutdown will be automatically triggered when the
     /// Jobs instance is dropped.
-    #[instrument(name = "job.shutdown", skip(self), err)]
+    #[instrument(name = "job.shutdown", skip(self))]
     pub async fn shutdown(&self) -> Result<(), JobError> {
         if let Some(handle) = &self.poller_handle {
             handle.shutdown().await?;

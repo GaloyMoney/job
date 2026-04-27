@@ -175,8 +175,7 @@ impl JobPoller {
         name = "job.poll_and_dispatch",
         level = "debug",
         skip(self),
-        fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in),
-        err
+        fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in)
     )]
     async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
         let span = Span::current();
@@ -393,8 +392,7 @@ impl JobPoller {
     #[instrument(
         name = "job.dispatch_job",
         skip(self, polled_job),
-        fields(job_id, job_type, poller_id, attempt, now),
-        err
+        fields(job_id, job_type, poller_id, attempt, now)
     )]
     async fn dispatch_job(&self, polled_job: PolledJob) -> Result<(), JobError> {
         let span = Span::current();
@@ -503,7 +501,7 @@ impl JobPoller {
     }
 }
 
-#[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty), err)]
+#[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty))]
 async fn poll_jobs(
     pool: &PgPool,
     n_jobs_to_poll: usize,
@@ -780,7 +778,7 @@ async fn perform_shutdown(
     kill_remaining_jobs(repo, instance_id, clock).await
 }
 
-#[instrument(name = "jobs.kill_remaining_jobs", skip(repo, clock), fields(instance_id = %instance_id, n_killed = tracing::field::Empty), err)]
+#[instrument(name = "jobs.kill_remaining_jobs", skip(repo, clock), fields(instance_id = %instance_id, n_killed = tracing::field::Empty))]
 async fn kill_remaining_jobs(
     repo: Arc<JobRepo>,
     instance_id: uuid::Uuid,

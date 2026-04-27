@@ -50,8 +50,8 @@ impl JobDispatcher {
     }
 
     #[instrument(name = "job.execute_job", skip_all,
-        fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now),
-    err)]
+        fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now)
+    )]
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_job(
         mut self,
