@@ -160,11 +160,11 @@ fn default_job_lost_interval() -> Duration {
 }
 
 fn default_max_jobs_per_process() -> usize {
-    50
+    75
 }
 
 fn default_min_jobs_per_process() -> usize {
-    30
+    50
 }
 
 fn default_shutdown_timeout() -> Duration {
