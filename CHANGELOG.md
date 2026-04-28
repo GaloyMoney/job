@@ -1,3 +1,11 @@
+# [job release v0.6.22](https://github.com/GaloyMoney/job/releases/tag/0.6.22)
+
+
+
+### Miscellaneous Tasks
+
+- Remove err from instrumentation (#97)
+
 # [job release v0.6.21](https://github.com/GaloyMoney/job/releases/tag/0.6.21)
 
 
