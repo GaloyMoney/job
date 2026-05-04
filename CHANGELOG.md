@@ -1,3 +1,11 @@
+# [job release v0.6.23](https://github.com/GaloyMoney/job/releases/tag/0.6.23)
+
+
+
+### Bug Fixes
+
+- Measure liveness in wall-clock time, not the application clock (#100)
+
 # [job release v0.6.22](https://github.com/GaloyMoney/job/releases/tag/0.6.22)
 
 
