@@ -221,14 +221,18 @@ impl JobPoller {
         let instance_id = self.instance_id;
         OwnedTaskHandle::new(spawn_named_task!("job-poller-lost-handler", async move {
             loop {
-                clock.sleep_coalesce(job_lost_interval / 2).await;
-                let now = clock.now();
-                let check_time = now - job_lost_interval;
+                // Liveness is a wall-clock question — a manual application clock
+                // can be frozen between operator-driven advances while the OS
+                // process holding a job either is or isn't actually alive.
+                tokio::time::sleep(job_lost_interval / 2).await;
+                let alive_threshold = chrono::Utc::now() - job_lost_interval;
+                let reschedule_at = clock.now();
 
                 let span = tracing::debug_span!(
                     parent: None,
                     "job.detect_lost_jobs",
-                    check_time = %check_time,
+                    alive_threshold = %alive_threshold,
+                    reschedule_at = %reschedule_at,
                     instance_id = %instance_id,
                     n_lost_jobs = tracing::field::Empty,
                 );
@@ -237,15 +241,16 @@ impl JobPoller {
                     if let Ok(rows) = sqlx::query!(
                         r#"
                         UPDATE job_executions
-                        SET state = 'pending', execute_at = $1, attempt_index = attempt_index + 1, poller_instance_id = NULL
+                        SET state = 'pending', execute_at = $4, attempt_index = attempt_index + 1, poller_instance_id = NULL
                         WHERE state = 'running' AND alive_at < $1::timestamptz
                         AND job_type = ANY($2)
                         AND poller_instance_id IS DISTINCT FROM $3
                         RETURNING id as id
                         "#,
-                        check_time,
+                        alive_threshold,
                         &supported_job_types as _,
                         instance_id,
+                        reschedule_at,
                     )
                     .fetch_all(&pool)
                     .await
@@ -269,13 +274,15 @@ impl JobPoller {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
         let instance_id = self.instance_id;
-        let clock = self.clock.clone();
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
             async move {
                 let mut failures = 0;
                 loop {
-                    let now = clock.now();
+                    // alive_at is a wall-clock liveness heartbeat. Using the
+                    // application clock would let a frozen manual clock make
+                    // a healthy poller appear stale to its peers.
+                    let now = chrono::Utc::now();
                     let span = tracing::debug_span!(
                         parent: None,
                         "job.keep_alive",
@@ -311,7 +318,7 @@ impl JobPoller {
                     .instrument(span)
                     .await;
 
-                    clock.sleep_coalesce(timeout).await;
+                    tokio::time::sleep(timeout).await;
                 }
             }
         ))
@@ -509,8 +516,12 @@ async fn poll_jobs(
     supported_job_types: &[super::entity::JobType],
     clock: &ClockHandle,
 ) -> Result<JobPollResult, sqlx::Error> {
-    let now = clock.now();
-    Span::current().record("now", tracing::field::display(now));
+    // sim_now drives execute_at scheduling (whatever clock the application uses);
+    // wall_now drives the initial alive_at heartbeat so liveness is always
+    // measured in real time, independent of manual-clock advances.
+    let sim_now = clock.now();
+    let wall_now = chrono::Utc::now();
+    Span::current().record("now", tracing::field::display(sim_now));
 
     let rows = sqlx::query_as!(
         JobPollRow,
@@ -552,7 +563,7 @@ async fn poll_jobs(
         ),
         updated AS (
             UPDATE job_executions AS je
-            SET state = 'running', alive_at = $2, execute_at = NULL, poller_instance_id = $3
+            SET state = 'running', alive_at = $5, execute_at = NULL, poller_instance_id = $3
             FROM selected_jobs
             WHERE je.id = selected_jobs.id
               AND je.state = 'pending'
@@ -576,9 +587,10 @@ async fn poll_jobs(
         ) AS result
         "#,
         n_jobs_to_poll as i32,
-        now,
+        sim_now,
         instance_id,
         supported_job_types as _,
+        wall_now,
     )
     .fetch_all(pool)
     .await?;
