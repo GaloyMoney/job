@@ -1950,20 +1950,21 @@ async fn test_lost_handler_skips_own_instance_running_jobs() -> anyhow::Result<(
         assert!(attempts < 50, "listener job never reached running state");
     }
 
-    // 3) Force alive_at into the past so the lost-handler would find it stale.
-    let stale_time = clock.now() - chrono::Duration::seconds(60);
+    // 3) Force alive_at into the past (in wall-clock terms) so the
+    //    lost-handler would find it stale.
+    let stale_time = chrono::Utc::now() - chrono::Duration::seconds(60);
     sqlx::query("UPDATE job_executions SET alive_at = $1 WHERE id = $2")
         .bind(stale_time)
         .bind(listener_id)
         .execute(&pool)
         .await?;
 
-    // 4) Advance the manual clock by 2 * job_lost_interval. This fires both
-    //    the keep-alive and lost-handler coalesce wakes.
-    controller.advance(Duration::from_secs(20)).await;
-
-    // Give the loops a tick.
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // 4) Wait long enough for both the keep-alive and lost-handler loops
+    //    (which now tick on real wall time) to fire at least once. The
+    //    keep-alive runs every job_lost_interval/4 = 2.5s and the lost-handler
+    //    every job_lost_interval/2 = 5s; sleep covers both.
+    tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+    let _ = controller; // silence unused-warning; clock no longer drives these loops
 
     // 5) The listener must still be 'running' — the lost-handler should have
     //    skipped it because it belongs to our own instance.
@@ -2014,11 +2015,13 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
         job_type: JobType::new("orphan-rescue"),
     });
 
-    // Insert rows directly as if left behind by a crashed peer.
+    // Insert rows directly as if left behind by a crashed peer. alive_at is
+    // a wall-clock heartbeat now, so the "stale" timestamp must be in real
+    // time, not simulated time.
     let orphan_id = JobId::new();
     let other_instance = uuid::Uuid::now_v7();
     let now = clock.now();
-    let stale_alive_at = now - chrono::Duration::seconds(60);
+    let stale_alive_at = chrono::Utc::now() - chrono::Duration::seconds(60);
 
     // Parent row in `jobs` (FK target for job_executions).
     sqlx::query(
@@ -2047,12 +2050,12 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
     // Poll until the orphan is rescued. We check that the poller_instance_id
     // is no longer the other instance — the lost handler resets it to NULL
     // (pending) but the main poller may immediately re-claim it, so we can't
-    // reliably assert state='pending'. Each iteration advances the clock by
-    // job_lost_interval so the lost-handler gets a fresh wake.
+    // reliably assert state='pending'. The lost-handler now ticks on real
+    // wall time at job_lost_interval/2 (5s here), so a short real sleep per
+    // iteration is enough.
     let mut attempts = 0;
     loop {
-        controller.advance(Duration::from_secs(10)).await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         let row: (Option<uuid::Uuid>,) =
             sqlx::query_as("SELECT poller_instance_id FROM job_executions WHERE id = $1")
                 .bind(orphan_id)
@@ -2066,10 +2069,109 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
         }
         attempts += 1;
         assert!(
-            attempts < 20,
+            attempts < 30,
             "orphan from another instance must be rescued"
         );
     }
+    let _ = controller; // silence unused-warning; clock no longer drives this loop
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Regression: liveness must be measured in wall-clock time, not the
+/// application clock. With a manual clock that never advances, an orphan
+/// row left behind by a crashed peer must still be reclaimed within
+/// `job_lost_interval` of real wall time.
+///
+/// Before this fix, `start_lost_handler` slept on `clock.sleep_coalesce()`
+/// and computed `check_time = clock.now() - job_lost_interval`. Under a
+/// frozen manual clock that meant the lost-handler never woke and never
+/// matched stale rows — even if the orphaned process had been dead for
+/// hours of wall time. (See lana-bank PR #4934, which set
+/// `job_lost_interval = 365 days` to mask a related false-positive.)
+#[tokio::test]
+async fn test_lost_handler_uses_wall_clock_under_frozen_manual_clock() -> anyhow::Result<()> {
+    use job::JobPollerConfig;
+
+    let pool = helpers::init_pool().await?;
+    let (clock, _controller) = ClockHandle::manual();
+
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .clock(clock.clone())
+        .poller_config(JobPollerConfig {
+            job_lost_interval: Duration::from_secs(2),
+            ..Default::default()
+        })
+        .build()
+        .expect("build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let _spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("frozen-clock-orphan"),
+    });
+
+    let frozen_sim_now = clock.now();
+
+    // Insert an orphan row whose alive_at is far in the past in WALL-CLOCK
+    // terms but at the manual clock's `now` in sim terms. With sim-clock
+    // liveness this would NEVER be reclaimed (alive_at == sim_now). With
+    // wall-clock liveness it will be reclaimed within job_lost_interval.
+    let orphan_id = JobId::new();
+    let other_instance = uuid::Uuid::now_v7();
+    let stale_alive_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+    sqlx::query(
+        "INSERT INTO jobs (id, unique_per_type, job_type, created_at) VALUES ($1, false, 'frozen-clock-orphan', $2)",
+    )
+    .bind(orphan_id)
+    .bind(frozen_sim_now)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, execution_state_json, attempt_index, created_at)
+        VALUES ($1, 'frozen-clock-orphan', 'running', $2, $3, '{}', 1, $4)
+        "#,
+    )
+    .bind(orphan_id)
+    .bind(stale_alive_at)
+    .bind(other_instance)
+    .bind(frozen_sim_now)
+    .execute(&pool)
+    .await?;
+
+    jobs.start_poll().await?;
+
+    // Crucially: we never advance the manual clock. The lost-handler has to
+    // fire purely from real wall-time progress.
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let row: (Option<uuid::Uuid>,) =
+            sqlx::query_as("SELECT poller_instance_id FROM job_executions WHERE id = $1")
+                .bind(orphan_id)
+                .fetch_one(&pool)
+                .await?;
+        if row.0 != Some(other_instance) {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 20,
+            "orphan must be rescued via wall-clock liveness even with a frozen manual clock"
+        );
+    }
+
+    // Sanity check: the manual clock did not advance during this test.
+    assert_eq!(
+        clock.now(),
+        frozen_sim_now,
+        "manual clock must not have advanced; reclaim must come from wall time"
+    );
 
     jobs.shutdown().await?;
     Ok(())
