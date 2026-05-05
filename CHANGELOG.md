@@ -1,3 +1,11 @@
+# [job release v0.6.24](https://github.com/GaloyMoney/job/releases/tag/0.6.24)
+
+
+
+### Bug Fixes
+
+- Use wall-clock sleep in stale-pending-jobs checker (#101)
+
 # [job release v0.6.23](https://github.com/GaloyMoney/job/releases/tag/0.6.23)
 
 
