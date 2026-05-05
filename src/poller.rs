@@ -333,7 +333,10 @@ impl JobPoller {
             "job-poller-stale-jobs-handler",
             async move {
                 loop {
-                    clock.sleep_coalesce(pending_jobs_check_interval).await;
+                    // Staleness reporting is a wall-clock concern — a manual clock
+                    // advance should not immediately fire the stale checker before
+                    // the poller has had a chance to pick up newly-eligible jobs.
+                    tokio::time::sleep(pending_jobs_check_interval).await;
                     let now = clock.now();
 
                     let span = tracing::info_span!(
