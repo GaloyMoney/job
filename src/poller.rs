@@ -153,7 +153,12 @@ impl JobPoller {
                 }
                 Err(e) => {
                     failures += 1;
-                    tracing::error!(error = %e, failures, "main loop error");
+                    tracing::error!(
+                        exception.message = %e,
+                        exception.type = std::any::type_name_of_val(&e),
+                        failures,
+                        "main loop error"
+                    );
                     Duration::from_millis(50 << failures)
                 }
             };
@@ -310,7 +315,12 @@ impl JobPoller {
                             }
                             Err(e) => {
                                 failures += 1;
-                                tracing::error!(instance_id = %instance_id, error = %e, "keep alive error");
+                                tracing::error!(
+                                    instance_id = %instance_id,
+                                    exception.message = %e,
+                                    exception.type = std::any::type_name_of_val(&e),
+                                    "keep alive error"
+                                );
                                 Duration::from_millis(50 << failures)
                             }
                         }
@@ -388,7 +398,11 @@ impl JobPoller {
                                     .record("max_pending_duration_secs", max_pending_secs);
                             }
                             Err(e) => {
-                                tracing::error!(error = %e, "failed to check stale pending jobs");
+                                tracing::error!(
+                                    exception.message = %e,
+                                    exception.type = std::any::type_name_of_val(&e),
+                                    "failed to check stale pending jobs"
+                                );
                             }
                         }
                     }
@@ -445,7 +459,13 @@ impl JobPoller {
             .execute_job(polled_job, shutdown_rx)
             .await
             {
-                tracing::error!(job_id = %id, attempt, error = %e, "job dispatcher error");
+                tracing::error!(
+                    job_id = %id,
+                    attempt,
+                    exception.message = %e,
+                    exception.type = std::any::type_name_of_val(&e),
+                    "job dispatcher error"
+                );
             }
         });
 
