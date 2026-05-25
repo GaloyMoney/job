@@ -106,7 +106,11 @@ impl JobNotificationRouter {
                         }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "job notification listener error");
+                        tracing::error!(
+                            exception.message = %e,
+                            exception.type = std::any::type_name_of_val(&e),
+                            "job notification listener error"
+                        );
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
