@@ -1,15 +1,23 @@
-clean-deps:
-	docker compose down
+NIX_DEPS_DIR := .nix-deps
+
+.PHONY: start-deps clean-deps setup-db reset-deps sqlx-prepare check-code test-in-ci
 
 start-deps:
-	@command -v docker >/dev/null 2>&1 && docker compose up -d || echo "Docker not found, skipping start-deps"
+	@mkdir -p $(NIX_DEPS_DIR)
+	nix run .#nix-deps-base -- up -D
+	nix run .#nix-deps-base -- project is-ready --wait
+
+clean-deps:
+	-nix run .#nix-deps-base -- down
+	chmod -R u+w $(NIX_DEPS_DIR) 2>/dev/null || true
+	rm -rf $(NIX_DEPS_DIR)
 
 setup-db:
-	cargo sqlx migrate run
+	nix run .#setup-db-dev
 
-reset-deps: clean-deps start-deps setup-db
+reset-deps: clean-deps start-deps
 
-test-in-ci: start-deps setup-db
+test-in-ci: start-deps
 	cargo nextest run --workspace --verbose
 	cargo test --doc --workspace
 	cargo doc --no-deps --workspace
