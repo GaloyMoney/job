@@ -153,12 +153,22 @@
 //! ## Parameterized Job Types
 //!
 //! For cases where the job type is configured at runtime (e.g., multi-tenant inboxes),
-//! store the job type in your initializer and return it from the instance method:
+//! create it with `JobType::from_owned`, store it in your initializer, and return it
+//! from the instance method:
 //!
 //! ```ignore
 //! struct TenantJobInitializer {
 //!     job_type: JobType,
 //!     tenant_id: String,
+//! }
+//!
+//! impl TenantJobInitializer {
+//!     fn new(tenant_id: String) -> Self {
+//!         Self {
+//!             job_type: JobType::from_owned(format!("tenant.{tenant_id}.sync")),
+//!             tenant_id,
+//!         }
+//!     }
 //! }
 //!
 //! impl JobInitializer for TenantJobInitializer {

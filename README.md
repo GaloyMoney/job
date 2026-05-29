@@ -126,12 +126,21 @@ cleanup_spawner.spawn_unique(JobId::new(), CleanupConfig::default()).await?;
 ### Parameterized Job Types
 
 For cases where the job type is configured at runtime,
-store the job type in your initializer:
+create it with `JobType::from_owned` and store it in your initializer:
 
 ```rust
 struct TenantJobInitializer {
     job_type: JobType,
     tenant_id: String,
+}
+
+impl TenantJobInitializer {
+    fn new(tenant_id: String) -> Self {
+        Self {
+            job_type: JobType::from_owned(format!("tenant.{tenant_id}.sync")),
+            tenant_id,
+        }
+    }
 }
 
 impl JobInitializer for TenantJobInitializer {

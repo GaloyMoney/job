@@ -20,7 +20,8 @@ use crate::{
 #[serde(transparent)]
 /// Identifier describing a job type or class of work.
 ///
-/// Use `JobType::new` for static name registration.
+/// Use `JobType::new` for static name registration and
+/// `JobType::from_owned` for names derived from runtime configuration.
 ///
 /// # Examples
 ///
@@ -39,8 +40,11 @@ impl JobType {
         &self.0
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_owned(job_type: String) -> Self {
+    /// Creates a job type from an owned string.
+    ///
+    /// Use this when the job type is derived from runtime configuration rather
+    /// than a compile-time literal.
+    pub fn from_owned(job_type: String) -> Self {
         JobType(Cow::Owned(job_type))
     }
 }
