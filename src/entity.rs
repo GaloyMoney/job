@@ -20,7 +20,12 @@ use crate::{
 #[serde(transparent)]
 /// Identifier describing a job type or class of work.
 ///
-/// Use `JobType::new` for static name registration.
+/// Use `JobType::new` for compile-time-known names (the common case). Use
+/// `JobType::from_owned` when the name is only known at runtime — e.g. a
+/// per-instance discriminator from boot-time config in a multi-instance
+/// module. Runtime-constructed names retain the same uniqueness and
+/// registration semantics as static ones; the runner's flat global namespace
+/// does not distinguish between them.
 ///
 /// # Examples
 ///
@@ -28,6 +33,8 @@ use crate::{
 /// use job::JobType;
 ///
 /// const CLEANUP_JOB: JobType = JobType::new("cleanup-job");
+///
+/// let scoped = JobType::from_owned(format!("cleanup-job.{}", "tenant-a"));
 /// ```
 pub struct JobType(Cow<'static, str>);
 impl JobType {
@@ -39,8 +46,7 @@ impl JobType {
         &self.0
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_owned(job_type: String) -> Self {
+    pub fn from_owned(job_type: String) -> Self {
         JobType(Cow::Owned(job_type))
     }
 }
