@@ -1,7 +1,6 @@
 //! Traits and types used when defining job logic.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{
@@ -64,23 +63,6 @@ pub enum JobCompletion {
     RescheduleNowWithOp(es_entity::DbOp<'static>),
     /// Schedule a new run immediately and return a transaction that the job service will commit.
     RescheduleNowWithTx(sqlx::Transaction<'static, sqlx::Postgres>),
-    /// Schedule the next run after a delay.
-    RescheduleIn(std::time::Duration),
-    #[cfg(feature = "es-entity")]
-    /// Schedule the next run after a delay and return an `EsEntity` operation that the job service will commit.
-    RescheduleInWithOp(es_entity::DbOp<'static>, std::time::Duration),
-    /// Schedule the next run after a delay and return a transaction that the job service will commit.
-    RescheduleInWithTx(
-        sqlx::Transaction<'static, sqlx::Postgres>,
-        std::time::Duration,
-    ),
-    /// Schedule the next run at an exact timestamp.
-    RescheduleAt(DateTime<Utc>),
-    #[cfg(feature = "es-entity")]
-    /// Schedule the next run at an exact timestamp and return an `EsEntity` operation that the job service will commit.
-    RescheduleAtWithOp(es_entity::DbOp<'static>, DateTime<Utc>),
-    /// Schedule the next run at an exact timestamp and return a transaction that the job service will commit.
-    RescheduleAtWithTx(sqlx::Transaction<'static, sqlx::Postgres>, DateTime<Utc>),
 }
 
 #[async_trait]
