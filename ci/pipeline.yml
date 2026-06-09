@@ -1,7 +1,6 @@
 #@ load("@ytt:data", "data")
 
 #@ load("vendor/pipeline-fragments.lib.yml",
-#@   "public_docker_registry",
 #@   "repo_resource",
 #@   "version_resource",
 #@   "pipeline_tasks_resource",
@@ -53,7 +52,6 @@ jobs:
       - { get: pipeline-tasks }
     - task: tests
       attempts: 2
-      privileged: true
       config:
         platform: linux
         image_resource: #@ nix_task_image_config()
