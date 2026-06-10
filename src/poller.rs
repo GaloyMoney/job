@@ -854,7 +854,7 @@ async fn kill_remaining_jobs(
     for (job_id, mut job) in entities {
         let attempt_index = attempt_map[&job_id];
 
-        tracing::error!(
+        tracing::warn!(
             job_id = %job_id,
             job_type = %job.job_type,
             attempt = attempt_index,
