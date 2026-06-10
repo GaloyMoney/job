@@ -1,3 +1,17 @@
+# [job release v0.6.26](https://github.com/GaloyMoney/job/releases/tag/0.6.26)
+
+
+
+### Bug Fixes
+
+- Downgrade graceful-shutdown reschedule log from ERROR to WARN (#117)
+- Use OTel exception.* fields instead of colliding `error` in error logs (#108)
+
+### Miscellaneous Tasks
+
+- Replace docker-compose with nix process-compose for dev deps (#114)
+- Bump the all-dependencies group with 4 updates (#105)
+
 # [job release v0.6.25](https://github.com/GaloyMoney/job/releases/tag/0.6.25)
 
 
