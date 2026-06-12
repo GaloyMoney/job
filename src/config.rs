@@ -13,7 +13,7 @@ pub struct JobPollerConfig {
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_job_lost_interval")]
     /// How long a job may be in a 'running' state
-    pub job_lost_interval: Duration,
+        pub job_lost_interval: Duration,
     #[serde(default = "default_max_jobs_per_process")]
     /// Maximum number of concurrent jobs this process will execute.
     pub max_jobs_per_process: usize,
