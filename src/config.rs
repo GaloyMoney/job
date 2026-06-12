@@ -16,7 +16,7 @@ pub struct JobPollerConfig {
     pub job_lost_interval: Duration,
     #[serde(default = "default_max_jobs_per_process")]
     /// Maximum number of concurrent jobs this process will execute.
-    pub max_jobs_per_process: usize,
+        pub max_jobs_per_process: usize,
     #[serde(default = "default_min_jobs_per_process")]
     /// Minimum number of concurrent jobs to keep running before the poller sleeps.
     pub min_jobs_per_process: usize,
