@@ -1894,22 +1894,29 @@ impl JobRunner for InfiniteListenerRunner {
     }
 }
 
-/// Verify that the lost-handler does NOT mark running jobs owned by its own
-/// poller instance as lost. Without the instance filter, a race between the
-/// lost-handler and the keep-alive handler can desync the in-memory job
-/// counter and permanently wedge the poller.
+/// Verify that a job with a *live* runner future on this instance is not
+/// reclaimed by the lost-handler, because the keep-alive handler keeps its
+/// `alive_at` fresh.
+///
+/// The lost-handler no longer special-cases its own instance (that exclusion is
+/// what allowed a lost terminal write to zombie forever). What protects a
+/// running row from reclaim is now *liveness*, not ownership: the keep-alive
+/// handler heartbeats only jobs that still have a live future, so a live job's
+/// `alive_at` (a wall-clock heartbeat) never crosses the staleness threshold.
 #[tokio::test]
-async fn test_lost_handler_skips_own_instance_running_jobs() -> anyhow::Result<()> {
+async fn test_keep_alive_protects_live_own_instance_jobs() -> anyhow::Result<()> {
     use job::JobPollerConfig;
 
     let pool = helpers::init_pool().await?;
-    let (clock, controller) = ClockHandle::manual();
 
+    // Use the real clock: the keep-alive and lost-handler now measure liveness
+    // in wall-clock time, so a manual clock would not drive them.
     let config = JobSvcConfig::builder()
         .pool(pool.clone())
-        .clock(clock.clone())
         .poller_config(JobPollerConfig {
-            job_lost_interval: Duration::from_secs(10),
+            // Short interval so the lost-handler (fires every interval/2) gets
+            // several chances to reclaim within the test window.
+            job_lost_interval: Duration::from_secs(3),
             // Pin min == max == 2 so a single leaked counter slot would wedge
             // the poller. This makes the assertion strict.
             min_jobs_per_process: 2,
@@ -1929,7 +1936,8 @@ async fn test_lost_handler_skips_own_instance_running_jobs() -> anyhow::Result<(
 
     jobs.start_poll().await?;
 
-    // 2) Spawn the listener. It will park at shutdown_requested().
+    // 2) Spawn the listener. It will park at shutdown_requested(), keeping its
+    //    future live for the duration of the test.
     let listener_id = JobId::new();
     listener_spawner
         .spawn(listener_id, InfiniteListenerConfig)
@@ -1950,34 +1958,29 @@ async fn test_lost_handler_skips_own_instance_running_jobs() -> anyhow::Result<(
         assert!(attempts < 50, "listener job never reached running state");
     }
 
-    // 3) Force alive_at into the past (in wall-clock terms) so the
-    //    lost-handler would find it stale.
-    let stale_time = chrono::Utc::now() - chrono::Duration::seconds(60);
-    sqlx::query("UPDATE job_executions SET alive_at = $1 WHERE id = $2")
-        .bind(stale_time)
-        .bind(listener_id)
-        .execute(&pool)
-        .await?;
+    // 3) Wait well past job_lost_interval so the wall-clock lost-handler fires
+    //    several times. The keep-alive (every interval/4) must keep the live
+    //    job's alive_at fresh so it never crosses the staleness threshold.
+    tokio::time::sleep(tokio::time::Duration::from_secs(7)).await;
 
-    // 4) Wait long enough for both the keep-alive and lost-handler loops
-    //    (which now tick on real wall time) to fire at least once. The
-    //    keep-alive runs every job_lost_interval/4 = 2.5s and the lost-handler
-    //    every job_lost_interval/2 = 5s; sleep covers both.
-    tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
-    let _ = controller; // silence unused-warning; clock no longer drives these loops
-
-    // 5) The listener must still be 'running' — the lost-handler should have
-    //    skipped it because it belongs to our own instance.
-    let row: (String,) = sqlx::query_as("SELECT state::text FROM job_executions WHERE id = $1")
-        .bind(listener_id)
-        .fetch_one(&pool)
-        .await?;
+    // 4) The listener must still be 'running' AND never reclaimed. A reclaim
+    //    NULLs poller_instance_id and bumps attempt_index, so an unchanged
+    //    attempt_index is race-free proof the keep-alive protected the job.
+    let row: (String, i32) =
+        sqlx::query_as("SELECT state::text, attempt_index FROM job_executions WHERE id = $1")
+            .bind(listener_id)
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(
         row.0, "running",
-        "own-instance running job must not be marked lost"
+        "live own-instance running job must stay running (kept fresh by keep-alive)"
+    );
+    assert_eq!(
+        row.1, 1,
+        "live job must not have been reclaimed (attempt_index must stay 1)"
     );
 
-    // 6) The poller must still be healthy — spawn a canary and confirm it runs.
+    // 5) The poller must still be healthy — spawn a canary and confirm it runs.
     //    If the counter had leaked, the poller would be wedged and this would
     //    time out.
     let canary_id = JobId::new();
