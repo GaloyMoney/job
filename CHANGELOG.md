@@ -1,3 +1,17 @@
+# [job release v0.6.27](https://github.com/GaloyMoney/job/releases/tag/0.6.27)
+
+
+
+### Bug Fixes
+
+- Heartbeat only live jobs so a lost terminal write can't zombie (#123)
+
+### Miscellaneous Tasks
+
+- Bump the all-dependencies group with 2 updates (#121)
+- Bump es-entity to 0.10.40 (#120)
+- Bump the all-dependencies group across 1 directory with 2 updates (#115)
+
 # [job release v0.6.26](https://github.com/GaloyMoney/job/releases/tag/0.6.26)
 
 
