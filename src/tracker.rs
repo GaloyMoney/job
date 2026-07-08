@@ -1,5 +1,6 @@
 use tokio::sync::{Notify, mpsc};
 
+use std::collections::HashMap;
 use std::sync::{
     Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -11,6 +12,54 @@ use super::JobId;
 pub(crate) enum LiveJobEvent {
     Started(JobId),
     Finished(JobId),
+}
+
+/// Ref-counted set of jobs with a live runner future on this instance, owned by
+/// the keep-alive handler.
+///
+/// A single job id can have more than one live runner at once on the same
+/// instance: a self-reclaim (the lost-handler reclaiming a stale-but-still-live
+/// row) lets the poller re-dispatch a job while its previous future is still
+/// running. A plain set would drop the id on the *first* `Finished`, leaving the
+/// other still-live runner un-heartbeated. Counting keeps the id alive until the
+/// last runner finishes.
+#[derive(Default)]
+pub(crate) struct LiveJobs {
+    counts: HashMap<JobId, usize>,
+}
+
+impl LiveJobs {
+    pub fn apply(&mut self, event: LiveJobEvent) {
+        match event {
+            LiveJobEvent::Started(id) => {
+                *self.counts.entry(id).or_insert(0) += 1;
+            }
+            LiveJobEvent::Finished(id) => {
+                // `get_mut` guards an unmatched `Finished` (a runner that errored
+                // before it registered): decrement nothing rather than evict a
+                // different runner's still-live id.
+                if let Some(n) = self.counts.get_mut(&id) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.counts.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// The distinct live job ids as raw UUIDs, for binding to `id = ANY($n)`.
+    pub fn ids(&self) -> Vec<uuid::Uuid> {
+        self.counts.keys().map(|id| uuid::Uuid::from(*id)).collect()
+    }
 }
 
 pub(crate) struct JobTracker {
@@ -73,5 +122,38 @@ impl JobTracker {
         if rescheduled || n_running_jobs == self.min_jobs {
             self.notify.notify_one();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_id_until_last_runner_finishes() {
+        let id = JobId::new();
+        let mut live = LiveJobs::default();
+
+        // Two concurrent runners for the same id (self-reclaim re-dispatch).
+        live.apply(LiveJobEvent::Started(id));
+        live.apply(LiveJobEvent::Started(id));
+        assert_eq!(live.len(), 1);
+
+        // First runner finishes: the id must stay live for the second.
+        live.apply(LiveJobEvent::Finished(id));
+        assert!(!live.is_empty(), "id dropped while a runner is still live");
+        assert_eq!(live.ids().len(), 1);
+
+        // Second runner finishes: only now is the id removed.
+        live.apply(LiveJobEvent::Finished(id));
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn ignores_unmatched_finished() {
+        let id = JobId::new();
+        let mut live = LiveJobs::default();
+        live.apply(LiveJobEvent::Finished(id));
+        assert!(live.is_empty());
     }
 }

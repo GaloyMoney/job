@@ -25,6 +25,7 @@ pub(crate) struct JobDispatcher {
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
     rescheduled: bool,
+    dispatched: bool,
     id: JobId,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
@@ -45,6 +46,7 @@ impl JobDispatcher {
             runner: Some(runner),
             tracker,
             rescheduled: false,
+            dispatched: false,
             id,
             instance_id,
             clock,
@@ -93,6 +95,7 @@ impl JobDispatcher {
             self.clock.clone(),
             Arc::clone(&self.repo),
         );
+        self.dispatched = true;
         self.tracker.dispatch_job(self.id);
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
@@ -363,6 +366,12 @@ impl JobDispatcher {
 
 impl Drop for JobDispatcher {
     fn drop(&mut self) {
-        self.tracker.job_completed(self.id, self.rescheduled)
+        // Only balance the counter/registry if we actually registered. If
+        // `execute_job` errored before `dispatch_job` ran, there was no
+        // `Started`; emitting `Finished` here would drop another runner's live
+        // id and underflow the running-jobs counter.
+        if self.dispatched {
+            self.tracker.job_completed(self.id, self.rescheduled);
+        }
     }
 }

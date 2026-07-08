@@ -5,7 +5,6 @@ use sqlx::postgres::{PgPool, types::PgInterval};
 use tracing::{Instrument, Span, instrument};
 
 use std::{
-    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -22,7 +21,7 @@ use super::{
     handle::OwnedTaskHandle,
     registry::JobRegistry,
     repo::JobRepo,
-    tracker::{JobTracker, LiveJobEvent},
+    tracker::{JobTracker, LiveJobEvent, LiveJobs},
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -295,20 +294,17 @@ impl JobPoller {
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
             async move {
-                // Jobs with a live runner future; the heartbeat is scoped to these
-                // so an orphaned `running` row stops being refreshed and goes stale.
-                let mut live_jobs: HashSet<JobId> = HashSet::new();
+                // Ref-counted set of jobs with a live runner future on this
+                // instance; the heartbeat is scoped to these ids, so an orphaned
+                // `running` row (no live future) stops being refreshed and goes
+                // stale. Note `poll_jobs` already seeds a fresh `alive_at` when it
+                // marks a row `running`, so a just-dispatched job is covered from
+                // the moment it exists — the keep-alive only continues that.
+                let mut live_jobs = LiveJobs::default();
                 let mut failures = 0;
                 loop {
                     while let Ok(event) = live_events_rx.try_recv() {
-                        match event {
-                            LiveJobEvent::Started(id) => {
-                                live_jobs.insert(id);
-                            }
-                            LiveJobEvent::Finished(id) => {
-                                live_jobs.remove(&id);
-                            }
-                        }
+                        live_jobs.apply(event);
                     }
 
                     // alive_at is a wall-clock liveness heartbeat (see lost-handler).
@@ -327,8 +323,7 @@ impl JobPoller {
                             failures = 0;
                             return job_lost_interval / 4;
                         }
-                        let live_ids: Vec<uuid::Uuid> =
-                            live_jobs.iter().map(|id| uuid::Uuid::from(*id)).collect();
+                        let live_ids = live_jobs.ids();
                         match sqlx::query!(
                             r#"
                         UPDATE job_executions
