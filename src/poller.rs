@@ -5,6 +5,7 @@ use sqlx::postgres::{PgPool, types::PgInterval};
 use tracing::{Instrument, Span, instrument};
 
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,8 +14,15 @@ use std::{
 };
 
 use super::{
-    JobId, config::JobPollerConfig, dispatcher::*, entity::JobType, error::JobError,
-    handle::OwnedTaskHandle, registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
+    JobId,
+    config::JobPollerConfig,
+    dispatcher::*,
+    entity::JobType,
+    error::JobError,
+    handle::OwnedTaskHandle,
+    registry::JobRegistry,
+    repo::JobRepo,
+    tracker::{JobTracker, LiveJobEvent},
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -102,7 +110,8 @@ impl JobPoller {
         router_waiter_handle: OwnedTaskHandle,
     ) -> JobPollerHandle {
         let lost_handle = self.start_lost_handler();
-        let keep_alive_handle = self.start_keep_alive_handler();
+        let live_events_rx = self.tracker.take_live_job_events();
+        let keep_alive_handle = self.start_keep_alive_handler(live_events_rx);
         let stale_jobs_handle = self.start_stale_jobs_handler();
         let shutdown_tx = self.shutdown_tx.clone();
         let repo = Arc::clone(&self.repo);
@@ -243,18 +252,19 @@ impl JobPoller {
                 );
 
                 async {
+                    // No `poller_instance_id IS DISTINCT FROM self` gate: a stale
+                    // row is no longer heartbeated, so self-owned orphans are safe
+                    // to reclaim and single-pod deploys self-heal.
                     if let Ok(rows) = sqlx::query!(
                         r#"
                         UPDATE job_executions
-                        SET state = 'pending', execute_at = $4, attempt_index = attempt_index + 1, poller_instance_id = NULL
+                        SET state = 'pending', execute_at = $3, attempt_index = attempt_index + 1, poller_instance_id = NULL
                         WHERE state = 'running' AND alive_at < $1::timestamptz
                         AND job_type = ANY($2)
-                        AND poller_instance_id IS DISTINCT FROM $3
                         RETURNING id as id
                         "#,
                         alive_threshold,
                         &supported_job_types as _,
-                        instance_id,
                         reschedule_at,
                     )
                     .fetch_all(&pool)
@@ -275,36 +285,61 @@ impl JobPoller {
         }))
     }
 
-    fn start_keep_alive_handler(&self) -> OwnedTaskHandle {
+    fn start_keep_alive_handler(
+        &self,
+        mut live_events_rx: tokio::sync::mpsc::UnboundedReceiver<LiveJobEvent>,
+    ) -> OwnedTaskHandle {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
         let instance_id = self.instance_id;
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
             async move {
+                // Jobs with a live runner future; the heartbeat is scoped to these
+                // so an orphaned `running` row stops being refreshed and goes stale.
+                let mut live_jobs: HashSet<JobId> = HashSet::new();
                 let mut failures = 0;
                 loop {
-                    // alive_at is a wall-clock liveness heartbeat. Using the
-                    // application clock would let a frozen manual clock make
-                    // a healthy poller appear stale to its peers.
+                    while let Ok(event) = live_events_rx.try_recv() {
+                        match event {
+                            LiveJobEvent::Started(id) => {
+                                live_jobs.insert(id);
+                            }
+                            LiveJobEvent::Finished(id) => {
+                                live_jobs.remove(&id);
+                            }
+                        }
+                    }
+
+                    // alive_at is a wall-clock liveness heartbeat (see lost-handler).
                     let now = chrono::Utc::now();
                     let span = tracing::debug_span!(
                         parent: None,
                         "job.keep_alive",
                         instance_id = %instance_id,
                         now = %now,
+                        n_live_jobs = live_jobs.len(),
                         failures
                     );
 
                     let timeout = async {
+                        if live_jobs.is_empty() {
+                            failures = 0;
+                            return job_lost_interval / 4;
+                        }
+                        let live_ids: Vec<uuid::Uuid> =
+                            live_jobs.iter().map(|id| uuid::Uuid::from(*id)).collect();
                         match sqlx::query!(
                             r#"
                         UPDATE job_executions
                         SET alive_at = $1
-                        WHERE poller_instance_id = $2 AND state = 'running'
+                        WHERE poller_instance_id = $2
+                          AND state = 'running'
+                          AND id = ANY($3)
                         "#,
                             now,
                             instance_id,
+                            &live_ids,
                         )
                         .execute(&pool)
                         .await
