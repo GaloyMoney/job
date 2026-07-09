@@ -1598,6 +1598,66 @@ async fn test_await_completions_timeout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression test for the `await_completions` wedge: an orchestrator that waits
+/// on a burst of fast-completing jobs must not hang when their terminal
+/// notifications are dropped.
+///
+/// Preconditions are reproduced deterministically: a size-1 terminal broadcast
+/// buffer so a completion burst overflows it and those notifications are lost
+/// (they are never redelivered), leaving the periodic reconciliation sweep as
+/// the sole resolution path. Previously that sweep was the lowest-priority arm
+/// of a `biased` select and could be starved indefinitely by a terminal
+/// firehose, wedging `await_completions(None)` until the process restarted. With
+/// the sweep polled first, a bounded `sweep_interval` caps resolution regardless
+/// of load — so this must complete well within the timeout.
+#[tokio::test]
+async fn test_await_completions_resolves_when_notifications_dropped() -> anyhow::Result<()> {
+    use job::JobPollerConfig;
+
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .poller_config(JobPollerConfig {
+            // Tiny buffer: a completion burst overflows it and terminal
+            // notifications are dropped, forcing resolution through the sweep.
+            terminal_channel_size: 1,
+            // Short cadence so the (now unstarvable) backstop is fast to assert on.
+            sweep_interval: Duration::from_millis(250),
+            ..Default::default()
+        })
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("await-completions-dropped-notifications"),
+    });
+    jobs.start_poll().await?;
+
+    // A burst of fast jobs that all finish in a tight window.
+    let ids: Vec<JobId> = (0..40).map(|_| JobId::new()).collect();
+    for id in &ids {
+        spawner.spawn(*id, TestJobConfig { delay_ms: 10 }).await?;
+    }
+
+    // `None` = wait indefinitely. It must still resolve — via the sweep — despite
+    // the dropped notifications. The outer timeout is the wedge assertion.
+    let outcomes =
+        tokio::time::timeout(Duration::from_secs(20), jobs.await_completions(&ids, None))
+            .await
+            .expect("await_completions wedged: dropped notifications were never reconciled")?;
+
+    assert_eq!(outcomes.len(), ids.len());
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_job_completion_results_trait() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;

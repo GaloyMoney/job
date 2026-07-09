@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::JobId;
 use crate::entity::JobType;
@@ -10,7 +10,7 @@ use crate::repo::JobRepo;
 use crate::tracker::JobTracker;
 use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::instrument;
+use tracing::{Span, instrument};
 
 /// Notification types from the unified `job_events` channel.
 #[derive(Debug, serde::Deserialize)]
@@ -22,21 +22,47 @@ enum JobNotification {
 
 type WaiterRegistration = (JobId, oneshot::Sender<JobTerminalState>);
 
+/// The set of oneshot senders waiting on a single job, plus when the first of
+/// them registered. `registered_at` powers the oldest-waiter-age gauge so a
+/// stalled wait is observable instead of silent.
+struct Waiters {
+    senders: Vec<oneshot::Sender<JobTerminalState>>,
+    registered_at: Instant,
+}
+
+impl Waiters {
+    fn new() -> Self {
+        Self {
+            senders: Vec::new(),
+            registered_at: Instant::now(),
+        }
+    }
+}
+
+type WaiterMap = HashMap<JobId, Waiters>;
+
 pub(crate) struct JobNotificationRouter {
     pool: PgPool,
     repo: Arc<JobRepo>,
     terminal_tx: broadcast::Sender<JobId>,
     register_tx: OnceLock<mpsc::UnboundedSender<WaiterRegistration>>,
+    sweep_interval: Duration,
 }
 
 impl JobNotificationRouter {
-    pub fn new(pool: &PgPool, repo: Arc<JobRepo>, buffer_size: usize) -> Self {
+    pub fn new(
+        pool: &PgPool,
+        repo: Arc<JobRepo>,
+        buffer_size: usize,
+        sweep_interval: Duration,
+    ) -> Self {
         let (terminal_tx, _) = broadcast::channel(buffer_size.max(1));
         Self {
             pool: pool.clone(),
             repo,
             terminal_tx,
             register_tx: OnceLock::new(),
+            sweep_interval,
         }
     }
 
@@ -68,6 +94,7 @@ impl JobNotificationRouter {
             self.terminal_tx.subscribe(),
             self.pool.clone(),
             self.repo.clone(),
+            self.sweep_interval,
         );
         Ok((listener_handle, waiter_handle))
     }
@@ -125,47 +152,42 @@ impl JobNotificationRouter {
         mut terminal_rx: broadcast::Receiver<JobId>,
         pool: PgPool,
         repo: Arc<JobRepo>,
+        sweep_interval: Duration,
     ) -> OwnedTaskHandle {
         let handle = tokio::spawn(async move {
-            let mut waiters: HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>> =
-                HashMap::new();
-            let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
+            let mut waiters: WaiterMap = HashMap::new();
+            let mut sweep = tokio::time::interval(sweep_interval);
+            // Missed ticks are redundant (the sweep is idempotent), so don't let
+            // a brief stall queue a burst of catch-up sweeps.
+            sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
                     biased;
 
-                    Some((job_id, tx)) = register_rx.recv() => {
-                        // Immediate DB check: no execution row means the job is terminal
-                        match has_execution_row(&pool, job_id).await {
-                            Ok(false) => {
-                                // No execution row → job is terminal, but the caller
-                                // needs to know *how* it ended (Completed vs Errored),
-                                // so we load the entity's event history.
-                                // On transient DB failure the waiter is parked for the
-                                // sweep to retry.
-                                match load_terminal_state(&repo, job_id).await {
-                                    Some(state) => {
-                                        let _ = tx.send(state);
-                                        send_to_waiters(&mut waiters, job_id, state);
-                                    }
-                                    None => {
-                                        waiters.entry(job_id).or_default().push(tx);
-                                    }
-                                }
-                            }
-                            Ok(true) => {
-                                waiters.entry(job_id).or_default().push(tx);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "register_waiter: failed to check execution row"
-                                );
-                                // Register anyway — sweep will catch it
-                                waiters.entry(job_id).or_default().push(tx);
-                            }
+                    // The reconciliation sweep is polled FIRST so a sustained
+                    // terminal-notification firehose can never starve it. It is
+                    // the only backstop that resolves waiters whose single
+                    // terminal notification was dropped (broadcast overflow) and
+                    // is never redelivered; if it can be starved, those waiters
+                    // wedge until the process restarts. `tick()` is ready only
+                    // once per interval, so giving it priority only pre-empts the
+                    // register/terminal branches for one iteration per period.
+                    _ = sweep.tick() => {
+                        sweep_waiters(&mut waiters, &pool, &repo).await;
+                    }
+
+                    // Registration is polled before the terminal branch so a
+                    // waiter lands in the map before the terminal notification
+                    // for its job is processed (avoids a lost wakeup). All
+                    // immediately-available registrations are drained and checked
+                    // with a single query rather than one round-trip per waiter.
+                    Some(reg) = register_rx.recv() => {
+                        let mut batch = vec![reg];
+                        while let Ok(next) = register_rx.try_recv() {
+                            batch.push(next);
                         }
+                        register_waiters(&mut waiters, &pool, &repo, batch).await;
                     }
 
                     result = terminal_rx.recv() => {
@@ -204,10 +226,6 @@ impl JobNotificationRouter {
                             }
                         }
                     }
-
-                    _ = sweep.tick() => {
-                        sweep_waiters(&mut waiters, &pool, &repo).await;
-                    }
                 }
             }
         });
@@ -216,34 +234,98 @@ impl JobNotificationRouter {
     }
 }
 
-const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Register a batch of completion-waiters.
+///
+/// Every registration is parked first (so a concurrent terminal notification can
+/// find it), then a single query determines which jobs are still running; any
+/// job with no execution row is already terminal and is resolved immediately in
+/// one batched entity load. This replaces the previous one-DB-round-trip-per-
+/// registration path, which both serialized large batches and monopolized the
+/// waiter-manager while completion notifications piled up and overflowed.
+async fn register_waiters(
+    waiters: &mut WaiterMap,
+    pool: &PgPool,
+    repo: &JobRepo,
+    batch: Vec<WaiterRegistration>,
+) {
+    let mut ids: Vec<JobId> = Vec::with_capacity(batch.len());
+    for (job_id, tx) in batch {
+        ids.push(job_id);
+        waiters
+            .entry(job_id)
+            .or_insert_with(Waiters::new)
+            .senders
+            .push(tx);
+    }
 
-/// Check whether a `job_executions` row exists for the given ID.
-async fn has_execution_row(pool: &PgPool, id: JobId) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query!("SELECT id FROM job_executions WHERE id = $1", id as JobId,)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.is_some())
+    // Single batched query: the subset of IDs that still have execution rows
+    // (i.e. are still running). Any ID NOT returned is terminal.
+    let still_running: HashSet<JobId> = match sqlx::query_scalar!(
+        "SELECT id FROM job_executions WHERE id = ANY($1)",
+        &ids as &[JobId],
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.into_iter().map(JobId::from).collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "register_waiters: failed to batch-check execution rows"
+            );
+            // Everyone stays parked — the sweep will retry.
+            return;
+        }
+    };
+
+    let terminal_ids: Vec<JobId> = ids
+        .into_iter()
+        .filter(|id| !still_running.contains(id))
+        .collect();
+
+    if !terminal_ids.is_empty() {
+        batch_load_and_notify(waiters, repo, terminal_ids).await;
+    }
 }
 
 /// Sweep all waiters: prune closed receivers and check for newly-terminal jobs.
 ///
 /// Uses a single batched query instead of N sequential queries to determine
 /// which waited-on jobs have reached terminal state.
-async fn sweep_waiters(
-    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
-    pool: &PgPool,
-    repo: &JobRepo,
-) {
+///
+/// A waiter resolved here is one whose terminal notification never arrived
+/// (dropped on broadcast overflow, or a transient load failure at registration).
+/// A nonzero `n_resolved` therefore means notification delivery is lagging and
+/// the sweep is carrying completion delivery — the early warning that would have
+/// surfaced the 35 h wedge in minutes — so it is logged at `warn`.
+#[instrument(
+    name = "job.notification_router.sweep_waiters",
+    skip_all,
+    fields(n_waiters, oldest_waiter_age_secs, n_resolved)
+)]
+async fn sweep_waiters(waiters: &mut WaiterMap, pool: &PgPool, repo: &JobRepo) {
     // Prune dropped receivers
-    waiters.retain(|_, senders| {
-        senders.retain(|tx| !tx.is_closed());
-        !senders.is_empty()
+    waiters.retain(|_, w| {
+        w.senders.retain(|tx| !tx.is_closed());
+        !w.senders.is_empty()
     });
 
+    let span = Span::current();
     if waiters.is_empty() {
+        span.record("n_waiters", 0);
+        span.record("oldest_waiter_age_secs", 0u64);
+        span.record("n_resolved", 0);
         return;
     }
+
+    let n_waiters = waiters.len();
+    let oldest_age = waiters
+        .values()
+        .map(|w| w.registered_at.elapsed())
+        .max()
+        .unwrap_or_default();
+    span.record("n_waiters", n_waiters);
+    span.record("oldest_waiter_age_secs", oldest_age.as_secs());
 
     let ids: Vec<JobId> = waiters.keys().copied().collect();
 
@@ -264,10 +346,22 @@ async fn sweep_waiters(
     };
 
     // Notify waiters for jobs that no longer have an execution row
+    let mut n_resolved = 0usize;
     for id in ids {
-        if !still_running.contains(&id) {
-            load_and_notify(waiters, repo, id).await;
+        if !still_running.contains(&id) && load_and_notify(waiters, repo, id).await {
+            n_resolved += 1;
         }
+    }
+    span.record("n_resolved", n_resolved);
+
+    if n_resolved > 0 {
+        tracing::warn!(
+            n_resolved,
+            n_waiters,
+            oldest_waiter_age_secs = oldest_age.as_secs(),
+            "sweep resolved already-terminal waiters whose terminal notification \
+             was never delivered — notification delivery is lagging"
+        );
     }
 }
 
@@ -291,28 +385,25 @@ async fn load_terminal_state(repo: &JobRepo, job_id: JobId) -> Option<JobTermina
 
 /// Load the job entity and send the terminal state to all registered waiters.
 /// On failure, waiters remain registered so the sweep can retry.
-async fn load_and_notify(
-    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
-    repo: &JobRepo,
-    job_id: JobId,
-) {
+///
+/// Returns `true` if the job was terminal and its waiters were notified.
+async fn load_and_notify(waiters: &mut WaiterMap, repo: &JobRepo, job_id: JobId) -> bool {
     if !waiters.contains_key(&job_id) {
-        return;
+        return false;
     }
 
     if let Some(state) = load_terminal_state(repo, job_id).await {
         send_to_waiters(waiters, job_id, state);
+        true
+    } else {
+        false
     }
 }
 
 /// Load multiple job entities in a single query and notify all registered waiters.
 /// Jobs that fail to load remain registered for the sweep to retry.
 #[instrument(name = "job.notification_router.batch_load_and_notify", skip_all)]
-async fn batch_load_and_notify(
-    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
-    repo: &JobRepo,
-    ids: Vec<JobId>,
-) {
+async fn batch_load_and_notify(waiters: &mut WaiterMap, repo: &JobRepo, ids: Vec<JobId>) {
     // Deduplicate and keep only IDs with active waiters
     let unique_ids: Vec<JobId> = ids
         .into_iter()
@@ -350,13 +441,9 @@ async fn batch_load_and_notify(
 }
 
 /// Deliver a known terminal state to all waiters for a job.
-fn send_to_waiters(
-    waiters: &mut HashMap<JobId, Vec<oneshot::Sender<JobTerminalState>>>,
-    job_id: JobId,
-    state: JobTerminalState,
-) {
-    if let Some(senders) = waiters.remove(&job_id) {
-        for tx in senders {
+fn send_to_waiters(waiters: &mut WaiterMap, job_id: JobId, state: JobTerminalState) {
+    if let Some(w) = waiters.remove(&job_id) {
+        for tx in w.senders {
             let _ = tx.send(state);
         }
     }

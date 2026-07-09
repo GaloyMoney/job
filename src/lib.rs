@@ -288,6 +288,7 @@ impl Jobs {
             &pool,
             Arc::clone(&repo),
             config.poller_config.terminal_channel_size,
+            config.poller_config.sweep_interval,
         ));
         let clock = config.clock.clone();
         Ok(Self {
