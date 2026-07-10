@@ -8,7 +8,12 @@ use tracing::{Span, instrument};
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use super::{
-    JobId, current::CurrentJob, entity::RetryPolicy, error::JobError, repo::JobRepo, runner::*,
+    JobId,
+    current::CurrentJob,
+    entity::{Job, RetryPolicy},
+    error::JobError,
+    repo::JobRepo,
+    runner::*,
     tracker::JobTracker,
 };
 
@@ -25,6 +30,7 @@ pub(crate) struct JobDispatcher {
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
     rescheduled: bool,
+    dispatched: bool,
     id: JobId,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
@@ -45,6 +51,7 @@ impl JobDispatcher {
             runner: Some(runner),
             tracker,
             rescheduled: false,
+            dispatched: false,
             id,
             instance_id,
             clock,
@@ -57,12 +64,12 @@ impl JobDispatcher {
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_job(
         mut self,
+        job: Job,
         polled_job: PolledJob,
         shutdown_rx: tokio::sync::broadcast::Receiver<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
     ) -> Result<(), JobError> {
-        let job = self.repo.find_by_id(polled_job.id).await?;
         let span = Span::current();
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
@@ -93,6 +100,7 @@ impl JobDispatcher {
             self.clock.clone(),
             Arc::clone(&self.repo),
         );
+        self.dispatched = true;
         self.tracker.dispatch_job(self.id);
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
@@ -363,6 +371,8 @@ impl JobDispatcher {
 
 impl Drop for JobDispatcher {
     fn drop(&mut self) {
-        self.tracker.job_completed(self.id, self.rescheduled)
+        if self.dispatched {
+            self.tracker.job_completed(self.id, self.rescheduled);
+        }
     }
 }
