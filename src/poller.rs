@@ -14,8 +14,15 @@ use std::{
 };
 
 use super::{
-    JobId, config::JobPollerConfig, dispatcher::*, entity::JobType, error::JobError,
-    handle::OwnedTaskHandle, registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
+    JobId,
+    config::JobPollerConfig,
+    dispatcher::*,
+    entity::{Job, JobType},
+    error::JobError,
+    handle::OwnedTaskHandle,
+    registry::JobRegistry,
+    repo::JobRepo,
+    tracker::JobTracker,
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -210,8 +217,17 @@ impl JobPoller {
         };
         span.record("n_jobs_to_start", rows.len());
         if !rows.is_empty() {
+            let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
+            let mut entities = self.repo.find_all::<Job>(&ids).await?;
             for row in rows {
-                self.dispatch_job(row).await?;
+                let Some(job) = entities.remove(&row.id) else {
+                    tracing::error!(
+                        job_id = %row.id,
+                        "claimed job row has no entity; skipping dispatch"
+                    );
+                    continue;
+                };
+                self.dispatch_job(job, row).await?;
             }
         }
 
@@ -429,13 +445,12 @@ impl JobPoller {
 
     #[instrument(
         name = "job.dispatch_job",
-        skip(self, polled_job),
+        skip(self, job, polled_job),
         fields(job_id, job_type, poller_id, attempt, now)
     )]
-    async fn dispatch_job(&self, polled_job: PolledJob) -> Result<(), JobError> {
+    async fn dispatch_job(&self, job: Job, polled_job: PolledJob) -> Result<(), JobError> {
         let span = Span::current();
         span.record("attempt", polled_job.attempt);
-        let job = self.repo.find_by_id(polled_job.id).await?;
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
         let runner = self
