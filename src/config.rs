@@ -28,6 +28,13 @@ pub struct JobPollerConfig {
     /// Capacity of the broadcast channel used to propagate terminal-job notifications.
     pub terminal_channel_size: usize,
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[serde(default = "default_sweep_interval")]
+    /// How often the waiter-manager reconciles registered completion-waiters
+    /// against the database. This is the backstop that resolves waiters whose
+    /// terminal notification was dropped (e.g. broadcast overflow), so it must
+    /// run on a predictable cadence.
+    pub sweep_interval: Duration,
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     #[serde(default = "default_pending_jobs_check_interval")]
     /// How often to check for pending jobs that are past their scheduled execution time.
     pub pending_jobs_check_interval: Duration,
@@ -41,6 +48,7 @@ impl Default for JobPollerConfig {
             min_jobs_per_process: default_min_jobs_per_process(),
             shutdown_timeout: default_shutdown_timeout(),
             terminal_channel_size: default_terminal_channel_size(),
+            sweep_interval: default_sweep_interval(),
             pending_jobs_check_interval: default_pending_jobs_check_interval(),
         }
     }
@@ -173,6 +181,10 @@ fn default_shutdown_timeout() -> Duration {
 
 fn default_terminal_channel_size() -> usize {
     1024
+}
+
+fn default_sweep_interval() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn default_pending_jobs_check_interval() -> Duration {
