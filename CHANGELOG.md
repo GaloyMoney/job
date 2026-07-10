@@ -1,3 +1,16 @@
+# [job release v0.6.28](https://github.com/GaloyMoney/job/releases/tag/0.6.28)
+
+
+
+### Bug Fixes
+
+- Gate self-reclaim on in-process liveness so self-heal can't double-execute a job (#127)
+- Make completion-waiter sweep unstarvable so await_completions can't wedge (#126)
+
+### Miscellaneous Tasks
+
+- Bump the all-dependencies group across 1 directory with 3 updates (#125)
+
 # [job release v0.6.27](https://github.com/GaloyMoney/job/releases/tag/0.6.27)
 
 
