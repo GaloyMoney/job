@@ -25,6 +25,7 @@ pub(crate) struct JobDispatcher {
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
     rescheduled: bool,
+    dispatched: bool,
     id: JobId,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
@@ -45,6 +46,7 @@ impl JobDispatcher {
             runner: Some(runner),
             tracker,
             rescheduled: false,
+            dispatched: false,
             id,
             instance_id,
             clock,
@@ -93,6 +95,7 @@ impl JobDispatcher {
             self.clock.clone(),
             Arc::clone(&self.repo),
         );
+        self.dispatched = true;
         self.tracker.dispatch_job(self.id);
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
@@ -363,6 +366,8 @@ impl JobDispatcher {
 
 impl Drop for JobDispatcher {
     fn drop(&mut self) {
-        self.tracker.job_completed(self.id, self.rescheduled)
+        if self.dispatched {
+            self.tracker.job_completed(self.id, self.rescheduled);
+        }
     }
 }

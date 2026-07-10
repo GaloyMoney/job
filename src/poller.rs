@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use serde_json::Value as JsonValue;
@@ -5,7 +6,6 @@ use sqlx::postgres::{PgPool, types::PgInterval};
 use tracing::{Instrument, Span, instrument};
 
 use std::{
-    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,15 +14,8 @@ use std::{
 };
 
 use super::{
-    JobId,
-    config::JobPollerConfig,
-    dispatcher::*,
-    entity::JobType,
-    error::JobError,
-    handle::OwnedTaskHandle,
-    registry::JobRegistry,
-    repo::JobRepo,
-    tracker::{JobTracker, LiveJobEvent},
+    JobId, config::JobPollerConfig, dispatcher::*, entity::JobType, error::JobError,
+    handle::OwnedTaskHandle, registry::JobRegistry, repo::JobRepo, tracker::JobTracker,
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -110,8 +103,7 @@ impl JobPoller {
         router_waiter_handle: OwnedTaskHandle,
     ) -> JobPollerHandle {
         let lost_handle = self.start_lost_handler();
-        let live_events_rx = self.tracker.take_live_job_events();
-        let keep_alive_handle = self.start_keep_alive_handler(live_events_rx);
+        let keep_alive_handle = self.start_keep_alive_handler();
         let stale_jobs_handle = self.start_stale_jobs_handler();
         let shutdown_tx = self.shutdown_tx.clone();
         let repo = Arc::clone(&self.repo);
@@ -233,6 +225,7 @@ impl JobPoller {
         let clock = self.clock.clone();
         let supported_job_types = self.registry.registered_job_types();
         let instance_id = self.instance_id;
+        let tracker = Arc::clone(&self.tracker);
         OwnedTaskHandle::new(spawn_named_task!("job-poller-lost-handler", async move {
             loop {
                 // Liveness is a wall-clock question — a manual application clock
@@ -242,41 +235,43 @@ impl JobPoller {
                 let alive_threshold = chrono::Utc::now() - job_lost_interval;
                 let reschedule_at = clock.now();
 
+                let self_live_ids = tracker.live_job_ids();
+
                 let span = tracing::debug_span!(
                     parent: None,
                     "job.detect_lost_jobs",
                     alive_threshold = %alive_threshold,
                     reschedule_at = %reschedule_at,
                     instance_id = %instance_id,
+                    n_live_jobs = self_live_ids.len(),
                     n_lost_jobs = tracing::field::Empty,
                 );
 
                 async {
-                    // No `poller_instance_id IS DISTINCT FROM self` gate: a stale
-                    // row is no longer heartbeated, so self-owned orphans are safe
-                    // to reclaim and single-pod deploys self-heal.
-                    if let Ok(rows) = sqlx::query!(
-                        r#"
-                        UPDATE job_executions
-                        SET state = 'pending', execute_at = $3, attempt_index = attempt_index + 1, poller_instance_id = NULL
-                        WHERE state = 'running' AND alive_at < $1::timestamptz
-                        AND job_type = ANY($2)
-                        RETURNING id as id
-                        "#,
+                    match reclaim_lost_jobs(
+                        &pool,
+                        instance_id,
+                        &supported_job_types,
                         alive_threshold,
-                        &supported_job_types as _,
                         reschedule_at,
+                        &self_live_ids,
                     )
-                    .fetch_all(&pool)
                     .await
-                        && !rows.is_empty()
                     {
-                        Span::current().record("n_lost_jobs", rows.len());
-                        for row in rows {
-                            tracing::error!(job_id = %row.id, "lost job");
+                        Ok(ids) => {
+                            Span::current().record("n_lost_jobs", ids.len());
+                            for id in ids {
+                                tracing::error!(job_id = %id, "lost job");
+                            }
                         }
-                    } else {
-                        Span::current().record("n_lost_jobs", 0);
+                        Err(e) => {
+                            tracing::error!(
+                                exception.message = %e,
+                                exception.type = std::any::type_name_of_val(&e),
+                                "lost-handler failed to reclaim lost jobs"
+                            );
+                            Span::current().record("n_lost_jobs", 0);
+                        }
                     }
                 }
                 .instrument(span)
@@ -285,31 +280,17 @@ impl JobPoller {
         }))
     }
 
-    fn start_keep_alive_handler(
-        &self,
-        mut live_events_rx: tokio::sync::mpsc::UnboundedReceiver<LiveJobEvent>,
-    ) -> OwnedTaskHandle {
+    fn start_keep_alive_handler(&self) -> OwnedTaskHandle {
         let job_lost_interval = self.config.job_lost_interval;
         let pool = self.repo.pool().clone();
         let instance_id = self.instance_id;
+        let tracker = Arc::clone(&self.tracker);
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
             async move {
-                // Jobs with a live runner future; the heartbeat is scoped to these
-                // so an orphaned `running` row stops being refreshed and goes stale.
-                let mut live_jobs: HashSet<JobId> = HashSet::new();
                 let mut failures = 0;
                 loop {
-                    while let Ok(event) = live_events_rx.try_recv() {
-                        match event {
-                            LiveJobEvent::Started(id) => {
-                                live_jobs.insert(id);
-                            }
-                            LiveJobEvent::Finished(id) => {
-                                live_jobs.remove(&id);
-                            }
-                        }
-                    }
+                    let live_ids = tracker.live_job_ids();
 
                     // alive_at is a wall-clock liveness heartbeat (see lost-handler).
                     let now = chrono::Utc::now();
@@ -318,17 +299,15 @@ impl JobPoller {
                         "job.keep_alive",
                         instance_id = %instance_id,
                         now = %now,
-                        n_live_jobs = live_jobs.len(),
+                        n_live_jobs = live_ids.len(),
                         failures
                     );
 
                     let timeout = async {
-                        if live_jobs.is_empty() {
+                        if live_ids.is_empty() {
                             failures = 0;
                             return job_lost_interval / 4;
                         }
-                        let live_ids: Vec<uuid::Uuid> =
-                            live_jobs.iter().map(|id| uuid::Uuid::from(*id)).collect();
                         match sqlx::query!(
                             r#"
                         UPDATE job_executions
@@ -564,6 +543,36 @@ impl JobPoller {
 
         Ok(())
     }
+}
+
+async fn reclaim_lost_jobs(
+    pool: &PgPool,
+    instance_id: uuid::Uuid,
+    supported_job_types: &[JobType],
+    alive_threshold: DateTime<Utc>,
+    reschedule_at: DateTime<Utc>,
+    self_live_ids: &[uuid::Uuid],
+) -> Result<Vec<JobId>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"
+        UPDATE job_executions
+        SET state = 'pending', execute_at = $3, attempt_index = attempt_index + 1, poller_instance_id = NULL
+        WHERE state = 'running'
+          AND alive_at < $1::timestamptz
+          AND job_type = ANY($2)
+          AND (poller_instance_id IS DISTINCT FROM $4 OR id <> ALL($5))
+        RETURNING id AS "id!: JobId"
+        "#,
+        alive_threshold,
+        supported_job_types as _,
+        reschedule_at,
+        instance_id,
+        self_live_ids,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|r| r.id).collect())
 }
 
 #[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty))]
@@ -901,4 +910,102 @@ async fn kill_remaining_jobs(
     }
     op.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn init_pool() -> anyhow::Result<PgPool> {
+        let pg_con = std::env::var("PG_CON").unwrap();
+        Ok(sqlx::PgPool::connect(&pg_con).await?)
+    }
+
+    async fn seed_running_job(
+        pool: &PgPool,
+        job_type: &str,
+        instance_id: uuid::Uuid,
+        alive_at: DateTime<Utc>,
+    ) -> anyhow::Result<JobId> {
+        let id = JobId::new();
+        let uuid = uuid::Uuid::from(id);
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO jobs (id, unique_per_type, job_type, created_at) VALUES ($1, false, $2, $3)",
+        )
+        .bind(uuid)
+        .bind(job_type)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, state, poller_instance_id, attempt_index, alive_at, created_at) \
+             VALUES ($1, $2, 'running', $3, 1, $4, $5)",
+        )
+        .bind(uuid)
+        .bind(job_type)
+        .bind(instance_id)
+        .bind(alive_at)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    #[tokio::test]
+    async fn self_reclaim_skips_live_jobs() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let self_id = uuid::Uuid::now_v7();
+        let other_id = uuid::Uuid::now_v7();
+        let job_type = format!("reclaim-gate-{}", uuid::Uuid::now_v7());
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(600);
+
+        let live_self = seed_running_job(&pool, &job_type, self_id, stale).await?;
+        let orphan_self = seed_running_job(&pool, &job_type, self_id, stale).await?;
+        let other_instance = seed_running_job(&pool, &job_type, other_id, stale).await?;
+
+        let threshold = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let reschedule_at = chrono::Utc::now();
+        let self_live_ids = vec![uuid::Uuid::from(live_self)];
+        let types = vec![JobType::from_owned(job_type.clone())];
+
+        let reclaimed: std::collections::HashSet<JobId> = reclaim_lost_jobs(
+            &pool,
+            self_id,
+            &types,
+            threshold,
+            reschedule_at,
+            &self_live_ids,
+        )
+        .await?
+        .into_iter()
+        .collect();
+
+        assert!(
+            reclaimed.contains(&orphan_self),
+            "self-owned orphan (no live future) must be reclaimed"
+        );
+        assert!(
+            reclaimed.contains(&other_instance),
+            "another instance's stale row must be reclaimed"
+        );
+        assert!(
+            !reclaimed.contains(&live_self),
+            "self-owned row with a live runner must NOT be reclaimed"
+        );
+
+        let row: (String, Option<uuid::Uuid>, i32) = sqlx::query_as(
+            "SELECT state::text, poller_instance_id, attempt_index \
+             FROM job_executions WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(live_self))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.0, "running");
+        assert_eq!(row.1, Some(self_id));
+        assert_eq!(row.2, 1);
+
+        Ok(())
+    }
 }
