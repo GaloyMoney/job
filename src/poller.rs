@@ -464,7 +464,9 @@ impl JobPoller {
         span.record("now", tracing::field::display(clock.now()));
         span.record("poller_id", tracing::field::display(instance_id));
 
-        let shutdown_rx = self.shutdown_tx.subscribe();
+        let shutdown_rx_job = self.shutdown_tx.subscribe();
+        let mut shutdown_rx_monitor = self.shutdown_tx.subscribe();
+        let shutdown_timeout = self.config.shutdown_timeout;
         let job_id = job.id;
         let job_type = job.job_type.clone();
         #[cfg_attr(
@@ -473,49 +475,35 @@ impl JobPoller {
         )]
         let task_name = format!("job-{}-{}", job_type, job_id);
 
-        let job_handle = spawn_named_task!(&task_name, async move {
-            let id = job.id;
+        spawn_named_task!(&task_name, async move {
+            use tracing::Instrument;
+
             let attempt = polled_job.attempt;
-            if let Err(e) = JobDispatcher::new(
+            let job_fut = JobDispatcher::new(
                 repo,
                 tracker,
                 retry_settings,
-                job.id,
+                job_id,
                 runner,
                 instance_id,
                 clock,
             )
-            .execute_job(job, polled_job, shutdown_rx)
-            .await
-            {
-                tracing::error!(
-                    job_id = %id,
-                    attempt,
-                    exception.message = %e,
-                    exception.type = std::any::type_name_of_val(&e),
-                    "job dispatcher error"
-                );
-            }
-        });
-
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let shutdown_timeout = self.config.shutdown_timeout;
-        #[cfg_attr(
-            not(all(feature = "tokio-task-names", tokio_unstable)),
-            allow(unused_variables)
-        )]
-        let monitor_task_name = format!("job-{}-monitor-{}", job_type, job_id);
-
-        spawn_named_task!(&monitor_task_name, async move {
-            use tracing::Instrument;
-
-            tokio::pin!(job_handle);
+            .execute_job(job, polled_job, shutdown_rx_job);
+            tokio::pin!(job_fut);
 
             tokio::select! {
-                _ = &mut job_handle => {
-                    // Job completed - no need for shutdown coordination
+                res = &mut job_fut => {
+                    if let Err(e) = res {
+                        tracing::error!(
+                            job_id = %job_id,
+                            attempt,
+                            exception.message = %e,
+                            exception.type = std::any::type_name_of_val(&e),
+                            "job dispatcher error"
+                        );
+                    }
                 }
-                Ok(shutdown_notifier) = shutdown_rx.recv() => {
+                Ok(shutdown_notifier) = shutdown_rx_monitor.recv() => {
                     let (send, recv) = tokio::sync::oneshot::channel();
 
                     async {
@@ -525,13 +513,24 @@ impl JobPoller {
                                 tracing::info!("Acknowledgement sent, waiting for job completion");
                                 drop(shutdown_notifier);
 
-                                if tokio::time::timeout(shutdown_timeout, &mut job_handle).await.is_err() {
-                                    tracing::Span::current().record("job_completed", false);
-                                    tracing::warn!("Job exceeded timeout, aborting");
-                                    job_handle.abort();
-                                } else {
-                                    tracing::Span::current().record("job_completed", true);
-                                    tracing::info!("Job completed gracefully");
+                                match tokio::time::timeout(shutdown_timeout, &mut job_fut).await {
+                                    Ok(res) => {
+                                        tracing::Span::current().record("job_completed", true);
+                                        tracing::info!("Job completed gracefully");
+                                        if let Err(e) = res {
+                                            tracing::error!(
+                                                job_id = %job_id,
+                                                attempt,
+                                                exception.message = %e,
+                                                exception.type = std::any::type_name_of_val(&e),
+                                                "job dispatcher error"
+                                            );
+                                        }
+                                    }
+                                    Err(_) => {
+                                        tracing::Span::current().record("job_completed", false);
+                                        tracing::warn!("Job exceeded timeout, aborting");
+                                    }
                                 }
 
                                 let _ = send.send(());
