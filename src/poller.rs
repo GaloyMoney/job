@@ -485,7 +485,7 @@ impl JobPoller {
                 instance_id,
                 clock,
             )
-            .execute_job(polled_job, shutdown_rx)
+            .execute_job(job, polled_job, shutdown_rx)
             .await
             {
                 tracing::error!(

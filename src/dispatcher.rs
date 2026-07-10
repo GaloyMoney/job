@@ -8,7 +8,12 @@ use tracing::{Span, instrument};
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use super::{
-    JobId, current::CurrentJob, entity::RetryPolicy, error::JobError, repo::JobRepo, runner::*,
+    JobId,
+    current::CurrentJob,
+    entity::{Job, RetryPolicy},
+    error::JobError,
+    repo::JobRepo,
+    runner::*,
     tracker::JobTracker,
 };
 
@@ -59,12 +64,12 @@ impl JobDispatcher {
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_job(
         mut self,
+        job: Job,
         polled_job: PolledJob,
         shutdown_rx: tokio::sync::broadcast::Receiver<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
     ) -> Result<(), JobError> {
-        let job = self.repo.find_by_id(polled_job.id).await?;
         let span = Span::current();
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
