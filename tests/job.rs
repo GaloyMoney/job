@@ -2239,3 +2239,120 @@ async fn test_lost_handler_uses_wall_clock_under_frozen_manual_clock() -> anyhow
     jobs.shutdown().await?;
     Ok(())
 }
+
+/// An initializer whose runner fails its first attempt and succeeds on any
+/// retry, with a short deterministic backoff (no jitter).
+struct FailOnceInitializer;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FailOnceConfig;
+
+impl JobInitializer for FailOnceInitializer {
+    type Config = FailOnceConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("fail-once-job")
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(3),
+            min_backoff: Duration::from_millis(200),
+            max_backoff: Duration::from_secs(1),
+            backoff_jitter_pct: 0,
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(FailOnceRunner))
+    }
+}
+
+struct FailOnceRunner;
+
+#[async_trait]
+impl JobRunner for FailOnceRunner {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        if current_job.attempt() == 1 {
+            Err("transient failure".into())
+        } else {
+            Ok(JobCompletion::Complete)
+        }
+    }
+}
+
+/// Regression: an error retry's backoff is an operational (wall-clock)
+/// deadline, not a domain-scheduling one. Under a manual clock that is never
+/// advanced, a retry rescheduled at `sim-now + backoff` used to be
+/// permanently ineligible — the poller only claims `execute_at <= sim-now` —
+/// so one transient failure killed the job (or an outbox listener) forever.
+///
+/// The first attempt runs immediately (spawned at sim-now); it fails; the
+/// retry must then fire from real wall-time progress alone via
+/// `retry_due_wall_at`, without any clock advance.
+///
+/// (Observed in production shape on lana-bank staging sandbox `sb-realtime`:
+/// 16 of 32 outbox listeners hit a transient pool timeout at boot and their
+/// retries were stranded ~1s in the sim-future of a frozen clock, deadening
+/// approvals, disbursals and projections until the pod was replaced.)
+#[tokio::test]
+async fn test_error_retry_fires_under_frozen_manual_clock() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+
+    let (clock, _controller) = ClockHandle::manual();
+    let frozen_sim_now = clock.now();
+
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .clock(clock.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(FailOnceInitializer);
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, FailOnceConfig).await?;
+
+    // Crucially: we never advance the manual clock. The retry (200ms backoff)
+    // has to fire purely from real wall-time progress.
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let job = jobs.find(job_id).await?;
+        if job.completed() {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "errored job must be retried via wall-clock backoff even with a frozen manual clock"
+        );
+    }
+
+    let outcome = jobs.await_completion(job_id, None).await?;
+    assert_eq!(
+        outcome.state(),
+        JobTerminalState::Completed,
+        "retry must have succeeded"
+    );
+
+    // Sanity check: the manual clock did not advance during this test.
+    assert_eq!(
+        clock.now(),
+        frozen_sim_now,
+        "manual clock must not have advanced; the retry must come from wall time"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}

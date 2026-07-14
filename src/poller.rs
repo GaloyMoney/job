@@ -154,10 +154,10 @@ impl JobPoller {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
-            let timeout = match self.poll_and_dispatch(woken_up).await {
-                Ok(duration) => {
+            let wait = match self.poll_and_dispatch(woken_up).await {
+                Ok(wait) => {
                     failures = 0;
-                    duration
+                    wait
                 }
                 Err(e) => {
                     failures += 1;
@@ -167,18 +167,34 @@ impl JobPoller {
                         failures,
                         "main loop error"
                     );
-                    Duration::from_millis(50 << failures)
+                    NextPollWait {
+                        sim: Duration::from_millis(50 << failures),
+                        wall: None,
+                    }
                 }
             };
 
+            // The sim wait elapses on the application clock (on a manual clock
+            // only via advances); a wall wait — the nearest error-retry
+            // deadline — must elapse in real time even when a manual clock is
+            // frozen, so it is raced as a tokio (wall-clock) sleep.
             tokio::select! {
                 biased;
 
                 _ = shutdown_rx.recv() => {
                     break;
                 }
-                result = self.clock.timeout(timeout, self.tracker.notified()) => {
-                    woken_up = result.is_ok();
+                result = async {
+                    let notified = self.tracker.notified();
+                    match wait.wall {
+                        Some(wall) => tokio::select! {
+                            r = self.clock.timeout(wait.sim, notified) => r.is_ok(),
+                            _ = tokio::time::sleep(wall) => false,
+                        },
+                        None => self.clock.timeout(wait.sim, notified).await.is_ok(),
+                    }
+                } => {
+                    woken_up = result;
                 }
             }
         }
@@ -190,13 +206,13 @@ impl JobPoller {
         skip(self),
         fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in)
     )]
-    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
+    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<NextPollWait, JobError> {
         let span = Span::current();
         span.record("poller_id", tracing::field::display(self.instance_id));
         let Some(n_jobs_to_poll) = self.tracker.next_batch_size() else {
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
-            return Ok(MAX_WAIT);
+            return Ok(NextPollWait::max());
         };
         let supported_job_types = self.registry.registered_job_types();
         let rows = match poll_jobs(
@@ -208,10 +224,10 @@ impl JobPoller {
         )
         .await?
         {
-            JobPollResult::WaitTillNextJob(duration) => {
-                span.record("next_poll_in", tracing::field::debug(duration));
+            JobPollResult::WaitTillNextJob(wait) => {
+                span.record("next_poll_in", tracing::field::debug(wait.sim));
                 span.record("n_jobs_to_start", 0);
-                return Ok(duration);
+                return Ok(wait);
             }
             JobPollResult::Jobs(jobs) => jobs,
         };
@@ -232,7 +248,7 @@ impl JobPoller {
         }
 
         span.record("next_poll_in", tracing::field::debug(Duration::ZERO));
-        Ok(Duration::ZERO)
+        Ok(NextPollWait::immediate())
     }
 
     fn start_lost_handler(&self) -> OwnedTaskHandle {
@@ -599,7 +615,10 @@ async fn poll_jobs(
 ) -> Result<JobPollResult, sqlx::Error> {
     // sim_now drives execute_at scheduling (whatever clock the application uses);
     // wall_now drives the initial alive_at heartbeat so liveness is always
-    // measured in real time, independent of manual-clock advances.
+    // measured in real time, independent of manual-clock advances. It also
+    // gates retry_due_wall_at: an error retry's backoff is a wall-clock
+    // deadline (a transient failure heals in real time), so a frozen manual
+    // clock cannot strand an errored retry forever.
     let sim_now = clock.now();
     let wall_now = chrono::Utc::now();
     Span::current().record("now", tracing::field::display(sim_now));
@@ -608,7 +627,7 @@ async fn poll_jobs(
         JobPollRow,
         r#"
         WITH eligible AS (
-            SELECT id, queue_id, execute_at, execution_state_json, attempt_index
+            SELECT id, queue_id, execute_at, retry_due_wall_at, execution_state_json, attempt_index
             FROM job_executions
             WHERE state = 'pending'
             AND job_type = ANY($4)
@@ -620,9 +639,12 @@ async fn poll_jobs(
             )
         ),
         min_wait AS (
-            SELECT MIN(execute_at) - $2::timestamptz AS wait_time
+            SELECT
+                MIN(execute_at) - $2::timestamptz AS sim_wait,
+                MIN(retry_due_wall_at) - $5::timestamptz AS wall_wait
             FROM eligible
             WHERE execute_at > $2::timestamptz
+              AND (retry_due_wall_at IS NULL OR retry_due_wall_at > $5::timestamptz)
         ),
         candidates AS (
             SELECT id, execution_state_json AS data_json, attempt_index,
@@ -632,6 +654,7 @@ async fn poll_jobs(
                    ) AS rn
             FROM eligible
             WHERE execute_at <= $2::timestamptz
+               OR retry_due_wall_at <= $5::timestamptz
         ),
         selected_jobs AS (
             SELECT je.id, c.data_json, c.attempt_index
@@ -644,7 +667,7 @@ async fn poll_jobs(
         ),
         updated AS (
             UPDATE job_executions AS je
-            SET state = 'running', alive_at = $5, execute_at = NULL, poller_instance_id = $3
+            SET state = 'running', alive_at = $5, execute_at = NULL, retry_due_wall_at = NULL, poller_instance_id = $3
             FROM selected_jobs
             WHERE je.id = selected_jobs.id
               AND je.state = 'pending'
@@ -655,14 +678,16 @@ async fn poll_jobs(
                 u.id AS "id?: JobId",
                 u.data_json AS "data_json?: JsonValue",
                 u.attempt_index AS "attempt_index?",
-                NULL::INTERVAL AS "max_wait?: PgInterval"
+                NULL::INTERVAL AS "sim_wait?: PgInterval",
+                NULL::INTERVAL AS "wall_wait?: PgInterval"
             FROM updated u
             UNION ALL
             SELECT
                 NULL::UUID AS "id?: JobId",
                 NULL::JSONB AS "data_json?: JsonValue",
                 NULL::INT AS "attempt_index?",
-                mw.wait_time AS "max_wait?: PgInterval"
+                mw.sim_wait AS "sim_wait?: PgInterval",
+                mw.wall_wait AS "wall_wait?: PgInterval"
             FROM min_wait mw
             WHERE NOT EXISTS (SELECT 1 FROM updated)
         ) AS result
@@ -683,7 +708,34 @@ async fn poll_jobs(
 #[derive(Debug)]
 enum JobPollResult {
     Jobs(Vec<PolledJob>),
-    WaitTillNextJob(Duration),
+    WaitTillNextJob(NextPollWait),
+}
+
+/// How long the main loop should sleep before the next poll, split by
+/// timeline: `sim` elapses on the application clock (regular `execute_at`
+/// scheduling — on a manual clock this only elapses when the clock is
+/// advanced), `wall` elapses in real time (the nearest `retry_due_wall_at`
+/// error-retry deadline, which must fire even when a manual clock is frozen).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NextPollWait {
+    pub sim: Duration,
+    pub wall: Option<Duration>,
+}
+
+impl NextPollWait {
+    pub(crate) fn immediate() -> Self {
+        Self {
+            sim: Duration::ZERO,
+            wall: None,
+        }
+    }
+
+    pub(crate) fn max() -> Self {
+        Self {
+            sim: MAX_WAIT,
+            wall: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -691,20 +743,23 @@ struct JobPollRow {
     id: Option<JobId>,
     data_json: Option<JsonValue>,
     attempt_index: Option<i32>,
-    max_wait: Option<PgInterval>,
+    sim_wait: Option<PgInterval>,
+    wall_wait: Option<PgInterval>,
 }
 
 impl JobPollResult {
     /// Convert raw query rows into a JobPollResult
     pub fn from_rows(rows: Vec<JobPollRow>) -> Self {
         if rows.is_empty() {
-            JobPollResult::WaitTillNextJob(MAX_WAIT)
+            JobPollResult::WaitTillNextJob(NextPollWait::max())
         } else if rows.len() == 1 && rows[0].id.is_none() {
-            if let Some(interval) = &rows[0].max_wait {
-                JobPollResult::WaitTillNextJob(pg_interval_to_duration(interval))
-            } else {
-                JobPollResult::WaitTillNextJob(MAX_WAIT)
-            }
+            let sim = rows[0]
+                .sim_wait
+                .as_ref()
+                .map(pg_interval_to_duration)
+                .unwrap_or(MAX_WAIT);
+            let wall = rows[0].wall_wait.as_ref().map(pg_interval_to_duration);
+            JobPollResult::WaitTillNextJob(NextPollWait { sim, wall })
         } else {
             let jobs = rows
                 .into_iter()

@@ -29,6 +29,13 @@ CREATE TABLE job_executions (
   state JobExecutionState NOT NULL DEFAULT 'pending',
   execution_state_json JSONB,
   execute_at TIMESTAMPTZ,
+  -- Error retries are an operational concern (like the alive_at liveness
+  -- heartbeat), not a domain-scheduling one: a transient failure heals in
+  -- wall time, not application time. execute_at stays on the application
+  -- clock; retry_due_wall_at carries the same backoff as a wall-clock
+  -- deadline so a manual clock that is never advanced cannot strand an
+  -- errored retry forever. NULL for anything that is not an error retry.
+  retry_due_wall_at TIMESTAMPTZ,
   alive_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL
 );
@@ -44,6 +51,10 @@ CREATE INDEX idx_job_executions_running_alive_at
 CREATE INDEX idx_job_executions_pending_execute_at
   ON job_executions(execute_at)
   WHERE state = 'pending';
+
+CREATE INDEX idx_job_executions_pending_retry_due_wall_at
+  ON job_executions(retry_due_wall_at)
+  WHERE state = 'pending' AND retry_due_wall_at IS NOT NULL;
 
 CREATE INDEX idx_job_executions_pending_job_type_execute_at
   ON job_executions(job_type, execute_at)

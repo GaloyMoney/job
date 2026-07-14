@@ -266,8 +266,9 @@ impl JobDispatcher {
 
         let retry_policy = RetryPolicy::from(&self.retry_settings);
 
+        let now = self.clock.now();
         if let Some((reschedule_at, next_attempt)) =
-            job.maybe_schedule_retry(self.clock.now(), attempt, &retry_policy, error_str)
+            job.maybe_schedule_retry(now, attempt, &retry_policy, error_str)
         {
             let exceeded_warn_attempts = self
                 .retry_settings
@@ -283,14 +284,23 @@ impl JobDispatcher {
             self.rescheduled = true;
             span.record("will_retry", true);
 
+            // Error retries are an operational concern (like the alive_at
+            // liveness heartbeat), not a domain-scheduling one: a transient
+            // failure heals in wall time, not application time. Alongside the
+            // application-clock execute_at, stamp the same backoff as a
+            // wall-clock deadline so a manual clock that is never advanced
+            // cannot strand the retry forever.
+            let retry_due_wall_at = chrono::Utc::now() + reschedule_at.signed_duration_since(now);
+
             sqlx::query!(
                 r#"
                 UPDATE job_executions
-                SET state = 'pending', execute_at = $2, attempt_index = $3, poller_instance_id = NULL
-                WHERE id = $1 AND poller_instance_id = $4
+                SET state = 'pending', execute_at = $2, retry_due_wall_at = $3, attempt_index = $4, poller_instance_id = NULL
+                WHERE id = $1 AND poller_instance_id = $5
               "#,
                 id as JobId,
                 reschedule_at,
+                retry_due_wall_at,
                 next_attempt as i32,
                 self.instance_id
             )
