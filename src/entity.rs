@@ -518,6 +518,7 @@ mod tests {
                     event: serde_json::to_value(event).expect("serialize event"),
                     context: None,
                     recorded_at,
+                    forgettable_payload: None,
                 })
                 .collect::<Vec<_>>();
 
@@ -1163,6 +1164,7 @@ mod tests {
                     event: serde_json::to_value(event).expect("serialize event"),
                     context: None,
                     recorded_at,
+                    forgettable_payload: None,
                 })
                 .collect::<Vec<_>>();
 
