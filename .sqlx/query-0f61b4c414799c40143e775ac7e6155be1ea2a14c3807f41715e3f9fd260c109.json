@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "WITH entities AS (SELECT created_at, id FROM jobs WHERE (COALESCE((created_at, id) < ($3, $2), $2 IS NULL)) ORDER BY created_at DESC, id DESC LIMIT $1) SELECT i.id AS \"entity_id: Repo__Id\", e.sequence, e.event, CASE WHEN $4 THEN e.context ELSE NULL::jsonb END as \"context: es_entity::ContextData\", e.recorded_at FROM entities i JOIN job_events e ON i.id = e.id ORDER BY i.created_at desc, i.id desc, i.id, e.sequence",
+  "query": "WITH entities AS (SELECT id FROM jobs WHERE id = ANY($1)) SELECT i.id AS \"entity_id: Repo__Id\", e.sequence, e.event, CASE WHEN $2 THEN e.context ELSE NULL::jsonb END as \"context: es_entity::ContextData\", e.recorded_at, NULL::jsonb as \"forgettable_payload?\" FROM entities i JOIN job_events e ON i.id = e.id ORDER BY i.id, e.sequence",
   "describe": {
     "columns": [
       {
@@ -27,13 +27,16 @@
         "ordinal": 4,
         "name": "recorded_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "forgettable_payload?",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Uuid",
-        "Timestamptz",
+        "UuidArray",
         "Bool"
       ]
     },
@@ -42,8 +45,9 @@
       false,
       false,
       null,
-      false
+      false,
+      null
     ]
   },
-  "hash": "fe01de1969256000b4a02e472fbd608a31aa78e73e60e466b7ba47cd9b7a72cd"
+  "hash": "0f61b4c414799c40143e775ac7e6155be1ea2a14c3807f41715e3f9fd260c109"
 }
