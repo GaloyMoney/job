@@ -39,6 +39,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -430,13 +452,16 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "es-entity"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b10239773bfe267aef2997b044ec77d794b9c986cc7620cb247d6a615860129"
+checksum = "2e9202fb16f15dd697e20a31b1b7a38772f6e7926014cacd847cdefe2f2ce214"
 dependencies = [
+ "async-stream",
  "chrono",
  "derive_builder",
  "es-entity-macros",
+ "futures-core",
+ "futures-util",
  "im",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -455,9 +480,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8196c4a16efad694064949e98d06dbebce06583cbe74aa29dcd07a22c4cde1a9"
+checksum = "c0c32fdc62f4087581040d26a88e6708c0c754761b7509709ab13b7f4cff112d"
 dependencies = [
  "convert_case",
  "darling 0.23.0",
