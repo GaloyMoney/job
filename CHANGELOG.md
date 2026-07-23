@@ -1,3 +1,12 @@
+# [job release v0.6.32](https://github.com/GaloyMoney/job/releases/tag/0.6.32)
+
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.11.6 (#134)
+- Bump uuid in the all-dependencies group (#133)
+
 # [job release v0.6.31](https://github.com/GaloyMoney/job/releases/tag/0.6.31)
 
 
