@@ -1,3 +1,20 @@
+# [job release v0.6.34](https://github.com/GaloyMoney/job/releases/tag/0.6.34)
+
+
+
+### Bug Fixes
+
+- Only notify pollers when a job becomes eligible (#137)
+
+### Miscellaneous Tasks
+
+- Drop idx_job_executions_running_alive_at (#140)
+- Tune job_executions storage for update-heavy churn (#141)
+
+### Performance
+
+- Restructure poll query — filter due jobs first, fetch wide columns late (#139)
+
 # [job release v0.6.33](https://github.com/GaloyMoney/job/releases/tag/0.6.33)
 
 
