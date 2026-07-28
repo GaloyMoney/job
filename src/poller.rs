@@ -607,34 +607,42 @@ async fn poll_jobs(
     let rows = sqlx::query_as!(
         JobPollRow,
         r#"
-        WITH eligible AS (
-            SELECT id, queue_id, execute_at, execution_state_json, attempt_index
+        -- Narrowest set first: only due jobs, in execute_at order,
+        -- bounded by a small overscan of the poll limit.
+        -- idx_job_executions_pending_job_type_execute_at serves this as
+        -- an ordered index scan; future-scheduled jobs never reach the
+        -- anti-join / window-function work below.
+        WITH due AS (
+            SELECT id, queue_id, execute_at
             FROM job_executions
             WHERE state = 'pending'
             AND job_type = ANY($4)
-            AND NOT EXISTS (
-                SELECT 1 FROM job_executions AS running
-                WHERE running.state = 'running'
-                AND running.queue_id IS NOT NULL
-                AND running.queue_id = job_executions.queue_id
-            )
-        ),
-        min_wait AS (
-            SELECT MIN(execute_at) - $2::timestamptz AS wait_time
-            FROM eligible
-            WHERE execute_at > $2::timestamptz
+            AND execute_at <= $2::timestamptz
+            ORDER BY execute_at
+            LIMIT $1 * 4
         ),
         candidates AS (
-            SELECT id, execution_state_json AS data_json, attempt_index,
+            -- The 1-at-a-time-per-queue anti-join and the queue-dedup
+            -- window run only over the bounded due set instead of every
+            -- pending row.
+            SELECT id, execute_at,
                    ROW_NUMBER() OVER (
                        PARTITION BY COALESCE(queue_id, id::text)
                        ORDER BY execute_at
                    ) AS rn
-            FROM eligible
-            WHERE execute_at <= $2::timestamptz
+            FROM due
+            WHERE NOT EXISTS (
+                SELECT 1 FROM job_executions AS running
+                WHERE running.state = 'running'
+                AND running.queue_id IS NOT NULL
+                AND running.queue_id = due.queue_id
+            )
         ),
         selected_jobs AS (
-            SELECT je.id, c.data_json, c.attempt_index
+            -- The wide execution_state_json is fetched only for the
+            -- ~$1 winners, not carried through the CTEs and the window
+            -- sort for every pending job.
+            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index
             FROM candidates c
             JOIN job_executions je ON je.id = c.id
             WHERE c.rn = 1
@@ -649,6 +657,17 @@ async fn poll_jobs(
             WHERE je.id = selected_jobs.id
               AND je.state = 'pending'
             RETURNING je.id, selected_jobs.data_json, je.attempt_index
+        ),
+        min_wait AS (
+            -- Index-only scan over the pending partial index, no
+            -- anti-join. May wake slightly early when the nearest
+            -- future job is queue-blocked — one wasted wake-up at
+            -- worst, only while its queue stays busy.
+            SELECT MIN(execute_at) - $2::timestamptz AS wait_time
+            FROM job_executions
+            WHERE state = 'pending'
+            AND job_type = ANY($4)
+            AND execute_at > $2::timestamptz
         )
         SELECT * FROM (
             SELECT
