@@ -387,6 +387,116 @@ async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_queue_id_serializes_execution_across_two_pollers() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let release = Arc::new(Notify::new());
+
+    let make_initializer = || QueueJobInitializer {
+        job_type: JobType::new("queue-serial-two-pollers"),
+        started: Arc::clone(&started),
+        completed: Arc::clone(&completed),
+        release: Arc::clone(&release),
+    };
+
+    // Two independent Jobs services — two pollers with distinct instance
+    // ids — sharing one database. Both register the same job_type and get
+    // woken by the same notifications, so they race to claim queue heads.
+    let config_a = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs_a = Jobs::init(config_a).await?;
+    let spawner = jobs_a.add_initializer(make_initializer());
+    jobs_a
+        .start_poll()
+        .await
+        .expect("Failed to start job polling (A)");
+
+    let config_b = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs_b = Jobs::init(config_b).await?;
+    let _ = jobs_b.add_initializer(make_initializer());
+    jobs_b
+        .start_poll()
+        .await
+        .expect("Failed to start job polling (B)");
+
+    // Two jobs in the same queue, spawned back-to-back so both pollers'
+    // first polls race on the queue head with the same snapshot.
+    spawner
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "A".into() },
+            "serial-queue-two-pollers",
+        )
+        .await?;
+    spawner
+        .spawn_with_queue_id(
+            JobId::new(),
+            QueueJobConfig { label: "B".into() },
+            "serial-queue-two-pollers",
+        )
+        .await?;
+
+    // Wait for A to start
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if !started.lock().await.is_empty() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job A never started");
+    }
+
+    // With A running (blocked), give both pollers ample time for several
+    // poll cycles. Whichever poller lost the race for the queue head must
+    // skip it — never start B while A holds the queue.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        started.lock().await.as_slice(),
+        &["A"],
+        "a second same-queue job started while A was running (two pollers)"
+    );
+
+    // Release A — B may only start after A completes
+    release.notify_one();
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if started.lock().await.len() == 2 {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job B never started after A completed");
+    }
+    assert_eq!(started.lock().await.as_slice(), &["A", "B"]);
+
+    // Release B
+    release.notify_one();
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if completed.lock().await.len() == 2 {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "Job B never completed");
+    }
+    assert_eq!(completed.lock().await.as_slice(), &["A", "B"]);
+
+    jobs_a.shutdown().await?;
+    jobs_b.shutdown().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_different_queue_ids_run_concurrently() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
