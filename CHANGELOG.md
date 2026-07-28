@@ -1,3 +1,11 @@
+# [job release v0.6.33](https://github.com/GaloyMoney/job/releases/tag/0.6.33)
+
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.11.9 (#136)
+
 # [job release v0.6.32](https://github.com/GaloyMoney/job/releases/tag/0.6.32)
 
 
