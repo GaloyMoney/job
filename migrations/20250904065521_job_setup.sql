@@ -62,7 +62,13 @@ BEGIN
   END IF;
 
   IF TG_OP = 'UPDATE' THEN
-    IF NEW.execute_at IS DISTINCT FROM OLD.execute_at THEN
+    -- Only wake pollers when a row is (or becomes) eligible in the
+    -- pending set. Transitions out of 'pending' (a poller taking the job
+    -- sets execute_at = NULL, completion, etc.) must not notify: the
+    -- poller's own UPDATE would wake every poller including itself for
+    -- no reason, multiplying poll load with throughput.
+    IF NEW.state = 'pending'
+      AND NEW.execute_at IS DISTINCT FROM OLD.execute_at THEN
       PERFORM pg_notify('job_events',
         json_build_object('type', 'execution_ready', 'job_type', NEW.job_type)::text);
     END IF;
