@@ -1,3 +1,11 @@
+# [job release v0.6.35](https://github.com/GaloyMoney/job/releases/tag/0.6.35)
+
+
+
+### Performance
+
+- SKIP LOCKED when selecting jobs in the poll query (#138)
+
 # [job release v0.6.34](https://github.com/GaloyMoney/job/releases/tag/0.6.34)
 
 
