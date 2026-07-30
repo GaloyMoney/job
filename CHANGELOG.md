@@ -1,3 +1,15 @@
+# [job release v0.6.36](https://github.com/GaloyMoney/job/releases/tag/0.6.36)
+
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.11.11 (#144)
+
+### Performance
+
+- Unthrottle autovacuum on job_executions (#142)
+
 # [job release v0.6.35](https://github.com/GaloyMoney/job/releases/tag/0.6.35)
 
 
