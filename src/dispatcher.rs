@@ -254,7 +254,7 @@ impl JobDispatcher {
     )]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id(id).await?;
+        let mut job = self.repo.find_by_id_in_op(&mut op, id).await?;
 
         let span = Span::current();
         let error_str = error.to_string();
@@ -326,7 +326,7 @@ impl JobDispatcher {
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
     ) -> Result<(), JobError> {
-        let mut job = self.repo.find_by_id(&id).await?;
+        let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
         sqlx::query!(
             r#"
           DELETE FROM job_executions
@@ -350,7 +350,7 @@ impl JobDispatcher {
         reschedule_at: DateTime<Utc>,
     ) -> Result<(), JobError> {
         self.rescheduled = true;
-        let mut job = self.repo.find_by_id(&id).await?;
+        let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
         sqlx::query!(
             r#"
           UPDATE job_executions
