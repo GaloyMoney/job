@@ -1,3 +1,11 @@
+# [job release v0.6.37](https://github.com/GaloyMoney/job/releases/tag/0.6.37)
+
+
+
+### Miscellaneous Tasks
+
+- Reuse lifecycle operation for job reads (#145)
+
 # [job release v0.6.36](https://github.com/GaloyMoney/job/releases/tag/0.6.36)
 
 
