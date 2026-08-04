@@ -167,7 +167,12 @@ impl JobPoller {
                         failures,
                         "main loop error"
                     );
-                    Duration::from_millis(50 << failures)
+                    // Cap the shift exponent: at ~59 consecutive failures
+                    // `50 << failures` wraps u64 (collapsing the backoff to
+                    // ~0ms and hot-looping against a failing DB), and at 64
+                    // debug builds panic on shift-amount overflow. Capping at
+                    // 12 plateaus the backoff at ~3m25s rather than wrapping.
+                    Duration::from_millis(50 << failures.min(12))
                 }
             };
 
@@ -351,7 +356,9 @@ impl JobPoller {
                                     exception.type = std::any::type_name_of_val(&e),
                                     "keep alive error"
                                 );
-                                Duration::from_millis(50 << failures)
+                                // See main_loop: cap the shift to avoid
+                                // u64 wraparound / debug shift-overflow panic.
+                                Duration::from_millis(50 << failures.min(12))
                             }
                         }
                     }
