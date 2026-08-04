@@ -67,7 +67,7 @@
         cargo-deny
         mdbook
         bacon
-        postgresql
+        postgresql_18
         process-compose
         curl
         ytt
@@ -108,7 +108,7 @@
       pg-start = pkgs.writeShellApplication {
         name = "pg-start";
         runtimeInputs =
-          [pkgs.postgresql pkgs.coreutils]
+          [pkgs.postgresql_18 pkgs.coreutils]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.util-linux];
         text = ''
           NAME="$1" PORT="$2" PGUSER="$3" DB="$4"
@@ -210,7 +210,7 @@
           exec.command = "${
             pkgs.writeShellApplication {
               name = "ready-${name}";
-              runtimeInputs = [pkgs.postgresql];
+              runtimeInputs = [pkgs.postgresql_18];
               text = ''
                 exec psql -p "''${PGPORT:-${toString port}}" -U ${user} -h 127.0.0.1 -d ${db} -c 'SELECT 1' -t -q
               '';
