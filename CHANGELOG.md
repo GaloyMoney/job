@@ -1,3 +1,23 @@
+# [job release v0.7.0](https://github.com/GaloyMoney/job/releases/tag/0.7.0)
+
+
+
+### Bug Fixes
+
+- Cap exponential failure backoff to prevent overflow
+
+### Miscellaneous Tasks
+
+- Pin es-entity-macros to 0.12.0
+- [**breaking**] Bump es-entity 0.11.11 -> 0.12.0
+- Bump rustls-webpki 0.103.9 -> 0.103.13 (#149)
+- Upgrade postgres to 18 (#148)
+- Bump the all-dependencies group across 1 directory with 5 updates (#143)
+
+### Styling
+
+- Remove verbose backoff-cap comments
+
 # [job release v0.6.37](https://github.com/GaloyMoney/job/releases/tag/0.6.37)
 
 
