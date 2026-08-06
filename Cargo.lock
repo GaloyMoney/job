@@ -514,9 +514,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.12.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8b5490c0dd1adde59bdf5941059baef75a1d628aff229759488a90431586d5a"
+checksum = "c58fe4c10966dffe8e62a4fd7def3806bdae30abf8cfdda5dde9f9918073a620"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
