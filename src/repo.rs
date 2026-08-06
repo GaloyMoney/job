@@ -9,11 +9,7 @@ use crate::JobId;
 #[es_repo(
     entity = "Job",
     columns(
-        job_type(
-            ty = "JobType",
-            update(persist = false),
-            constraint = "idx_unique_job_type"
-        ),
+        job_type(ty = "JobType", update(persist = false)),
         unique_per_type(ty = "bool", update(persist = false)),
         parent_job_id(ty = "Option<JobId>", update(persist = false), list_for),
     ),
