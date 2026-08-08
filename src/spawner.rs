@@ -10,6 +10,8 @@ use super::{
     Job, JobId,
     entity::{JobType, NewJob},
     error::JobError,
+    handle_api::JobHandle,
+    notification_router::JobNotificationRouter,
     repo::JobRepo,
 };
 
@@ -75,6 +77,7 @@ impl<Config> JobSpec<Config> {
 pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
     job_type: JobType,
+    router: Arc<JobNotificationRouter>,
     clock: ClockHandle,
     parent_job_id: Option<JobId>,
     _phantom: PhantomData<Config>,
@@ -84,10 +87,16 @@ impl<Config> JobSpawner<Config>
 where
     Config: Serialize + Send + Sync,
 {
-    pub(crate) fn new(repo: Arc<JobRepo>, job_type: JobType, clock: ClockHandle) -> Self {
+    pub(crate) fn new(
+        repo: Arc<JobRepo>,
+        job_type: JobType,
+        router: Arc<JobNotificationRouter>,
+        clock: ClockHandle,
+    ) -> Self {
         Self {
             repo,
             job_type,
+            router,
             clock,
             parent_job_id: None,
             _phantom: PhantomData,
@@ -354,7 +363,10 @@ where
     /// Only one job of this type can exist at a time. This method consumes the
     /// spawner since no further jobs of this type can be created.
     ///
-    /// Returns `Ok(())` whether the job was created or already exists.
+    /// Returns a [`JobHandle`] whether the job was created or already exists.
+    /// On the duplicate path the handle's id is the PERSISTED job's id, not
+    /// the caller's fresh one, so a double-spawning orchestrator always
+    /// observes the job that actually runs.
     #[instrument(
         name = "job_spawner.spawn_unique",
         skip(self, config),
@@ -364,7 +376,7 @@ where
         self,
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
-    ) -> Result<(), JobError> {
+    ) -> Result<JobHandle, JobError> {
         let new_job = NewJob::builder()
             .id(id)
             .unique_per_type(true)
@@ -381,11 +393,38 @@ where
                 self.insert_execution(&mut op, &mut job, schedule_at, None)
                     .await?;
                 op.commit().await?;
+                Ok(self.handle(job.id))
             }
-            Err(e) if e.was_duplicate() => {}
-            Err(e) => return Err(e.into()),
+            Err(e) if e.was_duplicate() => {
+                // The unique job already exists — resolve the persisted job's
+                // id and hand back a handle to it. The transaction is poisoned
+                // by the constraint violation, so read on the pool after
+                // dropping (rolling back) the op.
+                drop(op);
+                // Race-free single-row read: per-type uniqueness is enforced
+                // by the partial unique index `idx_unique_job_type ON jobs
+                // (job_type) WHERE unique_per_type = TRUE`
+                // (migrations/20250904065521_job_setup.sql), and `jobs` rows
+                // are never deleted, so exactly one row matches.
+                let existing_id = sqlx::query_scalar!(
+                    r#"SELECT id AS "id!: JobId" FROM jobs WHERE job_type = $1 AND unique_per_type = true"#,
+                    &self.job_type as &JobType,
+                )
+                .fetch_one(self.repo.pool())
+                .await?;
+                Ok(self.handle(existing_id))
+            }
+            Err(e) => Err(e.into()),
         }
-        Ok(())
+    }
+
+    fn handle(&self, id: JobId) -> JobHandle {
+        JobHandle::new(
+            id,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+        )
     }
 
     #[instrument(name = "job.create_internal", skip(self, op, config), fields(job_type = %self.job_type))]

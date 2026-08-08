@@ -212,6 +212,21 @@ impl Job {
         }
     }
 
+    /// Returns the error string of the latest `ExecutionErrored` event, if any.
+    ///
+    /// For a job that terminated in `Errored`, `error_job` pushes exactly
+    /// `ExecutionErrored { error }` followed by `JobCompleted`, so the latest
+    /// `ExecutionErrored` is the terminal error.
+    pub(crate) fn last_error(&self) -> Option<String> {
+        self.events.iter_all().rev().find_map(|event| {
+            if let JobEvent::ExecutionErrored { error } = event {
+                Some(error.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Returns the raw return value attached to this job, if any.
     ///
     /// Scans for the latest `ReturnValueUpdated` event (last write wins).

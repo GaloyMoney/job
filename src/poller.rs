@@ -20,6 +20,7 @@ use super::{
     entity::{Job, JobType},
     error::JobError,
     handle::OwnedTaskHandle,
+    notification_router::JobNotificationRouter,
     registry::JobRegistry,
     repo::JobRepo,
     tracker::JobTracker,
@@ -49,6 +50,7 @@ pub(crate) struct JobPoller {
     repo: Arc<JobRepo>,
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
+    router: Arc<JobNotificationRouter>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
@@ -84,6 +86,7 @@ impl JobPoller {
         repo: Arc<JobRepo>,
         registry: JobRegistry,
         tracker: Arc<JobTracker>,
+        router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
@@ -94,6 +97,7 @@ impl JobPoller {
             repo,
             config,
             registry,
+            router,
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
             clock,
@@ -453,9 +457,12 @@ impl JobPoller {
         span.record("attempt", polled_job.attempt);
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
-        let runner = self
-            .registry
-            .init_job(&job, Arc::clone(&self.repo), self.clock.clone())?;
+        let runner = self.registry.init_job(
+            &job,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+        )?;
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = Arc::clone(&self.repo);
         let tracker = self.tracker.clone();

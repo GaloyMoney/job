@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id!: JobId\" FROM jobs WHERE job_type = $1 AND unique_per_type = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: JobId",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1b1f0c965f2ba6f4e737c27a863e9a9962e54167357ac03b80869b1b7df1c922"
+}
