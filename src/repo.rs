@@ -11,6 +11,7 @@ use crate::JobId;
     columns(
         job_type(ty = "JobType", update(persist = false)),
         unique_per_type(ty = "bool", update(persist = false)),
+        queue_id(ty = "Option<String>", update(persist = false)),
     ),
     persist_event_context = false
 )]

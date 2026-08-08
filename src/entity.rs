@@ -95,6 +95,7 @@ pub enum JobEvent {
         job_type: JobType,
         config: serde_json::Value,
         tracing_context: Option<TracingContext>,
+        queue_id: Option<String>,
     },
     ExecutionScheduled {
         attempt: u32,
@@ -211,6 +212,7 @@ impl RetryWindow {
 pub struct Job {
     pub id: JobId,
     pub job_type: JobType,
+    pub queue_id: Option<String>,
     config: serde_json::Value,
     events: EntityEvents<JobEvent>,
 }
@@ -406,11 +408,13 @@ impl TryFromEvents<JobEvent> for Job {
                     id,
                     job_type,
                     config,
+                    queue_id,
                     ..
                 } => {
                     builder = builder
                         .id(*id)
                         .job_type(job_type.clone())
+                        .queue_id(queue_id.clone())
                         .config(config.clone())
                 }
                 JobEvent::ExecutionScheduled { .. } => {}
@@ -437,6 +441,8 @@ pub struct NewJob {
     pub(super) config: serde_json::Value,
     #[builder(default)]
     pub(super) tracing_context: Option<TracingContext>,
+    #[builder(default)]
+    pub(super) queue_id: Option<String>,
 }
 
 impl NewJob {
@@ -462,6 +468,7 @@ impl IntoEvents<JobEvent> for NewJob {
                 job_type: self.job_type,
                 config: self.config,
                 tracing_context: self.tracing_context,
+                queue_id: self.queue_id,
             }],
         )
     }
@@ -580,6 +587,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -614,6 +622,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -649,6 +658,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(10),
             )];
@@ -684,6 +694,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(30),
             )];
@@ -728,6 +739,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -766,6 +778,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::hours(4),
             )];
@@ -808,6 +821,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(1),
             )];
@@ -846,6 +860,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(20),
             )];
@@ -877,6 +892,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(10),
             )];
@@ -903,6 +919,7 @@ mod tests {
                     job_type: job_type.clone(),
                     config: json!({}),
                     tracing_context: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::hours(1),
             )];
