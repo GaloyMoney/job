@@ -27,6 +27,8 @@ pub enum JobError {
     JobInitError(String),
     #[error("JobError - BadState: {0}")]
     CouldNotSerializeExecutionState(serde_json::Error),
+    #[error("JobError - BadState: {0}")]
+    CouldNotDeserializeExecutionState(serde_json::Error),
     #[error("JobError - BadResult: {0}")]
     CouldNotSerializeResult(serde_json::Error),
     #[error("JobError - BadConfig: {0}")]
@@ -51,6 +53,8 @@ pub enum JobError {
         "JobError - TimedOut: job {0} did not reach terminal state within the specified timeout"
     )]
     TimedOut(JobId),
+    #[error("JobError - RouterNotStarted: await called before Jobs::start_poll")]
+    RouterNotStarted,
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {

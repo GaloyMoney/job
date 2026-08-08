@@ -3,6 +3,7 @@ CREATE TABLE jobs (
   unique_per_type BOOLEAN NOT NULL,
   job_type VARCHAR NOT NULL,
   parent_job_id UUID REFERENCES jobs(id),
+  queue_id VARCHAR,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE UNIQUE INDEX idx_unique_job_type ON jobs (job_type) WHERE unique_per_type = TRUE;

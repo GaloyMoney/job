@@ -61,6 +61,7 @@ pub enum JobEvent {
         config: serde_json::Value,
         tracing_context: Option<TracingContext>,
         parent_job_id: Option<JobId>,
+        queue_id: Option<String>,
     },
     ExecutionScheduled {
         attempt: u32,
@@ -175,6 +176,7 @@ pub struct Job {
     pub id: JobId,
     pub job_type: JobType,
     pub parent_job_id: Option<JobId>,
+    pub queue_id: Option<String>,
     config: serde_json::Value,
     events: EntityEvents<JobEvent>,
 }
@@ -208,6 +210,21 @@ impl Job {
             },
             _ => None,
         }
+    }
+
+    /// Returns the error string of the latest `ExecutionErrored` event, if any.
+    ///
+    /// For a job that terminated in `Errored`, `error_job` pushes exactly
+    /// `ExecutionErrored { error }` followed by `JobCompleted`, so the latest
+    /// `ExecutionErrored` is the terminal error.
+    pub(crate) fn last_error(&self) -> Option<String> {
+        self.events.iter_all().rev().find_map(|event| {
+            if let JobEvent::ExecutionErrored { error } = event {
+                Some(error.clone())
+            } else {
+                None
+            }
+        })
     }
 
     /// Returns the raw return value attached to this job, if any.
@@ -371,12 +388,14 @@ impl TryFromEvents<JobEvent> for Job {
                     job_type,
                     config,
                     parent_job_id,
+                    queue_id,
                     ..
                 } => {
                     builder = builder
                         .id(*id)
                         .job_type(job_type.clone())
                         .parent_job_id(*parent_job_id)
+                        .queue_id(queue_id.clone())
                         .config(config.clone())
                 }
                 JobEvent::ExecutionScheduled { .. } => {}
@@ -405,6 +424,8 @@ pub struct NewJob {
     pub(super) tracing_context: Option<TracingContext>,
     #[builder(default)]
     pub(super) parent_job_id: Option<JobId>,
+    #[builder(default)]
+    pub(super) queue_id: Option<String>,
 }
 
 impl NewJob {
@@ -431,6 +452,7 @@ impl IntoEvents<JobEvent> for NewJob {
                 config: self.config,
                 tracing_context: self.tracing_context,
                 parent_job_id: self.parent_job_id,
+                queue_id: self.queue_id,
             }],
         )
     }
@@ -550,6 +572,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -585,6 +608,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -621,6 +645,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(10),
             )];
@@ -657,6 +682,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(30),
             )];
@@ -702,6 +728,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -741,6 +768,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::hours(4),
             )];
@@ -784,6 +812,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(1),
             )];
@@ -823,6 +852,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(20),
             )];
@@ -855,6 +885,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::minutes(10),
             )];
@@ -882,6 +913,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     parent_job_id: None,
+                    queue_id: None,
                 },
                 now - ChronoDuration::hours(1),
             )];
@@ -1188,6 +1220,7 @@ mod tests {
                         config: json!({}),
                         tracing_context: None,
                         parent_job_id: Some(parent_id),
+                        queue_id: None,
                     },
                     now,
                 )],
@@ -1211,6 +1244,7 @@ mod tests {
                         config: json!({}),
                         tracing_context: None,
                         parent_job_id: None,
+                        queue_id: None,
                     },
                     now,
                 )],
