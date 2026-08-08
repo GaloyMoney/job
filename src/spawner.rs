@@ -306,7 +306,6 @@ where
 
         for spec in specs {
             schedule_times.push(spec.schedule_at.unwrap_or(default_schedule_at));
-            queue_ids.push(spec.queue_id);
 
             let new_job = NewJob::builder()
                 .id(spec.id)
@@ -315,9 +314,11 @@ where
                 .config(spec.config)?
                 .tracing_context(es_entity::context::TracingContext::current())
                 .parent_job_id(self.parent_job_id)
+                .queue_id(spec.queue_id.clone())
                 .build()
                 .expect("Could not build new job");
             new_jobs.push(new_job);
+            queue_ids.push(spec.queue_id);
         }
 
         let mut jobs = self.repo.create_all_in_op(op, new_jobs).await?;
@@ -403,6 +404,7 @@ where
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
             .parent_job_id(self.parent_job_id)
+            .queue_id(queue_id.clone())
             .build()
             .expect("Could not build new job");
 

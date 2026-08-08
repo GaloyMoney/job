@@ -12,6 +12,7 @@ use crate::JobId;
         job_type(ty = "JobType", update(persist = false)),
         unique_per_type(ty = "bool", update(persist = false)),
         parent_job_id(ty = "Option<JobId>", update(persist = false), list_for),
+        queue_id(ty = "Option<String>", update(persist = false)),
     ),
     persist_event_context = false
 )]
