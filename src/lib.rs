@@ -114,7 +114,7 @@
 //! Jobs run immediately once a poller claims them. If you need a future start
 //! time, schedule it up front with [`JobSpawner::spawn_at_in_op`]. After a
 //! run completes, return [`JobCompletion::Complete`] for one-off work or use the
-//! `JobCompletion::Reschedule*` variants to book the next execution.
+//! `JobCompletion::RescheduleNow*` variants to book the next execution.
 //!
 //! ## Retries
 //!
