@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "WITH entities AS ((SELECT id FROM jobs WHERE (NOT $1 OR parent_job_id IS NOT DISTINCT FROM $2) AND (id > $4) AND ($4 IS NOT NULL) ORDER BY id ASC LIMIT $3) UNION ALL (SELECT id FROM jobs WHERE (NOT $1 OR parent_job_id IS NOT DISTINCT FROM $2) AND ($4 IS NULL) ORDER BY id ASC LIMIT $3) ORDER BY id ASC LIMIT $3) SELECT i.id AS \"entity_id!: Repo__Id\", e.sequence, e.event, CASE WHEN $5 THEN e.context ELSE NULL::jsonb END as \"context: es_entity::ContextData\", e.recorded_at, NULL::jsonb as \"forgettable_payload?\" FROM entities i JOIN job_events e ON i.id = e.id ORDER BY i.id asc, i.id, e.sequence",
+  "query": "WITH entities AS ((SELECT created_at, id FROM jobs WHERE parent_job_id IS NULL AND ((created_at, id) > ($3, $2)) AND ($2 IS NOT NULL) ORDER BY created_at ASC, id ASC LIMIT $1) UNION ALL (SELECT created_at, id FROM jobs WHERE parent_job_id IS NULL AND ($2 IS NULL) ORDER BY created_at ASC, id ASC LIMIT $1) ORDER BY created_at ASC, id ASC LIMIT $1) SELECT i.id AS \"entity_id!: Repo__Id\", e.sequence, e.event, CASE WHEN $4 THEN e.context ELSE NULL::jsonb END as \"context: es_entity::ContextData\", e.recorded_at, NULL::jsonb as \"forgettable_payload?\" FROM entities i JOIN job_events e ON i.id = e.id ORDER BY i.created_at asc, i.id asc, i.id, e.sequence",
   "describe": {
     "columns": [
       {
@@ -36,10 +36,9 @@
     ],
     "parameters": {
       "Left": [
-        "Bool",
-        "Uuid",
         "Int8",
         "Uuid",
+        "Timestamptz",
         "Bool"
       ]
     },
@@ -52,5 +51,5 @@
       null
     ]
   },
-  "hash": "3989f6e271552e36658702df298fe8262a8db21eb4490ccfbe52f73a62733384"
+  "hash": "d3eb1b3e6403cd84c52ab9dffab8c9c1b711816ab2b688b2b294daee1e91be9d"
 }

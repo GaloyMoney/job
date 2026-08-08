@@ -49,6 +49,9 @@
         src = craneLib.path ./.;
         filter = path: type:
           (builtins.match ".*\.sqlx/.*" path != null)
+          # The EsRepo derive reads migrations/*.sql at macro-expansion time
+          # to build its index catalog; the emitted SQL depends on it.
+          || (builtins.match ".*/migrations/.*\.sql$" path != null)
           || (builtins.match ".*deny\.toml$" path != null)
           || (craneLib.filterCargoSources path type);
       };
