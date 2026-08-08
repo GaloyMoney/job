@@ -1,3 +1,16 @@
+# [job release v0.7.1](https://github.com/GaloyMoney/job/releases/tag/0.7.1)
+
+
+
+### Documentation
+
+- Add SECURITY.md (#151)
+
+### Miscellaneous Tasks
+
+- Bump es-entity 0.12.0 -> 0.12.3 (#152)
+- Bump schemars in the all-dependencies group (#150)
+
 # [job release v0.7.0](https://github.com/GaloyMoney/job/releases/tag/0.7.0)
 
 
