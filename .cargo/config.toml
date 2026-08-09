@@ -1,0 +1,6 @@
+# Force sqlx into offline mode (use the committed .sqlx cache) so the crate
+# builds without a live Postgres — required for the fuzz job (`cargo fuzz build`
+# via the vendored ci/vendor/tasks/fuzz.sh) and keeps CI hermetic. Run
+# `make sqlx-prepare` after changing queries/migrations to refresh the cache.
+[env]
+SQLX_OFFLINE = "true"

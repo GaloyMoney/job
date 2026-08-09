@@ -34,11 +34,12 @@ reset-deps: clean-deps start-deps
 check-code:
 	nix flake check
 
-# Coverage-guided fuzzing via the shared script (ci/fuzz.sh), also used by
-# `nix run .#fuzz` and the Concourse `fuzz` job. Runs the target(s) for
-# $(FUZZ_TIME)s; the corpus lives in fuzz/corpus/ (gitignored).
+# Coverage-guided fuzzing via the shared vendored script
+# (ci/vendor/tasks/fuzz.sh), also used by `nix run .#fuzz` and the Concourse
+# `fuzz` job. Runs the target(s) for $(FUZZ_TIME)s; the corpus lives in
+# fuzz/corpus/ (gitignored).
 fuzz:
-	FUZZ_SECONDS=$(FUZZ_TIME) bash ci/fuzz.sh
+	FUZZ_SECONDS=$(FUZZ_TIME) bash ci/vendor/tasks/fuzz.sh
 
 sqlx-prepare:
 	cargo sqlx prepare --workspace

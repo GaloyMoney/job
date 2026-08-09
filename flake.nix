@@ -323,10 +323,10 @@
       '';
 
       # ── Fuzz runner (cargo-fuzz / libFuzzer) ───────────────────────────
-      # Wraps ci/fuzz.sh with the Rust toolchain + cargo-fuzz on PATH so the
-      # same script runs locally (`nix run .#fuzz`) and in the Concourse `fuzz`
-      # job. The target is pure — no Postgres needed. FUZZ_SECONDS etc. are
-      # passed through the environment; see ci/fuzz.sh.
+      # Wraps the shared ci/vendor/tasks/fuzz.sh (vendored from
+      # galoy-concourse-shared) with the Rust toolchain + cargo-fuzz on PATH so
+      # the same script runs locally (`nix run .#fuzz`) and in the Concourse
+      # `fuzz` job. The target is pure — no Postgres needed.
       fuzz-runner = pkgs.writeShellScriptBin "fuzz" ''
         set -e
         export PATH="${pkgs.lib.makeBinPath [
@@ -337,7 +337,7 @@
           pkgs.git
           pkgs.stdenv.cc
         ]}:$PATH"
-        exec bash ${./ci/fuzz.sh} "$@"
+        exec bash ${./ci/vendor/tasks/fuzz.sh} "$@"
       '';
     in
       with pkgs; {
