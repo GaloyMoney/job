@@ -1,3 +1,11 @@
+# [job release v0.7.2](https://github.com/GaloyMoney/job/releases/tag/0.7.2)
+
+
+
+### Performance
+
+- Stop re-planning the poll query; log job_executions autovacuum passes (#155)
+
 # [job release v0.7.1](https://github.com/GaloyMoney/job/releases/tag/0.7.1)
 
 
