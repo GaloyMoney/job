@@ -113,11 +113,14 @@ impl RetryPolicy {
     }
 
     fn apply_jitter(&self, backoff_ms: u64, max_ms: u64) -> u64 {
-        let jitter_amount = backoff_ms * self.backoff_jitter_pct as u64 / 100;
-        let jitter = rng().random_range(-(jitter_amount as i64)..=(jitter_amount as i64));
+        // Overflow-safe jitter: compute the magnitude in u128 (clamped to max_ms
+        // and i64's range), then add with saturation.
+        let jitter_amount = ((backoff_ms as u128) * (self.backoff_jitter_pct as u128) / 100)
+            .min(max_ms as u128)
+            .min(i64::MAX as u128) as i64;
+        let jitter = rng().random_range(-jitter_amount..=jitter_amount);
 
-        let jittered = (backoff_ms as i64 + jitter).max(0) as u64;
-        jittered.min(max_ms)
+        backoff_ms.saturating_add_signed(jitter).min(max_ms)
     }
 
     fn should_reset_attempt_count(&self, now: DateTime<Utc>, window: RetryWindow) -> bool {
@@ -1142,6 +1145,26 @@ mod tests {
                 reset,
                 "Elapsed time beyond the configured threshold should reset attempts"
             );
+        }
+
+        #[test]
+        fn apply_jitter_survives_huge_backoff_without_overflow() {
+            // The result must stay within [0, max_ms] and never panic, even
+            // with a huge max_backoff, across many jitter draws.
+            let huge = u64::MAX; // > i64::MAX
+            let policy = RetryPolicy {
+                max_attempts: None,
+                min_backoff: Duration::from_millis(huge),
+                max_backoff: Duration::from_millis(huge),
+                backoff_jitter_pct: u8::MAX,
+                attempt_reset_after_backoff_multiples: 1,
+            };
+            for _ in 0..256 {
+                let backoff = policy.calculate_backoff(1);
+                assert!(backoff <= huge, "backoff {backoff} exceeded max_ms {huge}");
+            }
+            // Exercises the i64::MAX backoff boundary directly without panicking.
+            assert!(policy.apply_jitter(i64::MAX as u64, u64::MAX) <= u64::MAX);
         }
     }
 

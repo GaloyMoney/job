@@ -8,6 +8,10 @@
 #@   "rust_task_image_config",
 #@   "gh_release_resource",
 #@   "nix_task_image_config",
+#@   "fuzz_job",
+#@   "fuzz_time_resource",
+#@   "zenduty_notification_resource",
+#@   "zenduty_resource_type",
 #@ )
 
 groups:
@@ -17,8 +21,15 @@ groups:
   - tests
   - release
   - set-dev-version
+  - fuzz
 
 jobs:
+#! Coverage-guided fuzzing (cargo-fuzz / libFuzzer), from galoy-concourse-shared.
+#! Self-bootstrapping (first run fuzzes from scratch — no manual seed), corpus
+#! persisted to GCS, Zenduty fires on crash. Default cadence: weekly Saturday
+#! 06:00 UTC for 24h; override via fuzz_job(fuzz_seconds="...").
+- #@ fuzz_job()
+
 - name: check-code
   serial: true
   plan:
@@ -168,3 +179,8 @@ resources:
 - #@ gh_release_resource()
 - #@ pipeline_tasks_resource()
 - #@ version_resource()
+- #@ fuzz_time_resource()
+- #@ zenduty_notification_resource()
+
+resource_types:
+- #@ zenduty_resource_type()
