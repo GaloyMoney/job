@@ -1,6 +1,9 @@
 NIX_DEPS_DIR := .nix-deps
 
-.PHONY: start-deps clean-deps setup-db reset-deps sqlx-prepare check-code
+# Seconds each fuzz target runs in `make fuzz`.
+FUZZ_TIME := 60
+
+.PHONY: start-deps clean-deps setup-db reset-deps sqlx-prepare check-code fuzz
 
 start-deps:
 	@mkdir -p $(NIX_DEPS_DIR)
@@ -30,6 +33,12 @@ reset-deps: clean-deps start-deps
 
 check-code:
 	nix flake check
+
+# Coverage-guided fuzzing via the shared script (ci/fuzz.sh), also used by
+# `nix run .#fuzz` and the Concourse `fuzz` job. Runs the target(s) for
+# $(FUZZ_TIME)s; the corpus lives in fuzz/corpus/ (gitignored).
+fuzz:
+	FUZZ_SECONDS=$(FUZZ_TIME) bash ci/fuzz.sh
 
 sqlx-prepare:
 	cargo sqlx prepare --workspace

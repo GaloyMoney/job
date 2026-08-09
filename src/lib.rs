@@ -229,7 +229,7 @@ use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobType};
+pub use entity::{Job, JobEvent, JobType, RetryPolicy, RetryWindow};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use es_entity::{ListDirection, PaginatedQueryArgs, PaginatedQueryRet};
 pub use migrate::*;

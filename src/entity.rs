@@ -80,8 +80,12 @@ pub enum JobEvent {
     AttemptCounterReset,
 }
 
+/// Retry/backoff policy for a job type.
+///
+/// Exposed (rather than `pub(crate)`) so the backoff/jitter arithmetic and the
+/// attempt-reset logic can be fuzzed and unit-tested outside the crate.
 #[derive(Debug, Clone)]
-pub(crate) struct RetryPolicy {
+pub struct RetryPolicy {
     pub max_attempts: Option<u32>,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
@@ -90,12 +94,12 @@ pub(crate) struct RetryPolicy {
 }
 
 impl RetryPolicy {
-    fn next_attempt_at(&self, now: DateTime<Utc>, attempt: u32) -> DateTime<Utc> {
+    pub fn next_attempt_at(&self, now: DateTime<Utc>, attempt: u32) -> DateTime<Utc> {
         let backoff_ms = self.calculate_backoff(attempt);
         now + Duration::from_millis(backoff_ms)
     }
 
-    fn calculate_backoff(&self, attempt: u32) -> u64 {
+    pub fn calculate_backoff(&self, attempt: u32) -> u64 {
         // Calculate base exponential backoff with overflow protection
         let safe_attempt = attempt.saturating_sub(1).min(30);
         let base_ms = self.min_backoff.as_millis() as u64;
@@ -112,15 +116,21 @@ impl RetryPolicy {
         }
     }
 
-    fn apply_jitter(&self, backoff_ms: u64, max_ms: u64) -> u64 {
-        let jitter_amount = backoff_ms * self.backoff_jitter_pct as u64 / 100;
-        let jitter = rng().random_range(-(jitter_amount as i64)..=(jitter_amount as i64));
+    pub fn apply_jitter(&self, backoff_ms: u64, max_ms: u64) -> u64 {
+        // Overflow-safe jitter. `backoff_ms * pct` overflows u64 for huge
+        // max_backoff values, and `backoff_ms as i64 + jitter` underflows when
+        // backoff_ms > i64::MAX — both found by fuzz_calculate_backoff. Compute
+        // the magnitude in u128, clamp it to what can actually move the (capped)
+        // result and to i64's range, then add with saturation.
+        let jitter_amount = ((backoff_ms as u128) * (self.backoff_jitter_pct as u128) / 100)
+            .min(max_ms as u128)
+            .min(i64::MAX as u128) as i64;
+        let jitter = rng().random_range(-jitter_amount..=jitter_amount);
 
-        let jittered = (backoff_ms as i64 + jitter).max(0) as u64;
-        jittered.min(max_ms)
+        backoff_ms.saturating_add_signed(jitter).min(max_ms)
     }
 
-    fn should_reset_attempt_count(&self, now: DateTime<Utc>, window: RetryWindow) -> bool {
+    pub fn should_reset_attempt_count(&self, now: DateTime<Utc>, window: RetryWindow) -> bool {
         let Some(elapsed_since_scheduled) = window.elapsed_since_retry_schedule(now) else {
             return false;
         };
@@ -134,14 +144,19 @@ impl RetryPolicy {
     }
 }
 
+/// A recorded failure→reschedule interval, used to decide whether a healthy
+/// gap justifies resetting the attempt counter. Exposed for fuzzing/testing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RetryWindow {
-    failure_recorded_at: DateTime<Utc>,
-    retry_scheduled_at: DateTime<Utc>,
+pub struct RetryWindow {
+    pub failure_recorded_at: DateTime<Utc>,
+    pub retry_scheduled_at: DateTime<Utc>,
 }
 
 impl RetryWindow {
-    fn new(failure_recorded_at: DateTime<Utc>, retry_scheduled_at: DateTime<Utc>) -> Option<Self> {
+    pub fn new(
+        failure_recorded_at: DateTime<Utc>,
+        retry_scheduled_at: DateTime<Utc>,
+    ) -> Option<Self> {
         if failure_recorded_at >= retry_scheduled_at {
             return None;
         }
@@ -151,14 +166,14 @@ impl RetryWindow {
         })
     }
 
-    fn backoff_duration(&self) -> Duration {
+    pub fn backoff_duration(&self) -> Duration {
         self.retry_scheduled_at
             .signed_duration_since(self.failure_recorded_at)
             .to_std()
             .expect("retry window invariants ensure positive backoff duration")
     }
 
-    fn elapsed_since_retry_schedule(&self, now: DateTime<Utc>) -> Option<Duration> {
+    pub fn elapsed_since_retry_schedule(&self, now: DateTime<Utc>) -> Option<Duration> {
         if now < self.retry_scheduled_at {
             return None;
         }
@@ -311,7 +326,7 @@ impl Job {
         es_entity::Idempotent::Executed(())
     }
 
-    pub(super) fn maybe_schedule_retry(
+    pub fn maybe_schedule_retry(
         &mut self,
         now: DateTime<Utc>,
         attempt: u32,
@@ -340,7 +355,7 @@ impl Job {
         Some((reschedule_at, next_attempt))
     }
 
-    fn latest_retry_window(&self) -> Option<RetryWindow> {
+    pub fn latest_retry_window(&self) -> Option<RetryWindow> {
         for persisted in self.events.iter_persisted().rev() {
             if let JobEvent::ExecutionScheduled {
                 attempt,
@@ -1142,6 +1157,29 @@ mod tests {
                 reset,
                 "Elapsed time beyond the configured threshold should reset attempts"
             );
+        }
+
+        #[test]
+        fn apply_jitter_survives_huge_backoff_without_overflow() {
+            // Regression for the two overflow paths in `apply_jitter` found by
+            // `fuzz_calculate_backoff`: `backoff_ms * jitter_pct` overflowed
+            // u64, and `backoff_ms as i64 + jitter` underflowed once backoff_ms
+            // exceeded i64::MAX. With a huge max_backoff the result must simply
+            // stay within [0, max_ms] and never panic, across many jitter draws.
+            let huge = u64::MAX; // > i64::MAX, exercises the i64 wrap path
+            let policy = RetryPolicy {
+                max_attempts: None,
+                min_backoff: Duration::from_millis(huge),
+                max_backoff: Duration::from_millis(huge),
+                backoff_jitter_pct: u8::MAX,
+                attempt_reset_after_backoff_multiples: 1,
+            };
+            for _ in 0..256 {
+                let backoff = policy.calculate_backoff(1);
+                assert!(backoff <= huge, "backoff {backoff} exceeded max_ms {huge}");
+            }
+            // Exercises the i64::MAX backoff boundary directly without panicking.
+            assert!(policy.apply_jitter(i64::MAX as u64, u64::MAX) <= u64::MAX);
         }
     }
 

@@ -1,0 +1,1 @@
+{"events":[{"type":"initialized","id":"00000000-0000-0000-0000-000000000000","job_type":"t","config":{},"tracing_context":null,"parent_job_id":null},{"type":"execution_scheduled","attempt":2,"scheduled_at":"1970-01-01T00:01:00Z"}],"now_ms":120000,"attempt":2,"policy":{"max_attempts":5,"min_ms":1000,"max_ms":60000,"jitter_pct":0,"reset_multiples":3}}

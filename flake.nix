@@ -321,10 +321,29 @@
 
         echo "Tests completed successfully!"
       '';
+
+      # ── Fuzz runner (cargo-fuzz / libFuzzer) ───────────────────────────
+      # Wraps ci/fuzz.sh with the Rust toolchain + cargo-fuzz on PATH so the
+      # same script runs locally (`nix run .#fuzz`) and in the Concourse `fuzz`
+      # job. The target is pure — no Postgres needed. FUZZ_SECONDS etc. are
+      # passed through the environment; see ci/fuzz.sh.
+      fuzz-runner = pkgs.writeShellScriptBin "fuzz" ''
+        set -e
+        export PATH="${pkgs.lib.makeBinPath [
+          rustToolchain
+          pkgs.cargo-fuzz
+          pkgs.gnutar
+          pkgs.coreutils
+          pkgs.git
+          pkgs.stdenv.cc
+        ]}:$PATH"
+        exec bash ${./ci/fuzz.sh} "$@"
+      '';
     in
       with pkgs; {
         packages = {
           nextest = nextest-runner;
+          fuzz = fuzz-runner;
           setup-db-dev = setupDbDev;
           dev-env = devEnv;
           inherit nix-deps-base;
@@ -374,6 +393,20 @@
           shellHook = ''
             eval "$(${devEnv}/bin/job-dev-env)"
           '';
+        };
+
+        # Lean dev shell for fuzzing: Rust toolchain + cargo-fuzz + gsutil (for
+        # the CI corpus round-trip) + tar. No Postgres/devEnv needed — the fuzz
+        # target is pure. Used by the Concourse `fuzz` job (`nix develop .#fuzz`).
+        devShells.fuzz = mkShell {
+          packages = [
+            rustToolchain
+            pkgs.cargo-fuzz
+            pkgs.google-cloud-sdk
+            pkgs.gnutar
+            pkgs.coreutils
+            pkgs.git
+          ];
         };
 
         formatter = alejandra;

@@ -1,6 +1,7 @@
 #@ load("@ytt:data", "data")
 
 #@ load("vendor/pipeline-fragments.lib.yml",
+#@   "public_docker_registry",
 #@   "repo_resource",
 #@   "version_resource",
 #@   "pipeline_tasks_resource",
@@ -17,8 +18,73 @@ groups:
   - tests
   - release
   - set-dev-version
+  - fuzz
+
+#! Fires a Zenduty alert (non-critical) — used as a job-level on_failure/on_error
+#! hook so a failed/crashed fuzz run pages the on-call rotation, same as the
+#! es-entity pipeline. Requires the `zenduty-notification` resource + type below.
+#@ def zenduty_notification_hook():
+put: zenduty-notification
+params:
+  alert_type: non-critical
+#@ end
 
 jobs:
+#! Nightly coverage-guided fuzzing (cargo-fuzz / libFuzzer).
+#!
+#! The target is pure (no Postgres), so this runs lighter than `tests`. The
+#! evolving corpus is persisted to GCS, NOT via a Concourse resource: the task
+#! itself downloads the latest corpus (gsutil) before fuzzing and uploads the
+#! grown one after — so the very first run self-bootstraps (no corpus → fuzzes
+#! from scratch → uploads). Each run fuzzes the target for FUZZ_SECONDS. A
+#! crash fails the job (Zenduty alert fires) and skips the upload so a
+#! crashing run isn't persisted.
+- name: fuzz
+  serial: true
+  plan:
+  - in_parallel:
+    - { get: repo }
+    - { get: pipeline-tasks }
+    - { get: fuzz-time, trigger: true }
+  - task: fuzz
+    config:
+      platform: linux
+      image_resource: #@ nix_task_image_config()
+      inputs:
+      - name: repo
+      caches:
+      - path: cargo-home
+      - path: cargo-target-dir
+      run:
+        path: sh
+        args:
+          - -exc
+          - |
+            set -euo pipefail
+            cd repo
+            cachix use $CACHIX_CACHE_NAME
+            # `nix develop .#fuzz` provides the Rust toolchain + cargo-fuzz +
+            # gsutil (google-cloud-sdk). ci/fuzz.sh restores the latest corpus
+            # from GCS (or bootstraps from scratch) and uploads the grown one.
+            # SQLX_OFFLINE is required because building the `job` crate expands
+            # its sqlx! macros at compile time.
+            cachix watch-exec $CACHIX_CACHE_NAME -- nix -L develop .#fuzz -c sh -exc '
+              set -euo pipefail
+              export CARGO_HOME=$PWD/../cargo-home
+              export CARGO_TARGET_DIR=$PWD/../cargo-target-dir
+              export SQLX_OFFLINE=true
+              bash ci/fuzz.sh
+            '
+      params:
+        CACHIX_AUTH_TOKEN: #@ data.values.cachix_auth_token
+        CACHIX_CACHE_NAME: #@ data.values.cachix_cache_name
+        FUZZ_SECONDS: "3600"    #! 1h per daily run (bump once proven)
+        GCS_BUCKET: ((staging-gcp-creds.bucket_name))
+        GCS_CREDS: ((staging-gcp-creds.creds_json))
+        GCS_PREFIX: #@ data.values.gh_repository + "-artifacts/fuzz-corpus"
+  on_failure: #@ zenduty_notification_hook()
+  on_error: #@ zenduty_notification_hook()
+
 - name: check-code
   serial: true
   plan:
@@ -168,3 +234,26 @@ resources:
 - #@ gh_release_resource()
 - #@ pipeline_tasks_resource()
 - #@ version_resource()
+
+#! Nightly trigger for the fuzz job.
+- name: fuzz-time
+  type: time
+  source:
+    interval: 24h
+
+#! Pages the on-call rotation when a nightly fuzz run fails or crashes.
+#! Reuses the shared `staging-gcp-creds` bucket credential like es-entity;
+#! swap for a dedicated fuzz credential if that isn't available to this team.
+- name: zenduty-notification
+  type: zenduty-notification
+  source:
+    webhook_url: #@ data.values.zenduty_webhook_url
+
+resource_types:
+- name: zenduty-notification
+  type: registry-image
+  source:
+    username: #@ data.values.gar_registry_user
+    password: #@ data.values.gar_registry_password
+    repository: #@ public_docker_registry() + "/zenduty-notification-resource"
+    tag: edge
