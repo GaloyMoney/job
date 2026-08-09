@@ -113,11 +113,8 @@ impl RetryPolicy {
     }
 
     fn apply_jitter(&self, backoff_ms: u64, max_ms: u64) -> u64 {
-        // Overflow-safe jitter. `backoff_ms * pct` overflows u64 for huge
-        // max_backoff values, and `backoff_ms as i64 + jitter` underflows when
-        // backoff_ms > i64::MAX — both found by fuzz_calculate_backoff. Compute
-        // the magnitude in u128, clamp it to what can actually move the (capped)
-        // result and to i64's range, then add with saturation.
+        // Overflow-safe jitter: compute the magnitude in u128 (clamped to max_ms
+        // and i64's range), then add with saturation.
         let jitter_amount = ((backoff_ms as u128) * (self.backoff_jitter_pct as u128) / 100)
             .min(max_ms as u128)
             .min(i64::MAX as u128) as i64;
@@ -1155,12 +1152,9 @@ mod tests {
 
         #[test]
         fn apply_jitter_survives_huge_backoff_without_overflow() {
-            // Regression for the two overflow paths in `apply_jitter` found by
-            // `fuzz_calculate_backoff`: `backoff_ms * jitter_pct` overflowed
-            // u64, and `backoff_ms as i64 + jitter` underflowed once backoff_ms
-            // exceeded i64::MAX. With a huge max_backoff the result must simply
-            // stay within [0, max_ms] and never panic, across many jitter draws.
-            let huge = u64::MAX; // > i64::MAX, exercises the i64 wrap path
+            // The result must stay within [0, max_ms] and never panic, even
+            // with a huge max_backoff, across many jitter draws.
+            let huge = u64::MAX; // > i64::MAX
             let policy = RetryPolicy {
                 max_attempts: None,
                 min_backoff: Duration::from_millis(huge),

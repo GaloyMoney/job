@@ -18,12 +18,10 @@ use job::{Job, JobEvent, JobId};
 use uuid::Uuid;
 
 fn make_events(values: &[serde_json::Value]) -> Vec<GenericEvent<JobId>> {
-    // Partition events into contiguous groups (each group = one entity) so that
-    // `load_n` actually reconstructs multiple entities and exercises its
-    // grouping + early-return-at-n paths — previously every event shared one id,
-    // so only one entity was ever built and the `len <= n` coverage was vacuous.
-    // `load_n` assumes events grouped by id, ordered by sequence per id; a
-    // varying stride gives a range of groupings.
+    // Partition events into contiguous groups (each group = one entity) so
+    // `load_n` reconstructs multiple entities and exercises its grouping +
+    // early-return-at-n paths. `load_n` assumes events grouped by id, ordered
+    // by sequence per id; a varying stride gives a range of groupings.
     let stride = (values.len() % 4).max(1);
     values
         .iter()
