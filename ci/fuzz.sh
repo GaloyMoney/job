@@ -26,6 +26,11 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT"
 
+# The fuzz targets build the `job` crate, whose `sqlx!` / `EsRepo` macros expand
+# against the schema at compile time. Use the committed `.sqlx` cache so no live
+# Postgres is required (matches `nix flake check` / CI).
+export SQLX_OFFLINE="${SQLX_OFFLINE:-true}"
+
 if ! command -v cargo-fuzz >/dev/null 2>&1; then
   echo "cargo-fuzz not found on PATH; installing..."
   cargo install cargo-fuzz --locked
