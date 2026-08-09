@@ -2,14 +2,14 @@ apiVersion: vendir.k14s.io/v1alpha1
 directories:
 - contents:
   - git:
-      commitTitle: 'Merge pull request #22 from GaloyMoney/fix/fuzz-corpus-restore-portable...'
-      sha: 26b38b457e1e638fd168a0d4f4c5db49c1bcb47e
+      commitTitle: 'Merge pull request #23 from GaloyMoney/feat/fuzz-seeds-merge...'
+      sha: cc91f0f689917e4f612bb00bd350388f0df1ddc1
     path: .
   path: ../.github/workflows/vendor
 - contents:
   - git:
-      commitTitle: 'Merge pull request #22 from GaloyMoney/fix/fuzz-corpus-restore-portable...'
-      sha: 26b38b457e1e638fd168a0d4f4c5db49c1bcb47e
+      commitTitle: 'Merge pull request #23 from GaloyMoney/feat/fuzz-seeds-merge...'
+      sha: cc91f0f689917e4f612bb00bd350388f0df1ddc1
     path: .
   path: vendor
 kind: LockConfig
