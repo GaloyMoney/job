@@ -17,6 +17,10 @@ fail-on-warnings = []
 es-entity = []
 json-schema = ["dep:schemars", "es-entity/json-schema"]
 tokio-task-names = ["tokio/tracing"]
+# Exposes otherwise crate-private retry primitives (RetryPolicy, RetryWindow,
+# Job::maybe_schedule_retry) for the cargo-fuzz crate. Off by default so the
+# crate's supported public API is unchanged.
+testing = []
 
 [dependencies]
 es-entity = { workspace = true, features = ["tracing-context"] }

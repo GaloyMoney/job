@@ -326,7 +326,7 @@ impl Job {
         es_entity::Idempotent::Executed(())
     }
 
-    pub fn maybe_schedule_retry(
+    pub(super) fn maybe_schedule_retry(
         &mut self,
         now: DateTime<Utc>,
         attempt: u32,
@@ -355,7 +355,7 @@ impl Job {
         Some((reschedule_at, next_attempt))
     }
 
-    pub fn latest_retry_window(&self) -> Option<RetryWindow> {
+    fn latest_retry_window(&self) -> Option<RetryWindow> {
         for persisted in self.events.iter_persisted().rev() {
             if let JobEvent::ExecutionScheduled {
                 attempt,

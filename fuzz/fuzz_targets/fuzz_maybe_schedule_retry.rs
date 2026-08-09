@@ -16,7 +16,8 @@ use libfuzzer_sys::fuzz_target;
 
 use chrono::{DateTime, Utc};
 use es_entity::*;
-use job::{Job, JobEvent, JobId, RetryPolicy};
+use job::testing::{maybe_schedule_retry, RetryPolicy};
+use job::{Job, JobEvent, JobId};
 use serde::Deserialize;
 use std::time::Duration;
 use uuid::Uuid;
@@ -77,7 +78,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let outcome = job.maybe_schedule_retry(now, input.attempt, &policy, "fuzz".to_string());
+    let outcome = maybe_schedule_retry(&mut job, now, input.attempt, &policy, "fuzz".to_string());
 
     if let Some((reschedule_at, next_attempt)) = outcome {
         // next_attempt is always incremented (possibly after a reset to 1 → 2),

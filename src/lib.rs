@@ -229,10 +229,35 @@ use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobEvent, JobType, RetryPolicy, RetryWindow};
+pub use entity::{Job, JobEvent, JobType};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use es_entity::{ListDirection, PaginatedQueryArgs, PaginatedQueryRet};
 pub use migrate::*;
+
+/// Test/fuzz-only access to the crate's internal retry primitives.
+///
+/// `RetryPolicy` / `RetryWindow` and `Job::maybe_schedule_retry` are otherwise
+/// crate-private. Gating them behind the `testing` feature keeps the crate's
+/// *default* public API unchanged while letting the cargo-fuzz crate exercise
+/// the backoff/jitter and attempt-reset logic without shipping it as supported
+/// surface.
+#[cfg(feature = "testing")]
+pub mod testing {
+    pub use crate::entity::{RetryPolicy, RetryWindow};
+
+    use chrono::{DateTime, Utc};
+
+    /// Wrapper over the otherwise crate-private `Job::maybe_schedule_retry`.
+    pub fn maybe_schedule_retry(
+        job: &mut crate::Job,
+        now: DateTime<Utc>,
+        attempt: u32,
+        retry_policy: &RetryPolicy,
+        error: String,
+    ) -> Option<(DateTime<Utc>, u32)> {
+        job.maybe_schedule_retry(now, attempt, retry_policy, error)
+    }
+}
 pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;
 pub use repo::job_cursor;

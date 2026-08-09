@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 # Path to the crate under test.
-job = { path = ".." }
+job = { path = "..", features = ["testing"] }
 # The hydration machinery (`EntityEvents`, `GenericEvent`, …) lives in
 # es-entity; pin the same version `job` depends on so the impls unify.
 es-entity = "0.12.3"

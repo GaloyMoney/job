@@ -15,7 +15,7 @@ use libfuzzer_sys::fuzz_target;
 
 use std::time::Duration;
 
-use job::RetryPolicy;
+use job::testing::RetryPolicy;
 
 fn u64_le(b: &mut &[u8]) -> Option<u64> {
     let (n, rest) = b.split_first_chunk::<8>()?;
