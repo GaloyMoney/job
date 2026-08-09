@@ -1,0 +1,6 @@
+# Force sqlx offline mode (committed .sqlx cache) only for the fuzz build, which
+# has no live Postgres. Sited under fuzz/ so root `cargo build`/`cargo test`
+# still use a live DB in dev. Discovered by `cargo fuzz build` (which runs from
+# fuzz/); see .cargo/config.toml discovery rules.
+[env]
+SQLX_OFFLINE = "true"
