@@ -144,10 +144,7 @@ struct RetryWindow {
 }
 
 impl RetryWindow {
-    fn new(
-        failure_recorded_at: DateTime<Utc>,
-        retry_scheduled_at: DateTime<Utc>,
-    ) -> Option<Self> {
+    fn new(failure_recorded_at: DateTime<Utc>, retry_scheduled_at: DateTime<Utc>) -> Option<Self> {
         if failure_recorded_at >= retry_scheduled_at {
             return None;
         }
