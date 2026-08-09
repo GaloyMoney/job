@@ -2,14 +2,14 @@ apiVersion: vendir.k14s.io/v1alpha1
 directories:
 - contents:
   - git:
-      commitTitle: 'Merge pull request #23 from GaloyMoney/feat/fuzz-seeds-merge...'
-      sha: cc91f0f689917e4f612bb00bd350388f0df1ddc1
+      commitTitle: 'Merge pull request #24 from GaloyMoney/feat/fuzz-sqlx-offline...'
+      sha: 60ebf3df8afba503eec84ac3dce5464598dd581e
     path: .
   path: ../.github/workflows/vendor
 - contents:
   - git:
-      commitTitle: 'Merge pull request #23 from GaloyMoney/feat/fuzz-seeds-merge...'
-      sha: cc91f0f689917e4f612bb00bd350388f0df1ddc1
+      commitTitle: 'Merge pull request #24 from GaloyMoney/feat/fuzz-sqlx-offline...'
+      sha: 60ebf3df8afba503eec84ac3dce5464598dd581e
     path: .
   path: vendor
 kind: LockConfig

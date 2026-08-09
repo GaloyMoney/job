@@ -38,6 +38,13 @@ fi
 
 FUZZ_SECONDS="${FUZZ_SECONDS:-60}"
 
+#! Build with the committed SQLx offline cache (.sqlx/) instead of connecting to
+#! a database — there is no Postgres in a fuzz build, and coverage-guided fuzzing
+#! wants pure, deterministic targets anyway. Harmless for non-SQLx repos (the
+#! var is ignored) and overridable via the environment. Mirrors what each repo's
+#! local `make fuzz` already does.
+export SQLX_OFFLINE="${SQLX_OFFLINE:-true}"
+
 #! Restore the corpus (no-op unless CORPUS_TARBALL_IN is set and matches a file).
 mkdir -p fuzz/corpus
 if [ -n "${CORPUS_TARBALL_IN:-}" ] && ls -d $CORPUS_TARBALL_IN >/dev/null 2>&1; then
