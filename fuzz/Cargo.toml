@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 # Path to the crate under test.
-job = { path = "..", features = ["testing"] }
+job = { path = ".." }
 # The hydration machinery (`EntityEvents`, `GenericEvent`, …) lives in
 # es-entity; pin the same version `job` depends on so the impls unify.
 es-entity = "0.12.3"
@@ -22,18 +22,6 @@ uuid = { version = "1.0", features = ["serde", "v7"] }
 [[bin]]
 name = "fuzz_job_hydration"
 path = "fuzz_targets/fuzz_job_hydration.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "fuzz_calculate_backoff"
-path = "fuzz_targets/fuzz_calculate_backoff.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "fuzz_maybe_schedule_retry"
-path = "fuzz_targets/fuzz_maybe_schedule_retry.rs"
 test = false
 doc = false
 

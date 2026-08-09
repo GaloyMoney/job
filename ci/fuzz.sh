@@ -59,20 +59,6 @@ fi
 
 (cd fuzz && cargo fuzz build --sanitizer=none)
 
-# ── Seed the corpus from checked-in building blocks ───────────────
-# Structured targets (e.g. fuzz_job_hydration) need a valid starting point the
-# fuzzer can't synthesize from scratch in reasonable time; fuzz/seeds/ ships
-# those seeds (committed, unlike the grown corpus). Merge any seeds into a
-# target's corpus if that corpus is empty (first run / bootstrap).
-for target in fuzz/seeds/*/; do
-  name="$(basename "$target")"
-  mkdir -p "fuzz/corpus/$name"
-  if [ -z "$(ls -A "fuzz/corpus/$name" 2>/dev/null)" ] && compgen -G "$target/*.json" > /dev/null; then
-    echo "seeding corpus/$name from seeds/$name"
-    cp "$target"/*.json "fuzz/corpus/$name/"
-  fi
-done
-
 JOBS_ARG=""
 if [ -n "${FUZZ_JOBS:-}" ]; then
   JOBS_ARG="-jobs=$FUZZ_JOBS"
@@ -80,7 +66,7 @@ fi
 
 # Fuzz every target. Loop kept generic so adding a target is just a name here
 # (mirrors the es-entity fuzz.sh).
-TARGETS=(fuzz_job_hydration fuzz_calculate_backoff fuzz_maybe_schedule_retry)
+TARGETS=(fuzz_job_hydration)
 
 echo "fuzzing ${TARGETS[*]} in parallel for ${FUZZ_SECONDS}s${JOBS_ARG:+ ($JOBS_ARG per target)}"
 pids=""

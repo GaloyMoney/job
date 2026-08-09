@@ -80,12 +80,8 @@ pub enum JobEvent {
     AttemptCounterReset,
 }
 
-/// Retry/backoff policy for a job type.
-///
-/// Exposed (rather than `pub(crate)`) so the backoff/jitter arithmetic and the
-/// attempt-reset logic can be fuzzed and unit-tested outside the crate.
 #[derive(Debug, Clone)]
-pub struct RetryPolicy {
+pub(crate) struct RetryPolicy {
     pub max_attempts: Option<u32>,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
@@ -94,12 +90,12 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
-    pub fn next_attempt_at(&self, now: DateTime<Utc>, attempt: u32) -> DateTime<Utc> {
+    fn next_attempt_at(&self, now: DateTime<Utc>, attempt: u32) -> DateTime<Utc> {
         let backoff_ms = self.calculate_backoff(attempt);
         now + Duration::from_millis(backoff_ms)
     }
 
-    pub fn calculate_backoff(&self, attempt: u32) -> u64 {
+    fn calculate_backoff(&self, attempt: u32) -> u64 {
         // Calculate base exponential backoff with overflow protection
         let safe_attempt = attempt.saturating_sub(1).min(30);
         let base_ms = self.min_backoff.as_millis() as u64;
@@ -116,7 +112,7 @@ impl RetryPolicy {
         }
     }
 
-    pub fn apply_jitter(&self, backoff_ms: u64, max_ms: u64) -> u64 {
+    fn apply_jitter(&self, backoff_ms: u64, max_ms: u64) -> u64 {
         // Overflow-safe jitter. `backoff_ms * pct` overflows u64 for huge
         // max_backoff values, and `backoff_ms as i64 + jitter` underflows when
         // backoff_ms > i64::MAX — both found by fuzz_calculate_backoff. Compute
@@ -130,7 +126,7 @@ impl RetryPolicy {
         backoff_ms.saturating_add_signed(jitter).min(max_ms)
     }
 
-    pub fn should_reset_attempt_count(&self, now: DateTime<Utc>, window: RetryWindow) -> bool {
+    fn should_reset_attempt_count(&self, now: DateTime<Utc>, window: RetryWindow) -> bool {
         let Some(elapsed_since_scheduled) = window.elapsed_since_retry_schedule(now) else {
             return false;
         };
@@ -144,16 +140,14 @@ impl RetryPolicy {
     }
 }
 
-/// A recorded failure→reschedule interval, used to decide whether a healthy
-/// gap justifies resetting the attempt counter. Exposed for fuzzing/testing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RetryWindow {
-    pub failure_recorded_at: DateTime<Utc>,
-    pub retry_scheduled_at: DateTime<Utc>,
+struct RetryWindow {
+    failure_recorded_at: DateTime<Utc>,
+    retry_scheduled_at: DateTime<Utc>,
 }
 
 impl RetryWindow {
-    pub fn new(
+    fn new(
         failure_recorded_at: DateTime<Utc>,
         retry_scheduled_at: DateTime<Utc>,
     ) -> Option<Self> {
@@ -166,14 +160,14 @@ impl RetryWindow {
         })
     }
 
-    pub fn backoff_duration(&self) -> Duration {
+    fn backoff_duration(&self) -> Duration {
         self.retry_scheduled_at
             .signed_duration_since(self.failure_recorded_at)
             .to_std()
             .expect("retry window invariants ensure positive backoff duration")
     }
 
-    pub fn elapsed_since_retry_schedule(&self, now: DateTime<Utc>) -> Option<Duration> {
+    fn elapsed_since_retry_schedule(&self, now: DateTime<Utc>) -> Option<Duration> {
         if now < self.retry_scheduled_at {
             return None;
         }
