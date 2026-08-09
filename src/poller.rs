@@ -604,6 +604,14 @@ async fn poll_jobs(
     let wall_now = chrono::Utc::now();
     Span::current().record("now", tracing::field::display(sim_now));
 
+    // Force the generic plan: auto never picks it for this statement, so
+    // every poll re-plans the 6-CTE query (35-54ms vs 0.3ms exec). SET LOCAL
+    // keeps the override off other statements on the caller-shared pool.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+        .execute(&mut *tx)
+        .await?;
+
     let rows = sqlx::query_as!(
         JobPollRow,
         r#"
@@ -692,8 +700,9 @@ async fn poll_jobs(
         supported_job_types as _,
         wall_now,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Span::current().record("n_jobs_found", rows.len());
     Ok(JobPollResult::from_rows(rows))
