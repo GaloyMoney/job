@@ -2349,3 +2349,214 @@ async fn test_lost_handler_uses_wall_clock_under_frozen_manual_clock() -> anyhow
     jobs.shutdown().await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// NOTIFY funnel: `execution_ready` must not ride the caller's transaction.
+//
+// Every notify-bearing commit serializes on an instance-wide lock held across
+// the WAL flush, so a trigger that emits `pg_notify` turns each spawn (and each
+// job's own work commit) into a commit that queues on it. These tests pin the
+// contract that replaced it: nothing on the write path notifies, the hint still
+// arrives out-of-band, and `job_terminal` -- which is NOT a hint -- still does.
+// ---------------------------------------------------------------------------
+
+/// Await the first `job_events` payload satisfying `pred`, ignoring unrelated
+/// traffic from concurrently-running tests. Returns `None` on timeout.
+async fn next_matching(
+    listener: &mut sqlx::postgres::PgListener,
+    within: Duration,
+    mut pred: impl FnMut(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let notification = match tokio::time::timeout(remaining, listener.recv()).await {
+            Ok(Ok(notification)) => notification,
+            _ => return None,
+        };
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(notification.payload())
+            && pred(&payload)
+        {
+            return Some(payload);
+        }
+    }
+}
+
+/// Writing to `job_executions` must not emit `execution_ready` from inside the
+/// writer's transaction. Fails against the pre-fix trigger, which emitted on
+/// every INSERT.
+#[tokio::test]
+async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+    listener.listen("job_events").await?;
+
+    let job_id = uuid::Uuid::now_v7();
+    let job_type = format!("notify-funnel-insert-{job_id}");
+
+    // Exactly the statements a spawn issues inside the caller's operation.
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO jobs (id, unique_per_type, job_type) VALUES ($1, false, $2)")
+        .bind(job_id)
+        .bind(&job_type)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO job_executions (id, job_type, queue_id, execute_at, alive_at, created_at) \
+         VALUES ($1, $2, 'notify-funnel-queue', NOW(), NOW(), NOW())",
+    )
+    .bind(job_id)
+    .bind(&job_type)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    // A reschedule (state stays 'pending', execute_at moves) is the other arm
+    // the old trigger notified on.
+    sqlx::query("UPDATE job_executions SET execute_at = NOW() + interval '1 hour' WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await?;
+
+    // `job_events` is a single global channel and tests run concurrently, so
+    // only notifications naming *this* test's job are evidence either way.
+    let stray = next_matching(&mut listener, Duration::from_millis(500), |payload| {
+        payload["job_type"] == job_type.as_str()
+    })
+    .await;
+    assert!(
+        stray.is_none(),
+        "write path emitted an in-transaction notification: {stray:?}"
+    );
+
+    // ...but completion must still deliver `job_terminal`: it carries a job_id,
+    // drives the completion-waiter broadcast, and losing it wedges await.
+    sqlx::query("DELETE FROM job_executions WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await?;
+
+    let payload = next_matching(&mut listener, Duration::from_secs(5), |payload| {
+        payload["job_id"] == job_id.to_string()
+    })
+    .await
+    .expect("timed out waiting for job_terminal");
+    assert_eq!(
+        payload["type"], "job_terminal",
+        "completion must still notify job_terminal, got {payload}"
+    );
+
+    sqlx::query("DELETE FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await?;
+
+    Ok(())
+}
+
+/// The debounced emitter must still reach *other* processes. The spawning
+/// service never starts a poller, so its in-process fast path is inert and the
+/// only route to the running poller is the out-of-transaction NOTIFY.
+#[tokio::test]
+async fn test_execution_ready_reaches_another_process() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+
+    let job_type = JobType::new("notify-funnel-crosspod");
+    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    // B runs the poller and is the only process that can execute the job.
+    let config_b = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs_b = Jobs::init(config_b).await?;
+    let _ = jobs_b.add_initializer(TrackingJobInitializer {
+        job_type: job_type.clone(),
+        completed: Arc::clone(&completed),
+    });
+    jobs_b.start_poll().await.expect("Failed to start poller B");
+
+    // A only spawns. No start_poll => no local tracker registered => the hint
+    // has to travel through Postgres to reach B.
+    let config_a = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs_a = Jobs::init(config_a).await?;
+    let spawner = jobs_a.add_initializer(TrackingJobInitializer {
+        job_type: job_type.clone(),
+        completed: Arc::clone(&completed),
+    });
+
+    spawner
+        .spawn(JobId::new(), TrackingJobConfig { label: "x".into() })
+        .await?;
+
+    // Generous bound, but far below the 60s MAX_WAIT fallback: passing this
+    // only via the fallback poll would take a minute.
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if !completed.lock().await.is_empty() {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "cross-process spawn was never picked up via NOTIFY (would have needed MAX_WAIT)"
+        );
+    }
+
+    jobs_b.shutdown().await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrackingJobConfig {
+    label: String,
+}
+
+struct TrackingJobInitializer {
+    job_type: JobType,
+    completed: Arc<Mutex<Vec<String>>>,
+}
+
+impl JobInitializer for TrackingJobInitializer {
+    type Config = TrackingJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: TrackingJobConfig = job.config()?;
+        Ok(Box::new(TrackingJobRunner {
+            config,
+            completed: Arc::clone(&self.completed),
+        }))
+    }
+}
+
+struct TrackingJobRunner {
+    config: TrackingJobConfig,
+    completed: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl JobRunner for TrackingJobRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        self.completed.lock().await.push(self.config.label.clone());
+        Ok(JobCompletion::Complete)
+    }
+}

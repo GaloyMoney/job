@@ -4,7 +4,10 @@ use es_entity::clock::ClockHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{entity::*, error::JobError, repo::JobRepo, runner::*, spawner::JobSpawner};
+use super::{
+    entity::*, error::JobError, notifier::ExecutionReadyNotifier, repo::JobRepo, runner::*,
+    spawner::JobSpawner,
+};
 
 /// Internal trait for storing initializers with erased Config type.
 /// Only `init` is needed after registration - job_type and retry_settings
@@ -15,6 +18,7 @@ pub(crate) trait AnyJobInitializer: Send + Sync + 'static {
         job: &Job,
         repo: Arc<JobRepo>,
         clock: ClockHandle,
+        notifier: Arc<ExecutionReadyNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
@@ -24,9 +28,10 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         job: &Job,
         repo: Arc<JobRepo>,
         clock: ClockHandle,
+        notifier: Arc<ExecutionReadyNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        let spawner =
-            JobSpawner::<T::Config>::new(repo, self.job_type(), clock).with_parent(job.id);
+        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), clock, notifier)
+            .with_parent(job.id);
         JobInitializer::init(self, job, spawner)
     }
 }
@@ -61,11 +66,12 @@ impl JobRegistry {
         job: &Job,
         repo: Arc<JobRepo>,
         clock: ClockHandle,
+        notifier: Arc<ExecutionReadyNotifier>,
     ) -> Result<Box<dyn JobRunner>, JobError> {
         self.initializers
             .get(&job.job_type)
             .ok_or(JobError::NoInitializerPresent)?
-            .init(job, repo, clock)
+            .init(job, repo, clock, notifier)
             .map_err(|e| JobError::JobInitError(e.to_string()))
     }
 

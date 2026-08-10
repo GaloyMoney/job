@@ -12,10 +12,17 @@ use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{Span, instrument};
 
+/// The single Postgres channel every job notification travels on.
+pub(crate) const JOB_EVENTS_CHANNEL: &str = "job_events";
+
 /// Notification types from the unified `job_events` channel.
-#[derive(Debug, serde::Deserialize)]
+///
+/// `Serialize` is derived so the debounced emitter in `notifier.rs` builds its
+/// payloads through this same type -- the wire format cannot drift between the
+/// side that writes it and the side that parses it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum JobNotification {
+pub(crate) enum JobNotification {
     ExecutionReady { job_type: String },
     JobTerminal { job_id: JobId },
 }
@@ -105,7 +112,7 @@ impl JobNotificationRouter {
         job_types: Vec<JobType>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen("job_events").await?;
+        listener.listen(JOB_EVENTS_CHANNEL).await?;
 
         let terminal_tx = self.terminal_tx.clone();
 

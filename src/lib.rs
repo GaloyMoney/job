@@ -212,6 +212,7 @@ mod entity;
 mod handle;
 mod migrate;
 mod notification_router;
+mod notifier;
 mod outcome;
 mod poller;
 mod registry;
@@ -255,6 +256,7 @@ pub struct Jobs {
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     router: Arc<JobNotificationRouter>,
+    notifier: Arc<notifier::ExecutionReadyNotifier>,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -290,12 +292,14 @@ impl Jobs {
             config.poller_config.terminal_channel_size,
             config.poller_config.sweep_interval,
         ));
+        let notifier = notifier::ExecutionReadyNotifier::spawn(&pool);
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
             router,
+            notifier,
             poller_handle: None,
             clock,
         })
@@ -463,10 +467,16 @@ impl Jobs {
             Arc::clone(&self.repo),
             registry,
             Arc::clone(&tracker),
+            Arc::clone(&self.notifier),
             self.clock.clone(),
         );
 
         let job_types = poller.registered_job_types();
+
+        // Spawns made in this process can wake this poller without a round trip
+        // through Postgres, leaving NOTIFY to do only the cross-process work.
+        self.notifier
+            .register_local_poller(Arc::clone(&tracker), job_types.clone());
 
         let (listener_handle, waiter_handle) =
             self.router.start(Arc::clone(&tracker), job_types).await?;
@@ -496,7 +506,12 @@ impl Jobs {
                 .expect("Registry has been consumed by executor")
                 .add_initializer(initializer)
         };
-        JobSpawner::new(Arc::clone(&self.repo), job_type, self.clock.clone())
+        JobSpawner::new(
+            Arc::clone(&self.repo),
+            job_type,
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )
     }
 
     /// Fetch the current snapshot of a job entity by identifier.

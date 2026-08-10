@@ -10,8 +10,9 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 use super::{
     JobId,
     current::CurrentJob,
-    entity::{Job, RetryPolicy},
+    entity::{Job, JobType, RetryPolicy},
     error::JobError,
+    notifier::{ExecutionReadyNotifier, notify_ready_on_commit},
     repo::JobRepo,
     runner::*,
     tracker::JobTracker,
@@ -29,6 +30,7 @@ pub(crate) struct JobDispatcher {
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
+    notifier: Arc<ExecutionReadyNotifier>,
     rescheduled: bool,
     dispatched: bool,
     id: JobId,
@@ -36,9 +38,11 @@ pub(crate) struct JobDispatcher {
     clock: ClockHandle,
 }
 impl JobDispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
+        notifier: Arc<ExecutionReadyNotifier>,
         retry_settings: RetrySettings,
         id: JobId,
         runner: Box<dyn JobRunner>,
@@ -50,6 +54,7 @@ impl JobDispatcher {
             retry_settings,
             runner: Some(runner),
             tracker,
+            notifier,
             rescheduled: false,
             dispatched: false,
             id,
@@ -296,6 +301,7 @@ impl JobDispatcher {
             )
             .execute(op.as_executor())
             .await?;
+            notify_ready_on_commit(&self.notifier, &mut op, &job.job_type).await?;
         } else {
             span.record(
                 "error.level",
@@ -303,20 +309,45 @@ impl JobDispatcher {
             );
             span.record("will_retry", false);
 
-            sqlx::query!(
-                r#"
-                DELETE FROM job_executions
-                WHERE id = $1 AND poller_instance_id = $2
-              "#,
-                id as JobId,
-                self.instance_id
-            )
-            .execute(op.as_executor())
-            .await?;
+            self.delete_execution_in_op(&mut op, id, &job.job_type)
+                .await?;
         }
 
         self.repo.update_in_op(&mut op, &mut job).await?;
         op.commit().await?;
+        Ok(())
+    }
+
+    /// Delete the execution row, reporting `execution_ready` when the row
+    /// carried a `queue_id`.
+    ///
+    /// `queue_id` serialization is a function of table state -- the poll query
+    /// anti-joins running rows -- so removing the last running row on a queue
+    /// is what makes the next job on it eligible. Without this report, that
+    /// successor would wait for a poll cycle rather than being woken.
+    async fn delete_execution_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: JobId,
+        job_type: &JobType,
+    ) -> Result<(), JobError> {
+        let freed_queue_id = sqlx::query_scalar!(
+            r#"
+          DELETE FROM job_executions
+          WHERE id = $1 AND poller_instance_id = $2
+          RETURNING queue_id
+        "#,
+            id as JobId,
+            self.instance_id
+        )
+        .fetch_optional(op.as_executor())
+        .await?
+        .flatten();
+
+        if freed_queue_id.is_some() {
+            notify_ready_on_commit(&self.notifier, op, job_type).await?;
+        }
+
         Ok(())
     }
 
@@ -327,16 +358,7 @@ impl JobDispatcher {
         id: JobId,
     ) -> Result<(), JobError> {
         let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
-        sqlx::query!(
-            r#"
-          DELETE FROM job_executions
-          WHERE id = $1 AND poller_instance_id = $2
-        "#,
-            id as JobId,
-            self.instance_id
-        )
-        .execute(op.as_executor())
-        .await?;
+        self.delete_execution_in_op(op, id, &job.job_type).await?;
         job.complete_job();
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())
@@ -363,6 +385,7 @@ impl JobDispatcher {
         )
         .execute(op.as_executor())
         .await?;
+        notify_ready_on_commit(&self.notifier, op, &job.job_type).await?;
         job.reschedule_execution(reschedule_at);
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())
