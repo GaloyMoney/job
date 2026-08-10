@@ -2,11 +2,12 @@ use tokio::sync::Notify;
 
 use std::collections::HashMap;
 use std::sync::{
-    Mutex,
+    Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
 use super::JobId;
+use crate::entity::JobType;
 
 #[derive(Default)]
 struct LiveJobs {
@@ -38,6 +39,17 @@ pub(crate) struct JobTracker {
     running_jobs: AtomicUsize,
     notify: Notify,
     live_jobs: Mutex<LiveJobs>,
+    /// The job types this process polls for, published once polling starts.
+    ///
+    /// Readiness reports arrive from two sources -- this process's own commits
+    /// and other processes' `pg_notify` -- and both are filtered here, so the
+    /// decision "is this worth waking for" lives with the poller that owns the
+    /// answer rather than being restated at each source.
+    ///
+    /// Empty until polling starts: nothing is consuming wake-ups before then,
+    /// and the first poll reads the table anyway, so reports that arrive
+    /// earlier are dropped rather than queued.
+    job_types: OnceLock<Vec<JobType>>,
 }
 
 impl JobTracker {
@@ -48,7 +60,14 @@ impl JobTracker {
             running_jobs: AtomicUsize::new(0),
             notify: Notify::new(),
             live_jobs: Mutex::new(LiveJobs::default()),
+            job_types: OnceLock::new(),
         }
+    }
+
+    /// Publish the job types this process polls for. Called once, when polling
+    /// starts.
+    pub fn set_job_types(&self, job_types: Vec<JobType>) {
+        let _ = self.job_types.set(job_types);
     }
 
     pub fn next_batch_size(&self) -> Option<usize> {
@@ -73,8 +92,19 @@ impl JobTracker {
         self.notify.notified()
     }
 
-    pub fn job_execution_inserted(&self) {
-        self.notify.notify_one()
+    /// Wake the poll loop for a job that just became ready, if this process
+    /// polls that type.
+    ///
+    /// `notify_one` stores at most one permit, so repeated reports -- including
+    /// the same event arriving both in process and back through `pg_notify` --
+    /// collapse into a single wake-up rather than needing to be deduplicated.
+    pub fn job_execution_inserted(&self, job_type: &str) {
+        let Some(job_types) = self.job_types.get() else {
+            return;
+        };
+        if job_types.iter().any(|jt| jt.as_str() == job_type) {
+            self.notify.notify_one();
+        }
     }
 
     pub fn job_completed(&self, id: JobId, rescheduled: bool) {

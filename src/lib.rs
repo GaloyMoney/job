@@ -256,6 +256,7 @@ pub struct Jobs {
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     router: Arc<JobNotificationRouter>,
+    tracker: Arc<JobTracker>,
     notifier: Arc<notifier::JobEventNotifier>,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
@@ -292,13 +293,24 @@ impl Jobs {
             config.poller_config.terminal_channel_size,
             config.poller_config.sweep_interval,
         ));
-        let notifier = notifier::JobEventNotifier::spawn(&pool);
+        // Both live from init so the notifier's delivery targets are
+        // unconditional; each is inert until polling starts.
+        let tracker = Arc::new(JobTracker::new(
+            config.poller_config.min_jobs_per_process,
+            config.poller_config.max_jobs_per_process,
+        ));
+        let notifier = notifier::JobEventNotifier::spawn(
+            &pool,
+            Arc::clone(&tracker),
+            router.terminal_sender(),
+        );
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
             router,
+            tracker,
             notifier,
             poller_handle: None,
             clock,
@@ -457,10 +469,7 @@ impl Jobs {
             .take()
             .expect("Registry has been consumed by executor");
 
-        let tracker = Arc::new(JobTracker::new(
-            self.config.poller_config.min_jobs_per_process,
-            self.config.poller_config.max_jobs_per_process,
-        ));
+        let tracker = Arc::clone(&self.tracker);
 
         let poller = JobPoller::new(
             self.config.poller_config.clone(),
@@ -471,19 +480,11 @@ impl Jobs {
             self.clock.clone(),
         );
 
-        let job_types = poller.registered_job_types();
+        // Publishing the served types is what arms readiness wake-ups, for
+        // reports from this process and from `pg_notify` alike.
+        tracker.set_job_types(poller.registered_job_types());
 
-        // Work done in this process reaches this poller and its completion
-        // waiters without a round trip through Postgres, leaving NOTIFY to do
-        // only the cross-process part.
-        self.notifier.register_local_delivery(
-            Arc::clone(&tracker),
-            job_types.clone(),
-            self.router.terminal_sender(),
-        );
-
-        let (listener_handle, waiter_handle) =
-            self.router.start(Arc::clone(&tracker), job_types).await?;
+        let (listener_handle, waiter_handle) = self.router.start(Arc::clone(&tracker)).await?;
 
         let poller_handle = poller.start(listener_handle, waiter_handle);
         self.poller_handle = Some(Arc::new(poller_handle));

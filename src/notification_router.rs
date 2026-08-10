@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::JobId;
-use crate::entity::JobType;
 use crate::handle::OwnedTaskHandle;
 use crate::outcome::JobTerminalState;
 use crate::repo::JobRepo;
@@ -95,14 +94,13 @@ impl JobNotificationRouter {
     pub async fn start(
         &self,
         tracker: Arc<JobTracker>,
-        job_types: Vec<JobType>,
     ) -> Result<(OwnedTaskHandle, OwnedTaskHandle), sqlx::Error> {
         let (register_tx, register_rx) = mpsc::unbounded_channel();
         self.register_tx
             .set(register_tx)
             .expect("router started more than once");
 
-        let listener_handle = self.start_listener(tracker, job_types).await?;
+        let listener_handle = self.start_listener(tracker).await?;
         let waiter_handle = Self::start_waiter_manager(
             register_rx,
             self.terminal_tx.subscribe(),
@@ -116,7 +114,6 @@ impl JobNotificationRouter {
     async fn start_listener(
         &self,
         tracker: Arc<JobTracker>,
-        job_types: Vec<JobType>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let mut listener = PgListener::connect_with(&self.pool).await?;
         listener.listen(JOB_EVENTS_CHANNEL).await?;
@@ -130,9 +127,7 @@ impl JobNotificationRouter {
                         let payload = notification.payload();
                         match serde_json::from_str::<JobNotification>(payload) {
                             Ok(JobNotification::ExecutionReady { job_type }) => {
-                                if job_types.iter().any(|jt| jt.as_str() == job_type) {
-                                    tracker.job_execution_inserted();
-                                }
+                                tracker.job_execution_inserted(&job_type);
                             }
                             Ok(JobNotification::JobTerminal { job_id }) => {
                                 let _ = terminal_tx.send(job_id);

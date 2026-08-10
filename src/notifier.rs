@@ -17,7 +17,7 @@ use sqlx::postgres::PgPool;
 use tokio::sync::{broadcast, mpsc};
 
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::JobId;
@@ -33,70 +33,61 @@ use crate::tracker::JobTracker;
 /// Matches the sibling emitter in `obix`.
 const NOTIFY_DEBOUNCE: Duration = Duration::from_millis(25);
 
-/// In-process delivery, registered when polling starts.
-///
-/// Most jobs are spawned and awaited in the same process that runs them, so
-/// delivering locally means the round trip through Postgres only ever has to
-/// reach *other* processes. `job_types` mirrors the membership test the
-/// listener applies, so a local poller is never woken for a type it does not
-/// serve.
-struct LocalDelivery {
-    tracker: Arc<JobTracker>,
-    job_types: Vec<JobType>,
-    terminal_tx: broadcast::Sender<JobId>,
-}
-
 pub(crate) struct JobEventNotifier {
     tx: mpsc::UnboundedSender<JobNotification>,
-    local: OnceLock<LocalDelivery>,
+    tracker: Arc<JobTracker>,
+    terminal_tx: broadcast::Sender<JobId>,
     _handle: OwnedTaskHandle,
 }
 
 impl JobEventNotifier {
-    pub fn spawn(pool: &PgPool) -> Arc<Self> {
+    pub fn spawn(
+        pool: &PgPool,
+        tracker: Arc<JobTracker>,
+        terminal_tx: broadcast::Sender<JobId>,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(Self::run(pool.clone(), rx));
         Arc::new(Self {
             tx,
-            local: OnceLock::new(),
+            tracker,
+            terminal_tx,
             _handle: OwnedTaskHandle::new(handle),
         })
-    }
-
-    /// Register in-process delivery so same-process work skips the round trip.
-    pub fn register_local_delivery(
-        &self,
-        tracker: Arc<JobTracker>,
-        job_types: Vec<JobType>,
-        terminal_tx: broadcast::Sender<JobId>,
-    ) {
-        let _ = self.local.set(LocalDelivery {
-            tracker,
-            job_types,
-            terminal_tx,
-        });
     }
 
     /// Report a notification. Infallible and non-blocking, so it is safe to
     /// call from a synchronous `post_commit` hook.
     ///
-    /// Delivering locally *and* over `pg_notify` can hand the same event to
-    /// this process twice; both receivers are idempotent (the tracker stores a
-    /// single permit, and resolved waiters are removed from the map).
+    /// **Both delivery paths always run.** In-process delivery is a latency
+    /// optimisation for this process only; `pg_notify` is the sole path to
+    /// every *other* process and is never skipped on account of it.
+    ///
+    /// The cost is that this process sees its own notifications twice -- once
+    /// in process, then again ~a debounce window later through its own
+    /// listener. Neither receiver needs deduplicating: `execution_ready`
+    /// collapses into a single `tokio::sync::Notify` permit, and for
+    /// `job_terminal` the first delivery removes the waiters from the map, so
+    /// the second is filtered out before it reaches the database.
+    ///
+    /// Whether a report is worth acting on is decided by the receiver, not
+    /// here: the tracker knows which job types this process polls, and both
+    /// receivers are inert before polling starts.
     pub fn notify(&self, notification: JobNotification) {
-        if let Some(local) = self.local.get() {
-            match &notification {
-                JobNotification::ExecutionReady { job_type } => {
-                    if local.job_types.iter().any(|jt| jt.as_str() == job_type) {
-                        local.tracker.job_execution_inserted();
-                    }
-                }
-                JobNotification::JobTerminal { job_id } => {
-                    let _ = local.terminal_tx.send(*job_id);
-                }
+        match &notification {
+            JobNotification::ExecutionReady { job_type } => {
+                self.tracker.job_execution_inserted(job_type);
+            }
+            JobNotification::JobTerminal { job_id } => {
+                // No subscribers until the waiter manager starts; `send` then
+                // returns `Err`, which is exactly the intended no-op.
+                let _ = self.terminal_tx.send(*job_id);
             }
         }
-        // Unbounded: a synchronous post-commit hook must never block here.
+
+        // Always published, independently of the above: other processes have
+        // no other way to hear about this. Unbounded so a synchronous
+        // post-commit hook never blocks on the emitter.
         let _ = self.tx.send(notification);
     }
 
