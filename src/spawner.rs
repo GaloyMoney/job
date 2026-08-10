@@ -10,7 +10,7 @@ use super::{
     Job, JobId,
     entity::{JobType, NewJob},
     error::JobError,
-    notifier::{JobEventNotifier, notify_execution_ready_on_commit},
+    notifier::JobEventNotifier,
     repo::JobRepo,
 };
 
@@ -347,8 +347,13 @@ where
         .bind(op.maybe_now())
         .execute(op.as_executor())
         .await?;
-
-        notify_execution_ready_on_commit(&self.notifier, op, &self.job_type).await?;
+        // there are a lot of top level functions - if they are module private (like in
+        // notifier.rs) its somewhat acceptable - but exposing it outside of the module and calling
+        // a top level function here from spawner.rs is NOT acceptable
+        // put fns onto notifier (Arc<Self> receiver - or whatever make sense)
+        self.notifier
+            .execution_ready_in_op(op, &self.job_type)
+            .await?;
 
         for (job, schedule_at) in jobs.iter_mut().zip(&schedule_times) {
             job.schedule_execution(*schedule_at);
@@ -443,7 +448,9 @@ where
         )
         .execute(op.as_executor())
         .await?;
-        notify_execution_ready_on_commit(&self.notifier, op, &job.job_type).await?;
+        self.notifier
+            .execution_ready_in_op(op, &job.job_type)
+            .await?;
         job.schedule_execution(schedule_at);
         self.repo.update_in_op(op, job).await?;
         Ok(())

@@ -33,9 +33,18 @@ use crate::tracker::JobTracker;
 /// Matches the sibling emitter in `obix`.
 const NOTIFY_DEBOUNCE: Duration = Duration::from_millis(25);
 
+/// The three places a report goes. The first reaches other processes; the
+/// other two are this process's own receivers, called directly rather than
+/// through a channel of their own.
 pub(crate) struct JobEventNotifier {
-    tx: mpsc::UnboundedSender<JobNotification>,
+    /// Hands the report to the debounced emitter task, which is what turns it
+    /// into a `pg_notify`. The only path out of this process.
+    publish_tx: mpsc::UnboundedSender<JobNotification>,
+    /// In-process readiness: wakes this process's poll loop, if it polls that
+    /// job type.
     tracker: Arc<JobTracker>,
+    /// In-process completion: resolves this process's `await_completion`
+    /// waiters.
     terminal_tx: broadcast::Sender<JobId>,
     _handle: OwnedTaskHandle,
 }
@@ -46,10 +55,10 @@ impl JobEventNotifier {
         tracker: Arc<JobTracker>,
         terminal_tx: broadcast::Sender<JobId>,
     ) -> Arc<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(Self::run(pool.clone(), rx));
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(Self::run(pool.clone(), publish_rx));
         Arc::new(Self {
-            tx,
+            publish_tx,
             tracker,
             terminal_tx,
             _handle: OwnedTaskHandle::new(handle),
@@ -79,16 +88,11 @@ impl JobEventNotifier {
                 self.tracker.job_execution_inserted(job_type);
             }
             JobNotification::JobTerminal { job_id } => {
-                // No subscribers until the waiter manager starts; `send` then
-                // returns `Err`, which is exactly the intended no-op.
                 let _ = self.terminal_tx.send(*job_id);
             }
         }
 
-        // Always published, independently of the above: other processes have
-        // no other way to hear about this. Unbounded so a synchronous
-        // post-commit hook never blocks on the emitter.
-        let _ = self.tx.send(notification);
+        let _ = self.publish_tx.send(notification);
     }
 
     /// Report that a job of `job_type` is (or became) ready to run, outside any
@@ -113,13 +117,11 @@ impl JobEventNotifier {
                     None => return,
                 }
             }
-            drain(&mut rx, &mut pending);
             tokio::time::sleep(NOTIFY_DEBOUNCE).await;
             drain(&mut rx, &mut pending);
 
-            match emit(&pool, &pending).await {
-                Ok(()) => pending.clear(),
-                Err(error) => record_notify_emit_failed(&error),
+            if let Err(error) = emit(&pool, &mut pending).await {
+                record_notify_emit_failed(&error);
             }
         }
     }
@@ -141,7 +143,12 @@ fn drain(
 /// transaction. `synchronous_commit` is read at commit time, so the setting
 /// applies regardless of target-list evaluation order -- which is the point: it
 /// takes the WAL flush out of the notify lock's hold window.
-async fn emit(pool: &PgPool, pending: &HashSet<JobNotification>) -> Result<(), sqlx::Error> {
+///
+/// Clears `pending` once the emit has actually landed. Reading rather than
+/// draining to build the payloads matters: `?` below leaves the fold intact on
+/// failure, so a window that could not be emitted is retried on the next one
+/// instead of being silently dropped.
+async fn emit(pool: &PgPool, pending: &mut HashSet<JobNotification>) -> Result<(), sqlx::Error> {
     let payloads: Vec<String> = pending.iter().map(payload).collect();
     sqlx::query(
         "SELECT set_config('synchronous_commit', 'off', true), \
@@ -151,6 +158,7 @@ async fn emit(pool: &PgPool, pending: &HashSet<JobNotification>) -> Result<(), s
     .bind(&payloads)
     .execute(pool)
     .await?;
+    pending.clear();
     Ok(())
 }
 
@@ -191,55 +199,59 @@ impl es_entity::operation::hooks::CommitHook for JobEventHook {
     }
 }
 
-/// Arrange for `notification` to be emitted once `op` commits.
-///
-/// Falls back to an in-transaction `pg_notify` when the operation has no
-/// commit-hook buffer (a bare `sqlx::Transaction`), so hook-less callers keep
-/// today's latency at today's cost rather than silently dropping to the
-/// table-derived fallback. This mirrors obix's `persist_events_notifying`.
-pub(crate) async fn notify_on_commit(
-    notifier: &Arc<JobEventNotifier>,
-    op: &mut impl es_entity::AtomicOperation,
-    notification: JobNotification,
-) -> Result<(), sqlx::Error> {
-    let serialized = payload(&notification);
-    let hook = JobEventHook {
-        notifier: Arc::clone(notifier),
-        notifications: HashSet::from([notification]),
-    };
-
-    if op.add_commit_hook(hook).is_err() {
-        sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(JOB_EVENTS_CHANNEL)
-            .bind(serialized)
-            .execute(op.as_executor())
-            .await?;
+impl JobEventNotifier {
+    /// Report that a job of `job_type` is ready to run, once `op` commits.
+    pub(crate) async fn execution_ready_in_op(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        job_type: &JobType,
+    ) -> Result<(), sqlx::Error> {
+        self.notify_in_op(
+            op,
+            JobNotification::ExecutionReady {
+                job_type: job_type.to_string(),
+            },
+        )
+        .await
     }
 
-    Ok(())
-}
+    /// Report that a job reached terminal state and its execution row is gone,
+    /// once `op` commits.
+    pub(crate) async fn job_terminal_in_op(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        job_id: JobId,
+    ) -> Result<(), sqlx::Error> {
+        self.notify_in_op(op, JobNotification::JobTerminal { job_id })
+            .await
+    }
 
-/// Report that a job of `job_type` is (or became) ready to run.
-pub(crate) async fn notify_execution_ready_on_commit(
-    notifier: &Arc<JobEventNotifier>,
-    op: &mut impl es_entity::AtomicOperation,
-    job_type: &JobType,
-) -> Result<(), sqlx::Error> {
-    notify_on_commit(
-        notifier,
-        op,
-        JobNotification::ExecutionReady {
-            job_type: job_type.to_string(),
-        },
-    )
-    .await
-}
+    /// Arrange for `notification` to be reported once `op` commits.
+    ///
+    /// Falls back to an in-transaction `pg_notify` when the operation has no
+    /// commit-hook buffer (a bare `sqlx::Transaction`), so hook-less callers
+    /// keep today's latency at today's cost rather than silently dropping to
+    /// the table-derived fallback. This mirrors obix's
+    /// `persist_events_notifying`.
+    async fn notify_in_op(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        notification: JobNotification,
+    ) -> Result<(), sqlx::Error> {
+        let serialized = payload(&notification);
+        let hook = JobEventHook {
+            notifier: Arc::clone(self),
+            notifications: HashSet::from([notification]),
+        };
 
-/// Report that a job reached terminal state and its execution row is gone.
-pub(crate) async fn notify_job_terminal_on_commit(
-    notifier: &Arc<JobEventNotifier>,
-    op: &mut impl es_entity::AtomicOperation,
-    job_id: JobId,
-) -> Result<(), sqlx::Error> {
-    notify_on_commit(notifier, op, JobNotification::JobTerminal { job_id }).await
+        if op.add_commit_hook(hook).is_err() {
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(JOB_EVENTS_CHANNEL)
+                .bind(serialized)
+                .execute(op.as_executor())
+                .await?;
+        }
+
+        Ok(())
+    }
 }

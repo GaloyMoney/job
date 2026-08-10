@@ -12,7 +12,7 @@ use super::{
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
     error::JobError,
-    notifier::{JobEventNotifier, notify_execution_ready_on_commit, notify_job_terminal_on_commit},
+    notifier::JobEventNotifier,
     repo::JobRepo,
     runner::*,
     tracker::JobTracker,
@@ -301,7 +301,9 @@ impl JobDispatcher {
             )
             .execute(op.as_executor())
             .await?;
-            notify_execution_ready_on_commit(&self.notifier, &mut op, &job.job_type).await?;
+            self.notifier
+                .execution_ready_in_op(&mut op, &job.job_type)
+                .await?;
         } else {
             span.record(
                 "error.level",
@@ -350,10 +352,10 @@ impl JobDispatcher {
             return Ok(());
         };
 
-        notify_job_terminal_on_commit(&self.notifier, op, id).await?;
+        self.notifier.job_terminal_in_op(op, id).await?;
 
         if freed_queue_id.is_some() {
-            notify_execution_ready_on_commit(&self.notifier, op, job_type).await?;
+            self.notifier.execution_ready_in_op(op, job_type).await?;
         }
 
         Ok(())
@@ -393,7 +395,9 @@ impl JobDispatcher {
         )
         .execute(op.as_executor())
         .await?;
-        notify_execution_ready_on_commit(&self.notifier, op, &job.job_type).await?;
+        self.notifier
+            .execution_ready_in_op(op, &job.job_type)
+            .await?;
         job.reschedule_execution(reschedule_at);
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())
