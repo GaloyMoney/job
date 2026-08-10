@@ -1,3 +1,15 @@
+# [job release v0.7.3](https://github.com/GaloyMoney/job/releases/tag/0.7.3)
+
+
+
+### Performance
+
+- Move execution_ready NOTIFY off the write path (#162)
+
+### Testing
+
+- Cargo-fuzz targets + nightly job; fix apply_jitter overflow (#154)
+
 # [job release v0.7.2](https://github.com/GaloyMoney/job/releases/tag/0.7.2)
 
 
