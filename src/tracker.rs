@@ -2,11 +2,12 @@ use tokio::sync::Notify;
 
 use std::collections::HashMap;
 use std::sync::{
-    Mutex,
+    Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
 use super::JobId;
+use crate::entity::JobType;
 
 #[derive(Default)]
 struct LiveJobs {
@@ -38,6 +39,10 @@ pub(crate) struct JobTracker {
     running_jobs: AtomicUsize,
     notify: Notify,
     live_jobs: Mutex<LiveJobs>,
+    /// The job types this process polls for. Readiness reports from every
+    /// source are filtered against these. Unset until polling starts, so
+    /// earlier reports are dropped rather than queued.
+    job_types: OnceLock<Vec<JobType>>,
 }
 
 impl JobTracker {
@@ -48,7 +53,13 @@ impl JobTracker {
             running_jobs: AtomicUsize::new(0),
             notify: Notify::new(),
             live_jobs: Mutex::new(LiveJobs::default()),
+            job_types: OnceLock::new(),
         }
+    }
+
+    /// Called once, when polling starts.
+    pub fn set_job_types(&self, job_types: Vec<JobType>) {
+        let _ = self.job_types.set(job_types);
     }
 
     pub fn next_batch_size(&self) -> Option<usize> {
@@ -73,8 +84,15 @@ impl JobTracker {
         self.notify.notified()
     }
 
-    pub fn job_execution_inserted(&self) {
-        self.notify.notify_one()
+    /// Wake the poll loop if this process polls `job_type`. `notify_one` holds
+    /// at most one permit, so repeated reports collapse into one wake-up.
+    pub fn job_execution_inserted(&self, job_type: &str) {
+        let Some(job_types) = self.job_types.get() else {
+            return;
+        };
+        if job_types.iter().any(|jt| jt.as_str() == job_type) {
+            self.notify.notify_one();
+        }
     }
 
     pub fn job_completed(&self, id: JobId, rescheduled: bool) {

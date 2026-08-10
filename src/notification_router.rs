@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::JobId;
-use crate::entity::JobType;
 use crate::handle::OwnedTaskHandle;
 use crate::outcome::JobTerminalState;
 use crate::repo::JobRepo;
@@ -12,10 +11,16 @@ use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{Span, instrument};
 
+/// The single Postgres channel every job notification travels on.
+pub(crate) const JOB_EVENTS_CHANNEL: &str = "job_events";
+
 /// Notification types from the unified `job_events` channel.
-#[derive(Debug, serde::Deserialize)]
+///
+/// `Serialize` is derived so the emitter builds payloads through this same
+/// type and the wire format cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum JobNotification {
+pub(crate) enum JobNotification {
     ExecutionReady { job_type: String },
     JobTerminal { job_id: JobId },
 }
@@ -66,6 +71,12 @@ impl JobNotificationRouter {
         }
     }
 
+    /// Handed to the notifier so a completion in this process resolves its
+    /// waiters without a round trip through Postgres.
+    pub fn terminal_sender(&self) -> broadcast::Sender<JobId> {
+        self.terminal_tx.clone()
+    }
+
     /// Register interest in a job reaching terminal state.
     /// Returns a oneshot receiver that delivers the terminal state.
     /// Drop the receiver to unsubscribe.
@@ -81,14 +92,13 @@ impl JobNotificationRouter {
     pub async fn start(
         &self,
         tracker: Arc<JobTracker>,
-        job_types: Vec<JobType>,
     ) -> Result<(OwnedTaskHandle, OwnedTaskHandle), sqlx::Error> {
         let (register_tx, register_rx) = mpsc::unbounded_channel();
         self.register_tx
             .set(register_tx)
             .expect("router started more than once");
 
-        let listener_handle = self.start_listener(tracker, job_types).await?;
+        let listener_handle = self.start_listener(tracker).await?;
         let waiter_handle = Self::start_waiter_manager(
             register_rx,
             self.terminal_tx.subscribe(),
@@ -102,10 +112,9 @@ impl JobNotificationRouter {
     async fn start_listener(
         &self,
         tracker: Arc<JobTracker>,
-        job_types: Vec<JobType>,
     ) -> Result<OwnedTaskHandle, sqlx::Error> {
         let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen("job_events").await?;
+        listener.listen(JOB_EVENTS_CHANNEL).await?;
 
         let terminal_tx = self.terminal_tx.clone();
 
@@ -116,9 +125,7 @@ impl JobNotificationRouter {
                         let payload = notification.payload();
                         match serde_json::from_str::<JobNotification>(payload) {
                             Ok(JobNotification::ExecutionReady { job_type }) => {
-                                if job_types.iter().any(|jt| jt.as_str() == job_type) {
-                                    tracker.job_execution_inserted();
-                                }
+                                tracker.job_execution_inserted(&job_type);
                             }
                             Ok(JobNotification::JobTerminal { job_id }) => {
                                 let _ = terminal_tx.send(job_id);

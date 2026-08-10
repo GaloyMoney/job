@@ -6,6 +6,7 @@ use sqlx::postgres::{PgPool, types::PgInterval};
 use tracing::{Instrument, Span, instrument};
 
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,6 +21,7 @@ use super::{
     entity::{Job, JobType},
     error::JobError,
     handle::OwnedTaskHandle,
+    notifier::JobEventNotifier,
     registry::JobRegistry,
     repo::JobRepo,
     tracker::JobTracker,
@@ -49,6 +51,7 @@ pub(crate) struct JobPoller {
     repo: Arc<JobRepo>,
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
+    notifier: Arc<JobEventNotifier>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
@@ -84,6 +87,7 @@ impl JobPoller {
         repo: Arc<JobRepo>,
         registry: JobRegistry,
         tracker: Arc<JobTracker>,
+        notifier: Arc<JobEventNotifier>,
         clock: ClockHandle,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
@@ -91,6 +95,7 @@ impl JobPoller {
         >(1);
         Self {
             tracker,
+            notifier,
             repo,
             config,
             registry,
@@ -242,6 +247,7 @@ impl JobPoller {
         let supported_job_types = self.registry.registered_job_types();
         let instance_id = self.instance_id;
         let tracker = Arc::clone(&self.tracker);
+        let notifier = Arc::clone(&self.notifier);
         OwnedTaskHandle::new(spawn_named_task!("job-poller-lost-handler", async move {
             loop {
                 // Liveness is a wall-clock question — a manual application clock
@@ -274,10 +280,14 @@ impl JobPoller {
                     )
                     .await
                     {
-                        Ok(ids) => {
-                            Span::current().record("n_lost_jobs", ids.len());
-                            for id in ids {
+                        Ok(reclaimed) => {
+                            Span::current().record("n_lost_jobs", reclaimed.len());
+                            let mut reported: HashSet<&JobType> = HashSet::new();
+                            for (id, job_type) in &reclaimed {
                                 tracing::error!(job_id = %id, "lost job");
+                                if reported.insert(job_type) {
+                                    notifier.execution_ready(job_type);
+                                }
                             }
                         }
                         Err(e) => {
@@ -453,12 +463,16 @@ impl JobPoller {
         span.record("attempt", polled_job.attempt);
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
-        let runner = self
-            .registry
-            .init_job(&job, Arc::clone(&self.repo), self.clock.clone())?;
+        let runner = self.registry.init_job(
+            &job,
+            Arc::clone(&self.repo),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )?;
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
         let repo = Arc::clone(&self.repo);
         let tracker = self.tracker.clone();
+        let notifier = Arc::clone(&self.notifier);
         let instance_id = self.instance_id;
         let clock = self.clock.clone();
         span.record("now", tracing::field::display(clock.now()));
@@ -482,6 +496,7 @@ impl JobPoller {
             let job_fut = JobDispatcher::new(
                 repo,
                 tracker,
+                notifier,
                 retry_settings,
                 job_id,
                 runner,
@@ -566,7 +581,7 @@ async fn reclaim_lost_jobs(
     alive_threshold: DateTime<Utc>,
     reschedule_at: DateTime<Utc>,
     self_live_ids: &[uuid::Uuid],
-) -> Result<Vec<JobId>, sqlx::Error> {
+) -> Result<Vec<(JobId, JobType)>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
         UPDATE job_executions
@@ -575,7 +590,7 @@ async fn reclaim_lost_jobs(
           AND alive_at < $1::timestamptz
           AND job_type = ANY($2)
           AND (poller_instance_id IS DISTINCT FROM $4 OR id <> ALL($5))
-        RETURNING id AS "id!: JobId"
+        RETURNING id AS "id!: JobId", job_type AS "job_type!: JobType"
         "#,
         alive_threshold,
         supported_job_types as _,
@@ -586,7 +601,7 @@ async fn reclaim_lost_jobs(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|r| r.id).collect())
+    Ok(rows.into_iter().map(|r| (r.id, r.job_type)).collect())
 }
 
 #[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty))]
@@ -1022,6 +1037,7 @@ mod tests {
         )
         .await?
         .into_iter()
+        .map(|(id, _)| id)
         .collect();
 
         assert!(

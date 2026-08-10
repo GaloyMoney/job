@@ -15,8 +15,7 @@ use crate::{
     outcome::{JobReturnValue, JobTerminalState},
 };
 
-#[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(transparent)]
+#[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 /// Identifier describing a job type or class of work.
 ///
@@ -48,6 +47,42 @@ impl JobType {
 impl std::fmt::Display for JobType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+// Hand-written rather than `#[sqlx(transparent)]`, which delegates `Decode` to
+// `Cow<'static, str>` and so demands a `'static` borrow no row can provide.
+// Decoding owned lets queries name the type: `AS "job_type!: JobType"`.
+impl sqlx::Type<sqlx::Postgres> for JobType {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <String as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl sqlx::postgres::PgHasArrayType for JobType {
+    fn array_type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as sqlx::postgres::PgHasArrayType>::array_type_info()
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Postgres> for JobType {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <&str as sqlx::Encode<sqlx::Postgres>>::encode(self.as_str(), buf)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for JobType {
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        Ok(JobType(Cow::Owned(<String as sqlx::Decode<
+            sqlx::Postgres,
+        >>::decode(value)?)))
     }
 }
 

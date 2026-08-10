@@ -212,6 +212,7 @@ mod entity;
 mod handle;
 mod migrate;
 mod notification_router;
+mod notifier;
 mod outcome;
 mod poller;
 mod registry;
@@ -255,6 +256,8 @@ pub struct Jobs {
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     router: Arc<JobNotificationRouter>,
+    tracker: Arc<JobTracker>,
+    notifier: Arc<notifier::JobEventNotifier>,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -290,12 +293,23 @@ impl Jobs {
             config.poller_config.terminal_channel_size,
             config.poller_config.sweep_interval,
         ));
+        let tracker = Arc::new(JobTracker::new(
+            config.poller_config.min_jobs_per_process,
+            config.poller_config.max_jobs_per_process,
+        ));
+        let notifier = notifier::JobEventNotifier::spawn(
+            &pool,
+            Arc::clone(&tracker),
+            router.terminal_sender(),
+        );
         let clock = config.clock.clone();
         Ok(Self {
             repo,
             config,
             registry,
             router,
+            tracker,
+            notifier,
             poller_handle: None,
             clock,
         })
@@ -453,23 +467,20 @@ impl Jobs {
             .take()
             .expect("Registry has been consumed by executor");
 
-        let tracker = Arc::new(JobTracker::new(
-            self.config.poller_config.min_jobs_per_process,
-            self.config.poller_config.max_jobs_per_process,
-        ));
+        let tracker = Arc::clone(&self.tracker);
 
         let poller = JobPoller::new(
             self.config.poller_config.clone(),
             Arc::clone(&self.repo),
             registry,
             Arc::clone(&tracker),
+            Arc::clone(&self.notifier),
             self.clock.clone(),
         );
 
-        let job_types = poller.registered_job_types();
+        tracker.set_job_types(poller.registered_job_types());
 
-        let (listener_handle, waiter_handle) =
-            self.router.start(Arc::clone(&tracker), job_types).await?;
+        let (listener_handle, waiter_handle) = self.router.start(Arc::clone(&tracker)).await?;
 
         let poller_handle = poller.start(listener_handle, waiter_handle);
         self.poller_handle = Some(Arc::new(poller_handle));
@@ -496,7 +507,12 @@ impl Jobs {
                 .expect("Registry has been consumed by executor")
                 .add_initializer(initializer)
         };
-        JobSpawner::new(Arc::clone(&self.repo), job_type, self.clock.clone())
+        JobSpawner::new(
+            Arc::clone(&self.repo),
+            job_type,
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )
     }
 
     /// Fetch the current snapshot of a job entity by identifier.

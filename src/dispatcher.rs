@@ -10,8 +10,9 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 use super::{
     JobId,
     current::CurrentJob,
-    entity::{Job, RetryPolicy},
+    entity::{Job, JobType, RetryPolicy},
     error::JobError,
+    notifier::JobEventNotifier,
     repo::JobRepo,
     runner::*,
     tracker::JobTracker,
@@ -29,6 +30,7 @@ pub(crate) struct JobDispatcher {
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
+    notifier: Arc<JobEventNotifier>,
     rescheduled: bool,
     dispatched: bool,
     id: JobId,
@@ -36,9 +38,11 @@ pub(crate) struct JobDispatcher {
     clock: ClockHandle,
 }
 impl JobDispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
+        notifier: Arc<JobEventNotifier>,
         retry_settings: RetrySettings,
         id: JobId,
         runner: Box<dyn JobRunner>,
@@ -50,6 +54,7 @@ impl JobDispatcher {
             retry_settings,
             runner: Some(runner),
             tracker,
+            notifier,
             rescheduled: false,
             dispatched: false,
             id,
@@ -296,6 +301,9 @@ impl JobDispatcher {
             )
             .execute(op.as_executor())
             .await?;
+            self.notifier
+                .execution_ready_in_op(&mut op, &job.job_type)
+                .await?;
         } else {
             span.record(
                 "error.level",
@@ -303,20 +311,46 @@ impl JobDispatcher {
             );
             span.record("will_retry", false);
 
-            sqlx::query!(
-                r#"
-                DELETE FROM job_executions
-                WHERE id = $1 AND poller_instance_id = $2
-              "#,
-                id as JobId,
-                self.instance_id
-            )
-            .execute(op.as_executor())
-            .await?;
+            self.delete_execution_in_op(&mut op, id, &job.job_type)
+                .await?;
         }
 
         self.repo.update_in_op(&mut op, &mut job).await?;
         op.commit().await?;
+        Ok(())
+    }
+
+    /// Delete the execution row and report what its removal makes true: the job
+    /// is terminal, and if it held a `queue_id`, that queue's next job is now
+    /// eligible. Reports nothing when no row was deleted.
+    async fn delete_execution_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: JobId,
+        job_type: &JobType,
+    ) -> Result<(), JobError> {
+        let deleted = sqlx::query_scalar!(
+            r#"
+          DELETE FROM job_executions
+          WHERE id = $1 AND poller_instance_id = $2
+          RETURNING queue_id
+        "#,
+            id as JobId,
+            self.instance_id
+        )
+        .fetch_optional(op.as_executor())
+        .await?;
+
+        let Some(freed_queue_id) = deleted else {
+            return Ok(());
+        };
+
+        self.notifier.job_terminal_in_op(op, id).await?;
+
+        if freed_queue_id.is_some() {
+            self.notifier.execution_ready_in_op(op, job_type).await?;
+        }
+
         Ok(())
     }
 
@@ -327,16 +361,7 @@ impl JobDispatcher {
         id: JobId,
     ) -> Result<(), JobError> {
         let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
-        sqlx::query!(
-            r#"
-          DELETE FROM job_executions
-          WHERE id = $1 AND poller_instance_id = $2
-        "#,
-            id as JobId,
-            self.instance_id
-        )
-        .execute(op.as_executor())
-        .await?;
+        self.delete_execution_in_op(op, id, &job.job_type).await?;
         job.complete_job();
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())
@@ -363,6 +388,9 @@ impl JobDispatcher {
         )
         .execute(op.as_executor())
         .await?;
+        self.notifier
+            .execution_ready_in_op(op, &job.job_type)
+            .await?;
         job.reschedule_execution(reschedule_at);
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())
