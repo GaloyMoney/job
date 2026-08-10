@@ -10,7 +10,7 @@ use super::{
     Job, JobId,
     entity::{JobType, NewJob},
     error::JobError,
-    notifier::{ExecutionReadyNotifier, notify_ready_on_commit},
+    notifier::{JobEventNotifier, notify_execution_ready_on_commit},
     repo::JobRepo,
 };
 
@@ -77,7 +77,7 @@ pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
     job_type: JobType,
     clock: ClockHandle,
-    notifier: Arc<ExecutionReadyNotifier>,
+    notifier: Arc<JobEventNotifier>,
     parent_job_id: Option<JobId>,
     _phantom: PhantomData<Config>,
 }
@@ -90,7 +90,7 @@ where
         repo: Arc<JobRepo>,
         job_type: JobType,
         clock: ClockHandle,
-        notifier: Arc<ExecutionReadyNotifier>,
+        notifier: Arc<JobEventNotifier>,
     ) -> Self {
         Self {
             repo,
@@ -348,7 +348,7 @@ where
         .execute(op.as_executor())
         .await?;
 
-        notify_ready_on_commit(&self.notifier, op, &self.job_type).await?;
+        notify_execution_ready_on_commit(&self.notifier, op, &self.job_type).await?;
 
         for (job, schedule_at) in jobs.iter_mut().zip(&schedule_times) {
             job.schedule_execution(*schedule_at);
@@ -443,7 +443,7 @@ where
         )
         .execute(op.as_executor())
         .await?;
-        notify_ready_on_commit(&self.notifier, op, &job.job_type).await?;
+        notify_execution_ready_on_commit(&self.notifier, op, &job.job_type).await?;
         job.schedule_execution(schedule_at);
         self.repo.update_in_op(op, job).await?;
         Ok(())

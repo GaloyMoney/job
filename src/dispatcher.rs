@@ -12,7 +12,7 @@ use super::{
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
     error::JobError,
-    notifier::{ExecutionReadyNotifier, notify_ready_on_commit},
+    notifier::{JobEventNotifier, notify_execution_ready_on_commit, notify_job_terminal_on_commit},
     repo::JobRepo,
     runner::*,
     tracker::JobTracker,
@@ -30,7 +30,7 @@ pub(crate) struct JobDispatcher {
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
-    notifier: Arc<ExecutionReadyNotifier>,
+    notifier: Arc<JobEventNotifier>,
     rescheduled: bool,
     dispatched: bool,
     id: JobId,
@@ -42,7 +42,7 @@ impl JobDispatcher {
     pub fn new(
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
-        notifier: Arc<ExecutionReadyNotifier>,
+        notifier: Arc<JobEventNotifier>,
         retry_settings: RetrySettings,
         id: JobId,
         runner: Box<dyn JobRunner>,
@@ -301,7 +301,7 @@ impl JobDispatcher {
             )
             .execute(op.as_executor())
             .await?;
-            notify_ready_on_commit(&self.notifier, &mut op, &job.job_type).await?;
+            notify_execution_ready_on_commit(&self.notifier, &mut op, &job.job_type).await?;
         } else {
             span.record(
                 "error.level",
@@ -318,20 +318,23 @@ impl JobDispatcher {
         Ok(())
     }
 
-    /// Delete the execution row, reporting `execution_ready` when the row
-    /// carried a `queue_id`.
+    /// Delete the execution row and report what its removal makes true.
     ///
-    /// `queue_id` serialization is a function of table state -- the poll query
-    /// anti-joins running rows -- so removing the last running row on a queue
-    /// is what makes the next job on it eligible. Without this report, that
-    /// successor would wait for a poll cycle rather than being woken.
+    /// `job_terminal` tells any waiter the job reached terminal state. When the
+    /// row carried a `queue_id`, its removal also frees that queue: queue
+    /// serialization is a function of table state -- the poll query anti-joins
+    /// running rows -- so the successor becomes eligible at exactly this point
+    /// and is worth waking.
+    ///
+    /// Both are reported only when a row was actually deleted; a no-op delete
+    /// (the row already gone, or claimed by another poller) announces nothing.
     async fn delete_execution_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
         job_type: &JobType,
     ) -> Result<(), JobError> {
-        let freed_queue_id = sqlx::query_scalar!(
+        let deleted = sqlx::query_scalar!(
             r#"
           DELETE FROM job_executions
           WHERE id = $1 AND poller_instance_id = $2
@@ -341,11 +344,16 @@ impl JobDispatcher {
             self.instance_id
         )
         .fetch_optional(op.as_executor())
-        .await?
-        .flatten();
+        .await?;
+
+        let Some(freed_queue_id) = deleted else {
+            return Ok(());
+        };
+
+        notify_job_terminal_on_commit(&self.notifier, op, id).await?;
 
         if freed_queue_id.is_some() {
-            notify_ready_on_commit(&self.notifier, op, job_type).await?;
+            notify_execution_ready_on_commit(&self.notifier, op, job_type).await?;
         }
 
         Ok(())
@@ -385,7 +393,7 @@ impl JobDispatcher {
         )
         .execute(op.as_executor())
         .await?;
-        notify_ready_on_commit(&self.notifier, op, &job.job_type).await?;
+        notify_execution_ready_on_commit(&self.notifier, op, &job.job_type).await?;
         job.reschedule_execution(reschedule_at);
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())

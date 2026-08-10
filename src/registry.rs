@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
-    entity::*, error::JobError, notifier::ExecutionReadyNotifier, repo::JobRepo, runner::*,
+    entity::*, error::JobError, notifier::JobEventNotifier, repo::JobRepo, runner::*,
     spawner::JobSpawner,
 };
 
@@ -18,7 +18,7 @@ pub(crate) trait AnyJobInitializer: Send + Sync + 'static {
         job: &Job,
         repo: Arc<JobRepo>,
         clock: ClockHandle,
-        notifier: Arc<ExecutionReadyNotifier>,
+        notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
@@ -28,7 +28,7 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         job: &Job,
         repo: Arc<JobRepo>,
         clock: ClockHandle,
-        notifier: Arc<ExecutionReadyNotifier>,
+        notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), clock, notifier)
             .with_parent(job.id);
@@ -66,7 +66,7 @@ impl JobRegistry {
         job: &Job,
         repo: Arc<JobRepo>,
         clock: ClockHandle,
-        notifier: Arc<ExecutionReadyNotifier>,
+        notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, JobError> {
         self.initializers
             .get(&job.job_type)

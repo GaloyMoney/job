@@ -2433,21 +2433,20 @@ async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Re
         "write path emitted an in-transaction notification: {stray:?}"
     );
 
-    // ...but completion must still deliver `job_terminal`: it carries a job_id,
-    // drives the completion-waiter broadcast, and losing it wedges await.
+    // The DELETE too: `job_terminal` is emitted by the crate after the commit,
+    // not by the row itself disappearing, so there is no trigger left to fire.
     sqlx::query("DELETE FROM job_executions WHERE id = $1")
         .bind(job_id)
         .execute(&pool)
         .await?;
 
-    let payload = next_matching(&mut listener, Duration::from_secs(5), |payload| {
-        payload["job_id"] == job_id.to_string()
+    let stray = next_matching(&mut listener, Duration::from_millis(500), |payload| {
+        payload["job_type"] == job_type.as_str() || payload["job_id"] == job_id.to_string()
     })
-    .await
-    .expect("timed out waiting for job_terminal");
-    assert_eq!(
-        payload["type"], "job_terminal",
-        "completion must still notify job_terminal, got {payload}"
+    .await;
+    assert!(
+        stray.is_none(),
+        "delete emitted an in-transaction notification: {stray:?}"
     );
 
     sqlx::query("DELETE FROM jobs WHERE id = $1")
@@ -2455,6 +2454,40 @@ async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Re
         .execute(&pool)
         .await?;
 
+    Ok(())
+}
+
+/// `job_terminal` must still reach the wire once a job actually completes --
+/// now from the debounced emitter rather than a trigger. This is what lets a
+/// waiter in another process resolve without falling back to the sweep.
+#[tokio::test]
+async fn test_job_terminal_is_delivered_out_of_band() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+    listener.listen("job_events").await?;
+
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("terminal-out-of-band"),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, TestJobConfig { delay_ms: 0 }).await?;
+
+    let payload = next_matching(&mut listener, Duration::from_secs(10), |payload| {
+        payload["job_id"] == job_id.to_string()
+    })
+    .await
+    .expect("job_terminal was never delivered for a completed job");
+    assert_eq!(payload["type"], "job_terminal", "got {payload}");
+
+    jobs.shutdown().await?;
     Ok(())
 }
 

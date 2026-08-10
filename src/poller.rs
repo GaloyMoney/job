@@ -21,7 +21,7 @@ use super::{
     entity::{Job, JobType},
     error::JobError,
     handle::OwnedTaskHandle,
-    notifier::ExecutionReadyNotifier,
+    notifier::JobEventNotifier,
     registry::JobRegistry,
     repo::JobRepo,
     tracker::JobTracker,
@@ -51,7 +51,7 @@ pub(crate) struct JobPoller {
     repo: Arc<JobRepo>,
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
-    notifier: Arc<ExecutionReadyNotifier>,
+    notifier: Arc<JobEventNotifier>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
@@ -87,7 +87,7 @@ impl JobPoller {
         repo: Arc<JobRepo>,
         registry: JobRegistry,
         tracker: Arc<JobTracker>,
-        notifier: Arc<ExecutionReadyNotifier>,
+        notifier: Arc<JobEventNotifier>,
         clock: ClockHandle,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<

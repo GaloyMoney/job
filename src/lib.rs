@@ -256,7 +256,7 @@ pub struct Jobs {
     repo: Arc<JobRepo>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     router: Arc<JobNotificationRouter>,
-    notifier: Arc<notifier::ExecutionReadyNotifier>,
+    notifier: Arc<notifier::JobEventNotifier>,
     poller_handle: Option<Arc<JobPollerHandle>>,
     clock: ClockHandle,
 }
@@ -292,7 +292,7 @@ impl Jobs {
             config.poller_config.terminal_channel_size,
             config.poller_config.sweep_interval,
         ));
-        let notifier = notifier::ExecutionReadyNotifier::spawn(&pool);
+        let notifier = notifier::JobEventNotifier::spawn(&pool);
         let clock = config.clock.clone();
         Ok(Self {
             repo,
@@ -473,10 +473,14 @@ impl Jobs {
 
         let job_types = poller.registered_job_types();
 
-        // Spawns made in this process can wake this poller without a round trip
-        // through Postgres, leaving NOTIFY to do only the cross-process work.
-        self.notifier
-            .register_local_poller(Arc::clone(&tracker), job_types.clone());
+        // Work done in this process reaches this poller and its completion
+        // waiters without a round trip through Postgres, leaving NOTIFY to do
+        // only the cross-process part.
+        self.notifier.register_local_delivery(
+            Arc::clone(&tracker),
+            job_types.clone(),
+            self.router.terminal_sender(),
+        );
 
         let (listener_handle, waiter_handle) =
             self.router.start(Arc::clone(&tracker), job_types).await?;

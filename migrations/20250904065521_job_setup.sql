@@ -71,44 +71,4 @@ ALTER TABLE job_executions SET (
   log_autovacuum_min_duration = 0
 );
 
--- PostgreSQL serializes every notify-bearing commit on an instance-wide
--- AccessExclusiveLock (PreCommit_Notify, src/backend/commands/async.c) that is
--- held across the WAL flush. A `pg_notify` in this trigger therefore converts
--- otherwise notify-free application transactions -- a GraphQL mutation that
--- happens to spawn a job, or a job's own work commit carrying the completion
--- DELETE -- into commits that queue on that cluster-wide lock.
---
--- All `execution_ready` emissions have moved out of the write path onto a
--- per-process debounced emitter (src/notifier.rs), which reports from an
--- es-entity post-commit hook and emits at most one notification per window on
--- its own connection with synchronous_commit = off. That is safe because
--- `execution_ready` is a content-free, receiver-coalesced *hint*: the listener
--- collapses any burst into a single `tokio::sync::Notify` permit, and a lost
--- hint costs at most MAX_WAIT (60s, src/poller.rs) of pickup latency -- never
--- correctness.
---
--- `job_terminal` stays in-transaction on purpose: unlike the hint it carries a
--- job_id, drives the completion-waiter broadcast, and its loss wedges
--- `await_completion` (backstopped only by the 30s sweep). Relocating it is a
--- separate, higher-risk change.
---
--- The trigger is scoped to AFTER DELETE for the same reason: as an
--- INSERT/UPDATE trigger it also fired per row on the two hottest statements on
--- this table (the `execution_state_json` update and the `alive_at` heartbeat),
--- paying a plpgsql invocation to evaluate guards and emit nothing.
-CREATE OR REPLACE FUNCTION notify_job_event() RETURNS TRIGGER AS $$
-BEGIN
-  IF TG_OP = 'DELETE' THEN
-    PERFORM pg_notify('job_events',
-      json_build_object('type', 'job_terminal', 'job_id', OLD.id::text)::text);
-  END IF;
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS job_executions_notify_event_trigger ON job_executions;
-
-CREATE TRIGGER job_executions_notify_event_trigger
-AFTER DELETE ON job_executions
-FOR EACH ROW
-EXECUTE FUNCTION notify_job_event();
+-- `job_executions` deliberately has NO notification trigger.
