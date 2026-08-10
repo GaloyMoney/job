@@ -16,9 +16,8 @@ pub(crate) const JOB_EVENTS_CHANNEL: &str = "job_events";
 
 /// Notification types from the unified `job_events` channel.
 ///
-/// `Serialize` is derived so the debounced emitter in `notifier.rs` builds its
-/// payloads through this same type -- the wire format cannot drift between the
-/// side that writes it and the side that parses it.
+/// `Serialize` is derived so the emitter builds payloads through this same
+/// type and the wire format cannot drift.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum JobNotification {
@@ -72,9 +71,8 @@ impl JobNotificationRouter {
         }
     }
 
-    /// Sender for the terminal-notification broadcast the waiter manager
-    /// consumes. Handed to the notifier so a completion in this process
-    /// resolves its waiters without a round trip through Postgres.
+    /// Handed to the notifier so a completion in this process resolves its
+    /// waiters without a round trip through Postgres.
     pub fn terminal_sender(&self) -> broadcast::Sender<JobId> {
         self.terminal_tx.clone()
     }

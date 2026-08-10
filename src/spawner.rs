@@ -347,10 +347,7 @@ where
         .bind(op.maybe_now())
         .execute(op.as_executor())
         .await?;
-        // there are a lot of top level functions - if they are module private (like in
-        // notifier.rs) its somewhat acceptable - but exposing it outside of the module and calling
-        // a top level function here from spawner.rs is NOT acceptable
-        // put fns onto notifier (Arc<Self> receiver - or whatever make sense)
+
         self.notifier
             .execution_ready_in_op(op, &self.job_type)
             .await?;

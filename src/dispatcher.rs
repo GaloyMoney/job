@@ -320,16 +320,9 @@ impl JobDispatcher {
         Ok(())
     }
 
-    /// Delete the execution row and report what its removal makes true.
-    ///
-    /// `job_terminal` tells any waiter the job reached terminal state. When the
-    /// row carried a `queue_id`, its removal also frees that queue: queue
-    /// serialization is a function of table state -- the poll query anti-joins
-    /// running rows -- so the successor becomes eligible at exactly this point
-    /// and is worth waking.
-    ///
-    /// Both are reported only when a row was actually deleted; a no-op delete
-    /// (the row already gone, or claimed by another poller) announces nothing.
+    /// Delete the execution row and report what its removal makes true: the job
+    /// is terminal, and if it held a `queue_id`, that queue's next job is now
+    /// eligible. Reports nothing when no row was deleted.
     async fn delete_execution_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,

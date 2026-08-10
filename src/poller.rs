@@ -282,9 +282,6 @@ impl JobPoller {
                     {
                         Ok(reclaimed) => {
                             Span::current().record("n_lost_jobs", reclaimed.len());
-                            // This UPDATE is autocommit (no operation, so no
-                            // commit hook); report once the statement has
-                            // succeeded, which is already post-commit.
                             let mut reported: HashSet<&JobType> = HashSet::new();
                             for (id, job_type) in &reclaimed {
                                 tracing::error!(job_id = %id, "lost job");
@@ -593,7 +590,7 @@ async fn reclaim_lost_jobs(
           AND alive_at < $1::timestamptz
           AND job_type = ANY($2)
           AND (poller_instance_id IS DISTINCT FROM $4 OR id <> ALL($5))
-        RETURNING id AS "id!: JobId", job_type AS "job_type!"
+        RETURNING id AS "id!: JobId", job_type AS "job_type!: JobType"
         "#,
         alive_threshold,
         supported_job_types as _,
@@ -604,10 +601,7 @@ async fn reclaim_lost_jobs(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| (r.id, JobType::from_owned(r.job_type)))
-        .collect())
+    Ok(rows.into_iter().map(|r| (r.id, r.job_type)).collect())
 }
 
 #[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty))]

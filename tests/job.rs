@@ -2350,16 +2350,6 @@ async fn test_lost_handler_uses_wall_clock_under_frozen_manual_clock() -> anyhow
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// NOTIFY funnel: `execution_ready` must not ride the caller's transaction.
-//
-// Every notify-bearing commit serializes on an instance-wide lock held across
-// the WAL flush, so a trigger that emits `pg_notify` turns each spawn (and each
-// job's own work commit) into a commit that queues on it. These tests pin the
-// contract that replaced it: nothing on the write path notifies, the hint still
-// arrives out-of-band, and `job_terminal` -- which is NOT a hint -- still does.
-// ---------------------------------------------------------------------------
-
 /// Await the first `job_events` payload satisfying `pred`, ignoring unrelated
 /// traffic from concurrently-running tests. Returns `None` on timeout.
 async fn next_matching(
@@ -2385,9 +2375,7 @@ async fn next_matching(
     }
 }
 
-/// Writing to `job_executions` must not emit `execution_ready` from inside the
-/// writer's transaction. Fails against the pre-fix trigger, which emitted on
-/// every INSERT.
+/// Writes to `job_executions` must not notify from inside the transaction.
 #[tokio::test]
 async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -2398,7 +2386,6 @@ async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Re
     let job_id = uuid::Uuid::now_v7();
     let job_type = format!("notify-funnel-insert-{job_id}");
 
-    // Exactly the statements a spawn issues inside the caller's operation.
     let mut tx = pool.begin().await?;
     sqlx::query("INSERT INTO jobs (id, unique_per_type, job_type) VALUES ($1, false, $2)")
         .bind(job_id)
@@ -2415,15 +2402,12 @@ async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Re
     .await?;
     tx.commit().await?;
 
-    // A reschedule (state stays 'pending', execute_at moves) is the other arm
-    // the old trigger notified on.
     sqlx::query("UPDATE job_executions SET execute_at = NOW() + interval '1 hour' WHERE id = $1")
         .bind(job_id)
         .execute(&pool)
         .await?;
 
-    // `job_events` is a single global channel and tests run concurrently, so
-    // only notifications naming *this* test's job are evidence either way.
+    // One global channel, concurrent tests: only this job is evidence.
     let stray = next_matching(&mut listener, Duration::from_millis(500), |payload| {
         payload["job_type"] == job_type.as_str()
     })
@@ -2433,8 +2417,6 @@ async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Re
         "write path emitted an in-transaction notification: {stray:?}"
     );
 
-    // The DELETE too: `job_terminal` is emitted by the crate after the commit,
-    // not by the row itself disappearing, so there is no trigger left to fire.
     sqlx::query("DELETE FROM job_executions WHERE id = $1")
         .bind(job_id)
         .execute(&pool)
@@ -2457,9 +2439,8 @@ async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Re
     Ok(())
 }
 
-/// `job_terminal` must still reach the wire once a job actually completes --
-/// now from the debounced emitter rather than a trigger. This is what lets a
-/// waiter in another process resolve without falling back to the sweep.
+/// `job_terminal` must still reach the wire when a job completes, so a waiter
+/// in another process resolves without falling back to the sweep.
 #[tokio::test]
 async fn test_job_terminal_is_delivered_out_of_band() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -2491,9 +2472,8 @@ async fn test_job_terminal_is_delivered_out_of_band() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The debounced emitter must still reach *other* processes. The spawning
-/// service never starts a poller, so its in-process fast path is inert and the
-/// only route to the running poller is the out-of-transaction NOTIFY.
+/// The emitter must reach other processes. The spawning service never polls,
+/// so its in-process delivery is inert and NOTIFY is the only route.
 #[tokio::test]
 async fn test_execution_ready_reaches_another_process() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -2501,7 +2481,6 @@ async fn test_execution_ready_reaches_another_process() -> anyhow::Result<()> {
     let job_type = JobType::new("notify-funnel-crosspod");
     let completed = Arc::new(Mutex::new(Vec::<String>::new()));
 
-    // B runs the poller and is the only process that can execute the job.
     let config_b = JobSvcConfig::builder()
         .pool(pool.clone())
         .build()
@@ -2513,8 +2492,6 @@ async fn test_execution_ready_reaches_another_process() -> anyhow::Result<()> {
     });
     jobs_b.start_poll().await.expect("Failed to start poller B");
 
-    // A only spawns. No start_poll => no local tracker registered => the hint
-    // has to travel through Postgres to reach B.
     let config_a = JobSvcConfig::builder()
         .pool(pool)
         .build()
@@ -2529,8 +2506,7 @@ async fn test_execution_ready_reaches_another_process() -> anyhow::Result<()> {
         .spawn(JobId::new(), TrackingJobConfig { label: "x".into() })
         .await?;
 
-    // Generous bound, but far below the 60s MAX_WAIT fallback: passing this
-    // only via the fallback poll would take a minute.
+    // Far below the 60s MAX_WAIT fallback.
     let mut attempts = 0;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

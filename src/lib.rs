@@ -293,8 +293,6 @@ impl Jobs {
             config.poller_config.terminal_channel_size,
             config.poller_config.sweep_interval,
         ));
-        // Both live from init so the notifier's delivery targets are
-        // unconditional; each is inert until polling starts.
         let tracker = Arc::new(JobTracker::new(
             config.poller_config.min_jobs_per_process,
             config.poller_config.max_jobs_per_process,
@@ -480,8 +478,6 @@ impl Jobs {
             self.clock.clone(),
         );
 
-        // Publishing the served types is what arms readiness wake-ups, for
-        // reports from this process and from `pg_notify` alike.
         tracker.set_job_types(poller.registered_job_types());
 
         let (listener_handle, waiter_handle) = self.router.start(Arc::clone(&tracker)).await?;
