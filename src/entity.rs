@@ -248,6 +248,21 @@ impl Job {
         }
     }
 
+    /// Returns the error string of the latest `ExecutionErrored` event, if any.
+    ///
+    /// For a job that terminated in `Errored`, `error_job` pushes exactly
+    /// `ExecutionErrored { error }` followed by `JobCompleted`, so the latest
+    /// `ExecutionErrored` is the terminal error.
+    pub(crate) fn last_error(&self) -> Option<String> {
+        self.events.iter_all().rev().find_map(|event| {
+            if let JobEvent::ExecutionErrored { error } = event {
+                Some(error.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Returns the raw return value attached to this job, if any.
     ///
     /// Scans for the latest `ReturnValueUpdated` event (last write wins).
@@ -1199,7 +1214,9 @@ mod tests {
                 assert!(backoff <= huge, "backoff {backoff} exceeded max_ms {huge}");
             }
             // Exercises the i64::MAX backoff boundary directly without panicking.
-            assert!(policy.apply_jitter(i64::MAX as u64, u64::MAX) <= u64::MAX);
+            // (The result is a u64, so a `<= u64::MAX` assertion would be
+            // vacuously true; calling it is the actual check.)
+            let _ = policy.apply_jitter(i64::MAX as u64, u64::MAX);
         }
     }
 }

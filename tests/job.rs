@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
     ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobRunner,
-    JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
+    JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
     error::JobError,
 };
 use serde::{Deserialize, Serialize};
@@ -86,8 +86,8 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
     let max_attempts = 50;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let job = jobs.find(job.id).await?;
-        if job.completed() {
+        let snap = jobs.handle(job.id).load().await?;
+        if snap.state().is_terminal() {
             break;
         }
         attempts += 1;
@@ -202,8 +202,8 @@ async fn test_scheduled_job_with_artificial_clock() -> anyhow::Result<()> {
     let max_attempts = 50;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let job = jobs.find(job.id).await?;
-        if job.completed() {
+        let snap = jobs.handle(job.id).load().await?;
+        if snap.state().is_terminal() {
             break;
         }
         attempts += 1;
@@ -677,8 +677,8 @@ async fn test_bulk_spawn_creates_and_runs_all_jobs() -> anyhow::Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         let mut all_done = true;
         for id in &ids {
-            let job = jobs.find(*id).await?;
-            if !job.completed() {
+            let snap = jobs.handle(*id).load().await?;
+            if !snap.state().is_terminal() {
                 all_done = false;
                 break;
             }
@@ -729,9 +729,9 @@ async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
     );
 
     // The first job should also not be persisted (transaction rolled back)
-    let find_result = jobs.find(duplicate_id).await;
+    let load_result = jobs.handle(duplicate_id).load().await;
     assert!(
-        find_result.is_err(),
+        load_result.is_err(),
         "No jobs should be persisted after rollback"
     );
 
@@ -825,7 +825,12 @@ async fn test_await_completion_on_success() -> anyhow::Result<()> {
         .await?;
 
     let jobs_clone = jobs.clone();
-    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id, None).await });
+    let handle = tokio::spawn(async move {
+        jobs_clone
+            .handle(job_id)
+            .await_completion(Duration::from_secs(30))
+            .await
+    });
 
     let outcome = handle.await??;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
@@ -849,7 +854,12 @@ async fn test_await_completion_on_error() -> anyhow::Result<()> {
     spawner.spawn(job_id, FailingJobConfig).await?;
 
     let jobs_clone = jobs.clone();
-    let handle = tokio::spawn(async move { jobs_clone.await_completion(job_id, None).await });
+    let handle = tokio::spawn(async move {
+        jobs_clone
+            .handle(job_id)
+            .await_completion(Duration::from_secs(30))
+            .await
+    });
 
     let outcome = handle.await??;
     assert_eq!(outcome.state(), JobTerminalState::Errored);
@@ -880,8 +890,8 @@ async fn test_await_completion_already_completed() -> anyhow::Result<()> {
     let mut attempts = 0;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let job = jobs.find(job_id).await?;
-        if job.completed() {
+        let snap = jobs.handle(job_id).load().await?;
+        if snap.state().is_terminal() {
             break;
         }
         attempts += 1;
@@ -889,7 +899,10 @@ async fn test_await_completion_already_completed() -> anyhow::Result<()> {
     }
 
     // Now call await_completion — should return immediately
-    let outcome = jobs.await_completion(job_id, None).await?;
+    let outcome = jobs
+        .handle(job_id)
+        .await_completion(Duration::from_secs(30))
+        .await?;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
 
     Ok(())
@@ -953,7 +966,10 @@ async fn test_await_completion_returns_result() -> anyhow::Result<()> {
     let job_id = JobId::new();
     spawner.spawn(job_id, ResultJobConfig).await?;
 
-    let outcome = jobs.await_completion(job_id, None).await?;
+    let outcome = jobs
+        .handle(job_id)
+        .await_completion(Duration::from_secs(30))
+        .await?;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
     let result: MyResult = outcome
         .result()
@@ -1019,7 +1035,10 @@ async fn test_await_completion_returns_partial_result_on_error() -> anyhow::Resu
     let job_id = JobId::new();
     spawner.spawn(job_id, ResultJobConfig).await?;
 
-    let outcome = jobs.await_completion(job_id, None).await?;
+    let outcome = jobs
+        .handle(job_id)
+        .await_completion(Duration::from_secs(30))
+        .await?;
     assert_eq!(outcome.state(), JobTerminalState::Errored);
     let result: MyResult = outcome
         .result()
@@ -1075,7 +1094,10 @@ async fn test_await_completion_no_result() -> anyhow::Result<()> {
     let job_id = JobId::new();
     spawner.spawn(job_id, ResultJobConfig).await?;
 
-    let outcome = jobs.await_completion(job_id, None).await?;
+    let outcome = jobs
+        .handle(job_id)
+        .await_completion(Duration::from_secs(30))
+        .await?;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
     assert!(
         outcome
@@ -1149,7 +1171,10 @@ async fn test_set_result_multiple_calls_keeps_last() -> anyhow::Result<()> {
     let job_id = JobId::new();
     spawner.spawn(job_id, ResultJobConfig).await?;
 
-    let outcome = jobs.await_completion(job_id, None).await?;
+    let outcome = jobs
+        .handle(job_id)
+        .await_completion(Duration::from_secs(30))
+        .await?;
     assert_eq!(outcome.state(), JobTerminalState::Completed);
     let progress: BatchProgress = outcome
         .result()
@@ -1227,7 +1252,10 @@ async fn test_set_result_partial_progress_preserved_on_error() -> anyhow::Result
     let job_id = JobId::new();
     spawner.spawn(job_id, ResultJobConfig).await?;
 
-    let outcome = jobs.await_completion(job_id, None).await?;
+    let outcome = jobs
+        .handle(job_id)
+        .await_completion(Duration::from_secs(30))
+        .await?;
     assert_eq!(outcome.state(), JobTerminalState::Errored);
     let progress: BatchProgress = outcome
         .result()
@@ -1246,7 +1274,7 @@ async fn test_set_result_partial_progress_preserved_on_error() -> anyhow::Result
 }
 
 #[tokio::test]
-async fn test_poll_completion() -> anyhow::Result<()> {
+async fn test_load_state_reflects_pending_and_terminal() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool)
@@ -1266,9 +1294,13 @@ async fn test_poll_completion() -> anyhow::Result<()> {
         .spawn_at(job_id, TestJobConfig { delay_ms: 10 }, schedule_at)
         .await?;
 
-    // Poll immediately — job hasn't completed yet
-    let state = jobs.poll_completion(job_id).await?;
-    assert_eq!(state, None, "Pending job should return None");
+    // Load immediately — job hasn't completed yet
+    let snap = jobs.handle(job_id).load().await?;
+    assert!(
+        !snap.state().is_terminal(),
+        "Pending job should not be terminal"
+    );
+    assert!(matches!(snap.state(), JobStatus::Pending { .. }));
 
     // Now spawn a quick job that will complete fast
     let quick_id = JobId::new();
@@ -1280,20 +1312,20 @@ async fn test_poll_completion() -> anyhow::Result<()> {
     let mut attempts = 0;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let job = jobs.find(quick_id).await?;
-        if job.completed() {
+        let snap = jobs.handle(quick_id).load().await?;
+        if snap.state().is_terminal() {
             break;
         }
         attempts += 1;
         assert!(attempts < 100, "Quick job never completed");
     }
 
-    // Poll the completed job — should return terminal state
-    let state = jobs.poll_completion(quick_id).await?;
+    // Load the completed job — state should be terminal Completed
+    let snap = jobs.handle(quick_id).load().await?;
     assert_eq!(
-        state,
-        Some(JobTerminalState::Completed),
-        "Completed job should return Some(Completed)"
+        snap.state(),
+        JobStatus::Completed { queue_id: None },
+        "Completed job should report Completed"
     );
 
     Ok(())
@@ -1322,7 +1354,8 @@ async fn test_await_completion_timeout() -> anyhow::Result<()> {
 
     // Call await_completion with a short timeout
     let result = jobs
-        .await_completion(job_id, Some(Duration::from_millis(200)))
+        .handle(job_id)
+        .await_completion(Duration::from_millis(200))
         .await;
 
     assert!(
@@ -1388,8 +1421,8 @@ async fn wait_for_jobs_completed(jobs: &Jobs, ids: &[JobId], max_attempts: usize
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         let mut all_done = true;
         for id in ids {
-            let job = jobs.find(*id).await.expect("job should exist");
-            if !job.completed() {
+            let snap = jobs.handle(*id).load().await.expect("job should exist");
+            if !snap.state().is_terminal() {
                 all_done = false;
                 break;
             }
@@ -1591,8 +1624,8 @@ async fn test_multi_day_scheduling_with_artificial_clock() -> anyhow::Result<()>
 
     // Verify every job is completed in the database
     for id in [job_2h_a, job_2h_b, job_2d, job_4d, job_7d] {
-        let job = jobs.find(id).await?;
-        assert!(job.completed(), "Job {id} should be completed");
+        let snap = jobs.handle(id).load().await?;
+        assert!(snap.state().is_terminal(), "Job {id} should be completed");
     }
 
     // Verify execution times are at or after their scheduled times
@@ -1642,7 +1675,8 @@ async fn test_await_completions_batch() -> anyhow::Result<()> {
     }
 
     let outcomes = jobs
-        .await_completions(&ids, Some(Duration::from_secs(10)))
+        .handles(ids.clone())
+        .await_all(Duration::from_secs(10))
         .await?;
     assert_eq!(outcomes.len(), 3);
     assert!(
@@ -1655,7 +1689,7 @@ async fn test_await_completions_batch() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_await_completions_empty_ids() -> anyhow::Result<()> {
+async fn test_await_all_empty_ids() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool)
@@ -1668,14 +1702,17 @@ async fn test_await_completions_empty_ids() -> anyhow::Result<()> {
     });
     jobs.start_poll().await?;
 
-    let outcomes = jobs.await_completions(&[], None).await?;
+    let outcomes = jobs
+        .handles(Vec::<JobId>::new())
+        .await_all(Duration::from_secs(1))
+        .await?;
     assert!(outcomes.is_empty());
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_await_completions_timeout() -> anyhow::Result<()> {
+async fn test_await_all_timeout() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool)
@@ -1696,7 +1733,8 @@ async fn test_await_completions_timeout() -> anyhow::Result<()> {
         .await?;
 
     let result = jobs
-        .await_completions(&[job_id], Some(Duration::from_millis(200)))
+        .handles([job_id])
+        .await_all(Duration::from_millis(200))
         .await;
 
     assert!(
@@ -1721,7 +1759,7 @@ async fn test_await_completions_timeout() -> anyhow::Result<()> {
 /// the sweep polled first, a bounded `sweep_interval` caps resolution regardless
 /// of load — so this must complete well within the timeout.
 #[tokio::test]
-async fn test_await_completions_resolves_when_notifications_dropped() -> anyhow::Result<()> {
+async fn test_await_all_resolves_when_notifications_dropped() -> anyhow::Result<()> {
     use job::JobPollerConfig;
 
     let pool = helpers::init_pool().await?;
@@ -1750,12 +1788,14 @@ async fn test_await_completions_resolves_when_notifications_dropped() -> anyhow:
         spawner.spawn(*id, TestJobConfig { delay_ms: 10 }).await?;
     }
 
-    // `None` = wait indefinitely. It must still resolve — via the sweep — despite
-    // the dropped notifications. The outer timeout is the wedge assertion.
-    let outcomes =
-        tokio::time::timeout(Duration::from_secs(20), jobs.await_completions(&ids, None))
-            .await
-            .expect("await_completions wedged: dropped notifications were never reconciled")?;
+    // Must still resolve — via the sweep — despite the dropped notifications.
+    // The required `await_all` timeout is the wedge assertion: if the sweep
+    // were starvable this would return `TimedOut` instead of the outcomes.
+    let outcomes = jobs
+        .handles(ids.clone())
+        .await_all(Duration::from_secs(20))
+        .await
+        .expect("await_all wedged: dropped notifications were never reconciled");
 
     assert_eq!(outcomes.len(), ids.len());
     assert!(
@@ -1798,7 +1838,8 @@ async fn test_job_completion_results_trait() -> anyhow::Result<()> {
     fail_spawner.spawn(f1, FailingJobConfig).await?;
 
     let outcomes = jobs
-        .await_completions(&[s1, s2, f1], Some(Duration::from_secs(10)))
+        .handles([s1, s2, f1])
+        .await_all(Duration::from_secs(10))
         .await?;
 
     assert_eq!(outcomes.len(), 3);
@@ -1821,7 +1862,8 @@ async fn test_job_completion_results_trait() -> anyhow::Result<()> {
         .await?;
 
     let success_outcomes = jobs
-        .await_completions(&[s3, s4], Some(Duration::from_secs(10)))
+        .handles([s3, s4])
+        .await_all(Duration::from_secs(10))
         .await?;
     assert!(success_outcomes.all_succeeded());
     assert_eq!(success_outcomes.failed_count(), 0);
@@ -2372,4 +2414,818 @@ impl JobRunner for TrackingJobRunner {
         self.completed.lock().await.push(self.config.label.clone());
         Ok(JobCompletion::Complete)
     }
+}
+
+// -- JobHandle / JobHandles tests --
+
+/// Contract 6: on the duplicate path `spawn_unique` returns a handle whose id
+/// is the PERSISTED job's id, not the caller's fresh one — and no second row
+/// is created.
+#[tokio::test]
+async fn spawn_unique_returns_existing_handle_on_duplicate() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    // Unique-per-run job type so the test is repeatable against a persistent
+    // DB (unique jobs are never deleted).
+    let job_type: &'static str =
+        Box::leak(format!("spawn-unique-dup-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new(job_type),
+    });
+    jobs.start_poll().await?;
+
+    let second_spawner = spawner.clone();
+    let first_id = JobId::new();
+    let first_handle = spawner
+        .spawn_unique(first_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(first_handle.id(), first_id);
+
+    // Second call with a DIFFERENT fresh id resolves to the persisted job.
+    let second_handle = second_spawner
+        .spawn_unique(JobId::new(), TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(
+        second_handle.id(),
+        first_id,
+        "duplicate path must return the persisted job's id"
+    );
+
+    // No second row was created.
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE job_type = $1")
+        .bind(job_type)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1);
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct CheckpointState {
+    processed: u32,
+}
+
+/// A runner that parks, then (on first release) writes execution state and
+/// signals, then (on second release) completes.
+struct StateWritingInitializer {
+    wrote: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl JobInitializer for StateWritingInitializer {
+    type Config = ResultJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("handle-execution-state")
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(StateWritingRunner {
+            wrote: Arc::clone(&self.wrote),
+            release: Arc::clone(&self.release),
+        }))
+    }
+}
+
+struct StateWritingRunner {
+    wrote: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl JobRunner for StateWritingRunner {
+    async fn run(
+        &self,
+        mut current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        self.release.notified().await;
+        current_job
+            .update_execution_state(CheckpointState { processed: 42 })
+            .await?;
+        self.wrote.notify_one();
+        self.release.notified().await;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+/// Contract 5 (honest absence) + typed read-back: `execution_state` is `None`
+/// before the first write and round-trips the committed value afterwards.
+#[tokio::test]
+async fn execution_state_none_before_first_write_then_roundtrips() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let wrote = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(StateWritingInitializer {
+        wrote: Arc::clone(&wrote),
+        release: Arc::clone(&release),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+
+    // Mint by id: no state written yet ⇒ None.
+    let handle = jobs.handle(job_id);
+    assert_eq!(
+        handle.load().await?.execution_state::<CheckpointState>()?,
+        None
+    );
+
+    // Release the runner to write its state, then read it back typed.
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), wrote.notified())
+        .await
+        .expect("runner never wrote its execution state");
+    assert_eq!(
+        handle.load().await?.execution_state::<CheckpointState>()?,
+        Some(CheckpointState { processed: 42 })
+    );
+
+    // Let the job finish; the row is deleted ⇒ honest absence again.
+    release.notify_one();
+    handle.await_completion(Duration::from_secs(10)).await?;
+    assert_eq!(
+        handle.load().await?.execution_state::<CheckpointState>()?,
+        None
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Drive jobs through the lifecycle and assert every `JobStatus` variant,
+/// including `queue_id` passthrough and the `Errored { error }` string.
+#[tokio::test]
+async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let release = Arc::new(Notify::new());
+    let queue_spawner = jobs.add_initializer(QueueJobInitializer {
+        job_type: JobType::new("handle-status-lifecycle"),
+        started: Arc::clone(&started),
+        completed: Arc::clone(&completed),
+        release: Arc::clone(&release),
+    });
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+    jobs.start_poll().await?;
+
+    // Pending: scheduled far in the future, in a queue.
+    let pending_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    queue_spawner
+        .spawn_at_with_queue_id(
+            pending_id,
+            QueueJobConfig { label: "P".into() },
+            schedule_at,
+            "status-queue-pending",
+        )
+        .await?;
+    match jobs.handle(pending_id).load().await?.state() {
+        JobStatus::Pending {
+            scheduled_at: at,
+            attempt,
+            queue_id,
+        } => {
+            assert!((at - schedule_at).num_seconds().abs() < 1);
+            assert_eq!(attempt, 1);
+            assert_eq!(queue_id.as_deref(), Some("status-queue-pending"));
+        }
+        other => panic!("expected Pending, got {other:?}"),
+    }
+
+    // Running: a parked job in a queue.
+    let running_id = JobId::new();
+    queue_spawner
+        .spawn_with_queue_id(
+            running_id,
+            QueueJobConfig { label: "R".into() },
+            "status-queue-running",
+        )
+        .await?;
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if !started.lock().await.is_empty() {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "running job never started");
+    }
+    let running_handle = jobs.handle(running_id);
+    match running_handle.load().await?.state() {
+        JobStatus::Running {
+            attempt, queue_id, ..
+        } => {
+            assert_eq!(attempt, 1);
+            assert_eq!(queue_id.as_deref(), Some("status-queue-running"));
+        }
+        other => panic!("expected Running, got {other:?}"),
+    }
+
+    // Completed: release it, await, and the terminal status still carries the
+    // queue identity (entity-sourced after the execution row is gone).
+    release.notify_one();
+    let outcome = running_handle
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+    assert_eq!(
+        running_handle.load().await?.state(),
+        JobStatus::Completed {
+            queue_id: Some("status-queue-running".into())
+        }
+    );
+
+    // Errored: a failing job in a queue; `error` is the final error string.
+    let errored_id = JobId::new();
+    fail_spawner
+        .spawn_with_queue_id(errored_id, FailingJobConfig, "status-queue-errored")
+        .await?;
+    let errored_handle = jobs.handle(errored_id);
+    let outcome = errored_handle
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    match errored_handle.load().await?.state() {
+        JobStatus::Errored { error, queue_id } => {
+            assert!(
+                error.contains("intentional failure"),
+                "unexpected error string: {error}"
+            );
+            assert_eq!(queue_id.as_deref(), Some("status-queue-errored"));
+        }
+        other => panic!("expected Errored, got {other:?}"),
+    }
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Contract 5: `load()` on an id that never existed is `Err(Find)`.
+#[tokio::test]
+async fn load_not_found_is_find_error() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let jobs = Jobs::init(config).await?;
+
+    let result = jobs.handle(JobId::new()).load().await;
+    assert!(
+        matches!(result, Err(JobError::Find(_))),
+        "expected Find error for a job that never existed, got Ok or wrong error",
+    );
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderedJobConfig {
+    index: i32,
+    delay_ms: u64,
+}
+
+struct OrderedResultInitializer;
+
+impl JobInitializer for OrderedResultInitializer {
+    type Config = OrderedJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("handle-await-all-order")
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: OrderedJobConfig = job.config()?;
+        Ok(Box::new(OrderedResultRunner { config }))
+    }
+}
+
+struct OrderedResultRunner {
+    config: OrderedJobConfig,
+}
+
+#[async_trait]
+impl JobRunner for OrderedResultRunner {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
+        current_job
+            .set_result(&MyResult {
+                value: self.config.index,
+            })
+            .await?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+/// Contract 2: `await_all` outcomes align positionally with the handles even
+/// when the jobs complete in shuffled order; `JobOutcomes` works on the
+/// result unchanged.
+#[tokio::test]
+async fn await_all_order_preserved() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(OrderedResultInitializer);
+    jobs.start_poll().await?;
+
+    // Reverse-staggered delays: later handles complete earlier.
+    let n = 5;
+    let ids: Vec<JobId> = (0..n).map(|_| JobId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        spawner
+            .spawn(
+                *id,
+                OrderedJobConfig {
+                    index: i as i32,
+                    delay_ms: ((n - i) as u64) * 60,
+                },
+            )
+            .await?;
+    }
+
+    let handles = jobs.handles(ids.clone());
+    let outcomes = handles.await_all(Duration::from_secs(20)).await?;
+
+    assert_eq!(outcomes.len(), n);
+    for (i, (outcome, handle)) in outcomes.iter().zip(handles.iter()).enumerate() {
+        assert_eq!(handle.id(), ids[i]);
+        let result: MyResult = outcome
+            .result()
+            .expect("deserialize result")
+            .expect("result should be Some");
+        assert_eq!(
+            result.value, i as i32,
+            "outcomes[{i}] must belong to handles[{i}]"
+        );
+    }
+    // `JobOutcomes` applies to the returned Vec unchanged.
+    assert_eq!(outcomes.failed_count(), 0);
+    assert!(outcomes.all_succeeded());
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// The wedge-inheritance guard (await-completions-wedge.md "How to confirm"):
+/// registration racing a completion burst whose terminal notifications are
+/// dropped (size-1 broadcast buffer). The REQUIRED timeout fires instead of
+/// wedging, and — contract 3 (cancel safety) — a fresh `await_all` after the
+/// timed-out (dropped) one re-registers and resolves via the sweep.
+#[tokio::test]
+async fn await_all_times_out_and_reawait_resolves() -> anyhow::Result<()> {
+    use job::JobPollerConfig;
+
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .poller_config(JobPollerConfig {
+            // Tiny buffer: the completion burst overflows it and terminal
+            // notifications are dropped (never redelivered), leaving the
+            // reconciliation sweep as the only resolution path.
+            terminal_channel_size: 1,
+            sweep_interval: Duration::from_millis(250),
+            ..Default::default()
+        })
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("handle-await-all-wedge"),
+    });
+    jobs.start_poll().await?;
+
+    // A burst of jobs whose completions race the registrations below.
+    let ids: Vec<JobId> = (0..40).map(|_| JobId::new()).collect();
+    for id in &ids {
+        spawner.spawn(*id, TestJobConfig { delay_ms: 100 }).await?;
+    }
+
+    let handles = jobs.handles(ids.clone());
+
+    // The bounded timeout fires: the batch cannot fully resolve this fast
+    // (the last-spawned job alone needs ≥100ms).
+    let result = handles.await_all(Duration::from_millis(50)).await;
+    assert!(
+        matches!(result, Err(JobError::TimedOut(id)) if id == ids[0]),
+        "expected TimedOut with the first handle's id, got: {result:?}"
+    );
+
+    // The timed-out call dropped its waiters (select! loser). A FRESH
+    // `await_all` must re-register and resolve — via the sweep — despite the
+    // dropped terminal notifications.
+    let outcomes = handles.await_all(Duration::from_secs(20)).await?;
+    assert_eq!(outcomes.len(), ids.len());
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Awaiting through a handle before `Jobs::start_poll` is a
+/// `RouterNotStarted` error, not a panic. (Runs without a live database: the
+/// lazy pool is never contacted because the router check precedes any query.)
+#[tokio::test]
+async fn await_before_start_poll_is_router_not_started_error() -> anyhow::Result<()> {
+    use sqlx::postgres::PgPoolOptions;
+
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://user:password@localhost:5432/nonexistent-db")?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let jobs = Jobs::init(config).await?;
+
+    let handle = jobs.handle(JobId::new());
+    let result = handle.await_completion(Duration::from_millis(100)).await;
+    assert!(
+        matches!(result, Err(JobError::RouterNotStarted)),
+        "expected RouterNotStarted, got: {result:?}"
+    );
+
+    let handles = jobs.handles([JobId::new(), JobId::new()]);
+    let result = handles.await_all(Duration::from_millis(100)).await;
+    assert!(
+        matches!(result, Err(JobError::RouterNotStarted)),
+        "expected RouterNotStarted, got: {result:?}"
+    );
+
+    Ok(())
+}
+
+/// Handle awaits surface the right errors and results: a missing job is a
+/// Find error, a pending job times out, and a batch resolves positionally.
+#[tokio::test]
+async fn handle_await_find_timeout_and_batch() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("handle-await-errors"),
+    });
+    jobs.start_poll().await?;
+
+    // await_completion on a job that never existed → Find error.
+    let result = jobs
+        .handle(JobId::new())
+        .await_completion(Duration::from_secs(1))
+        .await;
+    assert!(
+        matches!(result, Err(JobError::Find(_))),
+        "expected Find error, got: {result:?}"
+    );
+
+    // await_completion on a far-future job → TimedOut carrying its id.
+    let pending_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(pending_id, TestJobConfig { delay_ms: 10 }, schedule_at)
+        .await?;
+    let result = jobs
+        .handle(pending_id)
+        .await_completion(Duration::from_millis(200))
+        .await;
+    assert!(
+        matches!(result, Err(JobError::TimedOut(id)) if id == pending_id),
+        "expected TimedOut, got: {result:?}"
+    );
+
+    // await_all: batch resolves with positional outcomes.
+    let batch: Vec<JobId> = (0..3).map(|_| JobId::new()).collect();
+    for id in &batch {
+        spawner.spawn(*id, TestJobConfig { delay_ms: 10 }).await?;
+    }
+    let outcomes = jobs
+        .handles(batch.clone())
+        .await_all(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcomes.len(), 3);
+    assert!(outcomes.all_succeeded());
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Part 0 payoff: after the terminal DELETE removes the execution row, the
+/// job's queue identity survives on the entity and is carried by the terminal
+/// `JobStatus` variants.
+#[tokio::test]
+async fn terminal_status_carries_queue_id() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("terminal-queue-id"),
+    });
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+    jobs.start_poll().await?;
+
+    // Completed path.
+    let done_id = JobId::new();
+    spawner
+        .spawn_with_queue_id(done_id, TestJobConfig { delay_ms: 10 }, "terminal-q")
+        .await?;
+    let done_handle = jobs.handle(done_id);
+    let outcome = done_handle
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT queue_id FROM job_executions WHERE id = $1")
+            .bind(done_id)
+            .fetch_optional(&pool)
+            .await?;
+    assert!(row.is_none(), "execution row must be gone after completion");
+    assert_eq!(
+        done_handle.load().await?.state(),
+        JobStatus::Completed {
+            queue_id: Some("terminal-q".into())
+        }
+    );
+
+    // Errored path.
+    let errored_id = JobId::new();
+    fail_spawner
+        .spawn_with_queue_id(errored_id, FailingJobConfig, "terminal-q-err")
+        .await?;
+    let errored_handle = jobs.handle(errored_id);
+    let outcome = errored_handle
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    match errored_handle.load().await?.state() {
+        JobStatus::Errored { queue_id, .. } => {
+            assert_eq!(queue_id.as_deref(), Some("terminal-q-err"));
+        }
+        other => panic!("expected Errored, got {other:?}"),
+    }
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A single `load()` exposes the config proxy and `next_run` for a pending
+/// job, and the return value for a completed one — all via sync snapshot
+/// getters. Also covers the `JobHandles::load_all` batch mint.
+#[tokio::test]
+async fn snapshot_exposes_config_next_run_and_return_value() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    // A dedicated result initializer with a constant return value keeps this
+    // test isolated from the order-sensitive `await_all_order_preserved`.
+    let result_spawner = jobs.add_initializer(ResultJobInitializer);
+    let test_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("snapshot-getters"),
+    });
+    jobs.start_poll().await?;
+
+    // Pending job: one load() yields config + next_run without extra calls.
+    let pending_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    test_spawner
+        .spawn_at(pending_id, TestJobConfig { delay_ms: 77 }, schedule_at)
+        .await?;
+    let snap = jobs.handle(pending_id).load().await?;
+    assert!(matches!(snap.state(), JobStatus::Pending { .. }));
+    assert_eq!(snap.config::<TestJobConfig>()?.delay_ms, 77);
+    assert_eq!(snap.attempt(), Some(1));
+    let next_run = snap.next_run().expect("pending job has a next_run");
+    assert!((next_run - schedule_at).num_seconds().abs() < 1);
+    // Return value absent before the job has run.
+    assert_eq!(snap.return_value::<MyResult>()?, None);
+
+    // Completed job: the return value the runner set is readable off the snapshot.
+    let done_id = JobId::new();
+    result_spawner.spawn(done_id, ResultJobConfig).await?;
+    let done_handle = jobs.handle(done_id);
+    done_handle
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    let done_snap = done_handle.load().await?;
+    assert!(
+        done_snap.next_run().is_none(),
+        "terminal job has no next_run"
+    );
+    assert_eq!(
+        done_snap.return_value::<MyResult>()?,
+        Some(MyResult { value: 42 })
+    );
+
+    // load_all preserves order positionally (contract 2).
+    let snaps = jobs.handles([pending_id, done_id]).load_all().await?;
+    assert_eq!(snaps.len(), 2);
+    assert!(matches!(snaps[0].state(), JobStatus::Pending { .. }));
+    assert!(matches!(snaps[1].state(), JobStatus::Completed { .. }));
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Regression (Cursor Bugbot): the entity is authoritative for terminal state.
+/// If a concurrent completion leaves a live execution row visible mid-commit
+/// (reproduced deterministically by injecting a stale `running` row for an
+/// already-completed job — the exact shape a torn read under READ COMMITTED
+/// would observe), `load()` must still report the terminal status, not
+/// `Running`, and must not leak any live-row-derived fields.
+#[tokio::test]
+async fn load_prefers_terminal_entity_over_stale_execution_row() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("terminal-vs-stale-row"),
+    });
+    jobs.start_poll().await?;
+
+    // Run a job to completion: entity terminal, execution row deleted.
+    let job_id = JobId::new();
+    spawner
+        .spawn(job_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    let handle = jobs.handle(job_id);
+    handle.await_completion(Duration::from_secs(10)).await?;
+    assert!(handle.load().await?.state().is_terminal());
+
+    // Inject a stale `running` execution row (poller_instance_id NULL so no
+    // poller claims it) — the live-row-alongside-terminal-entity torn shape.
+    sqlx::query(
+        "INSERT INTO job_executions (id, job_type, state, alive_at, attempt_index, created_at) \
+         VALUES ($1, 'terminal-vs-stale-row', 'running', NOW(), 1, NOW())",
+    )
+    .bind(job_id)
+    .execute(&pool)
+    .await?;
+
+    // The entity wins: terminal status, and no live-row fields leak through.
+    let snap = handle.load().await?;
+    assert!(
+        snap.state().is_terminal(),
+        "terminal entity must win over a stale running row, got {:?}",
+        snap.state()
+    );
+    assert_eq!(snap.attempt(), None, "terminal job exposes no attempt");
+    assert_eq!(snap.next_run(), None, "terminal job has no next_run");
+    assert_eq!(
+        snap.execution_state::<serde_json::Value>()?,
+        None,
+        "terminal job exposes no execution state"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Regression (Cursor Bugbot): `spawn_unique` must distinguish an `id`
+/// primary-key collision from the unique-per-type collision. When no unique
+/// job of the type exists, an id clash surfaces `DuplicateId` — not a panic,
+/// and not a handle to an unrelated persisted job.
+#[tokio::test]
+async fn spawn_unique_id_collision_surfaces_duplicate_id() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    // Distinct, run-unique job types so there is NO unique job of the second
+    // type yet — the only possible collision is on the `id` primary key.
+    let plain_type: &'static str =
+        Box::leak(format!("id-clash-plain-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let unique_type: &'static str =
+        Box::leak(format!("id-clash-unique-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let plain_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new(plain_type),
+    });
+    let unique_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new(unique_type),
+    });
+    jobs.start_poll().await?;
+
+    // Occupy an id with a normal job (its `jobs` row persists forever).
+    let clashing_id = JobId::new();
+    plain_spawner
+        .spawn(clashing_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+
+    // spawn_unique with the SAME id but a different type: no unique job of this
+    // type exists, so the collision is purely on the `id` PK ⇒ DuplicateId.
+    let result = unique_spawner
+        .spawn_unique(clashing_id, TestJobConfig { delay_ms: 10 })
+        .await;
+    assert!(
+        matches!(result, Err(JobError::DuplicateId(_))),
+        "expected DuplicateId for an id collision, got Ok(handle) or a different error",
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// `handle_unique(job_type)` mirrors `handle(id)` for at-most-one-per-type
+/// jobs: it resolves the persisted job's id from the DB — `Some` once the
+/// unique job is spawned (even after it completes, since the `jobs` row
+/// persists), `None` for a type that has none.
+#[tokio::test]
+async fn handle_unique_resolves_the_unique_job() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("handle-unique-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new(job_type),
+    });
+    jobs.start_poll().await?;
+
+    // No unique job of this type yet ⇒ None.
+    assert!(
+        jobs.handle_unique(JobType::new(job_type)).await?.is_none(),
+        "no unique job spawned yet"
+    );
+
+    // Spawn the unique job; handle_unique now resolves to its persisted id.
+    let id = JobId::new();
+    let spawned = spawner
+        .spawn_unique(id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    let handle = jobs
+        .handle_unique(JobType::new(job_type))
+        .await?
+        .expect("unique job should resolve");
+    assert_eq!(handle.id(), id);
+    assert_eq!(handle.id(), spawned.id());
+
+    // A type that was never spawned ⇒ None.
+    assert!(
+        jobs.handle_unique(JobType::new("handle-unique-never-spawned"))
+            .await?
+            .is_none()
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
 }

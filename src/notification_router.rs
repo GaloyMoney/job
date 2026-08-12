@@ -78,13 +78,17 @@ impl JobNotificationRouter {
     }
 
     /// Register interest in a job reaching terminal state.
-    /// Returns a oneshot receiver that delivers the terminal state.
-    /// Drop the receiver to unsubscribe.
-    pub fn wait_for_terminal(&self, job_id: JobId) -> oneshot::Receiver<JobTerminalState> {
+    /// Returns a oneshot receiver that delivers the terminal state, or
+    /// `None` when the router has not been started yet (i.e. before
+    /// `Jobs::start_poll`). Drop the receiver to unsubscribe.
+    pub fn try_wait_for_terminal(
+        &self,
+        job_id: JobId,
+    ) -> Option<oneshot::Receiver<JobTerminalState>> {
+        let register_tx = self.register_tx.get()?;
         let (tx, rx) = oneshot::channel();
-        let register_tx = self.register_tx.get().expect("router not started");
         let _ = register_tx.send((job_id, tx));
-        rx
+        Some(rx)
     }
 
     /// Start the PG NOTIFY listener and waiter-manager tasks.

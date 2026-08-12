@@ -51,6 +51,8 @@ pub enum JobError {
         "JobError - TimedOut: job {0} did not reach terminal state within the specified timeout"
     )]
     TimedOut(JobId),
+    #[error("JobError - RouterNotStarted: await called before Jobs::start_poll")]
+    RouterNotStarted,
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {

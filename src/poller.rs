@@ -21,6 +21,7 @@ use super::{
     entity::{Job, JobType},
     error::JobError,
     handle::OwnedTaskHandle,
+    notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     registry::JobRegistry,
     repo::JobRepo,
@@ -51,6 +52,7 @@ pub(crate) struct JobPoller {
     repo: Arc<JobRepo>,
     registry: JobRegistry,
     tracker: Arc<JobTracker>,
+    router: Arc<JobNotificationRouter>,
     notifier: Arc<JobEventNotifier>,
     instance_id: uuid::Uuid,
     shutdown_tx: tokio::sync::broadcast::Sender<
@@ -87,6 +89,7 @@ impl JobPoller {
         repo: Arc<JobRepo>,
         registry: JobRegistry,
         tracker: Arc<JobTracker>,
+        router: Arc<JobNotificationRouter>,
         notifier: Arc<JobEventNotifier>,
         clock: ClockHandle,
     ) -> Self {
@@ -99,6 +102,7 @@ impl JobPoller {
             repo,
             config,
             registry,
+            router,
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
             clock,
@@ -466,6 +470,7 @@ impl JobPoller {
         let runner = self.registry.init_job(
             &job,
             Arc::clone(&self.repo),
+            Arc::clone(&self.router),
             self.clock.clone(),
             Arc::clone(&self.notifier),
         )?;
