@@ -1,3 +1,11 @@
+# [job release v0.8.0](https://github.com/GaloyMoney/job/releases/tag/0.8.0)
+
+
+
+### Features
+
+- [**breaking**] Remove the parent job concept (#164)
+
 # [job release v0.7.3](https://github.com/GaloyMoney/job/releases/tag/0.7.3)
 
 
