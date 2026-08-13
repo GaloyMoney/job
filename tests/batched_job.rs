@@ -125,7 +125,11 @@ async fn batched_jobs_complete_and_are_awaitable() -> anyhow::Result<()> {
                     label: format!("item-{i}"),
                 },
             )
-            .queue_id(format!("queue-{i}"))
+            // Namespaced per test: the poll query's "is this queue busy"
+            // anti-join matches on queue_id across *every* job type, so a
+            // generic name here would block an unrelated test's job of a
+            // different type that happened to pick the same one.
+            .queue_id(format!("batched-complete-all-q{i}"))
         })
         .collect();
     let ids: Vec<JobId> = specs.iter().map(|s| s.id).collect();
@@ -593,7 +597,7 @@ async fn same_queue_jobs_are_never_in_one_batch() -> anyhow::Result<()> {
                     label: format!("serial-{i}"),
                 },
             )
-            .queue_id("one-queue")
+            .queue_id("batched-same-queue-one-queue")
         })
         .collect();
     let ids: Vec<JobId> = specs.iter().map(|s| s.id).collect();
