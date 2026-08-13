@@ -360,22 +360,21 @@ where
     /// Only one job of this type can exist at a time. This method consumes the
     /// spawner since no further jobs of this type can be created.
     ///
+    /// The job's id is generated internally — a unique-per-type job is
+    /// identified by its type, not a caller-chosen id — so read the id back
+    /// from the returned [`JobHandle`].
+    ///
     /// Returns a [`JobHandle`] whether the job was created or already exists.
-    /// On the duplicate path the handle's id is the PERSISTED job's id, not
-    /// the caller's fresh one, so a double-spawning orchestrator always
-    /// observes the job that actually runs.
+    /// On the duplicate path the handle carries the PERSISTED job's id, so a
+    /// double-spawning orchestrator always observes the job that actually runs.
     #[instrument(
         name = "job_spawner.spawn_unique",
         skip(self, config),
         fields(job_type = %self.job_type)
     )]
-    pub async fn spawn_unique(
-        self,
-        id: impl Into<JobId> + std::fmt::Debug,
-        config: Config,
-    ) -> Result<JobHandle, JobError> {
+    pub async fn spawn_unique(self, config: Config) -> Result<JobHandle, JobError> {
         let new_job = NewJob::builder()
-            .id(id)
+            .id(JobId::new())
             .unique_per_type(true)
             .job_type(self.job_type.clone())
             .config(config)?
@@ -407,8 +406,9 @@ where
                     .expect("unique-per-type collision guarantees the row exists");
                 Ok(self.handle(existing.id))
             }
-            // An `id` collision surfaces as `DuplicateId`; any other create
-            // error propagates unchanged.
+            // The id is an internally-generated v7 uuid, so a primary-key
+            // collision cannot occur; any other create error propagates
+            // unchanged.
             Err(e) => Err(e.into()),
         }
     }

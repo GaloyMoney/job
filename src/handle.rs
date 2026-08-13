@@ -41,8 +41,9 @@ use crate::{
 ///    `Pending`/`Running` for a finished job, regardless of isolation level.
 /// 5. **Honest absence:** [`JobSnapshot::execution_state`] ⇒ `Ok(None)` on
 ///    no-row/no-state; `load()` ⇒ `Err(Find)` only if the job never existed.
-/// 6. **`spawn_unique` handle identity:** on the duplicate path the returned
-///    handle's id is the PERSISTED job's id, not the caller's fresh one.
+/// 6. **`spawn_unique` handle identity:** `spawn_unique` generates the job's
+///    id internally; on the duplicate path the returned handle's id is the
+///    PERSISTED job's id. Either way, callers read the id back from the handle.
 #[derive(Clone)]
 pub struct JobHandle {
     id: JobId,

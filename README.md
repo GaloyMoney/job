@@ -120,7 +120,7 @@ job of this type can be created:
 let cleanup_spawner = jobs.add_initializer(CleanupInitializer);
 
 // Consumes spawner - can't accidentally spawn twice
-cleanup_spawner.spawn_unique(JobId::new(), CleanupConfig::default()).await?;
+cleanup_spawner.spawn_unique(CleanupConfig::default()).await?;
 ```
 
 ### Parameterized Job Types

@@ -2436,8 +2436,7 @@ impl JobRunner for TrackingJobRunner {
 // -- JobHandle / JobHandles tests --
 
 /// Contract 6: on the duplicate path `spawn_unique` returns a handle whose id
-/// is the PERSISTED job's id, not the caller's fresh one — and no second row
-/// is created.
+/// is the PERSISTED job's id — and no second row is created.
 #[tokio::test]
 async fn spawn_unique_returns_existing_handle_on_duplicate() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -2457,15 +2456,14 @@ async fn spawn_unique_returns_existing_handle_on_duplicate() -> anyhow::Result<(
     jobs.start_poll().await?;
 
     let second_spawner = spawner.clone();
-    let first_id = JobId::new();
     let first_handle = spawner
-        .spawn_unique(first_id, TestJobConfig { delay_ms: 10 })
+        .spawn_unique(TestJobConfig { delay_ms: 10 })
         .await?;
-    assert_eq!(first_handle.id(), first_id);
+    let first_id = first_handle.id();
 
-    // Second call with a DIFFERENT fresh id resolves to the persisted job.
+    // A second spawn of the same type resolves to the persisted job.
     let second_handle = second_spawner
-        .spawn_unique(JobId::new(), TestJobConfig { delay_ms: 10 })
+        .spawn_unique(TestJobConfig { delay_ms: 10 })
         .await?;
     assert_eq!(
         second_handle.id(),
@@ -3159,53 +3157,6 @@ async fn load_prefers_terminal_entity_over_stale_execution_row() -> anyhow::Resu
     Ok(())
 }
 
-/// Regression (Cursor Bugbot): `spawn_unique` must distinguish an `id`
-/// primary-key collision from the unique-per-type collision. When no unique
-/// job of the type exists, an id clash surfaces `DuplicateId` — not a panic,
-/// and not a handle to an unrelated persisted job.
-#[tokio::test]
-async fn spawn_unique_id_collision_surfaces_duplicate_id() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let config = JobSvcConfig::builder()
-        .pool(pool)
-        .build()
-        .expect("Failed to build JobsConfig");
-
-    let mut jobs = Jobs::init(config).await?;
-    // Distinct, run-unique job types so there is NO unique job of the second
-    // type yet — the only possible collision is on the `id` primary key.
-    let plain_type: &'static str =
-        Box::leak(format!("id-clash-plain-{}", uuid::Uuid::now_v7()).into_boxed_str());
-    let unique_type: &'static str =
-        Box::leak(format!("id-clash-unique-{}", uuid::Uuid::now_v7()).into_boxed_str());
-    let plain_spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new(plain_type),
-    });
-    let unique_spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new(unique_type),
-    });
-    jobs.start_poll().await?;
-
-    // Occupy an id with a normal job (its `jobs` row persists forever).
-    let clashing_id = JobId::new();
-    plain_spawner
-        .spawn(clashing_id, TestJobConfig { delay_ms: 10 })
-        .await?;
-
-    // spawn_unique with the SAME id but a different type: no unique job of this
-    // type exists, so the collision is purely on the `id` PK ⇒ DuplicateId.
-    let result = unique_spawner
-        .spawn_unique(clashing_id, TestJobConfig { delay_ms: 10 })
-        .await;
-    assert!(
-        matches!(result, Err(JobError::DuplicateId(_))),
-        "expected DuplicateId for an id collision, got Ok(handle) or a different error",
-    );
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
 /// `handle_unique(job_type)` mirrors `handle(id)` for at-most-one-per-type
 /// jobs: it resolves the persisted job's id from the DB — `Some` once the
 /// unique job is spawned (even after it completes, since the `jobs` row
@@ -3233,15 +3184,13 @@ async fn handle_unique_resolves_the_unique_job() -> anyhow::Result<()> {
     );
 
     // Spawn the unique job; handle_unique now resolves to its persisted id.
-    let id = JobId::new();
     let spawned = spawner
-        .spawn_unique(id, TestJobConfig { delay_ms: 10 })
+        .spawn_unique(TestJobConfig { delay_ms: 10 })
         .await?;
     let handle = jobs
         .handle_unique(JobType::new(job_type))
         .await?
         .expect("unique job should resolve");
-    assert_eq!(handle.id(), id);
     assert_eq!(handle.id(), spawned.id());
 
     // A type that was never spawned ⇒ None.
