@@ -23,6 +23,10 @@ pub struct PolledJob {
     pub id: JobId,
     pub data_json: Option<JsonValue>,
     pub attempt: u32,
+    /// The queue this row was claimed from. At most one row per queue is
+    /// claimed per poll, so this doubles as the canonical ordering key when
+    /// forming batches.
+    pub queue_id: Option<String>,
 }
 
 pub(crate) struct JobDispatcher {

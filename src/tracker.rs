@@ -39,6 +39,9 @@ pub(crate) struct JobTracker {
     running_jobs: AtomicUsize,
     notify: Notify,
     live_jobs: Mutex<LiveJobs>,
+    /// Batches currently executing, per job type. Read by the poller to size
+    /// each batched type's claim so it never locks rows no batch can start on.
+    batches_in_flight: Mutex<HashMap<JobType, usize>>,
     /// The job types this process polls for. Readiness reports from every
     /// source are filtered against these. Unset until polling starts, so
     /// earlier reports are dropped rather than queued.
@@ -53,6 +56,7 @@ impl JobTracker {
             running_jobs: AtomicUsize::new(0),
             notify: Notify::new(),
             live_jobs: Mutex::new(LiveJobs::default()),
+            batches_in_flight: Mutex::new(HashMap::new()),
             job_types: OnceLock::new(),
         }
     }
@@ -80,6 +84,42 @@ impl JobTracker {
             .started(id);
     }
 
+    /// Account for a batch as a **single** unit of saturation while keeping
+    /// every job in it individually live.
+    ///
+    /// `running_jobs` bounds concurrent execution units — tasks, transactions,
+    /// pool connections — and a batch is exactly one of each no matter how many
+    /// rows it carries. Counting rows instead would let one batch consume the
+    /// whole process budget and stall polling until it commits. Liveness is a
+    /// per-row question (the keep-alive heartbeat and lost-job reclaim both work
+    /// on ids), so those stay unbatched.
+    pub fn dispatch_batch(&self, job_type: &JobType, ids: &[JobId]) {
+        self.running_jobs.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut live = self.live_jobs.lock().expect("live_jobs poisoned");
+            for id in ids {
+                live.started(*id);
+            }
+        }
+        *self
+            .batches_in_flight
+            .lock()
+            .expect("batches_in_flight poisoned")
+            .entry(job_type.clone())
+            .or_insert(0) += 1;
+    }
+
+    /// Batches of `job_type` executing right now. The poller subtracts this
+    /// from the type's slot count to decide how many rows it may claim.
+    pub fn batches_in_flight(&self, job_type: &JobType) -> usize {
+        self.batches_in_flight
+            .lock()
+            .expect("batches_in_flight poisoned")
+            .get(job_type)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
@@ -104,6 +144,34 @@ impl JobTracker {
         if rescheduled || n_running_jobs == self.min_jobs {
             self.notify.notify_one();
         }
+    }
+
+    /// Release the single unit taken by [`dispatch_batch`](Self::dispatch_batch),
+    /// clear every job it held live, and free its type's batch slot.
+    ///
+    /// Always wakes the poll loop: a freed slot is what makes the type's
+    /// backlog claimable again, and nothing else would trigger that poll.
+    pub fn batch_completed(&self, job_type: &JobType, ids: &[JobId], _rescheduled: bool) {
+        self.running_jobs.fetch_sub(1, Ordering::SeqCst);
+        {
+            let mut live = self.live_jobs.lock().expect("live_jobs poisoned");
+            for id in ids {
+                live.finished(*id);
+            }
+        }
+        {
+            let mut counts = self
+                .batches_in_flight
+                .lock()
+                .expect("batches_in_flight poisoned");
+            if let Some(n) = counts.get_mut(job_type) {
+                *n -= 1;
+                if *n == 0 {
+                    counts.remove(job_type);
+                }
+            }
+        }
+        self.notify.notify_one();
     }
 
     pub fn live_job_ids(&self) -> Vec<uuid::Uuid> {
