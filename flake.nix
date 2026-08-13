@@ -145,6 +145,12 @@
               echo "port = $PORT"
               echo "unix_socket_directories = '/tmp'"
               echo "listen_addresses = '127.0.0.1'"
+              # nextest runs one process per test, each opening its own pool
+              # (sqlx defaults to 10 connections). The default cap of 100 is
+              # reached on any reasonably wide runner, and the symptom is not
+              # an obvious "too many clients" failure but a scatter of test
+              # timeouts, because pools wait out their 30s acquire timeout.
+              echo "max_connections = 500"
             } >> "$PGDATA/postgresql.conf"
           else
             if [ "$IS_ROOT" = "true" ]; then chown -R $PG_UID:$PG_GID "$PGDATA"; fi
