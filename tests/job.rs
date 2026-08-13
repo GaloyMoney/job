@@ -2456,9 +2456,7 @@ async fn spawn_unique_returns_existing_handle_on_duplicate() -> anyhow::Result<(
     jobs.start_poll().await?;
 
     let second_spawner = spawner.clone();
-    let first_handle = spawner
-        .spawn_unique(TestJobConfig { delay_ms: 10 })
-        .await?;
+    let first_handle = spawner.spawn_unique(TestJobConfig { delay_ms: 10 }).await?;
     let first_id = first_handle.id();
 
     // A second spawn of the same type resolves to the persisted job.
@@ -3184,9 +3182,7 @@ async fn handle_unique_resolves_the_unique_job() -> anyhow::Result<()> {
     );
 
     // Spawn the unique job; handle_unique now resolves to its persisted id.
-    let spawned = spawner
-        .spawn_unique(TestJobConfig { delay_ms: 10 })
-        .await?;
+    let spawned = spawner.spawn_unique(TestJobConfig { delay_ms: 10 }).await?;
     let handle = jobs
         .handle_unique(JobType::new(job_type))
         .await?
