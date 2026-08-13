@@ -6,7 +6,7 @@ use sqlx::postgres::{PgPool, types::PgInterval};
 use tracing::{Instrument, Span, instrument};
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,6 +16,8 @@ use std::{
 
 use super::{
     JobId,
+    batch_dispatcher::BatchDispatcher,
+    batched::RawBatchItem,
     config::JobPollerConfig,
     dispatcher::*,
     entity::{Job, JobType},
@@ -207,12 +209,46 @@ impl JobPoller {
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         };
-        let supported_job_types = self.registry.registered_job_types();
+        // Size each type's claim before touching the database. A batched type
+        // may only claim what its free batch slots can immediately execute, so
+        // the poller never takes rows that would just sit in `running` waiting
+        // for a slot. The cap is enforced on what the poll claims, not on what
+        // it may lock — see `selected_jobs`. A type with no free slot is
+        // dropped from the poll entirely; `batch_completed` wakes the loop when
+        // one frees up.
+        let (pollable_types, row_limits) = {
+            let mut types = Vec::new();
+            let mut limits = Vec::new();
+            for job_type in self.registry.registered_job_types() {
+                let limit = match self.registry.batch_policy(&job_type) {
+                    Some(policy) => policy
+                        .max_concurrent_batches
+                        .saturating_sub(self.tracker.batches_in_flight(&job_type))
+                        .saturating_mul(policy.max_batch_size),
+                    None => n_jobs_to_poll,
+                };
+                let limit = limit.min(n_jobs_to_poll);
+                if limit == 0 {
+                    continue;
+                }
+                types.push(job_type);
+                limits.push(limit as i32);
+            }
+            (types, limits)
+        };
+        if pollable_types.is_empty() {
+            // Every batched type is saturated and nothing else is registered.
+            span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
+            span.record("n_jobs_to_start", 0);
+            return Ok(MAX_WAIT);
+        }
+
         let rows = match poll_jobs(
             self.repo.pool(),
             n_jobs_to_poll,
             self.instance_id,
-            &supported_job_types,
+            &pollable_types,
+            &row_limits,
             &self.clock,
         )
         .await?
@@ -228,6 +264,11 @@ impl JobPoller {
         if !rows.is_empty() {
             let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
             let mut entities = self.repo.find_all::<Job>(&ids).await?;
+            // Claims for batched types are collected here rather than
+            // dispatched one by one: the poll query guarantees at most one row
+            // per queue_id, so a type's claims from a single poll are exactly
+            // the set that may be executed together.
+            let mut batched: HashMap<JobType, Vec<RawBatchItem>> = HashMap::new();
             for row in rows {
                 let Some(job) = entities.remove(&row.id) else {
                     tracing::error!(
@@ -236,7 +277,22 @@ impl JobPoller {
                     );
                     continue;
                 };
-                self.dispatch_job(job, row).await?;
+                if self.registry.is_batched(&job.job_type) {
+                    batched
+                        .entry(job.job_type.clone())
+                        .or_default()
+                        .push(RawBatchItem {
+                            attempt: row.attempt,
+                            queue_id: row.queue_id,
+                            execution_state_json: row.data_json,
+                            job,
+                        });
+                } else {
+                    self.dispatch_job(job, row).await?;
+                }
+            }
+            for (job_type, items) in batched {
+                self.dispatch_batches(job_type, items).await?;
             }
         }
 
@@ -457,6 +513,188 @@ impl JobPoller {
         ))
     }
 
+    /// Split one poll's claims for a batched type into batches, then dispatch
+    /// each batch as a single unit of work.
+    ///
+    /// Two rules are encoded here:
+    ///
+    /// - **Canonical order.** Items are sorted by `queue_id` (job id when
+    ///   unqueued) so that every batch in the process reaches shared domain
+    ///   rows in the same order, which is what keeps concurrent batch
+    ///   transactions from deadlocking against each other.
+    /// - **Retries run alone.** A job on its second or later attempt is
+    ///   dispatched as a batch of one. The first failure of a poisonous job is
+    ///   shared with its batch-mates (they are all retried), but from then on
+    ///   it can only ever fail by itself.
+    #[instrument(
+        name = "job.dispatch_batches",
+        skip(self, items),
+        fields(job_type = %job_type, n_items = items.len(), max_batch_size, n_batches)
+    )]
+    async fn dispatch_batches(
+        &self,
+        job_type: JobType,
+        mut items: Vec<RawBatchItem>,
+    ) -> Result<(), JobError> {
+        let span = Span::current();
+        let max_batch_size = self.registry.max_batch_size(&job_type);
+        span.record("max_batch_size", max_batch_size);
+
+        items.sort_by(
+            |a, b| match (a.queue_id.as_deref(), b.queue_id.as_deref()) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => uuid::Uuid::from(a.job.id).cmp(&uuid::Uuid::from(b.job.id)),
+            },
+        );
+
+        let (retries, mut fresh): (Vec<_>, Vec<_>) =
+            items.into_iter().partition(|item| item.attempt > 1);
+
+        let mut n_batches = 0;
+        for retry in retries {
+            n_batches += 1;
+            self.dispatch_batch(job_type.clone(), vec![retry]).await?;
+        }
+        while !fresh.is_empty() {
+            let take = max_batch_size.min(fresh.len());
+            let chunk: Vec<RawBatchItem> = fresh.drain(..take).collect();
+            n_batches += 1;
+            self.dispatch_batch(job_type.clone(), chunk).await?;
+        }
+        span.record("n_batches", n_batches);
+        Ok(())
+    }
+
+    #[instrument(
+        name = "job.dispatch_batch",
+        skip(self, items),
+        fields(job_type = %job_type, n_items = items.len(), poller_id, now)
+    )]
+    async fn dispatch_batch(
+        &self,
+        job_type: JobType,
+        items: Vec<RawBatchItem>,
+    ) -> Result<(), JobError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let span = Span::current();
+        let runner = self.registry.init_batch(
+            &job_type,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )?;
+        let retry_settings = self.registry.retry_settings(&job_type).clone();
+        let repo = Arc::clone(&self.repo);
+        let tracker = self.tracker.clone();
+        let notifier = Arc::clone(&self.notifier);
+        let instance_id = self.instance_id;
+        let clock = self.clock.clone();
+        span.record("now", tracing::field::display(clock.now()));
+        span.record("poller_id", tracing::field::display(instance_id));
+
+        let shutdown_rx_batch = self.shutdown_tx.subscribe();
+        let mut shutdown_rx_monitor = self.shutdown_tx.subscribe();
+        let shutdown_timeout = self.config.shutdown_timeout;
+        let n_items = items.len();
+        let dispatched_type = job_type.clone();
+        #[cfg_attr(
+            not(all(feature = "tokio-task-names", tokio_unstable)),
+            allow(unused_variables)
+        )]
+        let task_name = format!("job-batch-{}-{}", job_type, n_items);
+
+        // Built here, not in the task: constructing the dispatcher claims the
+        // type's batch slot, and that must happen before the poll loop's next
+        // iteration or it would claim rows against a slot already spoken for.
+        let dispatcher = BatchDispatcher::new(
+            repo,
+            tracker,
+            notifier,
+            retry_settings,
+            dispatched_type.clone(),
+            runner,
+            instance_id,
+            clock,
+            &items,
+        );
+
+        spawn_named_task!(&task_name, async move {
+            use tracing::Instrument;
+
+            let batch_fut = dispatcher.execute_batch(items, shutdown_rx_batch);
+            tokio::pin!(batch_fut);
+
+            tokio::select! {
+                res = &mut batch_fut => {
+                    if let Err(e) = res {
+                        tracing::error!(
+                            job_type = %dispatched_type,
+                            n_items,
+                            exception.message = %e,
+                            exception.type = std::any::type_name_of_val(&e),
+                            "batch dispatcher error"
+                        );
+                    }
+                }
+                Ok(shutdown_notifier) = shutdown_rx_monitor.recv() => {
+                    let (send, recv) = tokio::sync::oneshot::channel();
+
+                    async {
+                        match shutdown_notifier.send(recv).await {
+                            Ok(()) => {
+                                tracing::Span::current().record("ack_sent", true);
+                                tracing::info!("Acknowledgement sent, waiting for batch completion");
+                                drop(shutdown_notifier);
+
+                                match tokio::time::timeout(shutdown_timeout, &mut batch_fut).await {
+                                    Ok(res) => {
+                                        tracing::Span::current().record("job_completed", true);
+                                        tracing::info!("Batch completed gracefully");
+                                        if let Err(e) = res {
+                                            tracing::error!(
+                                                n_items,
+                                                exception.message = %e,
+                                                exception.type = std::any::type_name_of_val(&e),
+                                                "batch dispatcher error"
+                                            );
+                                        }
+                                    }
+                                    Err(_) => {
+                                        tracing::Span::current().record("job_completed", false);
+                                        tracing::warn!("Batch exceeded timeout, aborting");
+                                    }
+                                }
+
+                                let _ = send.send(());
+                                tracing::info!("Final completion signal sent");
+                            }
+                            Err(_) => {
+                                tracing::Span::current().record("ack_sent", false);
+                                tracing::error!("Failed to send acknowledgement - stopped listening");
+                            }
+                        }
+                    }.instrument(tracing::info_span!(
+                            parent: None,
+                            "job.shutdown_coordination",
+                            job_type = %dispatched_type,
+                            n_items,
+                            coordination_path = "shutdown_first",
+                            ack_sent = tracing::field::Empty,
+                            job_completed = tracing::field::Empty,
+                        )
+                    ).await;
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     #[instrument(
         name = "job.dispatch_job",
         skip(self, job, polled_job),
@@ -609,12 +847,13 @@ async fn reclaim_lost_jobs(
     Ok(rows.into_iter().map(|r| (r.id, r.job_type)).collect())
 }
 
-#[instrument(name = "job.poll_jobs", level = "debug", skip(pool, supported_job_types, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty))]
+#[instrument(name = "job.poll_jobs", level = "debug", skip(pool, pollable_types, row_limits, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty))]
 async fn poll_jobs(
     pool: &PgPool,
     n_jobs_to_poll: usize,
     instance_id: uuid::Uuid,
-    supported_job_types: &[super::entity::JobType],
+    pollable_types: &[super::entity::JobType],
+    row_limits: &[i32],
     clock: &ClockHandle,
 ) -> Result<JobPollResult, sqlx::Error> {
     // sim_now drives execute_at scheduling (whatever clock the application uses);
@@ -640,8 +879,18 @@ async fn poll_jobs(
         -- idx_job_executions_pending_job_type_execute_at serves this as
         -- an ordered index scan; future-scheduled jobs never reach the
         -- anti-join / window-function work below.
-        WITH due AS (
-            SELECT id, queue_id, execute_at
+        WITH limits AS (
+            -- One row per pollable type carrying how many rows this poll may
+            -- claim for it. For a batched type that is
+            -- `max_batch_size * free batch slots`, so no more rows are taken
+            -- than a batch is free to execute immediately; the rest of the
+            -- backlog stays unclaimed for other pollers and accumulates into
+            -- fuller later batches. Types with no free slot are absent from
+            -- $4 entirely and never reach `due`.
+            SELECT * FROM UNNEST($4::text[], $6::int4[]) AS l(job_type, row_limit)
+        ),
+        due AS (
+            SELECT id, queue_id, execute_at, job_type
             FROM job_executions
             WHERE state = 'pending'
             AND job_type = ANY($4)
@@ -653,7 +902,7 @@ async fn poll_jobs(
             -- The 1-at-a-time-per-queue anti-join and the queue-dedup
             -- window run only over the bounded due set instead of every
             -- pending row.
-            SELECT id, execute_at,
+            SELECT id, execute_at, job_type,
                    ROW_NUMBER() OVER (
                        PARTITION BY COALESCE(queue_id, id::text)
                        ORDER BY execute_at
@@ -666,11 +915,21 @@ async fn poll_jobs(
                 AND running.queue_id = due.queue_id
             )
         ),
-        selected_jobs AS (
+        locked AS (
             -- The wide execution_state_json is fetched only for the
             -- ~$1 winners, not carried through the CTEs and the window
             -- sort for every pending job.
-            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index
+            --
+            -- Every queue-head is eligible here, deliberately: the per-type
+            -- cap is applied *after* this lock, never before it. Filtering to
+            -- each type's cap first would make every instance rank the same
+            -- global candidate set and target an identical head slice, so a
+            -- poller that lost the race would skip that whole slice and fall
+            -- through to nothing while due work sat unclaimed. SKIP LOCKED can
+            -- only route around a concurrent poller if there is something
+            -- past its rows left to see.
+            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index,
+                   c.job_type, je.execute_at
             FROM candidates c
             JOIN job_executions je ON je.id = c.id
             WHERE c.rn = 1
@@ -678,13 +937,37 @@ async fn poll_jobs(
             LIMIT $1
             FOR UPDATE OF je SKIP LOCKED
         ),
+        selected_jobs AS (
+            -- Enforce each type's cap on the rows this poller actually holds.
+            -- Rows over the cap are simply not claimed: they stay `pending`
+            -- and their lock is released when this short poll transaction
+            -- commits, so they remain visible to other instances and
+            -- accumulate into fuller later batches.
+            --
+            -- A type present in `limits` always has row_limit >= 1 (saturated
+            -- types are dropped from $4 entirely), so its first row always
+            -- survives — `selected_jobs` is never empty while `locked` isn't.
+            SELECT t.id, t.data_json, t.attempt_index
+            FROM (
+                SELECT l.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY l.job_type ORDER BY l.execute_at
+                       ) AS type_rn
+                FROM locked l
+            ) t
+            JOIN limits lim ON lim.job_type = t.job_type
+            WHERE t.type_rn <= lim.row_limit
+        ),
         updated AS (
+            -- queue_id rides along in the projection (it is already read by
+            -- `due`): batch formation needs it as the canonical ordering key,
+            -- and batched runners surface it per item.
             UPDATE job_executions AS je
             SET state = 'running', alive_at = $5, execute_at = NULL, poller_instance_id = $3
             FROM selected_jobs
             WHERE je.id = selected_jobs.id
               AND je.state = 'pending'
-            RETURNING je.id, selected_jobs.data_json, je.attempt_index
+            RETURNING je.id, selected_jobs.data_json, je.attempt_index, je.queue_id
         ),
         min_wait AS (
             -- Index-only scan over the pending partial index, no
@@ -702,6 +985,7 @@ async fn poll_jobs(
                 u.id AS "id?: JobId",
                 u.data_json AS "data_json?: JsonValue",
                 u.attempt_index AS "attempt_index?",
+                u.queue_id AS "queue_id?",
                 NULL::INTERVAL AS "max_wait?: PgInterval"
             FROM updated u
             UNION ALL
@@ -709,6 +993,7 @@ async fn poll_jobs(
                 NULL::UUID AS "id?: JobId",
                 NULL::JSONB AS "data_json?: JsonValue",
                 NULL::INT AS "attempt_index?",
+                NULL::VARCHAR AS "queue_id?",
                 mw.wait_time AS "max_wait?: PgInterval"
             FROM min_wait mw
             WHERE NOT EXISTS (SELECT 1 FROM updated)
@@ -717,8 +1002,9 @@ async fn poll_jobs(
         n_jobs_to_poll as i32,
         sim_now,
         instance_id,
-        supported_job_types as _,
+        pollable_types as _,
         wall_now,
+        row_limits,
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -739,6 +1025,7 @@ struct JobPollRow {
     id: Option<JobId>,
     data_json: Option<JsonValue>,
     attempt_index: Option<i32>,
+    queue_id: Option<String>,
     max_wait: Option<PgInterval>,
 }
 
@@ -762,6 +1049,7 @@ impl JobPollResult {
                             id,
                             data_json: row.data_json,
                             attempt: attempt_index as u32,
+                            queue_id: row.queue_id,
                         })
                     } else {
                         None

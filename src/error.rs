@@ -37,6 +37,8 @@ pub enum JobError {
     NoInitializerPresent,
     #[error("JobError - JobExecutionError: {0}")]
     JobExecutionError(String),
+    #[error("JobError - BatchOutcomeMismatch: {0}")]
+    BatchOutcomeMismatch(String),
     #[error("JobError - DuplicateId: {0:?}")]
     DuplicateId(Option<String>),
     #[error("JobError - DuplicateUniqueJobType: {0:?}")]

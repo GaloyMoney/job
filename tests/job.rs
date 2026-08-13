@@ -765,7 +765,15 @@ async fn test_bulk_spawn_empty_batch() -> anyhow::Result<()> {
 // -- await_completion tests --
 
 /// An initializer whose runner always returns an error.
-struct FailingJobInitializer;
+///
+/// The job type is per-test rather than a shared constant: these tests run
+/// concurrently against one database, and a poller claims every registered
+/// type it sees. A shared type name lets one test's poller claim another
+/// test's rows, which shows up as rare, unrelated-looking failures in whichever
+/// test lost the row.
+struct FailingJobInitializer {
+    job_type: JobType,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FailingJobConfig;
@@ -774,7 +782,7 @@ impl JobInitializer for FailingJobInitializer {
     type Config = FailingJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("failing-job")
+        self.job_type.clone()
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
@@ -847,7 +855,9 @@ async fn test_await_completion_on_error() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(FailingJobInitializer);
+    let spawner = jobs.add_initializer(FailingJobInitializer {
+        job_type: JobType::new("failing-await-completion"),
+    });
     jobs.start_poll().await?;
 
     let job_id = JobId::new();
@@ -918,13 +928,16 @@ struct MyResult {
 #[derive(Debug, Serialize, Deserialize)]
 struct ResultJobConfig;
 
-struct ResultJobInitializer;
+/// Per-test job type, for the same reason as [`FailingJobInitializer`].
+struct ResultJobInitializer {
+    job_type: JobType,
+}
 
 impl JobInitializer for ResultJobInitializer {
     type Config = ResultJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("result-job")
+        self.job_type.clone()
     }
 
     fn init(
@@ -960,7 +973,9 @@ async fn test_await_completion_returns_result() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
 
     let mut jobs = Jobs::init(config).await?;
-    let spawner = jobs.add_initializer(ResultJobInitializer);
+    let spawner = jobs.add_initializer(ResultJobInitializer {
+        job_type: JobType::new("result-job-await-completion"),
+    });
     jobs.start_poll().await?;
 
     let job_id = JobId::new();
@@ -1821,7 +1836,9 @@ async fn test_job_completion_results_trait() -> anyhow::Result<()> {
     let success_spawner = jobs.add_initializer(TestJobInitializer {
         job_type: JobType::new("trait-success"),
     });
-    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer {
+        job_type: JobType::new("failing-results-trait"),
+    });
 
     jobs.start_poll().await?;
 
@@ -2593,7 +2610,9 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
     });
-    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer {
+        job_type: JobType::new("failing-status-transitions"),
+    });
     jobs.start_poll().await?;
 
     // Pending: scheduled far in the future, in a queue.
@@ -2969,7 +2988,9 @@ async fn terminal_status_carries_queue_id() -> anyhow::Result<()> {
     let spawner = jobs.add_initializer(TestJobInitializer {
         job_type: JobType::new("terminal-queue-id"),
     });
-    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer {
+        job_type: JobType::new("failing-terminal-queue-id"),
+    });
     jobs.start_poll().await?;
 
     // Completed path.
@@ -3030,7 +3051,9 @@ async fn snapshot_exposes_config_next_run_and_return_value() -> anyhow::Result<(
     let mut jobs = Jobs::init(config).await?;
     // A dedicated result initializer with a constant return value keeps this
     // test isolated from the order-sensitive `await_all_order_preserved`.
-    let result_spawner = jobs.add_initializer(ResultJobInitializer);
+    let result_spawner = jobs.add_initializer(ResultJobInitializer {
+        job_type: JobType::new("result-job-snapshot"),
+    });
     let test_spawner = jobs.add_initializer(TestJobInitializer {
         job_type: JobType::new("snapshot-getters"),
     });
@@ -3279,7 +3302,9 @@ async fn last_error_visible_mid_retry_and_terminal() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let retry_spawner = jobs.add_initializer(FailingWithRetriesInitializer);
-    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer {
+        job_type: JobType::new("failing-last-error"),
+    });
     let ok_spawner = jobs.add_initializer(TestJobInitializer {
         job_type: JobType::new("last-error-never-failed"),
     });

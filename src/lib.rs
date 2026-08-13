@@ -137,6 +137,76 @@
 //! }
 //! ```
 //!
+//! ## Batched execution
+//!
+//! Job types whose work is dominated by per-job transaction overhead — the
+//! common "an event spawns a command job that mutates one entity" shape — can
+//! opt into *batched* execution with [`Jobs::add_batched_initializer`]. The
+//! poller then hands a [`BatchedJobRunner`] every job of that type it claimed in
+//! one poll, so K jobs cost one transaction and one commit instead of K.
+//!
+//! ```ignore
+//! impl BatchedJobInitializer for RevalueInitializer {
+//!     type Config = RevalueConfig;
+//!
+//!     fn job_type(&self) -> JobType { JobType::new("command.revalue") }
+//!     fn max_batch_size(&self) -> usize { 25 }
+//!
+//!     fn init(&self, _: JobSpawner<Self::Config>)
+//!         -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn Error>>
+//!     {
+//!         Ok(Box::new(RevalueRunner { accounts: self.accounts.clone() }))
+//!     }
+//! }
+//!
+//! #[async_trait]
+//! impl BatchedJobRunner for RevalueRunner {
+//!     type Config = RevalueConfig;
+//!
+//!     async fn run_batch(&self, batch: CurrentBatchedJob<RevalueConfig>)
+//!         -> Result<JobBatchCompletion, Box<dyn Error>>
+//!     {
+//!         let mut op = batch.begin_op().await?;
+//!         for item in batch.items() {
+//!             self.accounts.revalue_in_op(&mut op, item.config().account_id).await?;
+//!         }
+//!         Ok(JobBatchCompletion::CompleteAllWithOp(op))
+//!     }
+//! }
+//! ```
+//!
+//! **Spawning and awaiting are unchanged.** Batched types use the same
+//! [`JobSpawner`] and resolve through the same
+//! [`await_completion`](Jobs::await_completion) — whether a job ran in a batch
+//! is invisible from both sides.
+//!
+//! Points worth knowing before opting in:
+//!
+//! - **At most one job per `queue_id` is ever in the same batch**, because the
+//!   poll query already claims at most one row per queue. Items arrive sorted by
+//!   `queue_id` so concurrent batches take domain locks in a consistent order.
+//! - **A batch of one is normal.** Under light load batches are size 1; write
+//!   `run_batch` to be correct at any length.
+//! - **Per-job outcomes** are available via
+//!   [`JobBatchCompletion::WithOutcomes`]: complete some, reschedule others,
+//!   fail the rest, all in one commit. Every job must get exactly one outcome —
+//!   the dispatcher rejects a partial set rather than guessing.
+//! - **Returning `Err` fails the whole batch**, retrying each job under the
+//!   type's [`RetrySettings`]. Jobs on a second or later attempt are never
+//!   batched, so a persistently failing job ends up retrying alone.
+//! - **A running batch costs one unit** of `max_jobs_per_process`, not one per
+//!   job — a batch is one task, one transaction, one connection.
+//! - **Claims are throttled by free batch slots.** A type may have
+//!   `max_concurrent_batches` (default 2) batches running per process, and the
+//!   poll query claims at most `max_batch_size × free slots` rows for it. Rows
+//!   are therefore only locked when a batch is free to start on them: the rest
+//!   of a backlog stays `pending` — claimable by other poller instances, and
+//!   accumulating into fuller later batches. Raise the slot count to trade
+//!   locked rows for more concurrency on a hot type.
+//! - **Keep external calls out of batched runners.** A shared transaction held
+//!   across HTTP or mail delivery is a liability; leave those types on
+//!   [`JobRunner`].
+//!
 //! ## Uniqueness
 //!
 //! For at-most-one semantics, use [`JobSpawner::spawn_unique`]. This method
@@ -205,6 +275,8 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(clippy::all))]
 #![forbid(unsafe_code)]
 
+mod batch_dispatcher;
+mod batched;
 mod config;
 mod current;
 mod dispatcher;
@@ -230,6 +302,10 @@ use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
 
+pub use batched::{
+    BatchItemOutcome, BatchOutcomes, BatchedJobInitializer, BatchedJobItem, BatchedJobRunner,
+    CurrentBatchedJob, DEFAULT_MAX_BATCH_SIZE, DEFAULT_MAX_CONCURRENT_BATCHES, JobBatchCompletion,
+};
 pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobEvent, JobType};
@@ -510,6 +586,46 @@ impl Jobs {
                 .as_mut()
                 .expect("Registry has been consumed by executor")
                 .add_initializer(initializer)
+        };
+        JobSpawner::new(
+            Arc::clone(&self.repo),
+            job_type,
+            Arc::clone(&self.router),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )
+    }
+
+    /// Register a [`BatchedJobInitializer`] and return a [`JobSpawner`] for
+    /// creating jobs of that type.
+    ///
+    /// Jobs of a batched type are executed many-at-a-time by a
+    /// [`BatchedJobRunner`] instead of one task per job. **Spawning and
+    /// awaiting are unchanged** — the returned spawner is the same one
+    /// [`add_initializer`](Self::add_initializer) returns, and awaiting through
+    /// a [`JobHandle`] resolves per job exactly as before — so whether a job
+    /// ran in a batch is invisible to both sides.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let spawner = jobs.add_batched_initializer(MyBatchedInitializer);
+    /// spawner.spawn_with_queue_id(JobId::new(), cfg, entity_id.to_string()).await?;
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after [`start_poll`](Self::start_poll).
+    pub fn add_batched_initializer<I: BatchedJobInitializer>(
+        &mut self,
+        initializer: I,
+    ) -> JobSpawner<I::Config> {
+        let job_type = {
+            let mut registry = self.registry.lock().expect("Couldn't lock Registry Mutex");
+            registry
+                .as_mut()
+                .expect("Registry has been consumed by executor")
+                .add_batched_initializer(initializer)
         };
         JobSpawner::new(
             Arc::clone(&self.repo),
