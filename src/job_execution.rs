@@ -2,7 +2,7 @@
 //!
 //! A row exists for as long as a job is schedulable (pending) or in-flight
 //! (running); the terminal transition deletes it. [`JobSnapshot`] pairs an
-//! optional [`JobExecutionRow`] with the durable [`Job`] entity and delegates
+//! optional `JobExecutionRow` with the durable [`Job`] entity and delegates
 //! its accessors to them.
 //!
 //! [`JobSnapshot`]: crate::JobSnapshot

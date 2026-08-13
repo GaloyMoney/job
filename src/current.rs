@@ -131,7 +131,7 @@ impl CurrentJob {
     ///
     /// The result is serialized to JSON and persisted to the database
     /// immediately. It will be available to callers via
-    /// [`Jobs::await_completion`](crate::Jobs::await_completion). Each call
+    /// [`JobHandle::await_completion`](crate::JobHandle::await_completion). Each call
     /// overwrites the previous value — the **last** value set is what callers
     /// see. This allows incremental progress updates; for example, a batch job
     /// can call `set_result` after each chunk so that partial progress is

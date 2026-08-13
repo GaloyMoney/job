@@ -10,7 +10,7 @@ use super::{
     Job, JobId,
     entity::{JobType, NewJob},
     error::JobError,
-    handle_api::JobHandle,
+    handle::JobHandle,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     repo::{JobColumn, JobRepo},

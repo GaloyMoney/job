@@ -20,11 +20,11 @@ use super::{
     dispatcher::*,
     entity::{Job, JobType},
     error::JobError,
-    handle::OwnedTaskHandle,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     registry::JobRegistry,
     repo::JobRepo,
+    task::OwnedTaskHandle,
     tracker::JobTracker,
 };
 

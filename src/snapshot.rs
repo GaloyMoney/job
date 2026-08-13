@@ -1,5 +1,5 @@
 //! [`JobSnapshot`] — a point-in-time view of a job, pairing the durable
-//! [`Job`] entity with an optional [`JobExecutionRow`] and delegating every
+//! [`Job`] entity with an optional `JobExecutionRow` and delegating every
 //! accessor to them.
 
 use chrono::{DateTime, Utc};
@@ -12,7 +12,7 @@ use crate::{
 
 /// A point-in-time view of a job, produced by [`JobHandle::load`](crate::JobHandle::load).
 ///
-/// It pairs the durable [`Job`] entity with an optional [`JobExecutionRow`]
+/// It pairs the durable [`Job`] entity with an optional `JobExecutionRow`
 /// (present until the job is terminal) and delegates every accessor to them —
 /// so one `load()` does a single pair of committed reads (within one op, so
 /// the two are consistent) and every getter below is then synchronous (only

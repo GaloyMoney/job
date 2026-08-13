@@ -3,9 +3,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::JobId;
-use crate::handle::OwnedTaskHandle;
 use crate::outcome::JobTerminalState;
 use crate::repo::JobRepo;
+use crate::task::OwnedTaskHandle;
 use crate::tracker::JobTracker;
 use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, mpsc, oneshot};
