@@ -211,9 +211,11 @@ impl JobPoller {
         };
         // Size each type's claim before touching the database. A batched type
         // may only claim what its free batch slots can immediately execute, so
-        // the poller never locks rows that would just sit in `running` waiting
-        // for a slot. A type with no free slot is dropped from the poll
-        // entirely; `batch_completed` wakes the loop when one frees up.
+        // the poller never takes rows that would just sit in `running` waiting
+        // for a slot. The cap is enforced on what the poll claims, not on what
+        // it may lock — see `selected_jobs`. A type with no free slot is
+        // dropped from the poll entirely; `batch_completed` wakes the loop when
+        // one frees up.
         let (pollable_types, row_limits) = {
             let mut types = Vec::new();
             let mut limits = Vec::new();
