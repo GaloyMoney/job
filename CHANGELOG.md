@@ -1,3 +1,21 @@
+# [job release v0.9.0](https://github.com/GaloyMoney/job/releases/tag/0.9.0)
+
+
+
+### Bug Fixes
+
+- Namespace batched-job queue ids per test
+- Stop test runs exhausting Postgres connection slots
+
+### Features
+
+- Batched job execution with slot-throttled claims (#165)
+- [**breaking**] JobHandle + JobSnapshot per-job facade (stage 1) + queue_id durability (#153)
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.12.7
+
 # [job release v0.8.0](https://github.com/GaloyMoney/job/releases/tag/0.8.0)
 
 
