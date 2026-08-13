@@ -210,6 +210,7 @@ mod current;
 mod dispatcher;
 mod entity;
 mod handle;
+mod job_execution;
 mod migrate;
 mod notification_router;
 mod notifier;
@@ -218,7 +219,9 @@ mod poller;
 mod registry;
 mod repo;
 mod runner;
+mod snapshot;
 mod spawner;
+mod task;
 mod tracker;
 
 pub mod error;
@@ -226,19 +229,21 @@ pub mod error;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobEvent, JobType};
+pub use error::JobError;
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
+pub use handle::{JobHandle, JobHandles};
+pub use job_execution::JobStatus;
 pub use migrate::*;
 pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;
 pub use runner::*;
+pub use snapshot::JobSnapshot;
 pub use spawner::*;
 
-use error::*;
 use notification_router::*;
 use poller::*;
 use repo::*;
@@ -472,6 +477,7 @@ impl Jobs {
             Arc::clone(&self.repo),
             registry,
             Arc::clone(&tracker),
+            Arc::clone(&self.router),
             Arc::clone(&self.notifier),
             self.clock.clone(),
         );
@@ -508,115 +514,215 @@ impl Jobs {
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
+            Arc::clone(&self.router),
             self.clock.clone(),
             Arc::clone(&self.notifier),
         )
     }
 
-    /// Fetch the current snapshot of a job entity by identifier.
-    #[instrument(name = "job.find", skip(self))]
-    pub async fn find(&self, id: JobId) -> Result<Job, JobError> {
-        Ok(self.repo.find_by_id(id).await?)
+    /// Mint a [`JobHandle`] for `id` — cheap and non-validating.
+    ///
+    /// No I/O happens until a method on the handle is called; handles hold no
+    /// cached state, so every read is a live committed read. The id does not
+    /// need to belong to an existing job: [`JobHandle::load`] and the
+    /// awaits return [`JobError::Find`] if it never existed.
+    ///
+    /// See [`Jobs::handles`] for the batch mint and the
+    /// persist-ids → re-mint → await pattern.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use job::{
+    /// #     Jobs, JobSvcConfig, Job, JobId, JobInitializer, JobRunner, JobType, JobCompletion,
+    /// #     CurrentJob, JobSpawner,
+    /// # };
+    /// # use job::error::JobError;
+    /// # use async_trait::async_trait;
+    /// # use serde::{Serialize, Deserialize};
+    /// # use sqlx::postgres::PgPoolOptions;
+    /// # use std::error::Error;
+    /// # use std::time::Duration;
+    /// # #[derive(Debug, Serialize, Deserialize)]
+    /// # struct MyConfig { value: i32 }
+    /// # struct MyInitializer;
+    /// # impl JobInitializer for MyInitializer {
+    /// #     type Config = MyConfig;
+    /// #     fn job_type(&self) -> JobType { JobType::new("example") }
+    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    /// #         Ok(Box::new(MyRunner))
+    /// #     }
+    /// # }
+    /// # struct MyRunner;
+    /// # #[async_trait]
+    /// # impl JobRunner for MyRunner {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error>> {
+    /// #         Ok(JobCompletion::Complete)
+    /// #     }
+    /// # }
+    /// # async fn example() -> Result<(), JobError> {
+    /// # let pool = PgPoolOptions::new()
+    /// #     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
+    /// # let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    /// # let mut jobs = Jobs::init(config).await?;
+    /// # let spawner: JobSpawner<MyConfig> = jobs.add_initializer(MyInitializer);
+    /// # jobs.start_poll().await?;
+    /// let job_id = JobId::new();
+    /// spawner.spawn(job_id, MyConfig { value: 42 }).await?;
+    ///
+    /// // Observe and await the job through its handle (live committed reads).
+    /// let handle = jobs.handle(job_id);
+    /// let snapshot = handle.load().await?;
+    /// let _state = snapshot.state();
+    /// let outcome = handle.await_completion(Duration::from_secs(60)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn handle(&self, id: impl Into<JobId>) -> JobHandle {
+        JobHandle::new(
+            id.into(),
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+        )
+    }
+
+    /// Mint an ordered [`JobHandles`] collection — cheap and non-validating.
+    ///
+    /// Results of the batch methods ([`JobHandles::await_all`],
+    /// [`JobHandles::load_all`]) align positionally with the input ids.
+    ///
+    /// # Examples
+    ///
+    /// Persist the ids first (crash-safe), spawn, then re-mint handles from
+    /// the persisted ids to await the batch:
+    ///
+    /// ```no_run
+    /// # use job::{
+    /// #     Jobs, JobSvcConfig, Job, JobId, JobInitializer, JobRunner, JobType, JobCompletion,
+    /// #     CurrentJob, JobSpawner, JobOutcomes,
+    /// # };
+    /// # use job::error::JobError;
+    /// # use async_trait::async_trait;
+    /// # use serde::{Serialize, Deserialize};
+    /// # use sqlx::postgres::PgPoolOptions;
+    /// # use std::error::Error;
+    /// # use std::time::Duration;
+    /// # #[derive(Debug, Serialize, Deserialize)]
+    /// # struct MyConfig { value: i32 }
+    /// # struct MyInitializer;
+    /// # impl JobInitializer for MyInitializer {
+    /// #     type Config = MyConfig;
+    /// #     fn job_type(&self) -> JobType { JobType::new("example") }
+    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    /// #         Ok(Box::new(MyRunner))
+    /// #     }
+    /// # }
+    /// # struct MyRunner;
+    /// # #[async_trait]
+    /// # impl JobRunner for MyRunner {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error>> {
+    /// #         Ok(JobCompletion::Complete)
+    /// #     }
+    /// # }
+    /// # async fn example() -> Result<(), JobError> {
+    /// # let pool = PgPoolOptions::new()
+    /// #     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
+    /// # let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    /// # let mut jobs = Jobs::init(config).await?;
+    /// # let spawner: JobSpawner<MyConfig> = jobs.add_initializer(MyInitializer);
+    /// # jobs.start_poll().await?;
+    /// // 1. Generate and PERSIST the ids before spawning (crash-safe: if the
+    /// //    process dies mid-batch, the ids can be reloaded and re-awaited).
+    /// let ids: Vec<JobId> = (0..3).map(|_| JobId::new()).collect();
+    /// // ... write `ids` into your own state in the same transaction ...
+    ///
+    /// // 2. Spawn the jobs.
+    /// for id in &ids {
+    ///     spawner.spawn(*id, MyConfig { value: 42 }).await?;
+    /// }
+    ///
+    /// // 3. Later (possibly after a restart): re-mint handles from the
+    /// //    persisted ids and await the whole batch, bounded.
+    /// let handles = jobs.handles(ids);
+    /// let outcomes = handles.await_all(Duration::from_secs(300)).await?;
+    /// assert!(outcomes.all_succeeded());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn handles(&self, ids: impl IntoIterator<Item = impl Into<JobId>>) -> JobHandles {
+        ids.into_iter().map(|id| self.handle(id)).collect()
+    }
+
+    /// Mint a [`JobHandle`] for the single unique job of `job_type`, if one
+    /// exists.
+    ///
+    /// The counterpart of [`handle`](Self::handle) for at-most-one-per-type
+    /// jobs (see [`JobSpawner::spawn_unique`]): unlike `handle(id)`, this
+    /// resolves the persisted job's id from the database, so it is async and
+    /// returns `None` when no unique job of that type has been spawned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use job::{
+    /// #     Jobs, JobSvcConfig, Job, JobId, JobInitializer, JobRunner, JobType, JobCompletion,
+    /// #     CurrentJob, JobSpawner,
+    /// # };
+    /// # use job::error::JobError;
+    /// # use async_trait::async_trait;
+    /// # use serde::{Serialize, Deserialize};
+    /// # use sqlx::postgres::PgPoolOptions;
+    /// # use std::error::Error;
+    /// # use std::time::Duration;
+    /// # #[derive(Debug, Serialize, Deserialize)]
+    /// # struct MyConfig { value: i32 }
+    /// # struct MyInitializer;
+    /// # impl JobInitializer for MyInitializer {
+    /// #     type Config = MyConfig;
+    /// #     fn job_type(&self) -> JobType { JobType::new("cleanup") }
+    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    /// #         Ok(Box::new(MyRunner))
+    /// #     }
+    /// # }
+    /// # struct MyRunner;
+    /// # #[async_trait]
+    /// # impl JobRunner for MyRunner {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error>> {
+    /// #         Ok(JobCompletion::Complete)
+    /// #     }
+    /// # }
+    /// # async fn example() -> Result<(), JobError> {
+    /// # let pool = PgPoolOptions::new()
+    /// #     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
+    /// # let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    /// # let mut jobs = Jobs::init(config).await?;
+    /// # let spawner: JobSpawner<MyConfig> = jobs.add_initializer(MyInitializer);
+    /// # jobs.start_poll().await?;
+    /// // Observe the (at most one) cleanup job without knowing its id.
+    /// if let Some(handle) = jobs.handle_unique(JobType::new("cleanup")).await? {
+    ///     let snapshot = handle.load().await?;
+    ///     let _state = snapshot.state();
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(name = "job.handle_unique", skip(self))]
+    pub async fn handle_unique(
+        &self,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+    ) -> Result<Option<JobHandle>, JobError> {
+        let job = self.repo.find_unique_by_job_type(&job_type.into()).await?;
+        Ok(job.map(|job| self.handle(job.id)))
     }
 
     /// Returns a reference to the clock used by this job service.
     pub fn clock(&self) -> &ClockHandle {
         &self.clock
-    }
-
-    /// Block until the given job reaches a terminal state (completed or errored)
-    /// and return the outcome together with any result value the
-    /// runner attached via [`CurrentJob::set_result`].
-    ///
-    /// When `timeout` is `Some(duration)`, the call returns
-    /// [`JobError::TimedOut`] if the job has not reached a terminal state
-    /// within the specified duration. Pass `None` to wait indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JobError::Find`] if the job does not exist.
-    /// Returns [`JobError::TimedOut`] if the timeout elapses before the job
-    /// reaches a terminal state.
-    /// Returns [`JobError::AwaitCompletionShutdown`] if the notification channel is
-    /// dropped (e.g., during shutdown) before delivering the terminal state.
-    #[instrument(name = "job.await_completion", skip(self))]
-    pub async fn await_completion(
-        &self,
-        id: JobId,
-        timeout: Option<Duration>,
-    ) -> Result<JobOutcome, JobError> {
-        // Fail fast if the job doesn't exist — avoids a 5-minute silent hang
-        // in the waiter manager for a JobId that will never resolve.
-        self.find(id).await?;
-        let rx = self.router.wait_for_terminal(id);
-        let state = match timeout {
-            Some(duration) => tokio::time::timeout(duration, rx)
-                .await
-                .map_err(|_| JobError::TimedOut(id))?
-                .map_err(|_| JobError::AwaitCompletionShutdown(id))?,
-            None => rx
-                .await
-                .map_err(|_| JobError::AwaitCompletionShutdown(id))?,
-        };
-        // Load job to retrieve any result value set by the runner
-        let job = self.find(id).await?;
-        Ok(JobOutcome::new(state, job.raw_return_value().cloned()))
-    }
-
-    /// Block until every job in `ids` reaches a terminal state (completed or
-    /// errored) and return all outcomes together with any result values the
-    /// runners attached via [`CurrentJob::set_result`].
-    ///
-    /// This is the batch counterpart of [`await_completion`](Self::await_completion).
-    /// Each job is awaited concurrently; the call resolves once **all** jobs
-    /// have finished.
-    ///
-    /// When `timeout` is `Some(duration)`, the call returns
-    /// [`JobError::TimedOut`] if the batch has not fully resolved within the
-    /// specified duration. Pass `None` to wait indefinitely.
-    ///
-    /// An empty `ids` slice returns an empty `Vec` immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JobError::Find`] if any job in the batch does not exist.
-    /// Returns [`JobError::TimedOut`] if the timeout elapses before every job
-    /// reaches a terminal state.
-    /// Returns [`JobError::AwaitCompletionShutdown`] if the notification channel
-    /// is dropped (e.g., during shutdown) before all jobs have resolved.
-    #[instrument(name = "job.await_completions", skip(self))]
-    pub async fn await_completions(
-        &self,
-        ids: &[JobId],
-        timeout: Option<Duration>,
-    ) -> Result<Vec<JobOutcome>, JobError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let futs: Vec<_> = ids
-            .iter()
-            .map(|id| self.await_completion(*id, None))
-            .collect();
-        let results = match timeout {
-            Some(duration) => {
-                let first_id = ids[0];
-                tokio::time::timeout(duration, futures::future::join_all(futs))
-                    .await
-                    .map_err(|_| JobError::TimedOut(first_id))?
-            }
-            None => futures::future::join_all(futs).await,
-        };
-        results.into_iter().collect()
-    }
-
-    /// Non-blocking check for job completion.
-    ///
-    /// Returns the terminal state immediately if the job has reached one,
-    /// or `None` if it is still running.
-    #[instrument(name = "job.poll_completion", skip(self))]
-    pub async fn poll_completion(&self, id: JobId) -> Result<Option<JobTerminalState>, JobError> {
-        let job = self.find(id).await?;
-        Ok(job.terminal_state())
     }
 
     /// Gracefully shut down the job poller.

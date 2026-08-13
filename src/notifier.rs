@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::JobId;
 use crate::entity::JobType;
-use crate::handle::OwnedTaskHandle;
 use crate::notification_router::{JOB_EVENTS_CHANNEL, JobNotification};
+use crate::task::OwnedTaskHandle;
 use crate::tracker::JobTracker;
 
 /// Deliberately not configurable: it bounds only added hint latency.

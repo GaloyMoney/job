@@ -34,7 +34,7 @@ impl JobReturnValue {
     }
 }
 
-/// Outcome returned by [`Jobs::await_completion`](crate::Jobs::await_completion),
+/// Outcome returned by [`JobHandle::await_completion`](crate::JobHandle::await_completion),
 /// carrying both the terminal state and an optional return value.
 #[derive(Debug, Clone)]
 pub struct JobOutcome {
