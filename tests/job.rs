@@ -2475,6 +2475,7 @@ struct CheckpointState {
 /// A runner that parks, then (on first release) writes execution state and
 /// signals, then (on second release) completes.
 struct StateWritingInitializer {
+    job_type: JobType,
     wrote: Arc<Notify>,
     release: Arc<Notify>,
 }
@@ -2483,7 +2484,7 @@ impl JobInitializer for StateWritingInitializer {
     type Config = ResultJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("handle-execution-state")
+        self.job_type.clone()
     }
 
     fn init(
@@ -2533,6 +2534,7 @@ async fn execution_state_none_before_first_write_then_roundtrips() -> anyhow::Re
     let wrote = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(StateWritingInitializer {
+        job_type: JobType::new("handle-execution-state"),
         wrote: Arc::clone(&wrote),
         release: Arc::clone(&release),
     });
@@ -3225,6 +3227,183 @@ async fn handle_unique_resolves_the_unique_job() -> anyhow::Result<()> {
             .await?
             .is_none()
     );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+// -- Round-2 additions (obix consumer proof): last_error mid-retry + execution_state point-read --
+
+/// A job that always fails, with retries remaining and a far-future backoff so
+/// it parks (non-terminal) after the first failure — the shape of obix's
+/// wedged, `repeat_indefinitely()` resident handler.
+struct FailingWithRetriesInitializer;
+
+impl JobInitializer for FailingWithRetriesInitializer {
+    type Config = FailingJobConfig;
+
+    fn job_type(&self) -> JobType {
+        JobType::new("failing-with-retries")
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(5),
+            // Huge backoff: after attempt 1 fails it reschedules ~1h out, so it
+            // stays Pending (non-terminal) with the error recorded.
+            min_backoff: Duration::from_secs(3600),
+            max_backoff: Duration::from_secs(3600),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(FailingJobRunner))
+    }
+}
+
+/// `A`: the last error is reachable while a job is still retrying (non-terminal),
+/// matches the `Errored { error }` string once terminal, and is `None` for a
+/// job that never failed.
+#[tokio::test]
+async fn last_error_visible_mid_retry_and_terminal() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let retry_spawner = jobs.add_initializer(FailingWithRetriesInitializer);
+    let fail_spawner = jobs.add_initializer(FailingJobInitializer);
+    let ok_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("last-error-never-failed"),
+    });
+    jobs.start_poll().await?;
+
+    // Mid-retry: fails once, then parks Pending ~1h out with the error recorded.
+    let retry_id = JobId::new();
+    retry_spawner.spawn(retry_id, FailingJobConfig).await?;
+    let retry_handle = jobs.handle(retry_id);
+
+    let mut attempts = 0;
+    let mid_retry = loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let snap = retry_handle.load().await?;
+        if snap.last_error().is_some() {
+            break snap;
+        }
+        attempts += 1;
+        assert!(attempts < 100, "job never recorded a failed attempt");
+    };
+    assert!(
+        !mid_retry.state().is_terminal(),
+        "job must still be retrying (non-terminal), got {:?}",
+        mid_retry.state()
+    );
+    assert!(matches!(mid_retry.state(), JobStatus::Pending { .. }));
+    assert!(
+        mid_retry
+            .last_error()
+            .expect("mid-retry error present")
+            .contains("intentional failure"),
+        "unexpected mid-retry error"
+    );
+
+    // Terminal errored: last_error equals the `Errored { error }` string.
+    let errored_id = JobId::new();
+    fail_spawner.spawn(errored_id, FailingJobConfig).await?;
+    let errored_handle = jobs.handle(errored_id);
+    errored_handle
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    let terminal = errored_handle.load().await?;
+    match terminal.state() {
+        JobStatus::Errored { error, .. } => {
+            assert_eq!(terminal.last_error(), Some(error.as_str()));
+        }
+        other => panic!("expected Errored, got {other:?}"),
+    }
+
+    // Never failed: last_error is None.
+    let ok_id = JobId::new();
+    ok_spawner
+        .spawn(ok_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    let ok_handle = jobs.handle(ok_id);
+    ok_handle.await_completion(Duration::from_secs(10)).await?;
+    assert_eq!(ok_handle.load().await?.last_error(), None);
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// `B`: the `execution_state` point-read round-trips a written state, is `None`
+/// for a missing row, surfaces `CouldNotDeserializeExecutionState` on a decode
+/// mismatch, and agrees with `load().execution_state()` on a live job.
+#[tokio::test]
+async fn execution_state_point_read() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let wrote = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(StateWritingInitializer {
+        job_type: JobType::new("execution-state-point-read"),
+        wrote: Arc::clone(&wrote),
+        release: Arc::clone(&release),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+    let handle = jobs.handle(job_id);
+
+    // No state written yet ⇒ None (row present, execution_state_json unset).
+    assert_eq!(handle.execution_state::<CheckpointState>().await?, None);
+
+    // A job that never existed ⇒ None (missing row).
+    assert_eq!(
+        jobs.handle(JobId::new())
+            .execution_state::<CheckpointState>()
+            .await?,
+        None
+    );
+
+    // Release the runner to write its state, then point-read it.
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), wrote.notified())
+        .await
+        .expect("runner never wrote its execution state");
+    assert_eq!(
+        handle.execution_state::<CheckpointState>().await?,
+        Some(CheckpointState { processed: 42 })
+    );
+
+    // Agrees with the snapshot's execution_state on the same live job.
+    assert_eq!(
+        handle.load().await?.execution_state::<CheckpointState>()?,
+        Some(CheckpointState { processed: 42 })
+    );
+
+    // Decode mismatch ⇒ CouldNotDeserializeExecutionState (an object is not a String).
+    let result = handle.execution_state::<String>().await;
+    assert!(
+        matches!(result, Err(JobError::CouldNotDeserializeExecutionState(_))),
+        "expected CouldNotDeserializeExecutionState, got {result:?}"
+    );
+
+    // Let the job finish so the runner's second `release.notified()` returns.
+    release.notify_one();
+    handle.await_completion(Duration::from_secs(10)).await?;
 
     jobs.shutdown().await?;
     Ok(())

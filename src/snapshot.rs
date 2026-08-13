@@ -38,7 +38,7 @@ impl JobSnapshot {
             None => match self.job.terminal_state() {
                 Some(JobTerminalState::Completed) => JobStatus::Completed { queue_id },
                 Some(JobTerminalState::Errored) => JobStatus::Errored {
-                    error: self.job.last_error().unwrap_or_default(),
+                    error: self.job.last_error().unwrap_or_default().to_owned(),
                     queue_id,
                 },
                 // `JobRepo::load_snapshot_by_id` keeps a row only for a
@@ -65,6 +65,16 @@ impl JobSnapshot {
     /// The queue this job belongs to, if any.
     pub fn queue_id(&self) -> Option<&str> {
         self.job.queue_id.as_deref()
+    }
+
+    /// The latest error string, if the job has ever failed an attempt.
+    ///
+    /// Unlike the terminal [`JobStatus::Errored`] error, this is available
+    /// while the job is still running/retrying — the signal that distinguishes
+    /// a wedged, never-terminal handler (crash-looping on the same error) from
+    /// a merely slow or backlogged one.
+    pub fn last_error(&self) -> Option<&str> {
+        self.job.last_error()
     }
 
     /// Decode the job's committed execution state as `S`.

@@ -4,6 +4,7 @@
 //! yourself.
 
 use es_entity::clock::ClockHandle;
+use serde::de::DeserializeOwned;
 use tracing::instrument;
 
 use std::{sync::Arc, time::Duration};
@@ -82,6 +83,36 @@ impl JobHandle {
     #[instrument(name = "job.handle.load", skip(self), fields(id = %self.id))]
     pub async fn load(&self) -> Result<JobSnapshot, JobError> {
         self.repo.load_snapshot_by_id(self.id).await
+    }
+
+    /// Read back only the committed execution state, decoded as `S`.
+    ///
+    /// A cheap point-read: one single-row `SELECT` on `job_executions`, no
+    /// entity hydration and no snapshot reconciliation — for hot poll loops
+    /// (e.g. a caught-up barrier) that only need the execution state and would
+    /// otherwise pay a full [`load`](Self::load) whose cost grows with the
+    /// event log. Use `load()` when you need a consistent status/config view.
+    ///
+    /// Honest absence: `Ok(None)` on a missing row (never spawned, or already
+    /// terminal) or unset state. Does not distinguish "never existed" from
+    /// "terminal" — use [`load`](Self::load) if that matters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::CouldNotDeserializeExecutionState`] if the stored
+    /// state does not decode into `S`.
+    #[instrument(
+        name = "job.handle.execution_state",
+        skip(self),
+        fields(id = %self.id)
+    )]
+    pub async fn execution_state<S: DeserializeOwned>(&self) -> Result<Option<S>, JobError> {
+        match self.repo.execution_state_json_by_id(self.id).await? {
+            Some(json) => serde_json::from_value(json)
+                .map(Some)
+                .map_err(JobError::CouldNotDeserializeExecutionState),
+            None => Ok(None),
+        }
     }
 
     /// Block until the job reaches a terminal state (completed or errored)

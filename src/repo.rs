@@ -48,6 +48,26 @@ impl JobRepo {
         .await?)
     }
 
+    /// Read only the committed `execution_state_json` for `id` — a single-row
+    /// SELECT on `job_executions`, no entity hydration, no snapshot
+    /// reconciliation. `Ok(None)` on a missing row or unset state.
+    ///
+    /// The cheap point-read behind [`JobHandle::execution_state`]; unlike
+    /// [`load_snapshot_by_id`](Self::load_snapshot_by_id) it does not scan
+    /// `job_events`, so it stays flat as retries grow the event log.
+    pub(super) async fn execution_state_json_by_id(
+        &self,
+        id: JobId,
+    ) -> Result<Option<serde_json::Value>, JobError> {
+        let row = sqlx::query!(
+            r#"SELECT execution_state_json FROM job_executions WHERE id = $1"#,
+            id as JobId,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.execution_state_json))
+    }
+
     /// Load a point-in-time [`JobSnapshot`] for `id`: the execution row (if the
     /// job is still schedulable/running) paired with the durable entity.
     ///

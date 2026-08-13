@@ -233,6 +233,7 @@ use std::sync::{Arc, Mutex};
 pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobEvent, JobType};
+pub use error::JobError;
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use handle_api::{JobHandle, JobHandles};
 pub use job_execution::JobStatus;
@@ -243,7 +244,6 @@ pub use runner::*;
 pub use snapshot::JobSnapshot;
 pub use spawner::*;
 
-use error::*;
 use notification_router::*;
 use poller::*;
 use repo::*;

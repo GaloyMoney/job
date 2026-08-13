@@ -250,13 +250,16 @@ impl Job {
 
     /// Returns the error string of the latest `ExecutionErrored` event, if any.
     ///
-    /// For a job that terminated in `Errored`, `error_job` pushes exactly
-    /// `ExecutionErrored { error }` followed by `JobCompleted`, so the latest
-    /// `ExecutionErrored` is the terminal error.
-    pub(crate) fn last_error(&self) -> Option<String> {
+    /// Recorded on **every** failed attempt, not only at terminal: a retry with
+    /// attempts remaining pushes `ExecutionErrored { error }` via
+    /// `schedule_retry`, and the terminal path pushes it via `error_job` before
+    /// `JobCompleted`. So this is `Some` for a mid-retry (still-running) job as
+    /// well as a terminally errored one — the signal a wedged, never-terminal
+    /// handler needs.
+    pub(crate) fn last_error(&self) -> Option<&str> {
         self.events.iter_all().rev().find_map(|event| {
             if let JobEvent::ExecutionErrored { error } = event {
-                Some(error.clone())
+                Some(error.as_str())
             } else {
                 None
             }
