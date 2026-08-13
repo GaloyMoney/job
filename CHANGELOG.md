@@ -1,3 +1,12 @@
+# [job release v0.9.1](https://github.com/GaloyMoney/job/releases/tag/0.9.1)
+
+
+
+### Bug Fixes
+
+- Fmt
+- Generate spawn_unique's job id internally
+
 # [job release v0.9.0](https://github.com/GaloyMoney/job/releases/tag/0.9.0)
 
 
