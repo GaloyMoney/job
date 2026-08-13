@@ -880,8 +880,8 @@ async fn poll_jobs(
         WITH limits AS (
             -- One row per pollable type carrying how many rows this poll may
             -- claim for it. For a batched type that is
-            -- `max_batch_size * free batch slots`, so rows are only locked
-            -- when a batch is actually free to work on them; the rest of the
+            -- `max_batch_size * free batch slots`, so no more rows are taken
+            -- than a batch is free to execute immediately; the rest of the
             -- backlog stays unclaimed for other pollers and accumulates into
             -- fuller later batches. Types with no free slot are absent from
             -- $4 entirely and never reach `due`.
@@ -913,29 +913,48 @@ async fn poll_jobs(
                 AND running.queue_id = due.queue_id
             )
         ),
-        admitted AS (
-            -- Rank each type's queue-heads and keep only as many as that
-            -- type's limit allows. Runs over the already-bounded candidate
-            -- set, so the per-type cap costs one window pass, not a scan.
-            SELECT c.id, c.execute_at, l.row_limit,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY c.job_type ORDER BY c.execute_at
-                   ) AS type_rn
-            FROM candidates c
-            JOIN limits l ON l.job_type = c.job_type
-            WHERE c.rn = 1
-        ),
-        selected_jobs AS (
+        locked AS (
             -- The wide execution_state_json is fetched only for the
             -- ~$1 winners, not carried through the CTEs and the window
             -- sort for every pending job.
-            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index
-            FROM admitted a
-            JOIN job_executions je ON je.id = a.id
-            WHERE a.type_rn <= a.row_limit
+            --
+            -- Every queue-head is eligible here, deliberately: the per-type
+            -- cap is applied *after* this lock, never before it. Filtering to
+            -- each type's cap first would make every instance rank the same
+            -- global candidate set and target an identical head slice, so a
+            -- poller that lost the race would skip that whole slice and fall
+            -- through to nothing while due work sat unclaimed. SKIP LOCKED can
+            -- only route around a concurrent poller if there is something
+            -- past its rows left to see.
+            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index,
+                   c.job_type, je.execute_at
+            FROM candidates c
+            JOIN job_executions je ON je.id = c.id
+            WHERE c.rn = 1
             ORDER BY je.execute_at ASC
             LIMIT $1
             FOR UPDATE OF je SKIP LOCKED
+        ),
+        selected_jobs AS (
+            -- Enforce each type's cap on the rows this poller actually holds.
+            -- Rows over the cap are simply not claimed: they stay `pending`
+            -- and their lock is released when this short poll transaction
+            -- commits, so they remain visible to other instances and
+            -- accumulate into fuller later batches.
+            --
+            -- A type present in `limits` always has row_limit >= 1 (saturated
+            -- types are dropped from $4 entirely), so its first row always
+            -- survives — `selected_jobs` is never empty while `locked` isn't.
+            SELECT t.id, t.data_json, t.attempt_index
+            FROM (
+                SELECT l.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY l.job_type ORDER BY l.execute_at
+                       ) AS type_rn
+                FROM locked l
+            ) t
+            JOIN limits lim ON lim.job_type = t.job_type
+            WHERE t.type_rn <= lim.row_limit
         ),
         updated AS (
             -- queue_id rides along in the projection (it is already read by
