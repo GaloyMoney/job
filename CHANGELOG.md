@@ -1,3 +1,11 @@
+# [job release v0.9.2](https://github.com/GaloyMoney/job/releases/tag/0.9.2)
+
+
+
+### Features
+
+- Per-item savepoint isolation via run_isolated (#166)
+
 # [job release v0.9.1](https://github.com/GaloyMoney/job/releases/tag/0.9.1)
 
 
