@@ -30,6 +30,13 @@
 //!   Pick `queue_id` to be whatever you need serialized.
 //! - **Do not perform external calls** (HTTP, mail, RPC) inside a shared batch
 //!   transaction — keep those job types on the per-job [`JobRunner`](crate::JobRunner).
+//! - A per-item **DB** error (a constraint violation, say) run straight
+//!   against the batch's `op` aborts the whole transaction. To isolate it —
+//!   so batch-mates still commit — run that item's work through
+//!   [`CurrentBatchedJob::run_isolated`], which wraps each item in its own
+//!   `SAVEPOINT` via [`es_entity::DbOp::with_savepoint`]. Savepoints isolate
+//!   *failures*, not *contention*: they do not release Postgres locks, so
+//!   they are not a lever for raising batch size under lock pressure.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -142,10 +149,17 @@ pub enum BatchItemOutcome {
     /// Treat this job as failed: it is retried per the type's
     /// [`RetrySettings`], or marked errored once attempts are exhausted.
     ///
-    /// Only for failures detected **without** poisoning the shared transaction
-    /// (validation, missing precondition, a domain rule saying "no"). A failed
-    /// SQL statement aborts the whole transaction — return `Err` from
-    /// `run_batch` in that case so the entire batch is retried.
+    /// For failures detected without poisoning the shared transaction
+    /// (validation, missing precondition, a domain rule saying "no"), just
+    /// return this outcome directly. A failed SQL statement run straight
+    /// against the batch's `op` still aborts the whole transaction — return
+    /// `Err` from `run_batch` in that case so the entire batch is retried.
+    /// To let a per-item **DB** error resolve to this outcome too, without
+    /// taking batch-mates down with it, run that item's work through
+    /// [`CurrentBatchedJob::run_isolated`] (or
+    /// [`es_entity::DbOp::with_savepoint`] directly): the savepoint rolls
+    /// back only that item's writes, and the shared transaction stays usable
+    /// for the rest of the batch.
     Fail(String),
 }
 
@@ -353,6 +367,64 @@ impl<C> CurrentBatchedJob<C> {
     #[cfg(feature = "es-entity")]
     pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobError> {
         Ok(es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?)
+    }
+
+    /// Run `f` once per item, each inside its own `SAVEPOINT` on `op`, and
+    /// collect a [`BatchOutcomes`] — the batch-loop counterpart of
+    /// [`es_entity::DbOp::with_savepoint`].
+    ///
+    /// A failing item is rolled back to its own savepoint without poisoning
+    /// `op`: earlier and later items still commit in the same transaction.
+    /// `f`'s `Ok(outcome)` is recorded as-is — usually
+    /// [`BatchItemOutcome::Complete`], though a successfully-released
+    /// savepoint can still resolve to `RescheduleIn`/`RescheduleAt` if the
+    /// item wants to run again later. `f`'s `Err` is translated to
+    /// [`BatchItemOutcome::Fail`] (via `E`'s `Display`), so the item is
+    /// retried per the type's [`RetrySettings`] like any other failure.
+    ///
+    /// Typical use, feeding the result into
+    /// [`JobBatchCompletion::WithOutcomesWithOp`]:
+    ///
+    /// ```rust,ignore
+    /// let mut op = current_batch.begin_op().await?;
+    /// let outcomes = current_batch
+    ///     .run_isolated(&mut op, |op, item| async move {
+    ///         self.execute_in_op(op, item.config()).await?;
+    ///         Ok(BatchItemOutcome::Complete)
+    ///     })
+    ///     .await?;
+    /// Ok(JobBatchCompletion::WithOutcomesWithOp(op, outcomes))
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The returned `Err` is the *outer* layer of
+    /// [`with_savepoint`](es_entity::DbOp::with_savepoint): the savepoint
+    /// machinery itself failed (e.g. a dead connection), not any one item's
+    /// domain logic. That failure isn't attributable to a single item —
+    /// propagate it with `?` and let the whole batch retry, exactly like a
+    /// whole-batch `Err` returned from `run_batch` today.
+    #[cfg(feature = "es-entity")]
+    pub async fn run_isolated<E>(
+        &self,
+        op: &mut es_entity::DbOp<'static>,
+        f: impl AsyncFn(
+            &mut es_entity::SavepointOp<'_>,
+            &BatchedJobItem<C>,
+        ) -> Result<BatchItemOutcome, E>,
+    ) -> Result<BatchOutcomes, sqlx::Error>
+    where
+        E: std::fmt::Display,
+    {
+        let mut outcomes = Vec::with_capacity(self.items.len());
+        for item in &self.items {
+            let outcome = match op.with_savepoint(async |sp| f(sp, item).await).await? {
+                Ok(outcome) => outcome,
+                Err(e) => BatchItemOutcome::Fail(e.to_string()),
+            };
+            outcomes.push((item.id, outcome));
+        }
+        Ok(outcomes)
     }
 
     /// Build a [`BatchOutcomes`] by deciding an outcome for every item.
