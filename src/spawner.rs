@@ -13,8 +13,13 @@ use super::{
     handle::JobHandle,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
-    repo::{JobColumn, JobRepo},
+    repo::{JobCreateError, JobRepo},
 };
+
+/// The key [`JobSpawner::spawn_unique`] registers under. Keyed and unique
+/// spawns of one type share this one key namespace per type — see
+/// [`JobSpawner::spawn_keyed`].
+pub const DEFAULT_UNIQUE_KEY: &str = "default";
 
 /// Describes a job to be created as part of a bulk [`JobSpawner::spawn_all`] call.
 ///
@@ -312,7 +317,6 @@ where
 
             let new_job = NewJob::builder()
                 .id(spec.id)
-                .unique_per_type(false)
                 .job_type(self.job_type.clone())
                 .config(spec.config)?
                 .tracing_context(es_entity::context::TracingContext::current())
@@ -355,27 +359,37 @@ where
         Ok(jobs)
     }
 
-    /// Create and spawn a unique job.
+    /// Create a keyed singleton: at most one job of this `(job_type, key)`
+    /// EVER exists (`jobs` rows are never deleted, so this is not "at most
+    /// one live at a time" — resharding or otherwise reusing a key needs a
+    /// fresh one, e.g. a generation-scoped `g2:3`). Returns a [`JobHandle`]
+    /// whether the job was created or already exists; on the duplicate path
+    /// the handle carries the PERSISTED job's id, so a double-spawning
+    /// caller always observes the job that actually runs. The job's id is
+    /// generated internally — a keyed singleton is identified by its
+    /// `(job_type, key)`, not a caller-chosen id — so read the id back from
+    /// the returned handle.
     ///
-    /// Only one job of this type can exist at a time. This method consumes the
-    /// spawner since no further jobs of this type can be created.
-    ///
-    /// The job's id is generated internally — a unique-per-type job is
-    /// identified by its type, not a caller-chosen id — so read the id back
-    /// from the returned [`JobHandle`].
-    ///
-    /// Returns a [`JobHandle`] whether the job was created or already exists.
-    /// On the duplicate path the handle carries the PERSISTED job's id, so a
-    /// double-spawning orchestrator always observes the job that actually runs.
+    /// Keys are opaque to the crate — a sharded consumer can spawn one
+    /// singleton per shard and later enumerate them all via
+    /// [`Jobs::keyed_handles`](crate::Jobs::keyed_handles), pairing each
+    /// handle with [`JobHandle::load`]'s execution state to answer "caught
+    /// up?" per shard. Does not consume the spawner: unlike
+    /// [`Self::spawn_unique`], many keys of one type are expected.
     #[instrument(
-        name = "job_spawner.spawn_unique",
+        name = "job_spawner.spawn_keyed",
         skip(self, config),
         fields(job_type = %self.job_type)
     )]
-    pub async fn spawn_unique(self, config: Config) -> Result<JobHandle, JobError> {
+    pub async fn spawn_keyed(
+        &self,
+        key: impl Into<String> + Send + std::fmt::Debug,
+        config: Config,
+    ) -> Result<JobHandle, JobError> {
+        let key = key.into();
         let new_job = NewJob::builder()
             .id(JobId::new())
-            .unique_per_type(true)
+            .unique_key(key.clone())
             .job_type(self.job_type.clone())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
@@ -390,27 +404,53 @@ where
                 op.commit().await?;
                 Ok(self.handle(job.id))
             }
-            // Only the unique-per-type constraint (not an `id` primary-key
-            // collision) means "this unique job already exists". Resolve the
-            // persisted job and hand back a handle to it (contract 6). The
-            // transaction is poisoned by the constraint violation, so drop
-            // (roll back) the op before reading.
-            Err(e) if e.was_duplicate_by(JobColumn::JobType) => {
+            // The id is an internally generated v7 uuid, so the only
+            // constraint that can fire on this insert is the
+            // (job_type, unique_key) partial unique index — es_entity's
+            // column attribution for a composite index is version-dependent,
+            // so match the violation broadly rather than by column and
+            // resolve the persisted job by lookup (contract preserved from
+            // `spawn_unique`). The violation poisons the transaction, so
+            // drop (roll back) the op before reading.
+            Err(JobCreateError::ConstraintViolation { .. }) => {
                 drop(op);
                 let existing = self
                     .repo
-                    .find_unique_by_job_type(&self.job_type)
+                    .find_keyed(&self.job_type, &key)
                     .await?
-                    // `jobs` rows are never deleted and the job_type unique
-                    // constraint just fired, so exactly one row exists.
-                    .expect("unique-per-type collision guarantees the row exists");
+                    // `jobs` rows are never deleted and the unique-key
+                    // collision just fired, so exactly one row exists.
+                    .expect("unique-key collision guarantees the row exists");
                 Ok(self.handle(existing.id))
             }
-            // The id is an internally-generated v7 uuid, so a primary-key
-            // collision cannot occur; any other create error propagates
-            // unchanged.
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Create and spawn a unique job: the type-level special case of a keyed
+    /// singleton, sugar for `spawn_keyed(`[`DEFAULT_UNIQUE_KEY`]`, config)`.
+    /// Only one job of this type can exist at a time. This method consumes
+    /// the spawner since no further jobs of this type can be created —
+    /// use [`Self::spawn_keyed`] directly when many jobs of one type, each
+    /// keyed, are expected.
+    ///
+    /// The job's id is generated internally — a unique-per-type job is
+    /// identified by its type, not a caller-chosen id — so read the id back
+    /// from the returned [`JobHandle`].
+    ///
+    /// Returns a [`JobHandle`] whether the job was created or already exists.
+    /// On the duplicate path the handle carries the PERSISTED job's id, so a
+    /// double-spawning orchestrator always observes the job that actually
+    /// runs. Note: since `spawn_unique` and `spawn_keyed` share one key
+    /// namespace per type, calling both on the same job type collides by
+    /// design — `spawn_unique` IS `spawn_keyed(DEFAULT_UNIQUE_KEY, …)`.
+    #[instrument(
+        name = "job_spawner.spawn_unique",
+        skip(self, config),
+        fields(job_type = %self.job_type)
+    )]
+    pub async fn spawn_unique(self, config: Config) -> Result<JobHandle, JobError> {
+        self.spawn_keyed(DEFAULT_UNIQUE_KEY, config).await
     }
 
     fn handle(&self, id: JobId) -> JobHandle {
@@ -433,7 +473,6 @@ where
     ) -> Result<Job, JobError> {
         let new_job = NewJob::builder()
             .id(id)
-            .unique_per_type(false)
             .job_type(self.job_type.clone())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())

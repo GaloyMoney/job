@@ -15,7 +15,7 @@ use crate::{
     entity = "Job",
     columns(
         job_type(ty = "JobType", update(persist = false)),
-        unique_per_type(ty = "bool", update(persist = false)),
+        unique_key(ty = "Option<String>", update(persist = false)),
         queue_id(ty = "Option<String>", update(persist = false)),
     ),
     persist_event_context = false
@@ -29,23 +29,46 @@ impl JobRepo {
         Self { pool: pool.clone() }
     }
 
-    /// Resolve the single unique job of `job_type`, if one exists.
+    /// Resolve the single keyed singleton of `(job_type, key)`, if one exists.
     ///
     /// Direct index-table query (via `es_query!`): the partial unique index
-    /// `idx_unique_job_type ON jobs (job_type) WHERE unique_per_type = TRUE`
-    /// (migrations/20250904065521_job_setup.sql) guarantees at most one match,
-    /// and `jobs` rows are never deleted — so this is a race-free single-row
-    /// lookup used to resolve `spawn_unique`'s duplicate path.
-    pub(super) async fn find_unique_by_job_type(
+    /// `idx_jobs_job_type_unique_key ON jobs (job_type, unique_key) WHERE
+    /// unique_key IS NOT NULL` (migrations/20250904065521_job_setup.sql)
+    /// guarantees at most one match, and `jobs` rows are never deleted — so
+    /// this is a race-free single-row lookup used to resolve
+    /// `spawn_keyed`/`spawn_unique`'s duplicate path.
+    pub(super) async fn find_keyed(
         &self,
         job_type: &JobType,
+        key: &str,
     ) -> Result<Option<Job>, JobError> {
         Ok(es_query!(
-            "SELECT id FROM jobs WHERE job_type = $1 AND unique_per_type = TRUE",
+            "SELECT id FROM jobs WHERE job_type = $1 AND unique_key = $2",
             job_type as &JobType,
+            key,
         )
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    /// `(unique_key, id)` of every keyed singleton of `job_type`, ordered by
+    /// key. The entry point for [`Jobs::keyed_handles`](crate::Jobs::keyed_handles).
+    pub(super) async fn list_keyed_ids_by_job_type(
+        &self,
+        job_type: &JobType,
+    ) -> Result<Vec<(String, JobId)>, JobError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT unique_key AS "unique_key!", id AS "id: JobId"
+            FROM jobs
+            WHERE job_type = $1 AND unique_key IS NOT NULL
+            ORDER BY unique_key
+            "#,
+            job_type as &JobType,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.unique_key, r.id)).collect())
     }
 
     /// Read only the committed `execution_state_json` for `id` — a single-row
@@ -130,8 +153,15 @@ mod tests {
         Ok(pool)
     }
 
+    /// D13: a duplicate `(job_type, unique_key)` insert must map to
+    /// `JobError::DuplicateUniqueKey`. es_entity's composite-index column
+    /// attribution resolves it to the last key column (`unique_key`) as of
+    /// the pinned version — this pins that assumption; if a future es_entity
+    /// bump ever attributes it to `job_type` (or leaves it unattributed) the
+    /// `From<JobCreateError>` arm in `error.rs` (and, on total
+    /// unattribution, this assertion) needs adjusting alongside it.
     #[tokio::test]
-    async fn unique_per_job_type() -> anyhow::Result<()> {
+    async fn unique_per_job_type_and_key() -> anyhow::Result<()> {
         let pool = init_pool().await?;
         let repo = JobRepo::new(&pool);
         let type_a = JobType::from_owned(uuid::Uuid::now_v7().to_string());
@@ -141,17 +171,17 @@ mod tests {
         let a_id = JobId::new();
         let new_job = NewJob::builder()
             .id(a_id)
-            .unique_per_type(true)
+            .unique_key("k1")
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
 
-        // Different id same type
+        // Same type, same key.
         let new_job = NewJob::builder()
             .id(JobId::new())
-            .unique_per_type(true)
+            .unique_key("k1")
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
             .build()
@@ -162,12 +192,23 @@ mod tests {
             .err()
             .expect("expected error")
             .into();
-        assert!(matches!(err, JobError::DuplicateUniqueJobType(_)));
+        assert!(matches!(err, JobError::DuplicateUniqueKey(_)));
 
-        // Same type same id
+        // Same type, different key: ok, not a collision.
+        let new_job = NewJob::builder()
+            .id(JobId::new())
+            .unique_key("k2")
+            .job_type(type_a.clone())
+            .config(serde_json::json!({}))?
+            .build()
+            .expect("Could not build new job");
+        repo.create(new_job).await?;
+
+        // Same id (regardless of key/type): a primary-key collision, not a
+        // unique-key collision.
         let new_job = NewJob::builder()
             .id(a_id)
-            .unique_per_type(true)
+            .unique_key("k3")
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
             .build()
@@ -180,15 +221,19 @@ mod tests {
             .into();
         assert!(matches!(err, JobError::DuplicateId(_)));
 
+        // Different type, same key: ok — the key namespace is per-type.
         let new_job = NewJob::builder()
             .id(JobId::new())
-            .unique_per_type(true)
+            .unique_key("k1")
             .job_type(type_b)
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
 
+        // Keyless jobs of one type: never collide with each other or with a
+        // keyed job of the same type (`unique_key IS NULL` is outside the
+        // partial index).
         let new_job = NewJob::builder()
             .id(JobId::new())
             .job_type(type_c.clone())

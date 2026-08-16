@@ -14,8 +14,12 @@
 //! - Durable Postgres-backed storage so jobs survive restarts and crashes.
 //! - Automatic exponential backoff with jitter, plus opt-in infinite retries.
 //! - Concurrency controls that let many worker instances share the workload,
-//!   configurable through [`JobPollerConfig`].
-//! - Optional at-most-one-per-type queueing via [`JobSpawner::spawn_unique`].
+//!   configurable through [`JobPollerConfig`], plus per-type concurrency caps
+//!   via [`JobInitializer::max_concurrent_per_process`] /
+//!   [`max_concurrent_global`](JobInitializer::max_concurrent_global).
+//! - Keyed singletons — at most one job per `(job_type, key)` ever — via
+//!   [`JobSpawner::spawn_keyed`], with [`JobSpawner::spawn_unique`] as the
+//!   at-most-one-per-type special case.
 //! - Built-in migrations that you can run automatically or embed into your own
 //!   migration workflow.
 //!
@@ -197,21 +201,69 @@
 //! - **A running batch costs one unit** of `max_jobs_per_process`, not one per
 //!   job — a batch is one task, one transaction, one connection.
 //! - **Claims are throttled by free batch slots.** A type may have
-//!   `max_concurrent_batches` (default 2) batches running per process, and the
-//!   poll query claims at most `max_batch_size × free slots` rows for it. Rows
-//!   are therefore only locked when a batch is free to start on them: the rest
-//!   of a backlog stays `pending` — claimable by other poller instances, and
-//!   accumulating into fuller later batches. Raise the slot count to trade
+//!   `max_concurrent_per_process` (default 2) batches running per process, and
+//!   the poll query claims at most `max_batch_size × free slots` rows for it.
+//!   Rows are therefore only locked when a batch is free to start on them: the
+//!   rest of a backlog stays `pending` — claimable by other poller instances,
+//!   and accumulating into fuller later batches. Raise the slot count to trade
 //!   locked rows for more concurrency on a hot type.
 //! - **Keep external calls out of batched runners.** A shared transaction held
 //!   across HTTP or mail delivery is a liability; leave those types on
 //!   [`JobRunner`].
 //!
-//! ## Uniqueness
+//! ## Per-type concurrency limits
 //!
-//! For at-most-one semantics, use [`JobSpawner::spawn_unique`]. This method
-//! consumes the spawner, enforcing at the type level that only one job of
-//! this type can exist:
+//! [`JobInitializer::max_concurrent_per_process`] bounds how many jobs of one
+//! type may execute concurrently in THIS process; while every slot is busy the
+//! poller stops claiming rows of that type and the backlog stays `pending` —
+//! cheap database rows, visible to other poller instances — instead of
+//! pinning executor slots, connections, and memory. This is the direct
+//! defense against a slow external dependency (a hanging HTTP call, say)
+//! confiscating [`JobPollerConfig::max_jobs_per_process`] from every other
+//! job type.
+//!
+//! [`JobInitializer::max_concurrent_global`] additionally bounds the type's
+//! concurrency across ALL poller instances — useful for rate-limiting a
+//! downstream dependency itself ("at most N concurrent calls to service X").
+//! It is **soft**: each instance pre-counts the type's running executions just
+//! before claiming, so concurrent polls across instances can transiently
+//! overshoot; steady-state stays at or below the cap. For a hard bound, pair
+//! it with `max_concurrent_per_process` (hard bound = per-process cap ×
+//! instance count).
+//!
+//! ```ignore
+//! impl JobInitializer for KeycloakSyncInitializer {
+//!     // ...
+//!     fn max_concurrent_per_process(&self) -> Option<usize> { Some(20) }
+//!     fn max_concurrent_global(&self) -> Option<usize> { Some(50) }
+//! }
+//! ```
+//!
+//! A capped type's backlog is observable the same way any pending backlog is:
+//! via the crate's existing stale-pending warnings
+//! (`job.check_stale_pending_jobs`), which fire regardless of *why* a type's
+//! rows are sitting `pending`.
+//!
+//! ## Keyed singletons
+//!
+//! For at-most-one-per-key semantics, use [`JobSpawner::spawn_keyed`]: at
+//! most one job of `(job_type, key)` EVER exists (`jobs` rows are never
+//! deleted, so revival needs a fresh key, e.g. a generation-scoped `g2:3`).
+//! Enumerate every key of a type — the entry point for a "have my listeners
+//! caught up?" check — with [`Jobs::keyed_handles`].
+//!
+//! ```ignore
+//! let shard_spawner = jobs.add_initializer(ShardListenerInitializer);
+//!
+//! // One singleton per shard; re-spawning the same shard is a no-op that
+//! // returns the existing job's handle.
+//! shard_spawner.spawn_keyed(format!("shard-{shard_id}"), ShardConfig { shard_id }).await?;
+//! ```
+//!
+//! [`JobSpawner::spawn_unique`] is the type-level special case — at most one
+//! job of a type — implemented as sugar for `spawn_keyed(DEFAULT_UNIQUE_KEY,
+//! …)`. It consumes the spawner, enforcing at the type level that only one job
+//! of this type can be created:
 //!
 //! ```ignore
 //! let cleanup_spawner = jobs.add_initializer(CleanupInitializer);
@@ -219,6 +271,9 @@
 //! // Consumes spawner - can't accidentally spawn twice
 //! cleanup_spawner.spawn_unique(CleanupConfig::default()).await?;
 //! ```
+//!
+//! `spawn_unique` and `spawn_keyed` share one key namespace per type, so
+//! calling both on the same job type collides by design.
 //!
 //! ## Parameterized Job Types
 //!
@@ -547,6 +602,10 @@ impl Jobs {
             .expect("Registry has been consumed by executor");
 
         let tracker = Arc::clone(&self.tracker);
+        // Read before `registry` moves into the poller below — capped_types()
+        // is a cheap scan of the registry's own concurrency map, computed
+        // here on the owned value while it's still available.
+        tracker.set_capped_types(registry.capped_types().into_iter().collect());
 
         let poller = JobPoller::new(
             self.config.poller_config.clone(),
@@ -777,6 +836,9 @@ impl Jobs {
     /// jobs (see [`JobSpawner::spawn_unique`]): unlike `handle(id)`, this
     /// resolves the persisted job's id from the database, so it is async and
     /// returns `None` when no unique job of that type has been spawned.
+    /// Sugar for [`keyed_handle`](Self::keyed_handle) with
+    /// [`DEFAULT_UNIQUE_KEY`] — `spawn_unique` is a keyed singleton under the
+    /// hood, spawned with that same key.
     ///
     /// # Errors
     ///
@@ -832,8 +894,52 @@ impl Jobs {
         &self,
         job_type: impl Into<JobType> + std::fmt::Debug,
     ) -> Result<Option<JobHandle>, JobError> {
-        let job = self.repo.find_unique_by_job_type(&job_type.into()).await?;
+        self.keyed_handle(job_type, DEFAULT_UNIQUE_KEY).await
+    }
+
+    /// Mint a [`JobHandle`] for the keyed singleton of `(job_type, key)`, if
+    /// one exists (see [`JobSpawner::spawn_keyed`]). `None` when no job of
+    /// that type has ever been spawned under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    #[instrument(name = "job.keyed_handle", skip(self))]
+    pub async fn keyed_handle(
+        &self,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+        key: impl AsRef<str> + std::fmt::Debug,
+    ) -> Result<Option<JobHandle>, JobError> {
+        let job = self.repo.find_keyed(&job_type.into(), key.as_ref()).await?;
         Ok(job.map(|job| self.handle(job.id)))
+    }
+
+    /// Every keyed singleton of `job_type`, ordered by key — includes the
+    /// [`DEFAULT_UNIQUE_KEY`] job if one was spawned via
+    /// [`JobSpawner::spawn_unique`]. The entry point for "have my listeners
+    /// caught up?": [`JobHandles::load_all`] batch-loads every job's
+    /// [`JobSnapshot`], and [`JobSnapshot::unique_key`] reads the key back
+    /// off each one — no separate bookkeeping of which handle is which key.
+    ///
+    /// Returns a plain [`JobHandles`], the same type [`Jobs::handles`]
+    /// returns: `await_all`'s [`JobOutcome`] doesn't carry the key (it's
+    /// deliberately minimal — just state and result), so if you need the key
+    /// alongside an *outcome* rather than a snapshot, zip it against the keys
+    /// you already hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    #[instrument(name = "job.keyed_handles", skip(self))]
+    pub async fn keyed_handles(
+        &self,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+    ) -> Result<JobHandles, JobError> {
+        let ids = self
+            .repo
+            .list_keyed_ids_by_job_type(&job_type.into())
+            .await?;
+        Ok(ids.into_iter().map(|(_, id)| self.handle(id)).collect())
     }
 
     /// Returns a reference to the clock used by this job service.

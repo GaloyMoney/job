@@ -210,22 +210,43 @@ impl JobPoller {
             return Ok(MAX_WAIT);
         };
         // Size each type's claim before touching the database. A batched type
-        // may only claim what its free batch slots can immediately execute, so
-        // the poller never takes rows that would just sit in `running` waiting
-        // for a slot. The cap is enforced on what the poll claims, not on what
-        // it may lock — see `selected_jobs`. A type with no free slot is
-        // dropped from the poll entirely; `batch_completed` wakes the loop when
-        // one frees up.
+        // may only claim what its free batch slots can immediately execute,
+        // and a per-process-capped plain type may only claim what its free
+        // slots can immediately run, so the poller never takes rows that
+        // would just sit in `running` waiting for a slot. A type with no free
+        // slot is dropped from the poll entirely; `job_completed` /
+        // `batch_completed` wake the loop when one frees up.
+        //
+        // Per-process/batch-slot limits are resolved here, client-side,
+        // because `units_in_flight` is in-process state no query can see.
+        // Global caps CANNOT be resolved here in the same pass: the running
+        // count is cross-instance state that only the database has, so
+        // folding it in would cost a second round trip before every single
+        // poll — for the whole process, not just for globally-capped types,
+        // since this method can't yet know which types would need it without
+        // asking. Instead the globally-capped subset of `pollable_types`
+        // (never batched types — see `JobInitializer::max_concurrent_global`)
+        // is passed to `poll_jobs` alongside its cap, and the running-count
+        // pre-count and the resulting row_limit adjustment both happen
+        // INSIDE that one query, ahead of `due`, so a saturated type still
+        // never floods the overscan window — see `poll_jobs`'s `pollable`
+        // CTE. The pre-count is still a snapshot taken moments before the
+        // claim, so the cap is still SOFT across instances (see
+        // `JobInitializer::max_concurrent_global` docs) — merging it into one
+        // round trip changes nothing about that.
         let (pollable_types, row_limits) = {
             let mut types = Vec::new();
             let mut limits = Vec::new();
             for job_type in self.registry.registered_job_types() {
                 let limit = match self.registry.batch_policy(&job_type) {
                     Some(policy) => policy
-                        .max_concurrent_batches
-                        .saturating_sub(self.tracker.batches_in_flight(&job_type))
+                        .max_concurrent_per_process
+                        .saturating_sub(self.tracker.units_in_flight(&job_type))
                         .saturating_mul(policy.max_batch_size),
-                    None => n_jobs_to_poll,
+                    None => match self.registry.per_process_cap(&job_type) {
+                        Some(cap) => cap.saturating_sub(self.tracker.units_in_flight(&job_type)),
+                        None => n_jobs_to_poll,
+                    },
                 };
                 let limit = limit.min(n_jobs_to_poll);
                 if limit == 0 {
@@ -237,11 +258,20 @@ impl JobPoller {
             (types, limits)
         };
         if pollable_types.is_empty() {
-            // Every batched type is saturated and nothing else is registered.
+            // Every type is saturated or capped and nothing else is registered.
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         }
+
+        let (global_cap_types, global_caps): (Vec<JobType>, Vec<i32>) = pollable_types
+            .iter()
+            .filter_map(|job_type| {
+                self.registry
+                    .global_cap(job_type)
+                    .map(|cap| (job_type.clone(), cap as i32))
+            })
+            .unzip();
 
         let rows = match poll_jobs(
             self.repo.pool(),
@@ -249,6 +279,8 @@ impl JobPoller {
             self.instance_id,
             &pollable_types,
             &row_limits,
+            &global_cap_types,
+            &global_caps,
             &self.clock,
         )
         .await?
@@ -726,27 +758,35 @@ impl JobPoller {
         let shutdown_timeout = self.config.shutdown_timeout;
         let job_id = job.id;
         let job_type = job.job_type.clone();
+        let globally_capped = self.registry.global_cap(&job_type).is_some();
         #[cfg_attr(
             not(all(feature = "tokio-task-names", tokio_unstable)),
             allow(unused_variables)
         )]
         let task_name = format!("job-{}-{}", job_type, job_id);
 
+        // Built here, not in the task: constructing the dispatcher claims the
+        // type's per-process slot, and that must happen before the poll
+        // loop's next iteration or it would claim rows against a slot
+        // already spoken for (mirrors `dispatch_batch`).
+        let dispatcher = JobDispatcher::new(
+            repo,
+            tracker,
+            notifier,
+            retry_settings,
+            job_id,
+            job_type.clone(),
+            globally_capped,
+            runner,
+            instance_id,
+            clock,
+        );
+
         spawn_named_task!(&task_name, async move {
             use tracing::Instrument;
 
             let attempt = polled_job.attempt;
-            let job_fut = JobDispatcher::new(
-                repo,
-                tracker,
-                notifier,
-                retry_settings,
-                job_id,
-                runner,
-                instance_id,
-                clock,
-            )
-            .execute_job(job, polled_job, shutdown_rx_job);
+            let job_fut = dispatcher.execute_job(job, polled_job, shutdown_rx_job);
             tokio::pin!(job_fut);
 
             tokio::select! {
@@ -847,13 +887,21 @@ async fn reclaim_lost_jobs(
     Ok(rows.into_iter().map(|r| (r.id, r.job_type)).collect())
 }
 
-#[instrument(name = "job.poll_jobs", level = "debug", skip(pool, pollable_types, row_limits, clock), fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty))]
+#[instrument(
+    name = "job.poll_jobs",
+    level = "debug",
+    skip(pool, pollable_types, row_limits, global_cap_types, global_caps, clock),
+    fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty)
+)]
+#[allow(clippy::too_many_arguments)]
 async fn poll_jobs(
     pool: &PgPool,
     n_jobs_to_poll: usize,
     instance_id: uuid::Uuid,
     pollable_types: &[super::entity::JobType],
     row_limits: &[i32],
+    global_cap_types: &[super::entity::JobType],
+    global_caps: &[i32],
     clock: &ClockHandle,
 ) -> Result<JobPollResult, sqlx::Error> {
     // sim_now drives execute_at scheduling (whatever clock the application uses);
@@ -879,21 +927,60 @@ async fn poll_jobs(
         -- idx_job_executions_pending_job_type_execute_at serves this as
         -- an ordered index scan; future-scheduled jobs never reach the
         -- anti-join / window-function work below.
-        WITH limits AS (
+        WITH global_running AS (
+            -- Running-execution count of the globally-capped subset of $4
+            -- ($7, almost always empty or tiny — batched types never appear
+            -- here, see `JobInitializer::max_concurrent_global`). Feeds
+            -- `limits` below. `job_executions` is small (bounded by the
+            -- fleet's slot budgets — hundreds of rows), and the partial index
+            -- idx_job_executions_poller_instance already covers
+            -- `state = 'running'`, so with $7 empty this is a no-op scan of
+            -- zero rows; with $7 populated it's still a cheap index scan, not
+            -- a sequential one.
+            SELECT job_type, COUNT(*) AS n
+            FROM job_executions
+            WHERE state = 'running' AND job_type = ANY($7)
+            GROUP BY job_type
+        ),
+        limits AS (
             -- One row per pollable type carrying how many rows this poll may
             -- claim for it. For a batched type that is
             -- `max_batch_size * free batch slots`, so no more rows are taken
             -- than a batch is free to execute immediately; the rest of the
             -- backlog stays unclaimed for other pollers and accumulates into
-            -- fuller later batches. Types with no free slot are absent from
-            -- $4 entirely and never reach `due`.
-            SELECT * FROM UNNEST($4::text[], $6::int4[]) AS l(job_type, row_limit)
+            -- fuller later batches. A plain type's per-process concurrency
+            -- cap (`JobInitializer::max_concurrent_per_process`) is folded
+            -- into `row_limit` client-side, before this query runs, via $6 —
+            -- `units_in_flight` is in-process state no query can see. A
+            -- global cap (`max_concurrent_global`) is folded in right here,
+            -- against `global_running`, in the SAME round trip as everything
+            -- else: types not in $7 are unaffected (`g.cap IS NULL`).
+            SELECT l.job_type,
+                   CASE WHEN g.cap IS NOT NULL
+                        THEN LEAST(l.row_limit, GREATEST(g.cap - COALESCE(gr.n, 0), 0))
+                        ELSE l.row_limit
+                   END AS row_limit
+            FROM UNNEST($4::text[], $6::int4[]) AS l(job_type, row_limit)
+            LEFT JOIN UNNEST($7::text[], $8::int4[]) AS g(job_type, cap)
+                   ON g.job_type = l.job_type
+            LEFT JOIN global_running gr ON gr.job_type = l.job_type
+        ),
+        pollable AS (
+            -- Types with zero effective row_limit — per-process/batch-slot
+            -- saturated (never reach here, already absent from $4) or
+            -- global-budget saturated (computed above) — are dropped here,
+            -- before `due`: exactly like today, a saturated type's backlog
+            -- never floods the overscan window below. A plain row set, not
+            -- an aggregated array: `= ANY(subquery)` compares against each
+            -- ROW of a subquery, so an array-typed aggregate here would
+            -- compare `job_type` against whole arrays instead of elements.
+            SELECT job_type FROM limits WHERE row_limit > 0
         ),
         due AS (
             SELECT id, queue_id, execute_at, job_type
             FROM job_executions
             WHERE state = 'pending'
-            AND job_type = ANY($4)
+            AND job_type IN (SELECT job_type FROM pollable)
             AND execute_at <= $2::timestamptz
             ORDER BY execute_at
             LIMIT $1 * 4
@@ -944,9 +1031,12 @@ async fn poll_jobs(
             -- commits, so they remain visible to other instances and
             -- accumulate into fuller later batches.
             --
-            -- A type present in `limits` always has row_limit >= 1 (saturated
-            -- types are dropped from $4 entirely), so its first row always
-            -- survives — `selected_jobs` is never empty while `locked` isn't.
+            -- Every type `locked` can contain came through `due`, which only
+            -- admits types `pollable` kept — i.e. row_limit >= 1 in `limits`
+            -- (`limits` itself may still hold saturated, row_limit = 0 rows;
+            -- `pollable` is what filters those out before `due`). So the
+            -- first row of any type present here always survives —
+            -- `selected_jobs` is never empty while `locked` isn't.
             SELECT t.id, t.data_json, t.attempt_index
             FROM (
                 SELECT l.*,
@@ -1005,6 +1095,8 @@ async fn poll_jobs(
         pollable_types as _,
         wall_now,
         row_limits,
+        global_cap_types as _,
+        global_caps,
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -1280,14 +1372,12 @@ mod tests {
         let id = JobId::new();
         let uuid = uuid::Uuid::from(id);
         let now = chrono::Utc::now();
-        sqlx::query(
-            "INSERT INTO jobs (id, unique_per_type, job_type, created_at) VALUES ($1, false, $2, $3)",
-        )
-        .bind(uuid)
-        .bind(job_type)
-        .bind(now)
-        .execute(pool)
-        .await?;
+        sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, $2, $3)")
+            .bind(uuid)
+            .bind(job_type)
+            .bind(now)
+            .execute(pool)
+            .await?;
         sqlx::query(
             "INSERT INTO job_executions \
              (id, job_type, state, poller_instance_id, attempt_index, alive_at, created_at) \
