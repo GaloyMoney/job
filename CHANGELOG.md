@@ -1,3 +1,11 @@
+# [job release v0.10.0](https://github.com/GaloyMoney/job/releases/tag/0.10.0)
+
+
+
+### Features
+
+- [**breaking**] Per-type concurrency caps and keyed singletons (#167)
+
 # [job release v0.9.2](https://github.com/GaloyMoney/job/releases/tag/0.9.2)
 
 
