@@ -35,6 +35,12 @@ pub(crate) struct JobDispatcher {
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
     notifier: Arc<JobEventNotifier>,
+    job_type: JobType,
+    /// Whether `job_type` carries a `max_concurrent_global` cap. A freed
+    /// global slot only becomes claimable by a PEER instance if that peer
+    /// learns about it — unlike the local case, which the tracker's
+    /// capped-type notify rule already covers. See `delete_execution_in_op`.
+    globally_capped: bool,
     rescheduled: bool,
     dispatched: bool,
     id: JobId,
@@ -42,6 +48,16 @@ pub(crate) struct JobDispatcher {
     clock: ClockHandle,
 }
 impl JobDispatcher {
+    /// Claims the type's per-process slot **synchronously**, at construction.
+    ///
+    /// The poller builds this before spawning the execution task, so the very
+    /// next poll already sees the slot occupied. Doing it inside
+    /// `execute_job` instead leaves a window in which the poll loop re-polls
+    /// — immediately, since a non-empty poll returns `Duration::ZERO` — still
+    /// reads zero units in flight, and claims a second round of rows: exactly
+    /// the over-claiming a per-process cap exists to prevent. Mirrors
+    /// `BatchDispatcher::new`. The slot is released by `Drop`, so it cannot
+    /// leak once taken.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<JobRepo>,
@@ -49,18 +65,23 @@ impl JobDispatcher {
         notifier: Arc<JobEventNotifier>,
         retry_settings: RetrySettings,
         id: JobId,
+        job_type: JobType,
+        globally_capped: bool,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
     ) -> Self {
+        tracker.dispatch_job(id, &job_type);
         Self {
             repo,
             retry_settings,
             runner: Some(runner),
             tracker,
             notifier,
+            job_type,
+            globally_capped,
             rescheduled: false,
-            dispatched: false,
+            dispatched: true,
             id,
             instance_id,
             clock,
@@ -109,8 +130,6 @@ impl JobDispatcher {
             self.clock.clone(),
             Arc::clone(&self.repo),
         );
-        self.dispatched = true;
-        self.tracker.dispatch_job(self.id);
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
                 span.record("conclusion", "Error");
@@ -325,8 +344,19 @@ impl JobDispatcher {
     }
 
     /// Delete the execution row and report what its removal makes true: the job
-    /// is terminal, and if it held a `queue_id`, that queue's next job is now
-    /// eligible. Reports nothing when no row was deleted.
+    /// is terminal, and its type may now have claimable backlog it didn't
+    /// before — because it held a `queue_id` and that queue's next job is now
+    /// eligible, or because `job_type` carries a global cap and this was the
+    /// slot that saturated it. The queue case only unblocks work THIS process
+    /// can already see (any instance may claim it on its next ordinary poll),
+    /// but the global-cap case is different: a PEER instance may have already
+    /// dropped `job_type` from its own poll entirely, having observed the cap
+    /// as saturated, and — absent this report — would only rediscover the
+    /// freed slot on its next unrelated poll or the 60s `MAX_WAIT` backstop.
+    /// The reschedule paths (`reschedule_job`, the retry branch of
+    /// `fail_job`) don't need this: they always report unconditionally,
+    /// since a job going back to `pending` is exactly the ordinary case every
+    /// instance already polls for. Reports nothing when no row was deleted.
     async fn delete_execution_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -351,7 +381,7 @@ impl JobDispatcher {
 
         self.notifier.job_terminal_in_op(op, id).await?;
 
-        if freed_queue_id.is_some() {
+        if freed_queue_id.is_some() || self.globally_capped {
             self.notifier.execution_ready_in_op(op, job_type).await?;
         }
 
@@ -404,7 +434,8 @@ impl JobDispatcher {
 impl Drop for JobDispatcher {
     fn drop(&mut self) {
         if self.dispatched {
-            self.tracker.job_completed(self.id, self.rescheduled);
+            self.tracker
+                .job_completed(self.id, &self.job_type, self.rescheduled);
         }
     }
 }

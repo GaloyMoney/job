@@ -37,6 +37,27 @@ pub trait JobInitializer: Send + Sync + 'static {
         Default::default()
     }
 
+    /// Max concurrent jobs of this type executing in THIS process. `None` =
+    /// unlimited. When every slot is busy the poller stops claiming rows of
+    /// this type: the backlog stays `pending` — cheap database rows, visible
+    /// to other poller instances — instead of pinning executor slots,
+    /// connections, and memory. The direct defense against a slow external
+    /// dependency confiscating `max_jobs_per_process` from other types.
+    fn max_concurrent_per_process(&self) -> Option<usize> {
+        None
+    }
+
+    /// Max concurrent jobs of this type across ALL poller instances (soft).
+    /// `None` = uncapped. Bounds load on a downstream dependency ("at most N
+    /// concurrent Keycloak calls"). SOFT: instances observe the running count
+    /// just before claiming, so concurrent polls can transiently overshoot.
+    /// Steady-state stays ≤ the cap; for a hard bound pair with
+    /// [`max_concurrent_per_process`](Self::max_concurrent_per_process)
+    /// (hard bound = per-process cap × instances).
+    fn max_concurrent_global(&self) -> Option<usize> {
+        None
+    }
+
     /// Produce a runner instance for the provided job.
     ///
     /// The spawner parameter allows the runner to spawn additional jobs of the

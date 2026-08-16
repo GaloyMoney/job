@@ -111,7 +111,12 @@ pub trait BatchedJobInitializer: Send + Sync + 'static {
     /// grows into fuller batches. The default of
     /// [`DEFAULT_MAX_CONCURRENT_BATCHES`] keeps one batch committing while the
     /// next executes.
-    fn max_concurrent_batches(&self) -> usize {
+    ///
+    /// The unit here is a *batch* (one execution unit), unlike the plain
+    /// [`JobInitializer::max_concurrent_per_process`](crate::JobInitializer::max_concurrent_per_process),
+    /// whose unit is a job — both bound "concurrent execution units per
+    /// process" for their respective job shapes.
+    fn max_concurrent_per_process(&self) -> usize {
         DEFAULT_MAX_CONCURRENT_BATCHES
     }
 

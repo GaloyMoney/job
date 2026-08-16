@@ -907,7 +907,7 @@ struct BlockingInitializer {
     seen: Arc<Mutex<HashSet<String>>>,
     release: Arc<AtomicBool>,
     max_batch_size: usize,
-    max_concurrent_batches: usize,
+    max_concurrent_per_process: usize,
 }
 
 impl BatchedJobInitializer for BlockingInitializer {
@@ -921,8 +921,8 @@ impl BatchedJobInitializer for BlockingInitializer {
         self.max_batch_size
     }
 
-    fn max_concurrent_batches(&self) -> usize {
-        self.max_concurrent_batches
+    fn max_concurrent_per_process(&self) -> usize {
+        self.max_concurrent_per_process
     }
 
     fn init(
@@ -990,7 +990,7 @@ async fn a_running_batch_costs_one_unit_of_poller_capacity() -> anyhow::Result<(
         seen: Arc::clone(&seen),
         release: Arc::clone(&release),
         max_batch_size: 3,
-        max_concurrent_batches: 2,
+        max_concurrent_per_process: 2,
     });
 
     let specs: Vec<JobSpec<BatchConfig>> = (0..9)
@@ -1038,8 +1038,8 @@ async fn a_running_batch_costs_one_unit_of_poller_capacity() -> anyhow::Result<(
     Ok(())
 }
 
-/// The poller claims at most `max_batch_size x max_concurrent_batches` rows of
-/// a type — it never locks rows that no batch slot is free to execute.
+/// The poller claims at most `max_batch_size x max_concurrent_per_process`
+/// rows of a type — it never locks rows that no batch slot is free to execute.
 ///
 /// This is the property that keeps a large backlog *claimable*: rows the
 /// process cannot start on stay `pending`, visible to other poller instances
@@ -1060,7 +1060,7 @@ async fn claims_are_capped_by_free_batch_slots() -> anyhow::Result<()> {
         seen: Arc::clone(&seen),
         release: Arc::clone(&release),
         max_batch_size: 5,
-        max_concurrent_batches: 2,
+        max_concurrent_per_process: 2,
     });
 
     // A backlog far larger than the slot budget.
@@ -1086,7 +1086,7 @@ async fn claims_are_capped_by_free_batch_slots() -> anyhow::Result<()> {
 
     assert!(
         claimed <= 10,
-        "claimed {claimed} rows, but max_batch_size(5) x max_concurrent_batches(2) \
+        "claimed {claimed} rows, but max_batch_size(5) x max_concurrent_per_process(2) \
          allows at most 10 — the poller is locking rows no batch can execute"
     );
     assert!(

@@ -18,8 +18,9 @@ use crate::{
 /// await a job you did not run yourself.
 ///
 /// Obtain one from [`Jobs::handle`](crate::Jobs::handle),
-/// [`Jobs::handles`](crate::Jobs::handles), or
-/// [`JobSpawner::spawn_unique`](crate::JobSpawner::spawn_unique).
+/// [`Jobs::handles`](crate::Jobs::handles),
+/// [`JobSpawner::spawn_unique`](crate::JobSpawner::spawn_unique), or
+/// [`JobSpawner::spawn_keyed`](crate::JobSpawner::spawn_keyed).
 ///
 /// The handle is a capability, not a value: it holds no cached state and
 /// exposes exactly two operations — [`load`](Self::load) for a point-in-time
@@ -41,9 +42,10 @@ use crate::{
 ///    `Pending`/`Running` for a finished job, regardless of isolation level.
 /// 5. **Honest absence:** [`JobSnapshot::execution_state`] ⇒ `Ok(None)` on
 ///    no-row/no-state; `load()` ⇒ `Err(Find)` only if the job never existed.
-/// 6. **`spawn_unique` handle identity:** `spawn_unique` generates the job's
-///    id internally; on the duplicate path the returned handle's id is the
-///    PERSISTED job's id. Either way, callers read the id back from the handle.
+/// 6. **`spawn_unique`/`spawn_keyed` handle identity:** both generate the
+///    job's id internally; on the duplicate path the returned handle's id is
+///    the PERSISTED job's id. Either way, callers read the id back from the
+///    handle.
 #[derive(Clone)]
 pub struct JobHandle {
     id: JobId,

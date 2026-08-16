@@ -3,13 +3,14 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobRunner,
-    JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
-    error::JobError,
+    ClockHandle, CurrentJob, DEFAULT_UNIQUE_KEY, Job, JobCompletion, JobId, JobInitializer,
+    JobOutcomes, JobRunner, JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState,
+    JobType, Jobs, RetrySettings, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
@@ -2060,13 +2061,11 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
     let stale_alive_at = chrono::Utc::now() - chrono::Duration::seconds(60);
 
     // Row in `jobs` (FK target for job_executions).
-    sqlx::query(
-        "INSERT INTO jobs (id, unique_per_type, job_type, created_at) VALUES ($1, false, 'orphan-rescue', $2)",
-    )
-    .bind(orphan_id)
-    .bind(now)
-    .execute(&pool)
-    .await?;
+    sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, 'orphan-rescue', $2)")
+        .bind(orphan_id)
+        .bind(now)
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         r#"
@@ -2160,7 +2159,7 @@ async fn test_lost_handler_uses_wall_clock_under_frozen_manual_clock() -> anyhow
     let stale_alive_at = chrono::Utc::now() - chrono::Duration::seconds(60);
 
     sqlx::query(
-        "INSERT INTO jobs (id, unique_per_type, job_type, created_at) VALUES ($1, false, 'frozen-clock-orphan', $2)",
+        "INSERT INTO jobs (id, job_type, created_at) VALUES ($1, 'frozen-clock-orphan', $2)",
     )
     .bind(orphan_id)
     .bind(frozen_sim_now)
@@ -2250,7 +2249,7 @@ async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Re
     let job_type = format!("notify-funnel-insert-{job_id}");
 
     let mut tx = pool.begin().await?;
-    sqlx::query("INSERT INTO jobs (id, unique_per_type, job_type) VALUES ($1, false, $2)")
+    sqlx::query("INSERT INTO jobs (id, job_type) VALUES ($1, $2)")
         .bind(job_id)
         .bind(&job_type)
         .execute(&mut *tx)
@@ -3374,6 +3373,660 @@ async fn execution_state_point_read() -> anyhow::Result<()> {
     // Let the job finish so the runner's second `release.notified()` returns.
     release.notify_one();
     handle.await_completion(Duration::from_secs(10)).await?;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+// -- Per-type concurrency caps --
+
+/// A runner that parks (spin-polling a shared flag, so a release covers
+/// runners started before AND after the release, unlike a one-shot
+/// `Notify`) while tracking how many of its type are concurrently in `run`.
+struct ConcurrencyProbeInitializer {
+    job_type: JobType,
+    max_concurrent_per_process: Option<usize>,
+    max_concurrent_global: Option<usize>,
+    running: Arc<AtomicUsize>,
+    high_water: Arc<AtomicUsize>,
+    release: Arc<AtomicBool>,
+}
+
+impl JobInitializer for ConcurrencyProbeInitializer {
+    type Config = ();
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn max_concurrent_per_process(&self) -> Option<usize> {
+        self.max_concurrent_per_process
+    }
+
+    fn max_concurrent_global(&self) -> Option<usize> {
+        self.max_concurrent_global
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(ConcurrencyProbeRunner {
+            running: Arc::clone(&self.running),
+            high_water: Arc::clone(&self.high_water),
+            release: Arc::clone(&self.release),
+        }))
+    }
+}
+
+struct ConcurrencyProbeRunner {
+    running: Arc<AtomicUsize>,
+    high_water: Arc<AtomicUsize>,
+    release: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl JobRunner for ConcurrencyProbeRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let n = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.high_water.fetch_max(n, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        Ok(JobCompletion::Complete)
+    }
+}
+
+/// D6/D7: `max_concurrent_per_process` bounds concurrent execution of one
+/// type, and a freed slot must wake the poll loop so the rest of the backlog
+/// still gets claimed — without the capped-type notify rule this test would
+/// time out waiting for waves 2 and 3 (the process-wide `min_jobs`
+/// threshold is never crossed by a single completion here).
+#[tokio::test]
+async fn per_process_cap_bounds_concurrency() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+
+    let running = Arc::new(AtomicUsize::new(0));
+    let high_water = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
+        job_type: JobType::new("per-process-cap-bounds-concurrency"),
+        max_concurrent_per_process: Some(2),
+        max_concurrent_global: None,
+        running: Arc::clone(&running),
+        high_water: Arc::clone(&high_water),
+        release: Arc::clone(&release),
+    });
+
+    let ids: Vec<JobId> = (0..6).map(|_| JobId::new()).collect();
+    for id in &ids {
+        spawner.spawn(*id, ()).await?;
+    }
+    jobs.start_poll().await?;
+
+    // Wait for the cap to saturate: exactly 2 concurrently running.
+    let mut peak = 0;
+    for _ in 0..100 {
+        peak = high_water.load(Ordering::SeqCst);
+        if peak >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(peak, 2, "cap must be reached given a backlog of 6");
+    assert_eq!(
+        running.load(Ordering::SeqCst),
+        2,
+        "no more than the cap may run at once"
+    );
+
+    release.store(true, Ordering::SeqCst);
+    // The completion timeout is what proves D7's notify rule: without it,
+    // waves 2 and 3 never get claimed and this times out.
+    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+    assert_eq!(
+        high_water.load(Ordering::SeqCst),
+        2,
+        "the cap must never have been exceeded across all 3 waves"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// D6: a saturated capped type must not starve an uncapped type sharing the
+/// process — the uncapped job completes promptly even while the capped
+/// type's backlog sits stuck behind its one slot.
+#[tokio::test]
+async fn capped_type_does_not_starve_others() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+
+    let capped_running = Arc::new(AtomicUsize::new(0));
+    let capped_high_water = Arc::new(AtomicUsize::new(0));
+    let capped_release = Arc::new(AtomicBool::new(false));
+    let capped_spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
+        job_type: JobType::new("capped-does-not-starve-capped"),
+        max_concurrent_per_process: Some(1),
+        max_concurrent_global: None,
+        running: Arc::clone(&capped_running),
+        high_water: Arc::clone(&capped_high_water),
+        release: Arc::clone(&capped_release),
+    });
+    let uncapped_spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new("capped-does-not-starve-uncapped"),
+    });
+
+    let capped_ids: Vec<JobId> = (0..5).map(|_| JobId::new()).collect();
+    for id in &capped_ids {
+        capped_spawner.spawn(*id, ()).await?;
+    }
+    jobs.start_poll().await?;
+
+    let mut attempts = 0;
+    while capped_running.load(Ordering::SeqCst) < 1 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        attempts += 1;
+        assert!(attempts < 100, "capped type never claimed its one slot");
+    }
+
+    let uncapped_id = JobId::new();
+    uncapped_spawner
+        .spawn(uncapped_id, TestJobConfig { delay_ms: 10 })
+        .await?;
+    let outcome = jobs
+        .handle(uncapped_id)
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(
+        outcome.state(),
+        JobTerminalState::Completed,
+        "an uncapped type must not be starved by a saturated capped type"
+    );
+    assert_eq!(
+        capped_high_water.load(Ordering::SeqCst),
+        1,
+        "the capped type's slot budget must have held throughout"
+    );
+
+    capped_release.store(true, Ordering::SeqCst);
+    jobs.handles(capped_ids)
+        .await_all(Duration::from_secs(30))
+        .await?;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// D3/D4/D17: `max_concurrent_global` bounds concurrency across the fleet,
+/// enforced via the poller's running-execution pre-count. In a single
+/// process the pre-count/claim sequence is not interleaved by a concurrent
+/// poll, so the cap is effectively exact here (see the softness caveat on
+/// `JobInitializer::max_concurrent_global`, which only applies across
+/// multiple instances).
+#[tokio::test]
+async fn global_cap_bounds_concurrency_single_instance() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+
+    let running = Arc::new(AtomicUsize::new(0));
+    let high_water = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
+        job_type: JobType::new("global-cap-bounds-concurrency"),
+        max_concurrent_per_process: None,
+        max_concurrent_global: Some(2),
+        running: Arc::clone(&running),
+        high_water: Arc::clone(&high_water),
+        release: Arc::clone(&release),
+    });
+
+    let ids: Vec<JobId> = (0..6).map(|_| JobId::new()).collect();
+    for id in &ids {
+        spawner.spawn(*id, ()).await?;
+    }
+    jobs.start_poll().await?;
+
+    let mut peak = 0;
+    for _ in 0..100 {
+        peak = high_water.load(Ordering::SeqCst);
+        if peak >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(peak, 2, "global cap must be reached given a backlog of 6");
+
+    release.store(true, Ordering::SeqCst);
+    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+    assert_eq!(high_water.load(Ordering::SeqCst), 2);
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A freed global-cap slot must wake a PEER instance too, not just the
+/// instance that completed the job. Instance A holds the type's only global
+/// slot (cap = 1); instance B registers the same type after the budget is
+/// already exhausted, so B's own first poll observes zero room and drops the
+/// type entirely — nothing else is queued for B, so absent a cross-instance
+/// notification it would only rediscover the freed slot on the 60s
+/// `MAX_WAIT` backstop. Releasing A's job must let B claim and complete its
+/// own job well within that.
+#[tokio::test]
+async fn global_cap_freed_slot_wakes_peer_instance() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let job_type = JobType::new("global-cap-wakes-peer");
+
+    let config_a = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs_a = Jobs::init(config_a).await?;
+    let release_a = Arc::new(AtomicBool::new(false));
+    let running_a = Arc::new(AtomicUsize::new(0));
+    let high_water_a = Arc::new(AtomicUsize::new(0));
+    let spawner_a = jobs_a.add_initializer(ConcurrencyProbeInitializer {
+        job_type: job_type.clone(),
+        max_concurrent_per_process: None,
+        max_concurrent_global: Some(1),
+        running: Arc::clone(&running_a),
+        high_water: Arc::clone(&high_water_a),
+        release: Arc::clone(&release_a),
+    });
+
+    let job1 = JobId::new();
+    spawner_a.spawn(job1, ()).await?;
+    jobs_a.start_poll().await?;
+
+    let mut attempts = 0;
+    while running_a.load(Ordering::SeqCst) < 1 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        attempts += 1;
+        assert!(attempts < 200, "instance A never claimed job1");
+    }
+
+    // Instance B: same globally-capped type, started only once the budget
+    // is already exhausted by A.
+    let config_b = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs_b = Jobs::init(config_b).await?;
+    let release_b = Arc::new(AtomicBool::new(true));
+    let running_b = Arc::new(AtomicUsize::new(0));
+    let high_water_b = Arc::new(AtomicUsize::new(0));
+    let spawner_b = jobs_b.add_initializer(ConcurrencyProbeInitializer {
+        job_type: job_type.clone(),
+        max_concurrent_per_process: None,
+        max_concurrent_global: Some(1),
+        running: Arc::clone(&running_b),
+        high_water: Arc::clone(&high_water_b),
+        release: Arc::clone(&release_b),
+    });
+    let job2 = JobId::new();
+    spawner_b.spawn(job2, ()).await?;
+    jobs_b.start_poll().await?;
+
+    // Give B at least one poll cycle to observe the exhausted budget and
+    // drop the type, settling into its long (MAX_WAIT-bound) sleep.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        running_b.load(Ordering::SeqCst),
+        0,
+        "B must not have claimed job2 while the global budget was exhausted"
+    );
+
+    // Shut A's poller down (job1 still running, blocked on `release_a`),
+    // then release job1 shortly after so it completes gracefully within the
+    // shutdown grace period. This is deliberate, not incidental: A ALSO
+    // polls this job_type, and A completing job1 triggers A's own
+    // pre-existing local capped-type notify (unrelated to this PR's fix) —
+    // without shutting A's poll loop down first, A could simply reclaim
+    // job2 itself, which would make this test pass regardless of whether
+    // the peer-wake fix under test does anything at all. Shutting A's main
+    // loop down first (it stops claiming new work immediately, before the
+    // in-flight job1 is asked to wrap up) removes A as a competitor, so
+    // job2 can only be claimed by a poller that was actually notified.
+    let shutdown_a = jobs_a.shutdown();
+    let release_job1 = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release_a.store(true, Ordering::SeqCst);
+    };
+    let (shutdown_result, ()) = tokio::join!(shutdown_a, release_job1);
+    shutdown_result?;
+
+    // Without this PR's peer-wake fix, B only rediscovers the freed budget
+    // on its MAX_WAIT (60s) backstop — the 10s timeout below is what proves
+    // the notification reached it.
+    let outcome = jobs_b
+        .handle(job2)
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+    assert!(
+        high_water_b.load(Ordering::SeqCst) >= 1,
+        "job2 must have run through B's own runner, not been reclaimed by A"
+    );
+
+    jobs_b.shutdown().await?;
+    Ok(())
+}
+
+// -- Keyed singletons --
+
+/// `spawn_keyed` twice with the same key: the second call must resolve to
+/// the first job's persisted id, and no second row is created (mirrors
+/// `spawn_unique_returns_existing_handle_on_duplicate`).
+#[tokio::test]
+async fn spawn_keyed_duplicate_returns_persisted_handle() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("spawn-keyed-dup-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new(job_type),
+    });
+    jobs.start_poll().await?;
+
+    let first_handle = spawner
+        .spawn_keyed("shard-1", TestJobConfig { delay_ms: 10 })
+        .await?;
+    let second_handle = spawner
+        .spawn_keyed("shard-1", TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(
+        second_handle.id(),
+        first_handle.id(),
+        "duplicate key must return the persisted job's id"
+    );
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE job_type = $1 AND unique_key = 'shard-1'")
+            .bind(job_type)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(count, 1, "no second row was created");
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Distinct keys of one type are distinct jobs and run (and complete)
+/// concurrently — `spawn_keyed` does not consume the spawner.
+#[tokio::test]
+async fn spawn_keyed_distinct_keys_run_concurrently() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("spawn-keyed-distinct-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new(job_type),
+    });
+    jobs.start_poll().await?;
+
+    let a = spawner
+        .spawn_keyed("a", TestJobConfig { delay_ms: 10 })
+        .await?;
+    let b = spawner
+        .spawn_keyed("b", TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_ne!(a.id(), b.id());
+
+    let outcomes = jobs
+        .handles(vec![a.id(), b.id()])
+        .await_all(Duration::from_secs(30))
+        .await?;
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// D11: `spawn_unique` is sugar for `spawn_keyed(DEFAULT_UNIQUE_KEY, …)` — a
+/// second spawner calling `spawn_keyed` with the default key on the same
+/// type resolves to the same persisted job.
+#[tokio::test]
+async fn spawn_unique_is_default_key() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("spawn-unique-default-key-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new(job_type),
+    });
+    let second_spawner = spawner.clone();
+    jobs.start_poll().await?;
+
+    let unique_handle = spawner.spawn_unique(TestJobConfig { delay_ms: 10 }).await?;
+    let keyed_handle = second_spawner
+        .spawn_keyed(DEFAULT_UNIQUE_KEY, TestJobConfig { delay_ms: 10 })
+        .await?;
+    assert_eq!(
+        keyed_handle.id(),
+        unique_handle.id(),
+        "spawn_unique and spawn_keyed(DEFAULT_UNIQUE_KEY) share one job"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// `keyed_handle` mirrors `handle_unique` for an explicit key, and
+/// `keyed_handles` lists every key of a type — including the default key
+/// once `spawn_unique` has been used — ordered by key.
+#[tokio::test]
+async fn keyed_handle_and_keyed_handles() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-handles-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: JobType::new(job_type),
+    });
+    jobs.start_poll().await?;
+
+    assert!(
+        jobs.keyed_handle(JobType::new(job_type), "shard-a")
+            .await?
+            .is_none(),
+        "no job spawned under this key yet"
+    );
+
+    let a = spawner
+        .spawn_keyed("shard-a", TestJobConfig { delay_ms: 10 })
+        .await?;
+    let b = spawner
+        .spawn_keyed("shard-b", TestJobConfig { delay_ms: 10 })
+        .await?;
+    let default = spawner.spawn_unique(TestJobConfig { delay_ms: 10 }).await?;
+
+    let handle_a = jobs
+        .keyed_handle(JobType::new(job_type), "shard-a")
+        .await?
+        .expect("shard-a should resolve");
+    assert_eq!(handle_a.id(), a.id());
+    handle_a.load().await?;
+
+    let keyed = jobs.keyed_handles(JobType::new(job_type)).await?;
+    let snapshots = keyed.load_all().await?;
+    let keys: Vec<Option<&str>> = snapshots.iter().map(|s| s.unique_key()).collect();
+    assert_eq!(
+        keys,
+        vec![Some(DEFAULT_UNIQUE_KEY), Some("shard-a"), Some("shard-b")],
+        "keyed_handles is ordered by key and includes the default key"
+    );
+    let ids: HashMap<&str, JobId> = snapshots
+        .iter()
+        .map(|s| (s.unique_key().expect("keyed job has a key"), s.job().id))
+        .collect();
+    assert_eq!(ids["shard-a"], a.id());
+    assert_eq!(ids["shard-b"], b.id());
+    assert_eq!(ids[DEFAULT_UNIQUE_KEY], default.id());
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KeyedCheckpointConfig {
+    processed: u32,
+}
+
+/// A runner that commits a per-key checkpoint then parks (spin-polling a
+/// shared flag) so the execution row stays alive for `execution_state` to
+/// read back.
+struct KeyedCheckpointInitializer {
+    job_type: JobType,
+    release: Arc<AtomicBool>,
+}
+
+impl JobInitializer for KeyedCheckpointInitializer {
+    type Config = KeyedCheckpointConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: KeyedCheckpointConfig = job.config()?;
+        Ok(Box::new(KeyedCheckpointRunner {
+            processed: config.processed,
+            release: Arc::clone(&self.release),
+        }))
+    }
+}
+
+struct KeyedCheckpointRunner {
+    processed: u32,
+    release: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl JobRunner for KeyedCheckpointRunner {
+    async fn run(
+        &self,
+        mut current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        current_job
+            .update_execution_state(CheckpointState {
+                processed: self.processed,
+            })
+            .await?;
+        while !self.release.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(JobCompletion::Complete)
+    }
+}
+
+/// The "caught up?" pattern: `keyed_handles(...).load_all()` batch-loads
+/// every shard's snapshot, and `unique_key()`/`execution_state()` on each
+/// snapshot read back which shard is at which cursor.
+#[tokio::test]
+async fn keyed_singletons_report_execution_state() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-caught-up-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let release = Arc::new(AtomicBool::new(false));
+    let spawner = jobs.add_initializer(KeyedCheckpointInitializer {
+        job_type: JobType::new(job_type),
+        release: Arc::clone(&release),
+    });
+    jobs.start_poll().await?;
+
+    spawner
+        .spawn_keyed("shard-0", KeyedCheckpointConfig { processed: 10 })
+        .await?;
+    spawner
+        .spawn_keyed("shard-1", KeyedCheckpointConfig { processed: 20 })
+        .await?;
+
+    let mut cursors: HashMap<String, u32> = HashMap::new();
+    for _ in 0..100 {
+        cursors.clear();
+        let keyed = jobs.keyed_handles(JobType::new(job_type)).await?;
+        for snapshot in keyed.load_all().await? {
+            if let (Some(key), Some(state)) = (
+                snapshot.unique_key(),
+                snapshot.execution_state::<CheckpointState>()?,
+            ) {
+                cursors.insert(key.to_string(), state.processed);
+            }
+        }
+        if cursors.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(cursors.get("shard-0"), Some(&10));
+    assert_eq!(cursors.get("shard-1"), Some(&20));
+
+    release.store(true, Ordering::SeqCst);
+    let keyed = jobs.keyed_handles(JobType::new(job_type)).await?;
+    let outcomes = keyed.await_all(Duration::from_secs(30)).await?;
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
 
     jobs.shutdown().await?;
     Ok(())

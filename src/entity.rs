@@ -96,6 +96,8 @@ pub enum JobEvent {
         config: serde_json::Value,
         tracing_context: Option<TracingContext>,
         queue_id: Option<String>,
+        #[serde(default)]
+        unique_key: Option<String>,
     },
     ExecutionScheduled {
         attempt: u32,
@@ -213,6 +215,7 @@ pub struct Job {
     pub id: JobId,
     pub job_type: JobType,
     pub queue_id: Option<String>,
+    pub unique_key: Option<String>,
     config: serde_json::Value,
     events: EntityEvents<JobEvent>,
 }
@@ -427,12 +430,14 @@ impl TryFromEvents<JobEvent> for Job {
                     job_type,
                     config,
                     queue_id,
+                    unique_key,
                     ..
                 } => {
                     builder = builder
                         .id(*id)
                         .job_type(job_type.clone())
                         .queue_id(queue_id.clone())
+                        .unique_key(unique_key.clone())
                         .config(config.clone())
                 }
                 JobEvent::ExecutionScheduled { .. } => {}
@@ -452,8 +457,6 @@ impl TryFromEvents<JobEvent> for Job {
 pub struct NewJob {
     #[builder(setter(into))]
     pub(super) id: JobId,
-    #[builder(default)]
-    pub(super) unique_per_type: bool,
     pub(super) job_type: JobType,
     #[builder(setter(custom))]
     pub(super) config: serde_json::Value,
@@ -461,6 +464,8 @@ pub struct NewJob {
     pub(super) tracing_context: Option<TracingContext>,
     #[builder(default)]
     pub(super) queue_id: Option<String>,
+    #[builder(setter(into, strip_option), default)]
+    pub(super) unique_key: Option<String>,
 }
 
 impl NewJob {
@@ -487,6 +492,7 @@ impl IntoEvents<JobEvent> for NewJob {
                 config: self.config,
                 tracing_context: self.tracing_context,
                 queue_id: self.queue_id,
+                unique_key: self.unique_key,
             }],
         )
     }
@@ -606,6 +612,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -641,6 +648,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -677,6 +685,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::minutes(10),
             )];
@@ -713,6 +722,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::minutes(30),
             )];
@@ -758,6 +768,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::minutes(5),
             )];
@@ -797,6 +808,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::hours(4),
             )];
@@ -840,6 +852,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::minutes(1),
             )];
@@ -879,6 +892,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::minutes(20),
             )];
@@ -911,6 +925,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::minutes(10),
             )];
@@ -938,6 +953,7 @@ mod tests {
                     config: json!({}),
                     tracing_context: None,
                     queue_id: None,
+                    unique_key: None,
                 },
                 now - ChronoDuration::hours(1),
             )];

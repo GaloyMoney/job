@@ -67,6 +67,12 @@ impl JobSnapshot {
         self.job.queue_id.as_deref()
     }
 
+    /// The singleton key this job was spawned under, if any (see
+    /// [`JobSpawner::spawn_keyed`](crate::JobSpawner::spawn_keyed)).
+    pub fn unique_key(&self) -> Option<&str> {
+        self.job.unique_key.as_deref()
+    }
+
     /// The latest error string, if the job has ever failed an attempt.
     ///
     /// Unlike the terminal [`JobStatus::Errored`] error, this is available
