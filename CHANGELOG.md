@@ -1,3 +1,11 @@
+# [job release v0.11.2](https://github.com/GaloyMoney/job/releases/tag/0.11.2)
+
+
+
+### Bug Fixes
+
+- Stop poll loop before draining at shutdown (#169)
+
 # [job release v0.11.1](https://github.com/GaloyMoney/job/releases/tag/0.11.1)
 
 
