@@ -1300,52 +1300,79 @@ async fn kill_remaining_jobs(
     instance_id: uuid::Uuid,
     clock: ClockHandle,
 ) -> Result<(), JobError> {
-    let mut op = repo.begin_op_with_clock(&clock).await?;
     let now = clock.now();
-    let rows = sqlx::query!(
+
+    // Which of our executions are still running? Read-only: the claim below
+    // re-checks atomically per job, inside the same op as the abort, so a job
+    // that finalizes between this scan and its claim is left alone.
+    let ids: Vec<JobId> = sqlx::query_scalar!(
         r#"
-        UPDATE job_executions
-        SET state = 'pending',
-            execute_at = $1,
-            poller_instance_id = NULL
-        WHERE poller_instance_id = $2 AND state = 'running'
-        RETURNING id as "id!: JobId", attempt_index
+        SELECT id AS "id!: JobId"
+        FROM job_executions
+        WHERE poller_instance_id = $1 AND state = 'running'
         "#,
-        now,
-        instance_id
+        instance_id,
     )
-    .fetch_all(op.as_executor())
+    .fetch_all(repo.pool())
     .await?;
 
-    let n_killed = rows.len();
-    tracing::Span::current().record("n_killed", n_killed);
+    tracing::Span::current().record("n_killed", ids.len());
 
-    if n_killed == 0 {
-        return Ok(());
-    }
+    for job_id in ids {
+        // Claim and abort in ONE op: the claim's row lock orders us against
+        // the dispatcher's execution-row delete, and the entity append reloads
+        // inside the same op — the entity is never loaded on a second
+        // connection while the claim is in flight (the old bulk claim +
+        // out-of-op `find_all` + in-op update lost exactly that race against a
+        // handler's `set_result`, surfacing ConcurrentModification from
+        // `shutdown()`).
+        let mut op = repo.begin_op_with_clock(&clock).await?;
 
-    let attempt_map: std::collections::HashMap<JobId, u32> = rows
-        .into_iter()
-        .map(|r| (r.id, r.attempt_index as u32))
-        .collect();
+        let claimed = sqlx::query!(
+            r#"
+            UPDATE job_executions
+            SET state = 'pending', execute_at = $3, poller_instance_id = NULL
+            WHERE id = $1 AND poller_instance_id = $2 AND state = 'running'
+            RETURNING attempt_index
+            "#,
+            job_id as JobId,
+            instance_id,
+            now,
+        )
+        .fetch_optional(op.as_executor())
+        .await?;
 
-    let ids: Vec<JobId> = attempt_map.keys().copied().collect();
-    let entities = repo.find_all::<crate::Job>(&ids).await?;
+        let Some(claimed) = claimed else {
+            // The dispatcher finished (or another writer removed the row)
+            // between the scan and the claim — nothing to kill.
+            continue;
+        };
+        let attempt_index = claimed.attempt_index as u32;
 
-    for (job_id, mut job) in entities {
-        let attempt_index = attempt_map[&job_id];
+        let result = repo
+            .append_events_in_op_with_retry(&mut op, &job_id, |job| {
+                job.abort_execution("killed job".to_string(), now, attempt_index);
+            })
+            .await?;
 
         tracing::warn!(
             job_id = %job_id,
-            job_type = %job.job_type,
+            job_type = %result.job_type,
             attempt = attempt_index,
             "Job still running after shutdown timeout, forcing reschedule"
         );
 
-        job.abort_execution("killed job".to_string(), now, attempt_index);
-        repo.update_in_op(&mut op, &mut job).await?;
+        if result.outcome == crate::repo::AppendOutcome::AlreadyTerminal {
+            // The dispatcher finalized the job while we held the claim: its
+            // poller-predicated delete missed our claimed row, and a terminal
+            // job must not keep a schedulable execution row — the poller would
+            // re-run a completed job forever.
+            sqlx::query!("DELETE FROM job_executions WHERE id = $1", job_id as JobId,)
+                .execute(op.as_executor())
+                .await?;
+        }
+        op.commit().await?;
     }
-    op.commit().await?;
     Ok(())
 }
 
@@ -1545,6 +1572,153 @@ mod tests {
         assert_eq!(row.1, Some(self_id));
         assert_eq!(row.2, 1);
 
+        Ok(())
+    }
+
+    // ── kill_remaining_jobs ─────────────────────────────────────────────
+    //
+    // The shutdown killer races the dispatcher and the handler by design; these
+    // tests pin the two outcomes of that race deterministically.
+
+    use crate::entity::NewJob;
+    use es_entity::EsEntity as _;
+
+    async fn seed_real_running_job(
+        pool: &PgPool,
+        repo: &crate::repo::JobRepo,
+        job_type: &str,
+        instance_id: uuid::Uuid,
+    ) -> anyhow::Result<JobId> {
+        let id = JobId::new();
+        let new_job = NewJob::builder()
+            .id(id)
+            .job_type(JobType::from_owned(job_type.to_string()))
+            .config(serde_json::json!({}))?
+            .build()
+            .expect("Could not build new job");
+        let mut job = repo.create(new_job).await?;
+        job.schedule_execution(chrono::Utc::now());
+        repo.update(&mut job).await?;
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, state, poller_instance_id, attempt_index, alive_at, created_at) \
+             VALUES ($1, $2, 'running', $3, 4, $4, $5)",
+        )
+        .bind(uuid::Uuid::from(id))
+        .bind(job_type)
+        .bind(instance_id)
+        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now())
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// A still-running job the killer claims is aborted and rescheduled: the
+    /// entity records `ExecutionAborted` + `ExecutionScheduled` and the
+    /// execution row goes back to `pending`, unowned.
+    #[tokio::test]
+    async fn kill_remaining_aborts_a_claimed_running_job() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = std::sync::Arc::new(crate::repo::JobRepo::new(&pool));
+        let instance_id = uuid::Uuid::now_v7();
+        let id = seed_real_running_job(&pool, &repo, "kill-aborts", instance_id).await?;
+        let clock = es_entity::clock::ClockHandle::realtime();
+
+        kill_remaining_jobs(Arc::clone(&repo), instance_id, clock).await?;
+
+        let row: (String, Option<uuid::Uuid>, i32) = sqlx::query_as(
+            "SELECT state::text, poller_instance_id, attempt_index \
+             FROM job_executions WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(id))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.0, "pending");
+        assert_eq!(row.1, None, "claimed row must be unowned");
+        assert_eq!(row.2, 4, "attempt index carried onto the reschedule");
+
+        let job = repo.find_by_id(id).await?;
+        let types: Vec<String> = job
+            .events()
+            .iter_all()
+            .map(|e| {
+                serde_json::to_value(e)
+                    .ok()
+                    .and_then(|v| v.get("type").cloned())
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            types.contains(&"execution_aborted".to_string()),
+            "{types:?}"
+        );
+        assert!(
+            types.contains(&"execution_scheduled".to_string()),
+            "{types:?}"
+        );
+        assert!(
+            job.terminal_state().is_none(),
+            "aborted job is not terminal"
+        );
+        Ok(())
+    }
+
+    /// The interleaving that used to fail `Jobs::shutdown` with
+    /// `JobModifyError - ConcurrentModification` and could strand a schedulable
+    /// row on a finished job: the dispatcher finalizes the entity while the
+    /// killer holds the execution-row claim. The killer must NOT append abort
+    /// events to the terminal job, must delete the claimed row (the poller
+    /// would otherwise re-run the completed job forever), and must not error.
+    #[tokio::test]
+    async fn kill_remaining_skips_and_cleans_a_job_finalized_during_the_claim() -> anyhow::Result<()>
+    {
+        let pool = init_pool().await?;
+        let repo = std::sync::Arc::new(crate::repo::JobRepo::new(&pool));
+        let instance_id = uuid::Uuid::now_v7();
+        let id = seed_real_running_job(&pool, &repo, "kill-terminal-race", instance_id).await?;
+
+        // The dispatcher's finalization: entity completed, row still running
+        // (its delete is about to be preempted by the killer's claim — or has
+        // matched nothing — either way the row survives finalization).
+        let mut op = repo.begin_op().await?;
+        repo.append_events_in_op_with_retry(&mut op, &id, |job| job.complete_job())
+            .await?;
+        op.commit().await?;
+
+        let clock = es_entity::clock::ClockHandle::realtime();
+        kill_remaining_jobs(Arc::clone(&repo), instance_id, clock).await?;
+
+        // No abort events were appended to the terminal job...
+        let job = repo.find_by_id(id).await?;
+        assert_eq!(
+            job.terminal_state(),
+            Some(crate::JobTerminalState::Completed)
+        );
+        let types: Vec<String> = job
+            .events()
+            .iter_all()
+            .map(|e| {
+                serde_json::to_value(e)
+                    .ok()
+                    .and_then(|v| v.get("type").cloned())
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            !types.contains(&"execution_aborted".to_string()),
+            "{types:?}"
+        );
+
+        // ...and the schedulable row is gone: a terminal job must not keep one.
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT state::text FROM job_executions WHERE id = $1")
+                .bind(uuid::Uuid::from(id))
+                .fetch_optional(&pool)
+                .await?;
+        assert!(row.is_none(), "terminal job must not keep an execution row");
         Ok(())
     }
 }

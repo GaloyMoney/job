@@ -282,21 +282,51 @@ impl JobDispatcher {
     )]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id_in_op(&mut op, id).await?;
 
         let span = Span::current();
         let error_str = error.to_string();
         span.record("job_id", tracing::field::display(id));
-        span.record("job_type", tracing::field::display(&job.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
         span.record("error", true);
         span.record("error.message", tracing::field::display(&error_str));
 
         let retry_policy = RetryPolicy::from(&self.retry_settings);
 
-        if let Some((reschedule_at, next_attempt)) =
-            job.maybe_schedule_retry(self.clock.now(), attempt, &retry_policy, error_str)
-        {
+        // `(reschedule_at, next_attempt)` when the retry policy schedules
+        // another attempt; `None` when the job errored terminally. Overwritten
+        // — never accumulated — on a concurrent-modification retry of the
+        // append below.
+        let mut retry_decision: Option<(DateTime<Utc>, u32)> = None;
+        let result = self
+            .repo
+            .append_events_in_op_with_retry(&mut op, &id, |job| {
+                span.record("job_type", tracing::field::display(&job.job_type));
+                if let Some((reschedule_at, next_attempt)) = job.maybe_schedule_retry(
+                    self.clock.now(),
+                    attempt,
+                    &retry_policy,
+                    error_str.clone(),
+                ) {
+                    retry_decision = Some((reschedule_at, next_attempt));
+                }
+            })
+            .await?;
+        span.record("job_type", tracing::field::display(&result.job_type));
+
+        if result.outcome == crate::repo::AppendOutcome::AlreadyTerminal {
+            // A concurrent writer finalized the job while this attempt was
+            // failing: there is nothing to record, and any execution row left
+            // behind must go (a terminal job must never keep a schedulable
+            // row — the poller would re-run a completed job).
+            self.delete_unowned_pending_execution_in_op(&mut op, &id)
+                .await?;
+            span.record("error.level", tracing::field::display(tracing::Level::WARN));
+            span.record("will_retry", false);
+            op.commit().await?;
+            return Ok(());
+        }
+
+        if let Some((reschedule_at, next_attempt)) = retry_decision {
             let exceeded_warn_attempts = self
                 .retry_settings
                 .n_warn_attempts
@@ -325,7 +355,7 @@ impl JobDispatcher {
             .execute(op.as_executor())
             .await?;
             self.notifier
-                .execution_ready_in_op(&mut op, &job.job_type)
+                .execution_ready_in_op(&mut op, &result.job_type)
                 .await?;
         } else {
             span.record(
@@ -334,11 +364,10 @@ impl JobDispatcher {
             );
             span.record("will_retry", false);
 
-            self.delete_execution_in_op(&mut op, id, &job.job_type)
+            self.delete_execution_in_op(&mut op, id, &result.job_type)
                 .await?;
         }
 
-        self.repo.update_in_op(&mut op, &mut job).await?;
         op.commit().await?;
         Ok(())
     }
@@ -380,6 +409,16 @@ impl JobDispatcher {
         .fetch_optional(op.as_executor())
         .await?;
 
+        // A concurrent shutdown/lost-job kill may have claimed this row first
+        // (flipping it to pending + unowned), in which case the poller-
+        // predicated delete above matched nothing. A terminal job must not
+        // keep a schedulable row — the poller would re-run the completed job —
+        // so also remove the claimed row. `pending AND poller IS NULL` never
+        // matches a row another instance is actively running (those carry
+        // `state = 'running'` + an owner); only terminal paths call here, so
+        // it also never hits a legitimate future attempt.
+        self.delete_unowned_pending_execution_in_op(op, &id).await?;
+
         let Some(freed_queue_id) = deleted else {
             return Ok(());
         };
@@ -393,16 +432,38 @@ impl JobDispatcher {
         Ok(())
     }
 
+    /// Remove an execution row that was reclaimed by a shutdown/lost-job
+    /// kill (`state = 'pending'`, no owner) for a job this caller is
+    /// finalizing. Harmless when no such row exists.
+    async fn delete_unowned_pending_execution_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        id: &JobId,
+    ) -> Result<(), JobError> {
+        sqlx::query!(
+            r#"
+          DELETE FROM job_executions
+          WHERE id = $1 AND state = 'pending' AND poller_instance_id IS NULL
+        "#,
+            id as &JobId,
+        )
+        .execute(op.as_executor())
+        .await?;
+        Ok(())
+    }
+
     #[instrument(name = "job.complete_job", skip(self, op), fields(id = %id))]
     async fn complete_job(
         &mut self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
     ) -> Result<(), JobError> {
-        let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
-        self.delete_execution_in_op(op, id, &job.job_type).await?;
-        job.complete_job();
-        self.repo.update_in_op(op, &mut job).await?;
+        let result = self
+            .repo
+            .append_events_in_op_with_retry(op, &id, |job| job.complete_job())
+            .await?;
+        self.delete_execution_in_op(op, id, &result.job_type)
+            .await?;
         Ok(())
     }
 
@@ -414,7 +475,21 @@ impl JobDispatcher {
         reschedule_at: DateTime<Utc>,
     ) -> Result<(), JobError> {
         self.rescheduled = true;
-        let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
+        let result = self
+            .repo
+            .append_events_in_op_with_retry(op, &id, |job| {
+                job.reschedule_execution(reschedule_at);
+            })
+            .await?;
+
+        if result.outcome == crate::repo::AppendOutcome::AlreadyTerminal {
+            // The job finalized while this runner asked to reschedule: there
+            // is no next attempt to schedule, and any kill-claimed execution
+            // row must not linger for a terminal job.
+            self.delete_unowned_pending_execution_in_op(op, &id).await?;
+            return Ok(());
+        }
+
         sqlx::query!(
             r#"
           UPDATE job_executions
@@ -428,10 +503,8 @@ impl JobDispatcher {
         .execute(op.as_executor())
         .await?;
         self.notifier
-            .execution_ready_in_op(op, &job.job_type)
+            .execution_ready_in_op(op, &result.job_type)
             .await?;
-        job.reschedule_execution(reschedule_at);
-        self.repo.update_in_op(op, &mut job).await?;
         Ok(())
     }
 }

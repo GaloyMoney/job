@@ -22,7 +22,7 @@ use super::{
         AnyBatchedJobRunner, BatchItemOutcome, BatchOutcomes, BatchRunCtx, JobBatchCompletion,
         RawBatchItem, ShutdownRx,
     },
-    entity::{Job, JobType, RetryPolicy},
+    entity::{JobType, RetryPolicy},
     error::JobError,
     notifier::JobEventNotifier,
     repo::JobRepo,
@@ -343,25 +343,40 @@ impl BatchDispatcher {
         .fetch_all(op.as_executor())
         .await?;
 
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let deleted: Vec<JobId> = rows.iter().map(|row| row.id).collect();
         let freed_a_queue = rows.iter().any(|row| row.queue_id.is_some());
 
-        let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &deleted).await?;
-        let mut jobs = Vec::with_capacity(deleted.len());
-        for id in &deleted {
-            if let Some(mut job) = entities.remove(id) {
-                job.complete_job();
-                jobs.push(job);
-            }
-        }
-        self.repo.update_all_in_op(op, &mut jobs).await?;
+        // Finalize the entities even when our row delete matched nothing: a
+        // shutdown/lost-job kill may have claimed the rows first, and the
+        // runners finished — a completed job must reach `JobCompleted` (and
+        // must not keep the kill-claimed schedulable row).
+        let results = self
+            .repo
+            .append_all_events_in_op_with_retry(&mut *op, &ids, |job| job.complete_job())
+            .await?;
 
-        for id in &deleted {
-            self.notifier.job_terminal_in_op(op, *id).await?;
+        for result in &results {
+            if result.outcome != crate::repo::AppendOutcome::Applied {
+                continue;
+            }
+            self.notifier.job_terminal_in_op(op, result.id).await?;
         }
+
+        // Remove any execution row a concurrent kill claimed (pending,
+        // unowned) for a job this batch finalized.
+        let completed: Vec<uuid::Uuid> = results
+            .iter()
+            .map(|result| uuid::Uuid::from(result.id))
+            .collect();
+        sqlx::query!(
+            r#"
+            DELETE FROM job_executions
+            WHERE id = ANY($1) AND state = 'pending' AND poller_instance_id IS NULL
+            "#,
+            &completed,
+        )
+        .execute(op.as_executor())
+        .await?;
+
         if freed_a_queue {
             self.notifier
                 .execution_ready_in_op(op, &self.job_type)
@@ -403,15 +418,38 @@ impl BatchDispatcher {
         .await?;
 
         let ids: Vec<JobId> = reschedules.iter().map(|(id, _)| *id).collect();
-        let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?;
-        let mut jobs = Vec::with_capacity(ids.len());
-        for (id, at) in &reschedules {
-            if let Some(mut job) = entities.remove(id) {
-                job.reschedule_execution(*at);
-                jobs.push(job);
-            }
+        let times_by_id: std::collections::HashMap<JobId, DateTime<Utc>> =
+            reschedules.iter().copied().collect();
+        let results = self
+            .repo
+            .append_all_events_in_op_with_retry(&mut *op, &ids, |job| {
+                let at = times_by_id
+                    .get(&job.id)
+                    .copied()
+                    .expect("reschedule time known for every requested id");
+                job.reschedule_execution(at);
+            })
+            .await?;
+
+        // Jobs that finalized while this batch asked to reschedule keep no
+        // next attempt: drop any kill-claimed row left behind for them.
+        let lingering: Vec<uuid::Uuid> = results
+            .iter()
+            .filter(|result| result.outcome == crate::repo::AppendOutcome::AlreadyTerminal)
+            .map(|result| uuid::Uuid::from(result.id))
+            .collect();
+        if !lingering.is_empty() {
+            sqlx::query!(
+                r#"
+                DELETE FROM job_executions
+                WHERE id = ANY($1) AND state = 'pending' AND poller_instance_id IS NULL
+                "#,
+                &lingering,
+            )
+            .execute(op.as_executor())
+            .await?;
         }
-        self.repo.update_all_in_op(op, &mut jobs).await?;
+
         self.notifier
             .execution_ready_in_op(op, &self.job_type)
             .await?;
@@ -437,29 +475,67 @@ impl BatchDispatcher {
         let retry_policy = RetryPolicy::from(&self.retry_settings);
 
         let ids: Vec<JobId> = fails.iter().map(|(id, _)| *id).collect();
-        let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?;
+        let reason_by_id: std::collections::HashMap<JobId, String> =
+            fails.iter().cloned().collect();
+
+        // Per-job outcome of the retry policy, recorded by the append closure.
+        // On a concurrent-modification retry the closure runs again for every
+        // job, so the map is rebuilt from scratch per attempt (clear-then-fill
+        // inside the closure is wrong here — the closure sees one job at a
+        // time; instead every attempt INSERTS over the previous decision and
+        // the map is reduced to the last attempt below).
+        let mut decisions: std::collections::HashMap<JobId, Option<(DateTime<Utc>, u32)>> =
+            std::collections::HashMap::new();
+
+        let results = self
+            .repo
+            .append_all_events_in_op_with_retry(&mut *op, &ids, |job| {
+                let reason = reason_by_id
+                    .get(&job.id)
+                    .cloned()
+                    .expect("fail reason known for every requested id");
+                let attempt = self.attempts.get(&job.id).copied().unwrap_or(1);
+                decisions.insert(
+                    job.id,
+                    job.maybe_schedule_retry(now, attempt, &retry_policy, reason),
+                );
+            })
+            .await?;
+
+        // Keep only the decisions from the LAST attempt per job: append
+        // retries re-run the closure, and the persisted events — and therefore
+        // the authoritative decisions — are the last attempt's.
+        let decisions: std::collections::HashMap<JobId, Option<(DateTime<Utc>, u32)>> = decisions
+            .into_iter()
+            .filter(|(id, _)| {
+                results.iter().any(|result| {
+                    result.id == *id && result.outcome == crate::repo::AppendOutcome::Applied
+                })
+            })
+            .collect();
 
         let mut retry_uuids = Vec::new();
         let mut retry_times = Vec::new();
         let mut retry_attempts = Vec::new();
         let mut terminal_uuids = Vec::new();
-        let mut jobs = Vec::with_capacity(ids.len());
+        let mut lingering_uuids = Vec::new();
 
-        for (id, reason) in fails {
-            let Some(mut job) = entities.remove(&id) else {
+        for result in &results {
+            if result.outcome != crate::repo::AppendOutcome::Applied {
+                // Finalized by a concurrent writer while this attempt failed:
+                // nothing to record, and any kill-claimed row must go.
+                lingering_uuids.push(uuid::Uuid::from(result.id));
                 continue;
-            };
-            let attempt = self.attempts.get(&id).copied().unwrap_or(1);
-            match job.maybe_schedule_retry(now, attempt, &retry_policy, reason) {
+            }
+            match decisions.get(&result.id).copied().flatten() {
                 Some((reschedule_at, next_attempt)) => {
-                    retry_uuids.push(uuid::Uuid::from(id));
+                    retry_uuids.push(uuid::Uuid::from(result.id));
                     retry_times.push(reschedule_at);
                     retry_attempts.push(next_attempt as i32);
                     self.rescheduled = true;
                 }
-                None => terminal_uuids.push(uuid::Uuid::from(id)),
+                None => terminal_uuids.push(uuid::Uuid::from(result.id)),
             }
-            jobs.push(job);
         }
 
         span.record("n_retried", retry_uuids.len());
@@ -516,7 +592,17 @@ impl BatchDispatcher {
             }
         }
 
-        self.repo.update_all_in_op(op, &mut jobs).await?;
+        if !lingering_uuids.is_empty() {
+            sqlx::query!(
+                r#"
+                DELETE FROM job_executions
+                WHERE id = ANY($1) AND state = 'pending' AND poller_instance_id IS NULL
+                "#,
+                &lingering_uuids,
+            )
+            .execute(op.as_executor())
+            .await?;
+        }
         Ok(())
     }
 

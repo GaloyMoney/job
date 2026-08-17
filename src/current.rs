@@ -136,15 +136,18 @@ impl CurrentJob {
     /// see. This allows incremental progress updates; for example, a batch job
     /// can call `set_result` after each chunk so that partial progress is
     /// preserved even on failure.
+    ///
+    /// Tolerates a concurrent shutdown/lost-job kill appending to the same
+    /// job's event log: both writers append commutative events, so a lost
+    /// append race retries on a fresh entity instead of failing the runner
+    /// (see [`JobRepo::append_events_in_op_with_retry`]).
     pub async fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
         let job_result =
             JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
-        if job.update_return_value(job_result).did_execute() {
-            self.repo.update_in_op(&mut op, &mut job).await?;
-            op.commit().await?;
-        }
+        self.set_result_in_op_with_retry(&mut op, job_result)
+            .await?;
+        op.commit().await?;
         Ok(())
     }
 
@@ -161,10 +164,26 @@ impl CurrentJob {
     ) -> Result<(), JobError> {
         let job_result =
             JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
-        let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
-        if job.update_return_value(job_result).did_execute() {
-            self.repo.update_in_op(op, &mut job).await?;
-        }
+        self.set_result_in_op_with_retry(op, job_result).await
+    }
+
+    /// Find, idempotently update, and persist the return value, retrying a
+    /// concurrent-modification race inside a savepoint so the caller's op
+    /// stays usable (a failed event INSERT would otherwise abort it).
+    async fn set_result_in_op_with_retry(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        job_result: JobReturnValue,
+    ) -> Result<(), JobError> {
+        self.repo
+            .append_events_in_op_with_retry(op, &self.id, |job| {
+                // `update_return_value` is an idempotency guard: when the value
+                // is unchanged it pushes no event, and the helper's
+                // `update_in_op` persists nothing for an entity with no new
+                // events — so the unchanged case stays write-free.
+                let _ = job.update_return_value(job_result.clone());
+            })
+            .await?;
         Ok(())
     }
 
