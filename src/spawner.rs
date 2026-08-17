@@ -24,7 +24,8 @@ pub const DEFAULT_UNIQUE_KEY: &str = "default";
 /// Describes a job to be created as part of a bulk [`JobSpawner::spawn_all`] call.
 ///
 /// Use [`JobSpec::new`] to create a spec with just an id and config, then
-/// chain [`JobSpec::schedule_at`] or [`JobSpec::queue_id`] for optional overrides.
+/// chain [`JobSpec::schedule_at`], [`JobSpec::queue_id`], or
+/// [`JobSpec::unique_key`] for optional overrides.
 ///
 /// # Examples
 ///
@@ -33,7 +34,8 @@ pub const DEFAULT_UNIQUE_KEY: &str = "default";
 ///     JobSpec::new(JobId::new(), MyConfig { value: 1 }),
 ///     JobSpec::new(JobId::new(), MyConfig { value: 2 })
 ///         .schedule_at(future_time)
-///         .queue_id("my-queue"),
+///         .queue_id("my-queue")
+///         .unique_key("my-key"),
 /// ];
 /// spawner.spawn_all(specs).await?;
 /// ```
@@ -42,6 +44,7 @@ pub struct JobSpec<Config> {
     pub config: Config,
     pub schedule_at: Option<DateTime<Utc>>,
     pub queue_id: Option<String>,
+    pub unique_key: Option<String>,
 }
 
 impl<Config> JobSpec<Config> {
@@ -51,6 +54,7 @@ impl<Config> JobSpec<Config> {
             config,
             schedule_at: None,
             queue_id: None,
+            unique_key: None,
         }
     }
 
@@ -61,6 +65,11 @@ impl<Config> JobSpec<Config> {
 
     pub fn queue_id(mut self, queue_id: impl Into<String>) -> Self {
         self.queue_id = Some(queue_id.into());
+        self
+    }
+
+    pub fn unique_key(mut self, unique_key: impl Into<String>) -> Self {
+        self.unique_key = Some(unique_key.into());
         self
     }
 }
@@ -315,14 +324,17 @@ where
         for spec in specs {
             schedule_times.push(spec.schedule_at.unwrap_or(default_schedule_at));
 
-            let new_job = NewJob::builder()
+            let mut builder = NewJob::builder();
+            builder
                 .id(spec.id)
                 .job_type(self.job_type.clone())
                 .config(spec.config)?
                 .tracing_context(es_entity::context::TracingContext::current())
-                .queue_id(spec.queue_id.clone())
-                .build()
-                .expect("Could not build new job");
+                .queue_id(spec.queue_id.clone());
+            if let Some(unique_key) = spec.unique_key {
+                builder.unique_key(unique_key);
+            }
+            let new_job = builder.build().expect("Could not build new job");
             new_jobs.push(new_job);
             queue_ids.push(spec.queue_id);
         }
