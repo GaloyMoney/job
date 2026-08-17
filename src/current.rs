@@ -67,12 +67,12 @@ impl CurrentJob {
             .map_err(JobError::CouldNotSerializeExecutionState)?;
         sqlx::query!(
             r#"
-          UPDATE job_executions
-          SET execution_state_json = $1
-          WHERE id = $2
+          INSERT INTO job_execution_states (id, execution_state_json)
+          VALUES ($1, $2)
+          ON CONFLICT (id) DO UPDATE SET execution_state_json = EXCLUDED.execution_state_json
         "#,
+            &self.id as &JobId,
             execution_state_json,
-            &self.id as &JobId
         )
         .execute(op.as_executor())
         .await?;
@@ -88,12 +88,12 @@ impl CurrentJob {
             .map_err(JobError::CouldNotSerializeExecutionState)?;
         sqlx::query!(
             r#"
-          UPDATE job_executions
-          SET execution_state_json = $1
-          WHERE id = $2
+          INSERT INTO job_execution_states (id, execution_state_json)
+          VALUES ($1, $2)
+          ON CONFLICT (id) DO UPDATE SET execution_state_json = EXCLUDED.execution_state_json
         "#,
+            &self.id as &JobId,
             execution_state_json,
-            &self.id as &JobId
         )
         .execute(&self.pool)
         .await?;

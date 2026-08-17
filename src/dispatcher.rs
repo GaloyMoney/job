@@ -365,9 +365,14 @@ impl JobDispatcher {
     ) -> Result<(), JobError> {
         let deleted = sqlx::query_scalar!(
             r#"
-          DELETE FROM job_executions
-          WHERE id = $1 AND poller_instance_id = $2
-          RETURNING queue_id
+          WITH deleted AS (
+              DELETE FROM job_executions
+              WHERE id = $1 AND poller_instance_id = $2
+              RETURNING id, queue_id
+          ), cleanup AS (
+              DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+          )
+          SELECT queue_id AS "queue_id?" FROM deleted
         "#,
             id as JobId,
             self.instance_id

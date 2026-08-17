@@ -10,8 +10,8 @@ mod helpers;
 
 use async_trait::async_trait;
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobPollerConfig, JobRunner, JobSpawner,
-    JobSpec, JobSvcConfig, JobType, Jobs,
+    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobPollerConfig, JobRunner,
+    JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -133,6 +133,89 @@ async fn poller_falls_through_locked_head_rows_to_later_due_jobs() -> anyhow::Re
          cap was applied before FOR UPDATE SKIP LOCKED, so the poller could \
          only ever target the 5 rows another poller had locked"
     );
+
+    Ok(())
+}
+
+/// A partial claim must sleep until the next scheduled job, not the 60s
+/// `MAX_WAIT` backstop. Job B is due ~2s after A and nothing else notifies
+/// the poll loop for this type in between.
+#[tokio::test]
+async fn partial_claim_sleeps_until_next_due() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let job_type = JobType::new("partial-claim-next-due");
+
+    let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let spawner = jobs.add_initializer(CountingInitializer {
+        job_type: job_type.clone(),
+        ran: Arc::clone(&ran),
+    });
+
+    let a_id = JobId::new();
+    let b_id = JobId::new();
+    spawner.spawn(a_id, Cfg { n: 0 }).await?;
+    spawner
+        .spawn_at(
+            b_id,
+            Cfg { n: 1 },
+            chrono::Utc::now() + chrono::Duration::seconds(2),
+        )
+        .await?;
+
+    jobs.start_poll().await?;
+
+    let outcomes = jobs
+        .handles(vec![a_id, b_id])
+        .await_all(Duration::from_secs(10))
+        .await?;
+    assert!(outcomes.all_succeeded());
+    assert_eq!(ran.load(Ordering::SeqCst), 2);
+
+    Ok(())
+}
+
+/// A full claim must re-poll immediately rather than sleeping, so a backlog
+/// well over one process's budget still drains promptly.
+#[tokio::test]
+async fn full_claim_drains_immediately() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let job_type = JobType::new("full-claim-drains-immediately");
+
+    let poller_config = JobPollerConfig {
+        max_jobs_per_process: 3,
+        min_jobs_per_process: 3,
+        ..Default::default()
+    };
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .poller_config(poller_config)
+        .build()
+        .unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let spawner = jobs.add_initializer(CountingInitializer {
+        job_type: job_type.clone(),
+        ran: Arc::clone(&ran),
+    });
+
+    let n = 20;
+    let ids: Vec<JobId> = (0..n).map(|_| JobId::new()).collect();
+    let specs: Vec<JobSpec<Cfg>> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| JobSpec::new(*id, Cfg { n: i }))
+        .collect();
+    spawner.spawn_all(specs).await?;
+
+    jobs.start_poll().await?;
+
+    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(10)).await?;
+    assert!(outcomes.all_succeeded());
+    assert_eq!(ran.load(Ordering::SeqCst), n);
 
     Ok(())
 }

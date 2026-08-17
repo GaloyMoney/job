@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use serde_json::Value as JsonValue;
-use sqlx::postgres::{PgPool, types::PgInterval};
+use sqlx::postgres::PgPool;
 use tracing::{Instrument, Span, instrument};
 
 use std::{
@@ -163,8 +163,18 @@ impl JobPoller {
         let mut failures = 0;
         let mut woken_up = false;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let debounce = self.config.poll_debounce;
+        let mut last_poll = std::time::Instant::now();
 
         loop {
+            if woken_up {
+                let since = last_poll.elapsed();
+                if since < debounce {
+                    tokio::time::sleep(debounce - since).await;
+                }
+            }
+            last_poll = std::time::Instant::now();
+
             let timeout = match self.poll_and_dispatch(woken_up).await {
                 Ok(duration) => {
                     failures = 0;
@@ -209,90 +219,37 @@ impl JobPoller {
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         };
-        // Size each type's claim before touching the database. A batched type
-        // may only claim what its free batch slots can immediately execute,
-        // and a per-process-capped plain type may only claim what its free
-        // slots can immediately run, so the poller never takes rows that
-        // would just sit in `running` waiting for a slot. A type with no free
-        // slot is dropped from the poll entirely; `job_completed` /
-        // `batch_completed` wake the loop when one frees up.
-        //
-        // Per-process/batch-slot limits are resolved here, client-side,
-        // because `units_in_flight` is in-process state no query can see.
-        // Global caps CANNOT be resolved here in the same pass: the running
-        // count is cross-instance state that only the database has, so
-        // folding it in would cost a second round trip before every single
-        // poll — for the whole process, not just for globally-capped types,
-        // since this method can't yet know which types would need it without
-        // asking. Instead the globally-capped subset of `pollable_types`
-        // (never batched types — see `JobInitializer::max_concurrent_global`)
-        // is passed to `poll_jobs` alongside its cap, and the running-count
-        // pre-count and the resulting row_limit adjustment both happen
-        // INSIDE that one query, ahead of `due`, so a saturated type still
-        // never floods the overscan window — see `poll_jobs`'s `pollable`
-        // CTE. The pre-count is still a snapshot taken moments before the
-        // claim, so the cap is still SOFT across instances (see
-        // `JobInitializer::max_concurrent_global` docs) — merging it into one
-        // round trip changes nothing about that.
-        let (pollable_types, row_limits) = {
-            let mut types = Vec::new();
-            let mut limits = Vec::new();
-            for job_type in self.registry.registered_job_types() {
-                let limit = match self.registry.batch_policy(&job_type) {
-                    Some(policy) => policy
-                        .max_concurrent_per_process
-                        .saturating_sub(self.tracker.units_in_flight(&job_type))
-                        .saturating_mul(policy.max_batch_size),
-                    None => match self.registry.per_process_cap(&job_type) {
-                        Some(cap) => cap.saturating_sub(self.tracker.units_in_flight(&job_type)),
-                        None => n_jobs_to_poll,
-                    },
-                };
-                let limit = limit.min(n_jobs_to_poll);
-                if limit == 0 {
-                    continue;
-                }
-                types.push(job_type);
-                limits.push(limit as i32);
-            }
-            (types, limits)
-        };
-        if pollable_types.is_empty() {
+        let plan = self.registry.plan_claim(n_jobs_to_poll);
+        if plan.types.is_empty() {
             // Every type is saturated or capped and nothing else is registered.
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         }
 
-        let (global_cap_types, global_caps): (Vec<JobType>, Vec<i32>) = pollable_types
-            .iter()
-            .filter_map(|job_type| {
-                self.registry
-                    .global_cap(job_type)
-                    .map(|cap| (job_type.clone(), cap as i32))
-            })
-            .unzip();
-
-        let rows = match poll_jobs(
+        let (rows, window) = match poll_jobs(
             self.repo.pool(),
             n_jobs_to_poll,
             self.instance_id,
-            &pollable_types,
-            &row_limits,
-            &global_cap_types,
-            &global_caps,
+            &plan.types,
+            &plan.row_limits,
+            &plan.global_cap_types,
+            &plan.global_caps,
             &self.clock,
         )
         .await?
         {
-            JobPollResult::WaitTillNextJob(duration) => {
+            JobPollResult::WaitTillNextJob(window) => {
+                // Fresh clock read: a duration captured earlier can go stale under a manual clock.
+                let duration = window.sleep_for(self.clock.now());
                 span.record("next_poll_in", tracing::field::debug(duration));
                 span.record("n_jobs_to_start", 0);
                 return Ok(duration);
             }
-            JobPollResult::Jobs(jobs) => jobs,
+            JobPollResult::Jobs { jobs, window } => (jobs, window),
         };
-        span.record("n_jobs_to_start", rows.len());
+        let jobs_len = rows.len();
+        span.record("n_jobs_to_start", jobs_len);
         if !rows.is_empty() {
             let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
             let mut entities = self.repo.find_all::<Job>(&ids).await?;
@@ -328,8 +285,15 @@ impl JobPoller {
             }
         }
 
-        span.record("next_poll_in", tracing::field::debug(Duration::ZERO));
-        Ok(Duration::ZERO)
+        // Full claim: budget was the limit, drain immediately. Partial claim: sleep,
+        // unless `may_have_more` says the due backlog wasn't fully seen this poll.
+        let next_poll_in = if jobs_len == n_jobs_to_poll {
+            Duration::ZERO
+        } else {
+            window.sleep_for(self.clock.now())
+        };
+        span.record("next_poll_in", tracing::field::debug(next_poll_in));
+        Ok(next_poll_in)
     }
 
     fn start_lost_handler(&self) -> OwnedTaskHandle {
@@ -1003,9 +967,8 @@ async fn poll_jobs(
             )
         ),
         locked AS (
-            -- The wide execution_state_json is fetched only for the
-            -- ~$1 winners, not carried through the CTEs and the window
-            -- sort for every pending job.
+            -- execution_state_json comes from job_execution_states via this
+            -- LEFT JOIN, fetched only for the ~$1 winners.
             --
             -- Every queue-head is eligible here, deliberately: the per-type
             -- cap is applied *after* this lock, never before it. Filtering to
@@ -1015,10 +978,13 @@ async fn poll_jobs(
             -- through to nothing while due work sat unclaimed. SKIP LOCKED can
             -- only route around a concurrent poller if there is something
             -- past its rows left to see.
-            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index,
+            --
+            -- FOR UPDATE OF je: bare FOR UPDATE errors on a nullable join side.
+            SELECT je.id, cp.execution_state_json AS data_json, je.attempt_index,
                    c.job_type, je.execute_at
             FROM candidates c
             JOIN job_executions je ON je.id = c.id
+            LEFT JOIN job_execution_states cp ON cp.id = c.id
             WHERE c.rn = 1
             ORDER BY je.execute_at ASC
             LIMIT $1
@@ -1064,11 +1030,20 @@ async fn poll_jobs(
             -- anti-join. May wake slightly early when the nearest
             -- future job is queue-blocked — one wasted wake-up at
             -- worst, only while its queue stays busy.
-            SELECT MIN(execute_at) - $2::timestamptz AS wait_time
+            --
+            -- Absolute timestamp; excludes already-due rows (see overscan_status).
+            SELECT MIN(execute_at) AS next_due_at
             FROM job_executions
             WHERE state = 'pending'
             AND job_type = ANY($4)
             AND execute_at > $2::timestamptz
+        ),
+        overscan_status AS (
+            -- Whether `due` or `locked` hit its LIMIT — if so, re-poll rather than trust next_due_at.
+            SELECT
+                (SELECT COUNT(*) FROM due) >= $1 * 4
+                OR (SELECT COUNT(*) FROM locked) >= $1
+                AS may_have_more
         )
         SELECT * FROM (
             SELECT
@@ -1076,17 +1051,18 @@ async fn poll_jobs(
                 u.data_json AS "data_json?: JsonValue",
                 u.attempt_index AS "attempt_index?",
                 u.queue_id AS "queue_id?",
-                NULL::INTERVAL AS "max_wait?: PgInterval"
-            FROM updated u
+                NULL::TIMESTAMPTZ AS "next_due_at?",
+                os.may_have_more AS "may_have_more!"
+            FROM updated u, overscan_status os
             UNION ALL
             SELECT
                 NULL::UUID AS "id?: JobId",
                 NULL::JSONB AS "data_json?: JsonValue",
                 NULL::INT AS "attempt_index?",
                 NULL::VARCHAR AS "queue_id?",
-                mw.wait_time AS "max_wait?: PgInterval"
-            FROM min_wait mw
-            WHERE NOT EXISTS (SELECT 1 FROM updated)
+                mw.next_due_at AS "next_due_at?",
+                os.may_have_more AS "may_have_more!"
+            FROM min_wait mw, overscan_status os
         ) AS result
         "#,
         n_jobs_to_poll as i32,
@@ -1106,10 +1082,33 @@ async fn poll_jobs(
     Ok(JobPollResult::from_rows(rows))
 }
 
+/// Whether the poller may sleep on `next_due_at`, or must re-poll
+/// immediately because this poll couldn't see the full due backlog.
+#[derive(Debug, Clone, Copy)]
+struct PollWindow {
+    next_due_at: Option<DateTime<Utc>>,
+    may_have_more: bool,
+}
+
+impl PollWindow {
+    /// Sleep duration for a fresh `now` read at the point of use.
+    fn sleep_for(&self, now: DateTime<Utc>) -> Duration {
+        if self.may_have_more {
+            Duration::ZERO
+        } else {
+            duration_until(self.next_due_at, now)
+        }
+    }
+}
+
 #[derive(Debug)]
 enum JobPollResult {
-    Jobs(Vec<PolledJob>),
-    WaitTillNextJob(Duration),
+    /// `window.next_due_at` is `None` when nothing else is pending for these types.
+    Jobs {
+        jobs: Vec<PolledJob>,
+        window: PollWindow,
+    },
+    WaitTillNextJob(PollWindow),
 }
 
 #[derive(Debug)]
@@ -1118,49 +1117,45 @@ struct JobPollRow {
     data_json: Option<JsonValue>,
     attempt_index: Option<i32>,
     queue_id: Option<String>,
-    max_wait: Option<PgInterval>,
+    next_due_at: Option<DateTime<Utc>>,
+    may_have_more: bool,
 }
 
 impl JobPollResult {
-    /// Convert raw query rows into a JobPollResult
+    /// Convert raw query rows into a JobPollResult. The min-wait row (`id`
+    /// NULL) is present in every result set; row order is not assumed.
     pub fn from_rows(rows: Vec<JobPollRow>) -> Self {
-        if rows.is_empty() {
-            JobPollResult::WaitTillNextJob(MAX_WAIT)
-        } else if rows.len() == 1 && rows[0].id.is_none() {
-            if let Some(interval) = &rows[0].max_wait {
-                JobPollResult::WaitTillNextJob(pg_interval_to_duration(interval))
-            } else {
-                JobPollResult::WaitTillNextJob(MAX_WAIT)
+        let mut jobs = Vec::with_capacity(rows.len());
+        let mut window = PollWindow {
+            next_due_at: None,
+            may_have_more: false,
+        };
+        for row in rows {
+            window.may_have_more = row.may_have_more;
+            match (row.id, row.attempt_index) {
+                (Some(id), Some(attempt_index)) => jobs.push(PolledJob {
+                    id,
+                    data_json: row.data_json,
+                    attempt: attempt_index as u32,
+                    queue_id: row.queue_id,
+                }),
+                _ => window.next_due_at = row.next_due_at,
             }
+        }
+        if jobs.is_empty() {
+            JobPollResult::WaitTillNextJob(window)
         } else {
-            let jobs = rows
-                .into_iter()
-                .filter_map(|row| {
-                    if let (Some(id), Some(attempt_index)) = (row.id, row.attempt_index) {
-                        Some(PolledJob {
-                            id,
-                            data_json: row.data_json,
-                            attempt: attempt_index as u32,
-                            queue_id: row.queue_id,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            JobPollResult::Jobs(jobs)
+            JobPollResult::Jobs { jobs, window }
         }
     }
 }
 
-fn pg_interval_to_duration(interval: &PgInterval) -> Duration {
-    const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
-    if interval.microseconds < 0 || interval.days < 0 || interval.months < 0 {
-        Duration::default()
-    } else {
-        let days = (interval.days as u64) + (interval.months as u64) * 30;
-        Duration::from_micros(interval.microseconds as u64)
-            + Duration::from_secs(days * SECONDS_PER_DAY)
+/// Sleep duration until `deadline`, clamped to zero if already past. `None`
+/// falls back to `MAX_WAIT`. Pass a `now` read as close as possible to use.
+fn duration_until(deadline: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Duration {
+    match deadline {
+        Some(at) => (at - now).to_std().unwrap_or(Duration::ZERO),
+        None => MAX_WAIT,
     }
 }
 
@@ -1391,6 +1386,109 @@ mod tests {
         .execute(pool)
         .await?;
         Ok(id)
+    }
+
+    async fn seed_pending_job(
+        pool: &PgPool,
+        job_type: &str,
+        execute_at: DateTime<Utc>,
+    ) -> anyhow::Result<JobId> {
+        let id = JobId::new();
+        let uuid = uuid::Uuid::from(id);
+        let now = chrono::Utc::now();
+        sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, $2, $3)")
+            .bind(uuid)
+            .bind(job_type)
+            .bind(now)
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, state, attempt_index, execute_at, alive_at, created_at) \
+             VALUES ($1, $2, 'pending', 1, $3, $4, $5)",
+        )
+        .bind(uuid)
+        .bind(job_type)
+        .bind(execute_at)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// A capped type's backlog can saturate the `due`/`locked` windows and
+    /// hide an uncapped type's due row; `may_have_more` must catch that.
+    #[tokio::test]
+    async fn may_have_more_when_capped_type_saturates_the_overscan_window() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let instance_id = uuid::Uuid::now_v7();
+        let type_a = format!("overscan-dominant-{}", uuid::Uuid::now_v7());
+        let type_b = format!("overscan-starved-{}", uuid::Uuid::now_v7());
+
+        // n_jobs_to_poll = 2 -> due overscan LIMIT = 8, locked LIMIT = 2.
+        let n_jobs_to_poll = 2usize;
+
+        // A: 10 due rows, all older than B's — saturates the overscan window alone.
+        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let mut a_ids = Vec::new();
+        for i in 0..10i64 {
+            a_ids
+                .push(seed_pending_job(&pool, &type_a, base + chrono::Duration::seconds(i)).await?);
+        }
+        // B: one due row, younger than all of A's but still due.
+        let b_id = seed_pending_job(
+            &pool,
+            &type_b,
+            chrono::Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await?;
+
+        let pollable_types = vec![
+            JobType::from_owned(type_a.clone()),
+            JobType::from_owned(type_b.clone()),
+        ];
+        // A capped to 1; B uncapped (row_limit = n_jobs_to_poll).
+        let row_limits = vec![1, n_jobs_to_poll as i32];
+        let clock = ClockHandle::realtime();
+
+        let result = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            instance_id,
+            &pollable_types,
+            &row_limits,
+            &[],
+            &[],
+            &clock,
+        )
+        .await?;
+
+        match result {
+            JobPollResult::Jobs { jobs, window } => {
+                assert_eq!(
+                    jobs.len(),
+                    1,
+                    "only A's single capped slot should be claimed this poll"
+                );
+                assert!(
+                    a_ids.contains(&jobs[0].id),
+                    "the one claimed row must be A's (oldest); B's row must \
+                     stay unclaimed, pushed out of the overscan window"
+                );
+                assert_ne!(jobs[0].id, b_id);
+                assert!(
+                    window.may_have_more,
+                    "the due/locked windows were saturated by A alone — B's \
+                     due row (and A's own remaining 9) are still out there, \
+                     unseen by this poll; min_wait cannot detect that, only \
+                     may_have_more can"
+                );
+            }
+            other => panic!("expected a partial Jobs claim, got {other:?}"),
+        }
+
+        Ok(())
     }
 
     #[tokio::test]

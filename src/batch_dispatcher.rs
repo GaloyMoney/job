@@ -328,9 +328,14 @@ impl BatchDispatcher {
         let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
         let rows = sqlx::query!(
             r#"
-            DELETE FROM job_executions
-            WHERE id = ANY($1) AND poller_instance_id = $2
-            RETURNING id AS "id!: JobId", queue_id
+            WITH deleted AS (
+                DELETE FROM job_executions
+                WHERE id = ANY($1) AND poller_instance_id = $2
+                RETURNING id, queue_id
+            ), cleanup AS (
+                DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+            )
+            SELECT id AS "id!: JobId", queue_id AS "queue_id?" FROM deleted
             "#,
             &uuids,
             self.instance_id,
@@ -485,9 +490,14 @@ impl BatchDispatcher {
         if !terminal_uuids.is_empty() {
             let rows = sqlx::query!(
                 r#"
-                DELETE FROM job_executions
-                WHERE id = ANY($1) AND poller_instance_id = $2
-                RETURNING id AS "id!: JobId", queue_id
+                WITH deleted AS (
+                    DELETE FROM job_executions
+                    WHERE id = ANY($1) AND poller_instance_id = $2
+                    RETURNING id, queue_id
+                ), cleanup AS (
+                    DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+                )
+                SELECT id AS "id!: JobId", queue_id AS "queue_id?" FROM deleted
                 "#,
                 &terminal_uuids,
                 self.instance_id,

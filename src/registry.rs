@@ -13,6 +13,7 @@ use super::{
     repo::JobRepo,
     runner::*,
     spawner::JobSpawner,
+    tracker::JobTracker,
 };
 
 /// Internal trait for storing initializers with erased Config type.
@@ -60,6 +61,15 @@ pub(crate) struct TypeConcurrency {
     pub global: Option<usize>,
 }
 
+/// One poll's per-type claim plan.
+pub(super) struct ClaimPlan {
+    pub types: Vec<JobType>,
+    pub row_limits: Vec<i32>,
+    /// The subset of `types` that also carries a global (cross-instance) cap.
+    pub global_cap_types: Vec<JobType>,
+    pub global_caps: Vec<i32>,
+}
+
 /// Keeps track of registered job types and their retry behaviour.
 pub struct JobRegistry {
     initializers: HashMap<JobType, Box<dyn AnyJobInitializer>>,
@@ -67,16 +77,18 @@ pub struct JobRegistry {
     batch_policies: HashMap<JobType, BatchPolicy>,
     concurrency: HashMap<JobType, TypeConcurrency>,
     retry_settings: HashMap<JobType, RetrySettings>,
+    tracker: Arc<JobTracker>,
 }
 
 impl JobRegistry {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(tracker: Arc<JobTracker>) -> Self {
         Self {
             initializers: HashMap::new(),
             batched_initializers: HashMap::new(),
             batch_policies: HashMap::new(),
             concurrency: HashMap::new(),
             retry_settings: HashMap::new(),
+            tracker,
         }
     }
 
@@ -197,6 +209,43 @@ impl JobRegistry {
             .map(|(job_type, _)| job_type.clone())
             .collect()
     }
+
+    /// Row limit for each registered type this poll. A type with no free
+    /// slot is dropped; global caps are split out but resolved in `poll_jobs`.
+    pub(super) fn plan_claim(&self, n_jobs_to_poll: usize) -> ClaimPlan {
+        let mut types = Vec::new();
+        let mut row_limits = Vec::new();
+        let mut global_cap_types = Vec::new();
+        let mut global_caps = Vec::new();
+        for job_type in self.registered_job_types() {
+            let limit = match self.batch_policy(&job_type) {
+                Some(policy) => policy
+                    .max_concurrent_per_process
+                    .saturating_sub(self.tracker.units_in_flight(&job_type))
+                    .saturating_mul(policy.max_batch_size),
+                None => match self.per_process_cap(&job_type) {
+                    Some(cap) => cap.saturating_sub(self.tracker.units_in_flight(&job_type)),
+                    None => n_jobs_to_poll,
+                },
+            };
+            let limit = limit.min(n_jobs_to_poll);
+            if limit == 0 {
+                continue;
+            }
+            if let Some(cap) = self.global_cap(&job_type) {
+                global_cap_types.push(job_type.clone());
+                global_caps.push(cap as i32);
+            }
+            types.push(job_type);
+            row_limits.push(limit as i32);
+        }
+        ClaimPlan {
+            types,
+            row_limits,
+            global_cap_types,
+            global_caps,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,7 +282,7 @@ mod tests {
     /// permanently starving a type.
     #[test]
     fn zero_cap_is_clamped_to_one() {
-        let mut registry = JobRegistry::new();
+        let mut registry = JobRegistry::new(Arc::new(JobTracker::new(0, 10)));
         let job_type = registry.add_initializer(ZeroCapInitializer);
 
         assert_eq!(registry.per_process_cap(&job_type), Some(1));
