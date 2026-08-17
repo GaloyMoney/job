@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM job_executions\n            WHERE id = ANY($1) AND state = 'pending' AND poller_instance_id IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "adcd0bcd151c500c4fd5aeb9223ea73ac36274b90d8d564193d98a04feb34758"
+}

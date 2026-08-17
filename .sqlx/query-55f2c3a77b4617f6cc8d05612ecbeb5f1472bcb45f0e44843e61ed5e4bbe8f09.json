@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id AS \"id!: JobId\"\n        FROM job_executions\n        WHERE poller_instance_id = $1 AND state = 'running'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: JobId",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "55f2c3a77b4617f6cc8d05612ecbeb5f1472bcb45f0e44843e61ed5e4bbe8f09"
+}

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE job_executions\n            SET state = 'pending', execute_at = $3, poller_instance_id = NULL\n            WHERE id = $1 AND poller_instance_id = $2 AND state = 'running'\n            RETURNING attempt_index\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "attempt_index",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d0a6e291fccb06d4d06dbb146517ff4a543eafb0250a8ca03b106d0014eab8ac"
+}
