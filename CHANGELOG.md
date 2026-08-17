@@ -1,3 +1,11 @@
+# [job release v0.11.0](https://github.com/GaloyMoney/job/releases/tag/0.11.0)
+
+
+
+### Performance
+
+- [**breaking**] Checkpoint-table split + poll-cadence decoupling (#168)
+
 # [job release v0.10.0](https://github.com/GaloyMoney/job/releases/tag/0.10.0)
 
 
