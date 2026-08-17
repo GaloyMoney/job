@@ -1,6 +1,6 @@
 //! [`JobSnapshot`] — a point-in-time view of a job, pairing the durable
-//! [`Job`] entity with an optional `JobExecutionRow` and delegating every
-//! accessor to them.
+//! [`Job`] entity with an optional `JobExecutionRow` and delegating most
+//! accessors to them.
 
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -13,19 +13,35 @@ use crate::{
 /// A point-in-time view of a job, produced by [`JobHandle::load`](crate::JobHandle::load).
 ///
 /// It pairs the durable [`Job`] entity with an optional `JobExecutionRow`
-/// (present until the job is terminal) and delegates every accessor to them —
-/// so one `load()` does a single pair of committed reads (within one op, so
-/// the two are consistent) and every getter below is then synchronous (only
-/// decoding can fail). Nothing is cached on the handle: a fresh `load()`
-/// always reflects the latest committed state.
+/// (present until the job is terminal) and delegates most accessors to
+/// them — so one `load()` does a small, fixed number of committed reads
+/// (within one op, so they're consistent) and every getter below is then
+/// synchronous (only decoding can fail). Nothing is cached on the handle: a
+/// fresh `load()` always reflects the latest committed state.
+///
+/// [`Self::execution_state`] is read independently of `row`: a regular or
+/// resident job's state is deleted alongside its execution row on terminal,
+/// but a **keyed** job's state is retained (see
+/// [`KeyedJobInitializer::inherits_state`](crate::KeyedJobInitializer::inherits_state))
+/// and must stay readable after terminal too — which `row` alone, being
+/// `None` once terminal, cannot express.
 pub struct JobSnapshot {
     job: Job,
     row: Option<JobExecutionRow>,
+    execution_state_json: Option<serde_json::Value>,
 }
 
 impl JobSnapshot {
-    pub(crate) fn from_parts(job: Job, row: Option<JobExecutionRow>) -> Self {
-        Self { job, row }
+    pub(crate) fn from_parts(
+        job: Job,
+        row: Option<JobExecutionRow>,
+        execution_state_json: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            job,
+            row,
+            execution_state_json,
+        }
     }
 
     /// The runtime [`JobStatus`] at load time. `Pending`/`Running` come from
@@ -67,8 +83,9 @@ impl JobSnapshot {
         self.job.queue_id.as_deref()
     }
 
-    /// The singleton key this job was spawned under, if any (see
-    /// [`JobSpawner::spawn_keyed`](crate::JobSpawner::spawn_keyed)).
+    /// The key this job was spawned under, if it's a keyed job (see
+    /// [`KeyedJobSpawner::spawn`](crate::KeyedJobSpawner::spawn)). `None`
+    /// for regular and resident jobs — resident jobs never carry a key.
     pub fn unique_key(&self) -> Option<&str> {
         self.job.unique_key.as_deref()
     }
@@ -85,12 +102,16 @@ impl JobSnapshot {
 
     /// Decode the job's committed execution state as `S`.
     ///
-    /// Honest absence: `Ok(None)` when no state has been written yet or the
-    /// execution row is gone (terminal job). Mirrors
-    /// [`CurrentJob::execution_state`](crate::CurrentJob::execution_state).
+    /// Honest absence: `Ok(None)` when no state has been written yet, or
+    /// (for regular/resident jobs) once the job is terminal — their state
+    /// row is deleted alongside the execution row. A **keyed** job's state
+    /// is the exception: its row is retained on terminal, so this stays
+    /// `Some` for a keyed job even after completion — see
+    /// [`KeyedJobInitializer::inherits_state`](crate::KeyedJobInitializer::inherits_state).
+    /// Mirrors [`CurrentJob::execution_state`](crate::CurrentJob::execution_state).
     pub fn execution_state<S: DeserializeOwned>(&self) -> Result<Option<S>, serde_json::Error> {
-        match &self.row {
-            Some(row) => row.execution_state(),
+        match &self.execution_state_json {
+            Some(json) => serde_json::from_value(json.clone()).map(Some),
             None => Ok(None),
         }
     }

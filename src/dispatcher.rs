@@ -357,6 +357,15 @@ impl JobDispatcher {
     /// `fail_job`) don't need this: they always report unconditionally,
     /// since a job going back to `pending` is exactly the ordinary case every
     /// instance already polls for. Reports nothing when no row was deleted.
+    ///
+    /// The `job_execution_states` cleanup is conditional on `unique_key IS
+    /// NULL`: a KEYED job's state row is deliberately RETAINED here (rather
+    /// than deleted alongside its execution row) so it stays readable after
+    /// terminal and can seed the next generation under
+    /// `KeyedJobInitializer::inherits_state` (see `keyed.rs`) — the retained
+    /// row is compacted away at that key's next spawn. Every other flavor's
+    /// execution never carries a `unique_key`, so this changes nothing for
+    /// them.
     async fn delete_execution_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -368,9 +377,10 @@ impl JobDispatcher {
           WITH deleted AS (
               DELETE FROM job_executions
               WHERE id = $1 AND poller_instance_id = $2
-              RETURNING id, queue_id
+              RETURNING id, queue_id, unique_key
           ), cleanup AS (
-              DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+              DELETE FROM job_execution_states s USING deleted d
+              WHERE s.id = d.id AND d.unique_key IS NULL
           )
           SELECT queue_id AS "queue_id?" FROM deleted
         "#,

@@ -110,17 +110,36 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### Unique Jobs
+### Resident Jobs
 
-For singleton jobs where only one instance should exist at a time,
-use `spawn_unique`. This method consumes the spawner, enforcing at the type level that only one
-job of this type can be created:
+For a process-wide singleton that just keeps running — a poller, a periodic
+sweep — register with `add_resident_initializer` and spawn with
+`ResidentJobSpawner::spawn`. At most one job of the type EVER exists, and it
+can never complete (only reschedule) — a `ResidentJobRunner` returns
+`ResidentJobCompletion`, which has no `Complete` variant. `spawn` consumes
+the spawner, enforcing at the type level that only one job of this type can
+be created:
 
 ```rust
-let cleanup_spawner = jobs.add_initializer(CleanupInitializer);
+let cleanup_spawner = jobs.add_resident_initializer(CleanupInitializer);
 
 // Consumes spawner - can't accidentally spawn twice
-cleanup_spawner.spawn_unique(CleanupConfig::default()).await?;
+cleanup_spawner.spawn(CleanupConfig::default()).await?;
+```
+
+### Keyed Jobs
+
+For at-most-one-LIVE-per-key semantics — respawnable once the current
+generation finishes — register with `add_keyed_initializer` and spawn with
+`KeyedJobSpawner::spawn`:
+
+```rust
+let shard_spawner = jobs.add_keyed_initializer(ShardListenerInitializer);
+
+// One job per shard; re-spawning a live shard is a no-op that returns the
+// existing job's handle. Once a shard's job goes terminal, spawning it
+// again starts a new generation.
+shard_spawner.spawn(format!("shard-{shard_id}"), ShardConfig { shard_id }).await?;
 ```
 
 ### Parameterized Job Types

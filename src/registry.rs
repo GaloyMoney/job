@@ -8,9 +8,11 @@ use super::{
     batched::{AnyBatchedJobInitializer, AnyBatchedJobRunner, BatchedJobInitializer},
     entity::*,
     error::JobError,
+    keyed::{KeyedJobInitializer, KeyedJobSpawner},
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     repo::JobRepo,
+    resident::{ResidentJobInitializer, ResidentRunnerAdapter},
     runner::*,
     spawner::JobSpawner,
     tracker::JobTracker,
@@ -35,12 +37,73 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         &self,
         job: &Job,
         repo: Arc<JobRepo>,
+        _router: Arc<JobNotificationRouter>,
+        clock: ClockHandle,
+        notifier: Arc<JobEventNotifier>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), clock, notifier);
+        JobInitializer::init(self, job, spawner)
+    }
+}
+
+/// Erases a [`KeyedJobInitializer`] into an [`AnyJobInitializer`].
+///
+/// Can't be a second blanket `impl<T: KeyedJobInitializer> AnyJobInitializer
+/// for T` — that would conflict with the blanket impl over `JobInitializer`
+/// above (the compiler can't rule out one type implementing both traits).
+/// This newtype sidesteps the conflict: it's a distinct concrete type that
+/// implements `AnyJobInitializer` itself, wrapping the caller's initializer
+/// rather than blanket-extending its trait.
+pub(crate) struct ErasedKeyedInitializer<I> {
+    inner: I,
+    inherits_state: bool,
+}
+
+impl<I> ErasedKeyedInitializer<I> {
+    pub(crate) fn new(inner: I, inherits_state: bool) -> Self {
+        Self {
+            inner,
+            inherits_state,
+        }
+    }
+}
+
+impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
+    fn init(
+        &self,
+        job: &Job,
+        repo: Arc<JobRepo>,
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), router, clock, notifier);
-        JobInitializer::init(self, job, spawner)
+        let spawner = KeyedJobSpawner::<I::Config>::new(
+            repo,
+            self.inner.job_type(),
+            router,
+            clock,
+            notifier,
+            self.inherits_state,
+        );
+        KeyedJobInitializer::init(&self.inner, job, spawner)
+    }
+}
+
+/// Erases a [`ResidentJobInitializer`] into an [`AnyJobInitializer`]. See
+/// [`ErasedKeyedInitializer`] for why this can't be a blanket impl.
+pub(crate) struct ErasedResidentInitializer<I>(pub(crate) I);
+
+impl<I: ResidentJobInitializer> AnyJobInitializer for ErasedResidentInitializer<I> {
+    fn init(
+        &self,
+        job: &Job,
+        _repo: Arc<JobRepo>,
+        _router: Arc<JobNotificationRouter>,
+        _clock: ClockHandle,
+        _notifier: Arc<JobEventNotifier>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let runner = ResidentJobInitializer::init(&self.0, job)?;
+        Ok(Box::new(ResidentRunnerAdapter(runner)))
     }
 }
 
@@ -104,6 +167,50 @@ impl JobRegistry {
         self.initializers
             .insert(job_type.clone(), Box::new(initializer));
         self.concurrency.insert(job_type.clone(), concurrency);
+        self.retry_settings.insert(job_type.clone(), retry_settings);
+        job_type
+    }
+
+    /// Register a [`KeyedJobInitializer`] and its associated retry settings.
+    /// Returns the job type that was registered. Stored in the same
+    /// `initializers` map as [`add_initializer`](Self::add_initializer) —
+    /// dispatch is identical once erased.
+    pub fn add_keyed_initializer<I: KeyedJobInitializer>(&mut self, initializer: I) -> JobType {
+        let job_type = initializer.job_type();
+        let retry_settings = initializer.retry_on_error_settings();
+        let concurrency = TypeConcurrency {
+            per_process: initializer.max_concurrent_per_process().map(|c| c.max(1)),
+            global: initializer.max_concurrent_global().map(|c| c.max(1)),
+        };
+        let inherits_state = initializer.inherits_state();
+        self.initializers.insert(
+            job_type.clone(),
+            Box::new(ErasedKeyedInitializer::new(initializer, inherits_state)),
+        );
+        self.concurrency.insert(job_type.clone(), concurrency);
+        self.retry_settings.insert(job_type.clone(), retry_settings);
+        job_type
+    }
+
+    /// Register a [`ResidentJobInitializer`]. Returns the job type that was
+    /// registered. Retry is always eternal (`n_attempts: None`) regardless
+    /// of what [`ResidentJobInitializer::retry_on_error_settings`] returns —
+    /// a resident job can never be exhausted into a terminal error — and no
+    /// concurrency entry is created: at most one job of this type ever
+    /// exists, so there is nothing to cap.
+    pub fn add_resident_initializer<I: ResidentJobInitializer>(
+        &mut self,
+        initializer: I,
+    ) -> JobType {
+        let job_type = initializer.job_type();
+        let retry_settings = RetrySettings {
+            n_attempts: None,
+            ..initializer.retry_on_error_settings()
+        };
+        self.initializers.insert(
+            job_type.clone(),
+            Box::new(ErasedResidentInitializer(initializer)),
+        );
         self.retry_settings.insert(job_type.clone(), retry_settings);
         job_type
     }

@@ -547,11 +547,11 @@ impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
     fn init_erased(
         &self,
         repo: Arc<JobRepo>,
-        router: Arc<crate::notification_router::JobNotificationRouter>,
+        _router: Arc<crate::notification_router::JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<crate::notifier::JobEventNotifier>,
     ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error>> {
-        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), router, clock, notifier);
+        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), clock, notifier);
         let runner = BatchedJobInitializer::init(self, spawner)?;
         Ok(Box::new(ErasedBatchedRunner::new(runner)))
     }

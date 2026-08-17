@@ -326,6 +326,12 @@ impl BatchDispatcher {
             return Ok(());
         }
         let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
+        // Unlike `dispatcher.rs`'s per-job `delete_execution_in_op`, no
+        // `unique_key IS NULL` guard is needed here: batched jobs are never
+        // keyed (`KeyedJobInitializer` registers through `add_initializer`'s
+        // ordinary per-job dispatch path, not `add_batched_initializer`), so
+        // every execution row a batch ever deletes already has a NULL
+        // `unique_key` and this cleanup always applies.
         let rows = sqlx::query!(
             r#"
             WITH deleted AS (
@@ -488,6 +494,8 @@ impl BatchDispatcher {
         }
 
         if !terminal_uuids.is_empty() {
+            // See the comment in `complete_in_op` above: batched jobs are
+            // never keyed, so no `unique_key IS NULL` guard is needed here.
             let rows = sqlx::query!(
                 r#"
                 WITH deleted AS (

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM job_execution_states s\n            USING jobs j\n            WHERE s.id = j.id AND j.job_type = $1 AND j.unique_key = $2 AND j.id != $3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "577bf824d1c1090bfbe78aa1663fd5ac2451ca74b71ef1a48d7bcd6764266c19"
+}
