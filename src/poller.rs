@@ -72,10 +72,26 @@ pub(crate) struct JobPollerHandle {
     router_listener_handle: OwnedTaskHandle,
     #[allow(dead_code)]
     router_waiter_handle: OwnedTaskHandle,
+    shutdown: Arc<ShutdownCoordinator>,
+}
+
+/// Drives the shutdown sequence for one poller instance.
+///
+/// Shared behind an `Arc` so the explicit [`JobPollerHandle::shutdown`] call and
+/// the drop path run the identical sequence, guarded by the same
+/// `shutdown_called` flag.
+struct ShutdownCoordinator {
     shutdown_tx: tokio::sync::broadcast::Sender<
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
-    shutdown_called: Arc<AtomicBool>,
+    /// Tells `main_loop` to stop polling. Separate from `shutdown_tx` on
+    /// purpose: the poll loop must be stopped and *drained* before the monitors
+    /// are signalled (see [`ShutdownCoordinator::perform`]).
+    poll_stop_tx: tokio::sync::watch::Sender<bool>,
+    /// Flipped by `main_loop` once it has left the loop. A dropped sender (the
+    /// task was aborted or panicked) counts as "exited" too.
+    poll_exited_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_called: AtomicBool,
     shutdown_timeout: Duration,
     max_jobs_per_process: usize,
     repo: Arc<JobRepo>,
@@ -129,11 +145,15 @@ impl JobPoller {
         let shutdown_timeout = self.config.shutdown_timeout;
         let max_jobs_per_process = self.config.max_jobs_per_process;
         let clock = self.clock.clone();
+        let (poll_stop_tx, poll_stop_rx) = tokio::sync::watch::channel(false);
+        let (poll_exited_tx, poll_exited_rx) = tokio::sync::watch::channel(false);
         let executor = Arc::new(self);
         let handle = OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-main-loop",
             Self::main_loop(
                 Arc::clone(&executor),
+                poll_stop_rx,
+                poll_exited_tx,
                 lost_handle,
                 keep_alive_handle,
                 stale_jobs_handle,
@@ -144,29 +164,48 @@ impl JobPoller {
             handle,
             router_listener_handle,
             router_waiter_handle,
-            shutdown_tx,
-            shutdown_called: Arc::new(AtomicBool::new(false)),
-            repo,
-            instance_id,
-            shutdown_timeout,
-            max_jobs_per_process,
-            clock,
+            shutdown: Arc::new(ShutdownCoordinator {
+                shutdown_tx,
+                poll_stop_tx,
+                poll_exited_rx,
+                shutdown_called: AtomicBool::new(false),
+                repo,
+                instance_id,
+                shutdown_timeout,
+                max_jobs_per_process,
+                clock,
+            }),
         }
     }
 
+    /// Claim-and-dispatch loop.
+    ///
+    /// Stopping is driven by `poll_stop_rx` — a `watch`, not the
+    /// `shutdown_tx` broadcast, because the stop must *latch*: a
+    /// `poll_and_dispatch()` already in flight when the signal lands has to see
+    /// it on the very next check rather than miss a one-shot notification. The
+    /// loop leaves an in-flight poll intact (every row it claimed still gets
+    /// dispatched, so no claim is stranded in `state='running'`) and then flips
+    /// `poll_exited_tx`, which is what
+    /// [`ShutdownCoordinator::perform`] waits for before signalling the
+    /// monitors.
     async fn main_loop(
         self: Arc<Self>,
+        mut poll_stop_rx: tokio::sync::watch::Receiver<bool>,
+        poll_exited_tx: tokio::sync::watch::Sender<bool>,
         _lost_task: OwnedTaskHandle,
         _keep_alive_task: OwnedTaskHandle,
         _stale_jobs_task: OwnedTaskHandle,
     ) {
         let mut failures = 0;
         let mut woken_up = false;
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let debounce = self.config.poll_debounce;
         let mut last_poll = std::time::Instant::now();
 
         loop {
+            if *poll_stop_rx.borrow_and_update() {
+                break;
+            }
             if woken_up {
                 let since = last_poll.elapsed();
                 if since < debounce {
@@ -195,7 +234,7 @@ impl JobPoller {
             tokio::select! {
                 biased;
 
-                _ = shutdown_rx.recv() => {
+                _ = poll_stop_rx.changed() => {
                     break;
                 }
                 result = self.clock.timeout(timeout, self.tracker.notified()) => {
@@ -203,6 +242,9 @@ impl JobPoller {
                 }
             }
         }
+
+        // Reported after the loop is provably done claiming rows.
+        let _ = poll_exited_tx.send(true);
     }
 
     #[instrument(
@@ -1170,131 +1212,182 @@ impl JobPollerHandle {
     ///
     /// If not called manually, it will be called automatically when the handle is dropped.
     pub async fn shutdown(&self) -> Result<(), JobError> {
-        perform_shutdown(
-            self.shutdown_tx.clone(),
-            Arc::clone(&self.repo),
-            self.instance_id,
-            self.shutdown_called.clone(),
-            self.shutdown_timeout,
-            self.max_jobs_per_process,
-            self.clock.clone(),
-        )
-        .await
+        self.shutdown.perform().await
     }
 }
 
 impl Drop for JobPollerHandle {
     fn drop(&mut self) {
-        let shutdown_tx = self.shutdown_tx.clone();
-        let repo = Arc::clone(&self.repo);
-        let instance_id = self.instance_id;
-        let shutdown_called = self.shutdown_called.clone();
-        let shutdown_timeout = self.shutdown_timeout;
-        let max_jobs_per_process = self.max_jobs_per_process;
-        let clock = self.clock.clone();
-
+        let shutdown = Arc::clone(&self.shutdown);
         spawn_named_task!("job-poller-shutdown-on-drop", async move {
-            let _ = perform_shutdown(
-                shutdown_tx,
-                repo,
-                instance_id,
-                shutdown_called,
-                shutdown_timeout,
-                max_jobs_per_process,
-                clock,
-            )
-            .await;
+            let _ = shutdown.perform().await;
         });
     }
 }
 
-#[instrument(
-    name = "jobs.perform_shutdown",
-    skip(shutdown_tx, repo, clock),
-    fields(n_jobs, instance_id = %instance_id, broadcast_ok, n_responses)
-)]
-async fn perform_shutdown(
-    shutdown_tx: tokio::sync::broadcast::Sender<
-        tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
-    >,
-    repo: Arc<JobRepo>,
-    instance_id: uuid::Uuid,
-    shutdown_called: Arc<AtomicBool>,
-    shutdown_timeout: Duration,
-    max_jobs_per_process: usize,
-    clock: ClockHandle,
-) -> Result<(), JobError> {
-    if shutdown_called
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    let (send, mut recv) =
-        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Receiver<()>>(max_jobs_per_process);
-
-    let broadcast_ok = shutdown_tx.send(send).is_ok();
-    tracing::Span::current().record("broadcast_ok", broadcast_ok);
-
-    if broadcast_ok {
-        let mut receivers = Vec::with_capacity(max_jobs_per_process);
-        let receive_timeout = Duration::from_millis(100);
-
-        tracing::info!("Starting to collect shutdown acknowledgements from job monitors");
-
-        loop {
-            match tokio::time::timeout(receive_timeout, recv.recv()).await {
-                Ok(Some(oneshot_rx)) => {
-                    receivers.push(oneshot_rx);
-                    tracing::info!(
-                        n_collected = receivers.len(),
-                        "Received acknowledgement from monitor task"
-                    );
-                }
-                Ok(None) => {
-                    tracing::info!(
-                        n_collected = receivers.len(),
-                        "Channel closed, all monitors responded"
-                    );
-                    break;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        n_collected = receivers.len(),
-                        "Receive timeout expired, moving on with collected responses"
-                    );
-                    break;
-                }
-            }
-        }
-
-        tracing::Span::current().record("n_responses", receivers.len());
-
-        tracing::info!(
-            n_responses = receivers.len(),
-            "Waiting for all acknowledged jobs to complete"
-        );
-
-        if tokio::time::timeout(shutdown_timeout, futures::future::join_all(receivers))
-            .await
+impl ShutdownCoordinator {
+    /// Shut this instance's poller down, in an order that keeps the drain
+    /// honest:
+    ///
+    /// 1. **Stop the poll loop and wait for it to exit.** Nothing new can be
+    ///    claimed or dispatched after this point, so the set of live executions
+    ///    is final. Doing this *before* step 2 is what makes the ack collection
+    ///    complete: `tokio::sync::broadcast` only delivers to receivers that
+    ///    subscribed before `send`, so a generation dispatched after the
+    ///    broadcast would never see the signal, never ack, never be waited
+    ///    for — and would then be force-aborted mid-flight by
+    ///    [`kill_remaining_jobs`], racing its own completion write on the same
+    ///    `Job` aggregate (`ConcurrentModification`, with the loser's execution
+    ///    outcome discarded).
+    /// 2. Broadcast to the monitor tasks and collect their acks.
+    /// 3. Wait for every acked execution to finish.
+    /// 4. Force-reschedule whatever is genuinely still `running`.
+    #[instrument(
+        name = "jobs.perform_shutdown",
+        skip(self),
+        fields(
+            instance_id = %self.instance_id,
+            poll_loop_stopped,
+            broadcast_ok,
+            n_responses
+        )
+    )]
+    async fn perform(&self) -> Result<(), JobError> {
+        if self
+            .shutdown_called
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            tracing::warn!("Some jobs did not signal completion within shutdown timeout");
-        } else {
-            tracing::info!("All acknowledged jobs completed");
+            return Ok(());
         }
-    } else {
-        // No active subscribers - wait for the shutdown timeout anyway
-        // to give jobs a chance to complete gracefully
-        tracing::warn!("No active shutdown subscribers, waiting for shutdown timeout");
-        tokio::time::sleep(shutdown_timeout).await;
+
+        let poll_loop_stopped = self.stop_poll_loop().await;
+        tracing::Span::current().record("poll_loop_stopped", poll_loop_stopped);
+
+        let (send, mut recv) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Receiver<()>>(
+            self.max_jobs_per_process,
+        );
+
+        let broadcast_ok = self.shutdown_tx.send(send).is_ok();
+        tracing::Span::current().record("broadcast_ok", broadcast_ok);
+
+        if broadcast_ok {
+            let mut receivers = Vec::with_capacity(self.max_jobs_per_process);
+            let receive_timeout = Duration::from_millis(100);
+
+            tracing::info!("Starting to collect shutdown acknowledgements from job monitors");
+
+            loop {
+                match tokio::time::timeout(receive_timeout, recv.recv()).await {
+                    Ok(Some(oneshot_rx)) => {
+                        receivers.push(oneshot_rx);
+                        tracing::info!(
+                            n_collected = receivers.len(),
+                            "Received acknowledgement from monitor task"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::info!(
+                            n_collected = receivers.len(),
+                            "Channel closed, all monitors responded"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            n_collected = receivers.len(),
+                            "Receive timeout expired, moving on with collected responses"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            tracing::Span::current().record("n_responses", receivers.len());
+
+            tracing::info!(
+                n_responses = receivers.len(),
+                "Waiting for all acknowledged jobs to complete"
+            );
+
+            if tokio::time::timeout(self.shutdown_timeout, futures::future::join_all(receivers))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Some jobs did not signal completion within shutdown timeout");
+            } else {
+                tracing::info!("All acknowledged jobs completed");
+            }
+        } else {
+            // No subscribers left. With the poll loop already stopped and
+            // drained (step 1) that means there is no live execution to wait
+            // for — every monitor task holds a subscription for as long as its
+            // execution runs — so there is nothing to give a grace period to.
+            tracing::info!("No live job monitors at shutdown, nothing to drain");
+        }
+
+        kill_remaining_jobs(Arc::clone(&self.repo), self.instance_id, self.clock.clone()).await
     }
 
-    kill_remaining_jobs(repo, instance_id, clock).await
+    /// Signal `main_loop` to stop and wait until it has actually exited.
+    ///
+    /// Returns `false` if the loop did not report back within
+    /// `shutdown_timeout` — the shutdown then continues regardless, since
+    /// [`kill_remaining_jobs`] still releases whatever the poller left claimed;
+    /// a wedged poll must not wedge shutdown.
+    ///
+    /// A dropped `poll_exited` sender resolves this immediately: the loop's task
+    /// is gone (aborted with the handle, or panicked), which is as stopped as it
+    /// gets.
+    async fn stop_poll_loop(&self) -> bool {
+        let _ = self.poll_stop_tx.send(true);
+
+        let mut exited_rx = self.poll_exited_rx.clone();
+        let exited = async {
+            loop {
+                let already_exited = *exited_rx.borrow_and_update();
+                if already_exited {
+                    return;
+                }
+                if exited_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+
+        match tokio::time::timeout(self.shutdown_timeout, exited).await {
+            Ok(()) => {
+                tracing::info!("Poll loop stopped, no further jobs will be dispatched");
+                true
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Poll loop did not stop within shutdown timeout, continuing shutdown"
+                );
+                false
+            }
+        }
+    }
 }
 
-#[instrument(name = "jobs.kill_remaining_jobs", skip(repo, clock), fields(instance_id = %instance_id, n_killed = tracing::field::Empty))]
+/// Release every execution this instance still holds, and record the forced
+/// reschedule on each `Job`.
+///
+/// The `UPDATE` runs first and inside `op`, so by the time anything is read the
+/// transaction already holds a row lock on every execution it is about to
+/// abort. The entity read then happens **in the same op** (not on a separate
+/// pool connection): every execution-path writer — `complete_job`,
+/// `reschedule_job`, the retry branch of `fail_job` — writes its
+/// `job_executions` row before appending its events, so those locks fence them
+/// out and the version snapshot read here cannot go stale under them.
+///
+/// Writers that touch a `Job` *without* its execution row (`set_result`) are not
+/// fenced by those locks, so each entity write additionally gets its own
+/// `SAVEPOINT`: a lost race rolls back that one row's audit events instead of
+/// failing the whole shutdown, and the release itself — the part that decides
+/// whether the job is schedulable again — is already durable in the same
+/// transaction either way.
+#[instrument(name = "jobs.kill_remaining_jobs", skip(repo, clock), fields(instance_id = %instance_id, n_killed = tracing::field::Empty, n_conflicts = tracing::field::Empty))]
 async fn kill_remaining_jobs(
     repo: Arc<JobRepo>,
     instance_id: uuid::Uuid,
@@ -1330,8 +1423,10 @@ async fn kill_remaining_jobs(
         .collect();
 
     let ids: Vec<JobId> = attempt_map.keys().copied().collect();
-    let entities = repo.find_all::<crate::Job>(&ids).await?;
+    let entities: std::collections::HashMap<JobId, crate::Job> =
+        repo.find_all_in_op(&mut op, &ids).await?;
 
+    let mut n_conflicts = 0usize;
     for (job_id, mut job) in entities {
         let attempt_index = attempt_map[&job_id];
 
@@ -1343,8 +1438,24 @@ async fn kill_remaining_jobs(
         );
 
         job.abort_execution("killed job".to_string(), now, attempt_index);
-        repo.update_in_op(&mut op, &mut job).await?;
+        if let Err(e) = op
+            .with_savepoint(async |sp| repo.update_in_op(sp, &mut job).await)
+            .await?
+        {
+            // The row is released regardless (that write is outside this
+            // savepoint), so the job stays schedulable; only its abort audit
+            // trail is missing.
+            n_conflicts += 1;
+            tracing::warn!(
+                job_id = %job_id,
+                attempt = attempt_index,
+                exception.message = %e,
+                exception.type = std::any::type_name_of_val(&e),
+                "Could not record forced reschedule; execution row released anyway"
+            );
+        }
     }
+    tracing::Span::current().record("n_conflicts", n_conflicts);
     op.commit().await?;
     Ok(())
 }
@@ -1356,6 +1467,117 @@ mod tests {
     async fn init_pool() -> anyhow::Result<PgPool> {
         let pg_con = std::env::var("PG_CON").unwrap();
         Ok(sqlx::PgPool::connect(&pg_con).await?)
+    }
+
+    /// Seed a real `Job` aggregate (events and all) plus a `running` execution
+    /// row owned by `instance_id` — what a live execution looks like to
+    /// [`kill_remaining_jobs`].
+    async fn seed_running_entity(
+        pool: &PgPool,
+        repo: &JobRepo,
+        job_type: &str,
+        instance_id: uuid::Uuid,
+    ) -> anyhow::Result<JobId> {
+        let id = JobId::new();
+        let new_job = crate::entity::NewJob::builder()
+            .id(id)
+            .job_type(JobType::from_owned(job_type.to_string()))
+            .config(serde_json::json!({}))?
+            .build()
+            .expect("build NewJob");
+        repo.create(new_job).await?;
+
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, state, poller_instance_id, attempt_index, alive_at, created_at) \
+             VALUES ($1, $2, 'running', $3, 1, $4, $4)",
+        )
+        .bind(uuid::Uuid::from(id))
+        .bind(job_type)
+        .bind(instance_id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Block until some backend on this database is waiting on a lock.
+    ///
+    /// The synchronisation point for the test below: it makes the interleaving
+    /// an observed fact rather than a timing assumption — no sleeping until the
+    /// race "probably" happened.
+    async fn wait_for_blocked_backend(pool: &PgPool) -> anyhow::Result<()> {
+        for _ in 0..600 {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await?;
+            if blocked > 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::bail!("no backend ever blocked on a lock");
+    }
+
+    /// `kill_remaining_jobs` must survive losing a version race on a `Job` it is
+    /// force-rescheduling — the failure lana PR #8282 saw escape
+    /// `Jobs::shutdown()` as `JobModifyError - ConcurrentModification`.
+    ///
+    /// The concurrent writer here has `set_result`'s shape: it appends to the
+    /// `Job` without touching the execution row, so the row locks
+    /// `kill_remaining_jobs` holds do not fence it out. It claims the entity's
+    /// next event sequence first and commits while the kill is mid-flight, so
+    /// the kill's own append is the one that collides.
+    ///
+    /// Releasing the execution row is what must survive: the job has to stay
+    /// schedulable, and shutdown must not fail because one audit append lost a
+    /// race.
+    #[tokio::test]
+    async fn kill_remaining_jobs_survives_losing_a_concurrent_entity_write() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = Arc::new(JobRepo::new(&pool));
+        let clock = ClockHandle::realtime();
+        let instance_id = uuid::Uuid::now_v7();
+        let job_type = format!("kill-race-{}", uuid::Uuid::now_v7());
+
+        let id = seed_running_entity(&pool, &repo, &job_type, instance_id).await?;
+
+        // The competing writer: entity append staged, not yet committed, so it
+        // owns the next event sequence.
+        let mut writer_op = repo.begin_op_with_clock(&clock).await?;
+        let mut job = repo.find_by_id_in_op(&mut writer_op, id).await?;
+        let return_value = crate::outcome::JobReturnValue::try_from(&"progress")?;
+        assert!(job.update_return_value(return_value).did_execute());
+        repo.update_in_op(&mut writer_op, &mut job).await?;
+
+        // The kill blocks on that staged sequence...
+        let kill = tokio::spawn(kill_remaining_jobs(
+            Arc::clone(&repo),
+            instance_id,
+            clock.clone(),
+        ));
+        wait_for_blocked_backend(&pool).await?;
+
+        // ...and only now does the competing write become the winner.
+        writer_op.commit().await?;
+
+        kill.await?
+            .expect("shutdown must not fail because a forced-reschedule append lost a race");
+
+        let row: (String, Option<uuid::Uuid>) = sqlx::query_as(
+            "SELECT state::text, poller_instance_id FROM job_executions WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(id))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.0, "pending", "execution must be released for reclaim");
+        assert_eq!(row.1, None, "released execution must not stay owned");
+
+        Ok(())
     }
 
     async fn seed_running_job(
