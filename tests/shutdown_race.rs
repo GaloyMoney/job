@@ -8,14 +8,12 @@
 //! `facility_matures_on_end_of_day` (the maturity job `set_result`s its failed
 //! count exactly as the test tears the poller down).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobType, JobSvcConfig, Jobs,
+    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobPollerConfig, JobRunner, JobSpawner,
+    JobStatus, JobSvcConfig, JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -80,22 +78,21 @@ async fn shutdown_survives_concurrent_set_result_storm() -> anyhow::Result<()> {
         let pool = helpers::init_pool().await?;
         let config = JobSvcConfig::builder()
             .pool(pool)
-            .shutdown_timeout(Duration::from_millis(10))
+            .poller_config(JobPollerConfig {
+                shutdown_timeout: Duration::from_millis(10),
+                ..Default::default()
+            })
             .build()
             .expect("Failed to build JobsConfig");
 
         let mut jobs = Jobs::init(config).await?;
-        let _spawner = jobs.add_initializer(BusyJobInitializer);
+        let spawner = jobs.add_initializer(BusyJobInitializer);
         jobs.start_poll().await?;
 
         let job_id = JobId::new();
-        let _spawner = jobs.add_initializer(BusyJobInitializer);
-        let handle = {
-            let mut spawner = jobs.spawner(BusyJobInitializer).expect("spawner");
-            spawner
-                .spawn_at(job_id, BusyJobConfig { iterations: 2_000 })
-                .await?
-        };
+        let job = spawner
+            .spawn(job_id, BusyJobConfig { iterations: 2_000 })
+            .await?;
 
         // Let the runner get well into its set_result loop, then tear the
         // poller down right on top of it.
@@ -105,13 +102,12 @@ async fn shutdown_survives_concurrent_set_result_storm() -> anyhow::Result<()> {
         // Whatever interleaving won: the job is either terminal, or cleanly
         // rescheduled (aborted, pending, unowned) for a later poller — never
         // wedged running with no owner.
-        let snapshot = handle.load().await?;
-        match snapshot.status() {
-            job::JobStatus::Running => {
+        let snapshot = jobs.handle(job.id).load().await?;
+        match snapshot.state() {
+            JobStatus::Running { .. } => {
                 panic!("round {round}: job must not be left Running after shutdown");
             }
-            job::JobStatus::Pending(_) | job::JobStatus::Completed | job::JobStatus::Errored => {}
-            other => panic!("round {round}: unexpected status {other:?}"),
+            JobStatus::Pending { .. } | JobStatus::Completed { .. } | JobStatus::Errored { .. } => {}
         }
     }
     Ok(())
