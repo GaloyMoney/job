@@ -2584,19 +2584,12 @@ async fn execution_state_none_before_first_write_then_roundtrips() -> anyhow::Re
     Ok(())
 }
 
-// -- Checkpoint-table split (job-dev:handoff-poll-cost-and-cadence.md, D1/D2) --
-//
-// `execution_state_json` moved off `job_executions` into its own
-// `job_execution_states` table, cleaned up by an explicit CTE delete
-// piggybacked on every `job_executions` DELETE (dispatcher.rs, batch_dispatcher.rs
-// x2). The public API (asserted above, unchanged) can't prove the cleanup
-// actually happened: once the `job_executions` row is gone, `execution_state()`
-// reports `None` via the LEFT JOIN regardless of whether `job_execution_states`
-// was ever cleaned up. These tests assert directly against the checkpoint
-// table so a leak in any of the three delete sites is caught (D2 guard).
+// The public API can't prove `job_execution_states` cleanup happened, since
+// `execution_state()` reports `None` once `job_executions` is gone either
+// way. These tests assert directly against the checkpoint table.
 
-/// D2 leak guard, completed path: a plain job's checkpoint row exists while
-/// running and is gone the instant the terminal DELETE commits.
+/// A plain job's checkpoint row exists while running and is gone the instant
+/// the terminal DELETE commits.
 #[tokio::test]
 async fn checkpoint_row_deleted_on_terminal() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -2654,8 +2647,7 @@ async fn checkpoint_row_deleted_on_terminal() -> anyhow::Result<()> {
 #[derive(Debug, Serialize, Deserialize)]
 struct StateWritingFailingConfig;
 
-/// A runner that writes a checkpoint then always fails; paired with
-/// `n_attempts: Some(1)` this reaches errored-terminal on its first attempt.
+/// Writes a checkpoint then always fails; reaches errored-terminal on its first attempt.
 struct StateWritingFailingInitializer {
     job_type: JobType,
     wrote: Arc<Notify>,
@@ -2704,9 +2696,7 @@ impl JobRunner for StateWritingFailingRunner {
     }
 }
 
-/// D2 leak guard, errored-terminal path: same delete site as the completed
-/// path (`JobDispatcher::delete_execution_in_op`), reached via `fail_job`
-/// once retries are exhausted rather than via `complete_job`.
+/// A checkpoint row is also deleted on the errored-terminal path.
 #[tokio::test]
 async fn checkpoint_row_deleted_on_errored_terminal() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -2748,9 +2738,7 @@ async fn checkpoint_row_deleted_on_errored_terminal() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A runner whose first attempt checkpoints then fails; the retry attempt
-/// records whatever `execution_state` it observes so the test can assert the
-/// checkpoint survived the failed attempt.
+/// First attempt checkpoints then fails; the retry records what it observes.
 struct CheckpointThenFailOnceInitializer {
     job_type: JobType,
     seen_on_retry: Arc<Mutex<Option<CheckpointState>>>,
@@ -2805,9 +2793,7 @@ impl JobRunner for CheckpointThenFailOnceRunner {
     }
 }
 
-/// The checkpoint written on attempt 1 must still be readable on attempt 2:
-/// a retry keeps the execution row (and with it the checkpoint row) alive,
-/// unlike the terminal paths above.
+/// A checkpoint written on attempt 1 must still be readable on the retry.
 #[tokio::test]
 async fn checkpoint_survives_retry() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;

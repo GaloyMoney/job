@@ -420,16 +420,16 @@ impl Jobs {
         }
 
         let repo = Arc::new(JobRepo::new(&pool));
-        let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
+        let tracker = Arc::new(JobTracker::new(
+            config.poller_config.min_jobs_per_process,
+            config.poller_config.max_jobs_per_process,
+        ));
+        let registry = Arc::new(Mutex::new(Some(JobRegistry::new(Arc::clone(&tracker)))));
         let router = Arc::new(JobNotificationRouter::new(
             &pool,
             Arc::clone(&repo),
             config.poller_config.terminal_channel_size,
             config.poller_config.sweep_interval,
-        ));
-        let tracker = Arc::new(JobTracker::new(
-            config.poller_config.min_jobs_per_process,
-            config.poller_config.max_jobs_per_process,
         ));
         let notifier = notifier::JobEventNotifier::spawn(
             &pool,

@@ -492,17 +492,12 @@ async fn batch_error_retries_every_item_and_retries_run_alone() -> anyhow::Resul
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Checkpoint-table split (job-dev:handoff-poll-cost-and-cadence.md, D1/D2)
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BatchCheckpoint {
     processed: u32,
 }
 
-/// Checkpoints every item, then completes `ok-*` labels and terminally fails
-/// `bad-*` ones (`n_attempts: Some(1)`) in the same `seal()` commit.
+/// Checkpoints every item, then completes `ok-*` labels and terminally fails `bad-*` ones.
 struct CheckpointBatchInitializer {
     job_type: JobType,
 }
@@ -554,10 +549,8 @@ impl BatchedJobRunner for CheckpointBatchRunner {
     }
 }
 
-/// D2 leak guard, batched path: `BatchDispatcher::complete_in_op` (the `ok`
-/// item) and its `fail_in_op` terminal branch (the `bad` item) are two more
-/// delete sites than the plain-job dispatcher has — both must clean up
-/// `job_execution_states` just as reliably.
+/// The batch dispatcher's two delete sites (complete and terminal-fail) must
+/// both clean up `job_execution_states`.
 #[tokio::test]
 async fn checkpoint_rows_deleted_on_batched_terminal() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
