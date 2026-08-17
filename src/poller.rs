@@ -1003,9 +1003,10 @@ async fn poll_jobs(
             )
         ),
         locked AS (
-            -- The wide execution_state_json is fetched only for the
-            -- ~$1 winners, not carried through the CTEs and the window
-            -- sort for every pending job.
+            -- The wide execution_state_json now lives in job_execution_states
+            -- (off the polled table, see migration comment) and is fetched
+            -- only for the ~$1 winners via this LEFT JOIN, not carried
+            -- through the CTEs and the window sort for every pending job.
             --
             -- Every queue-head is eligible here, deliberately: the per-type
             -- cap is applied *after* this lock, never before it. Filtering to
@@ -1015,10 +1016,14 @@ async fn poll_jobs(
             -- through to nothing while due work sat unclaimed. SKIP LOCKED can
             -- only route around a concurrent poller if there is something
             -- past its rows left to see.
-            SELECT je.id, je.execution_state_json AS data_json, je.attempt_index,
+            --
+            -- FOR UPDATE OF je is mandatory: a bare FOR UPDATE errors on the
+            -- nullable side of the LEFT JOIN below.
+            SELECT je.id, cp.execution_state_json AS data_json, je.attempt_index,
                    c.job_type, je.execute_at
             FROM candidates c
             JOIN job_executions je ON je.id = c.id
+            LEFT JOIN job_execution_states cp ON cp.id = c.id
             WHERE c.rn = 1
             ORDER BY je.execute_at ASC
             LIMIT $1

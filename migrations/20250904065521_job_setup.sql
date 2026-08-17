@@ -28,7 +28,6 @@ CREATE TABLE job_executions (
   poller_instance_id UUID,
   attempt_index INT NOT NULL DEFAULT 1,
   state JobExecutionState NOT NULL DEFAULT 'pending',
-  execution_state_json JSONB,
   execute_at TIMESTAMPTZ,
   alive_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL
@@ -73,3 +72,21 @@ ALTER TABLE job_executions SET (
 );
 
 -- `job_executions` deliberately has NO notification trigger.
+
+-- Checkpoint state lives OFF the polled table: its write rate (~60% of all
+-- job_executions updates under load) is what bloated the heap and indexes the
+-- poll query scans (sb-max3 re-analysis, 2026-08-17). By-PK access only, no
+-- secondary indexes, no FK (checkpoint writes must not lock the execution
+-- row); fillfactor 50 keeps every write HOT (no indexed column is ever
+-- updated). Cleanup piggybacks on the execution-row DELETEs.
+CREATE TABLE job_execution_states (
+  id UUID PRIMARY KEY,
+  execution_state_json JSONB NOT NULL
+);
+ALTER TABLE job_execution_states SET (
+  fillfactor = 50,
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_vacuum_threshold = 50,
+  autovacuum_analyze_scale_factor = 0.02,
+  autovacuum_vacuum_cost_delay = 0
+);

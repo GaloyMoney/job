@@ -2069,8 +2069,8 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
-        INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, execution_state_json, attempt_index, created_at)
-        VALUES ($1, 'orphan-rescue', 'running', $2, $3, '{}', 1, $4)
+        INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, attempt_index, created_at)
+        VALUES ($1, 'orphan-rescue', 'running', $2, $3, 1, $4)
         "#,
     )
     .bind(orphan_id)
@@ -2168,8 +2168,8 @@ async fn test_lost_handler_uses_wall_clock_under_frozen_manual_clock() -> anyhow
 
     sqlx::query(
         r#"
-        INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, execution_state_json, attempt_index, created_at)
-        VALUES ($1, 'frozen-clock-orphan', 'running', $2, $3, '{}', 1, $4)
+        INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, attempt_index, created_at)
+        VALUES ($1, 'frozen-clock-orphan', 'running', $2, $3, 1, $4)
         "#,
     )
     .bind(orphan_id)
@@ -2578,6 +2578,262 @@ async fn execution_state_none_before_first_write_then_roundtrips() -> anyhow::Re
     assert_eq!(
         handle.load().await?.execution_state::<CheckpointState>()?,
         None
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+// -- Checkpoint-table split (job-dev:handoff-poll-cost-and-cadence.md, D1/D2) --
+//
+// `execution_state_json` moved off `job_executions` into its own
+// `job_execution_states` table, cleaned up by an explicit CTE delete
+// piggybacked on every `job_executions` DELETE (dispatcher.rs, batch_dispatcher.rs
+// x2). The public API (asserted above, unchanged) can't prove the cleanup
+// actually happened: once the `job_executions` row is gone, `execution_state()`
+// reports `None` via the LEFT JOIN regardless of whether `job_execution_states`
+// was ever cleaned up. These tests assert directly against the checkpoint
+// table so a leak in any of the three delete sites is caught (D2 guard).
+
+/// D2 leak guard, completed path: a plain job's checkpoint row exists while
+/// running and is gone the instant the terminal DELETE commits.
+#[tokio::test]
+async fn checkpoint_row_deleted_on_terminal() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let wrote = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(StateWritingInitializer {
+        job_type: JobType::new("checkpoint-row-deleted-complete"),
+        wrote: Arc::clone(&wrote),
+        release: Arc::clone(&release),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+    let handle = jobs.handle(job_id);
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), wrote.notified())
+        .await
+        .expect("runner never wrote its execution state");
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM job_execution_states WHERE id = $1")
+            .bind(uuid::Uuid::from(job_id))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        count, 1,
+        "checkpoint row must exist while the job is running"
+    );
+
+    release.notify_one();
+    handle.await_completion(Duration::from_secs(10)).await?;
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM job_execution_states WHERE id = $1")
+            .bind(uuid::Uuid::from(job_id))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        count, 0,
+        "checkpoint row must be deleted along with the terminal execution row"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StateWritingFailingConfig;
+
+/// A runner that writes a checkpoint then always fails; paired with
+/// `n_attempts: Some(1)` this reaches errored-terminal on its first attempt.
+struct StateWritingFailingInitializer {
+    job_type: JobType,
+    wrote: Arc<Notify>,
+}
+
+impl JobInitializer for StateWritingFailingInitializer {
+    type Config = StateWritingFailingConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(StateWritingFailingRunner {
+            wrote: Arc::clone(&self.wrote),
+        }))
+    }
+}
+
+struct StateWritingFailingRunner {
+    wrote: Arc<Notify>,
+}
+
+#[async_trait]
+impl JobRunner for StateWritingFailingRunner {
+    async fn run(
+        &self,
+        mut current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        current_job
+            .update_execution_state(CheckpointState { processed: 7 })
+            .await?;
+        self.wrote.notify_one();
+        Err("intentional failure".into())
+    }
+}
+
+/// D2 leak guard, errored-terminal path: same delete site as the completed
+/// path (`JobDispatcher::delete_execution_in_op`), reached via `fail_job`
+/// once retries are exhausted rather than via `complete_job`.
+#[tokio::test]
+async fn checkpoint_row_deleted_on_errored_terminal() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let wrote = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(StateWritingFailingInitializer {
+        job_type: JobType::new("checkpoint-row-deleted-errored"),
+        wrote: Arc::clone(&wrote),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, StateWritingFailingConfig).await?;
+    let handle = jobs.handle(job_id);
+
+    tokio::time::timeout(Duration::from_secs(10), wrote.notified())
+        .await
+        .expect("runner never wrote its execution state");
+
+    let outcome = handle.await_completion(Duration::from_secs(10)).await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM job_execution_states WHERE id = $1")
+            .bind(uuid::Uuid::from(job_id))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        count, 0,
+        "checkpoint row must be deleted on the errored-terminal path too"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A runner whose first attempt checkpoints then fails; the retry attempt
+/// records whatever `execution_state` it observes so the test can assert the
+/// checkpoint survived the failed attempt.
+struct CheckpointThenFailOnceInitializer {
+    job_type: JobType,
+    seen_on_retry: Arc<Mutex<Option<CheckpointState>>>,
+}
+
+impl JobInitializer for CheckpointThenFailOnceInitializer {
+    type Config = ResultJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(3),
+            min_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(10),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(CheckpointThenFailOnceRunner {
+            seen_on_retry: Arc::clone(&self.seen_on_retry),
+        }))
+    }
+}
+
+struct CheckpointThenFailOnceRunner {
+    seen_on_retry: Arc<Mutex<Option<CheckpointState>>>,
+}
+
+#[async_trait]
+impl JobRunner for CheckpointThenFailOnceRunner {
+    async fn run(
+        &self,
+        mut current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        if current_job.attempt() == 1 {
+            current_job
+                .update_execution_state(CheckpointState { processed: 99 })
+                .await?;
+            return Err("intentional first-attempt failure".into());
+        }
+        let state = current_job.execution_state::<CheckpointState>()?;
+        *self.seen_on_retry.lock().await = state;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+/// The checkpoint written on attempt 1 must still be readable on attempt 2:
+/// a retry keeps the execution row (and with it the checkpoint row) alive,
+/// unlike the terminal paths above.
+#[tokio::test]
+async fn checkpoint_survives_retry() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+    let seen_on_retry = Arc::new(Mutex::new(None));
+    let spawner = jobs.add_initializer(CheckpointThenFailOnceInitializer {
+        job_type: JobType::new("checkpoint-survives-retry"),
+        seen_on_retry: Arc::clone(&seen_on_retry),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    spawner.spawn(job_id, ResultJobConfig).await?;
+    let handle = jobs.handle(job_id);
+    let outcome = handle.await_completion(Duration::from_secs(10)).await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+
+    assert_eq!(
+        *seen_on_retry.lock().await,
+        Some(CheckpointState { processed: 99 }),
+        "the retry attempt must observe attempt 1's checkpoint"
     );
 
     jobs.shutdown().await?;

@@ -493,6 +493,124 @@ async fn batch_error_retries_every_item_and_retries_run_alone() -> anyhow::Resul
 }
 
 // ---------------------------------------------------------------------------
+// Checkpoint-table split (job-dev:handoff-poll-cost-and-cadence.md, D1/D2)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BatchCheckpoint {
+    processed: u32,
+}
+
+/// Checkpoints every item, then completes `ok-*` labels and terminally fails
+/// `bad-*` ones (`n_attempts: Some(1)`) in the same `seal()` commit.
+struct CheckpointBatchInitializer {
+    job_type: JobType,
+}
+
+impl BatchedJobInitializer for CheckpointBatchInitializer {
+    type Config = BatchConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
+        Ok(Box::new(CheckpointBatchRunner))
+    }
+}
+
+struct CheckpointBatchRunner;
+
+#[async_trait]
+impl BatchedJobRunner for CheckpointBatchRunner {
+    type Config = BatchConfig;
+
+    async fn run_batch(
+        &self,
+        mut current_batch: CurrentBatchedJob<BatchConfig>,
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+        for item in current_batch.items_mut() {
+            item.update_execution_state(&BatchCheckpoint { processed: 1 })
+                .await?;
+        }
+        let outcomes = current_batch.outcomes_for_each(|item| {
+            if item.config().label.starts_with("ok") {
+                BatchItemOutcome::Complete
+            } else {
+                BatchItemOutcome::Fail("intentional terminal failure".to_string())
+            }
+        });
+        Ok(JobBatchCompletion::WithOutcomes(outcomes))
+    }
+}
+
+/// D2 leak guard, batched path: `BatchDispatcher::complete_in_op` (the `ok`
+/// item) and its `fail_in_op` terminal branch (the `bad` item) are two more
+/// delete sites than the plain-job dispatcher has — both must clean up
+/// `job_execution_states` just as reliably.
+#[tokio::test]
+async fn checkpoint_rows_deleted_on_batched_terminal() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_batched_initializer(CheckpointBatchInitializer {
+        job_type: JobType::new("batched-checkpoint-cleanup"),
+    });
+
+    let ok_id = JobId::new();
+    let bad_id = JobId::new();
+    let specs = vec![
+        JobSpec::new(
+            ok_id,
+            BatchConfig {
+                label: "ok".to_string(),
+            },
+        ),
+        JobSpec::new(
+            bad_id,
+            BatchConfig {
+                label: "bad".to_string(),
+            },
+        ),
+    ];
+    spawner.spawn_all(specs).await?;
+
+    jobs.start_poll().await?;
+
+    let outcomes = jobs
+        .handles(vec![ok_id, bad_id])
+        .await_all(Duration::from_secs(30))
+        .await?;
+    assert_eq!(outcomes[0].state(), JobTerminalState::Completed);
+    assert_eq!(outcomes[1].state(), JobTerminalState::Errored);
+
+    let ids = [uuid::Uuid::from(ok_id), uuid::Uuid::from(bad_id)];
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM job_execution_states WHERE id = ANY($1)")
+            .bind(&ids[..])
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        count, 0,
+        "checkpoint rows for both the completed and the errored-terminal \
+         batch items must be gone"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Seal validation
 // ---------------------------------------------------------------------------
 

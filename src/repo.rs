@@ -71,9 +71,8 @@ impl JobRepo {
         Ok(rows.into_iter().map(|r| (r.unique_key, r.id)).collect())
     }
 
-    /// Read only the committed `execution_state_json` for `id` — a single-row
-    /// SELECT on `job_executions`, no entity hydration, no snapshot
-    /// reconciliation. `Ok(None)` on a missing row or unset state.
+    /// Read only the committed `execution_state_json` for `id`. `Ok(None)` on
+    /// a missing row or unset state.
     ///
     /// The cheap point-read behind [`JobHandle::execution_state`]; unlike
     /// [`load_snapshot_by_id`](Self::load_snapshot_by_id) it does not scan
@@ -83,12 +82,12 @@ impl JobRepo {
         id: JobId,
     ) -> Result<Option<serde_json::Value>, JobError> {
         let row = sqlx::query!(
-            r#"SELECT execution_state_json FROM job_executions WHERE id = $1"#,
+            r#"SELECT execution_state_json FROM job_execution_states WHERE id = $1"#,
             id as JobId,
         )
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|r| r.execution_state_json))
+        Ok(row.map(|r| r.execution_state_json))
     }
 
     /// Load a point-in-time [`JobSnapshot`] for `id`: the execution row (if the
@@ -109,8 +108,11 @@ impl JobRepo {
         let row = sqlx::query_as!(
             JobExecutionRow,
             r#"
-            SELECT state AS "state: JobExecutionState", execute_at, attempt_index, alive_at, execution_state_json
-            FROM job_executions WHERE id = $1
+            SELECT je.state AS "state: JobExecutionState", je.execute_at, je.attempt_index,
+                   je.alive_at, cp.execution_state_json AS "execution_state_json?"
+            FROM job_executions je
+            LEFT JOIN job_execution_states cp ON cp.id = je.id
+            WHERE je.id = $1
             "#,
             id as JobId,
         )
