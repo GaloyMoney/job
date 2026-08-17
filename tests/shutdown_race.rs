@@ -107,7 +107,8 @@ async fn shutdown_survives_concurrent_set_result_storm() -> anyhow::Result<()> {
             JobStatus::Running { .. } => {
                 panic!("round {round}: job must not be left Running after shutdown");
             }
-            JobStatus::Pending { .. } | JobStatus::Completed { .. } | JobStatus::Errored { .. } => {}
+            JobStatus::Pending { .. } | JobStatus::Completed { .. } | JobStatus::Errored { .. } => {
+            }
         }
     }
     Ok(())

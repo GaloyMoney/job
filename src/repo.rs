@@ -562,7 +562,6 @@ mod tests {
         let append = {
             let pool = pool.clone();
             let repo = JobRepo::new(&pool);
-            let id = id;
             tokio::spawn(async move {
                 let mut op = repo.begin_op().await?;
                 let result = repo

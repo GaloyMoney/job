@@ -1349,11 +1349,28 @@ async fn kill_remaining_jobs(
         };
         let attempt_index = claimed.attempt_index as u32;
 
-        let result = repo
+        let result = match repo
             .append_events_in_op_with_retry(&mut op, &job_id, |job| {
                 job.abort_execution("killed job".to_string(), now, attempt_index);
             })
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            // The job has an executions row but no event-log entity (e.g. an
+            // orphaned row left by a crashed peer that only wrote the `jobs`
+            // FK target). There is nothing to abort; the claim above already
+            // returned the row to pending/unowned — the old bulk `find_all`
+            // silently skipped exactly these jobs, so keep that tolerance.
+            Err(crate::JobError::Find(e)) if e.was_not_found() => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "Job has no event-log entity; leaving claimed row pending without abort events"
+                );
+                op.commit().await?;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
 
         tracing::warn!(
             job_id = %job_id,
