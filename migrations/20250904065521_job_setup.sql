@@ -69,9 +69,16 @@ CREATE UNIQUE INDEX idx_job_executions_job_type_unique_key
   ON job_executions (job_type, unique_key)
   WHERE unique_key IS NOT NULL;
 
-CREATE INDEX idx_job_executions_poller_instance
-  ON job_executions(poller_instance_id)
-  WHERE state = 'running';
+-- NOTE: there is deliberately no index on `poller_instance_id`. Every hot-path
+-- query that filters on it is id-led (`WHERE id = ANY(...) AND
+-- poller_instance_id = $n`) and served by the unique index on `id`;
+-- `reclaim_lost_jobs` never uses it as a leading predicate. That leaves
+-- `kill_remaining_jobs` (once per process shutdown) as the only query it would
+-- serve, which is not worth an index on the claim path: every claim writes to
+-- every index, so carrying it made the poll itself measurably slower. Restore
+-- it if `job_executions` ever grows large enough that a shutdown-time scan
+-- matters -- the cost is O(heap pages), so bloat is the trigger, not poller
+-- count. See PERFORMANCE.md.
 
 -- The claim path's index set is measured, not assumed: see PERFORMANCE.md
 -- ("Indexes: the write-path trade-off") for why it is these three and not a

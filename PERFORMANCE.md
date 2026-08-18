@@ -238,7 +238,55 @@ Three things this settles:
 
 `idx_job_executions_pending_execute_at` is kept: `min_wait` and the
 stale-pending reporter need global `execute_at` order, which neither claim
-index provides.
+index provides. Serving `min_wait` per-type instead — to drop it and get back
+to the previous index count — was tried and **rejected**: it cost 2.3× on the
+poll (4,342 vs 1,908 buffers, 1.39 vs 0.61 ms), with the whole regression in
+`min_wait` itself.
+
+### Why `poller_instance_id` has no index
+
+Dropping it is what pays for the two claim indexes. Measured over 30k churned
+jobs, and on the poll itself:
+
+| index set | n | index bloat | poll median | poll buffers |
+|---|---|---|---|---|
+| previous | 6 | 5,320 kB | — | — |
+| claim indexes added | 7 | 7,064 kB (+33%) | 0.697 ms | 2,078 |
+| **…and `poller_instance` dropped** | **6** | **6,088 kB (+14%)** | **0.627 ms** | **1,807** |
+
+It is *better than free*: the claim `UPDATE` is ~42% of a poll and writes to
+every index, so carrying one fewer makes the poll cheaper as well as the write
+path. Every hot-path query filtering on `poller_instance_id` is id-led and
+served by the unique index on `id`; `reclaim_lost_jobs` never uses it as a
+leading predicate. Only `kill_remaining_jobs` (once per process shutdown) loses
+an index lookup, and it was measured *faster* scanning instead.
+
+Restore it if `job_executions` grows large: the shutdown scan is O(heap pages),
+so **bloat is the trigger, not poller count**.
+
+### HOT updates are structurally impossible here
+
+Worth knowing before optimising for them: the claim sets `state`, and `state`
+is in the predicate of every pending-partial index, so no claim can ever be a
+HOT update. Measured HOT is 0.0% under every index set tried — the production
+figure of ~1.3% is inherent to the pending/running design, not something an
+index change moves. Heap bloat is likewise identical across all configs
+(8,512 kB per 30k jobs); only *index* bloat responds.
+
+Roughly half of a poll's buffer touches on a production-shaped table are bloat
+rather than query shape (2,109 → 1,094 after `VACUUM FULL`), so vacuum health
+matters as much as the query here.
+
+That said, **this table's autovacuum settings are not known to need changing**,
+and were deliberately left alone. A 30k-job churn burst reclaimed nothing, but
+that burst completed in 909 ms against a 60 s `autovacuum_naptime` — the
+measurement proves only that a sub-second burst finishes before the launcher
+looks, not that vacuum falls behind. The table-level knobs are already near
+maximal (`scale_factor` 0.01, `threshold` 50, `cost_delay` 0 — no throttling);
+the remaining levers, `autovacuum_naptime` and `autovacuum_max_workers`, are
+cluster GUCs that cannot be set from a migration and belong to the deployment.
+If a stress run shows index bloat growing across a *sustained* window, that is
+where to look — and it needs measuring over minutes, not milliseconds.
 
 ---
 
