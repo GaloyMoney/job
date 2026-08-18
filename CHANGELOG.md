@@ -1,3 +1,11 @@
+# [job release v0.11.3](https://github.com/GaloyMoney/job/releases/tag/0.11.3)
+
+
+
+### Bug Fixes
+
+- Resolve broken rustdoc intra-doc links
+
 # [job release v0.11.2](https://github.com/GaloyMoney/job/releases/tag/0.11.2)
 
 
