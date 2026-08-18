@@ -41,6 +41,7 @@ pub enum JobError {
     BatchOutcomeMismatch(String),
     #[error("JobError - DuplicateId: {0:?}")]
     DuplicateId(Option<String>),
+    /// Returned when a resident job type already has a live job (#170).
     #[error("JobError - DuplicateResident: {0:?}")]
     DuplicateResident(Option<String>),
     #[error("JobError - Config: {0}")]
