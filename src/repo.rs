@@ -30,47 +30,21 @@ impl JobRepo {
         Self { pool: pool.clone() }
     }
 
-    /// Resolve the LIVE job of `(job_type, key)`, if one exists.
-    ///
-    /// Direct point-read on `job_executions`: the partial unique index
-    /// `idx_job_executions_job_type_unique_key` (migrations/20250904065521_job_setup.sql)
-    /// guarantees at most one match, and execution rows exist iff the job is
-    /// pending/running — so this is a race-free single-row lookup used to
-    /// resolve `KeyedJobSpawner::spawn`'s duplicate-while-live path.
-    pub(super) async fn find_live_keyed(
-        &self,
-        job_type: &JobType,
-        key: &str,
-    ) -> Result<Option<JobId>, JobError> {
-        let row = sqlx::query!(
-            r#"SELECT id AS "id: JobId" FROM job_executions WHERE job_type = $1 AND unique_key = $2"#,
-            job_type as &JobType,
-            key,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| r.id))
-    }
-
     /// Resolve the keyed singleton of `(job_type, key)`: the LIVE job if one
     /// exists, else the latest generation (for terminal read-back). `None`
     /// only when the key has never been spawned.
     ///
-    /// Live-first via `job_executions` (index-exact, see
-    /// [`find_live_keyed`](Self::find_live_keyed)), falling back to `jobs`
-    /// ordered by `created_at DESC` when no execution row is live — `jobs`
-    /// accumulates one row per generation and is never deleted, so the
-    /// latest generation is the answer whether it's live or long-terminal.
+    /// A single read of `jobs`, no live/terminal branch: `jobs` accumulates
+    /// one row per generation and is never deleted, and a new generation can
+    /// only be created once the previous one is no longer LIVE (enforced by
+    /// `idx_job_executions_job_type_unique_key`; a losing spawn rolls its
+    /// `jobs` row back). So the newest generation IS the live one whenever any
+    /// is live, and the latest-generation answer is correct either way.
     pub(super) async fn find_keyed(
         &self,
         job_type: &JobType,
         key: &str,
     ) -> Result<Option<Job>, JobError> {
-        if let Some(id) = self.find_live_keyed(job_type, key).await? {
-            // `jobs` rows are never deleted, so the entity `find_live_keyed`
-            // just resolved an id for is guaranteed to exist.
-            return Ok(Some(self.find_by_id(id).await?));
-        }
         Ok(es_query!(
             "SELECT id, created_at FROM jobs WHERE job_type = $1 AND unique_key = $2 ORDER BY created_at DESC, id DESC LIMIT 1",
             job_type as &JobType,
@@ -84,8 +58,7 @@ impl JobRepo {
     ///
     /// There is at most one, ever — enforced by `idx_jobs_job_type_resident`
     /// (migrations/20250904065521_job_setup.sql). `jobs` rows are never
-    /// deleted, so unlike [`find_live_keyed`](Self::find_live_keyed) this is
-    /// a point-read on `jobs` itself, not `job_executions`.
+    /// deleted, so this is a point-read on `jobs` itself, not `job_executions`.
     pub(super) async fn find_resident_id(
         &self,
         job_type: &JobType,

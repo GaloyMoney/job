@@ -4571,9 +4571,9 @@ async fn keyed_without_inherits_state_starts_fresh() -> anyhow::Result<()> {
         "gen2 must not inherit gen1's state when inherits_state is false"
     );
 
-    // Compaction is unconditional (runs regardless of `inherits_state`), so
-    // once gen2 has spawned and completed, only its own state row remains —
-    // gen1's retained row was deleted at gen2's spawn time.
+    // Without `inherits_state` each generation's state dies with it, so once
+    // both have completed the key holds nothing at all — no row survives to
+    // be compacted later.
     let (count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM job_execution_states s JOIN jobs j ON j.id = s.id \
          WHERE j.job_type = $1 AND j.unique_key = 'k'",
@@ -4581,17 +4581,20 @@ async fn keyed_without_inherits_state_starts_fresh() -> anyhow::Result<()> {
     .bind(job_type)
     .fetch_one(&pool)
     .await?;
-    assert_eq!(count, 1, "only gen2's state row remains after compaction");
+    assert_eq!(
+        count, 0,
+        "a key that does not inherit state retains nothing once its generations are terminal"
+    );
 
     jobs.shutdown().await?;
     Ok(())
 }
 
-/// NEW: a keyed job's execution state is retained on terminal — readable
-/// even before any respawn — unlike a regular job's, which is deleted
-/// alongside its execution row.
+/// With `inherits_state`, a keyed job's execution state survives terminal —
+/// readable even before any respawn — unlike a regular job's, which is
+/// deleted alongside its execution row.
 #[tokio::test]
-async fn keyed_terminal_state_retained() -> anyhow::Result<()> {
+async fn keyed_terminal_state_retained_when_inherited() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool)
@@ -4603,7 +4606,7 @@ async fn keyed_terminal_state_retained() -> anyhow::Result<()> {
     let spawner = jobs.add_keyed_initializer(KeyedCheckpointInitializer {
         job_type: JobType::new(job_type),
         release: Arc::new(AtomicBool::new(true)),
-        inherits_state: false,
+        inherits_state: true,
     });
     jobs.start_poll().await?;
 
@@ -4631,6 +4634,52 @@ async fn keyed_terminal_state_retained() -> anyhow::Result<()> {
         snapshot_state,
         Some(CheckpointState { processed: 7 }),
         "a terminal keyed job's state must also be readable via JobSnapshot::execution_state"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Without `inherits_state` (the default), a keyed job cleans up exactly like
+/// every other flavor: its state row is deleted with its execution row.
+/// Retention is something a type opts into, not a side effect of being keyed.
+#[tokio::test]
+async fn keyed_terminal_state_deleted_without_inherits_state() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-state-dropped-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_keyed_initializer(KeyedCheckpointInitializer {
+        job_type: JobType::new(job_type),
+        release: Arc::new(AtomicBool::new(true)),
+        inherits_state: false,
+    });
+    jobs.start_poll().await?;
+
+    let gen1 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 7 })
+        .await?;
+    jobs.handle(gen1.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+
+    let state: Option<CheckpointState> = jobs.handle(gen1.id()).execution_state().await?;
+    assert_eq!(
+        state, None,
+        "a keyed job that does not inherit state must not retain it past terminal"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_execution_states WHERE id = $1")
+        .bind(uuid::Uuid::from(gen1.id()))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        rows, 0,
+        "the state row itself must be gone, not just unread"
     );
 
     jobs.shutdown().await?;

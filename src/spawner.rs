@@ -421,3 +421,67 @@ pub(crate) async fn insert_execution(
     repo.update_in_op(op, job).await?;
     Ok(())
 }
+
+/// Outcome of a keyed execution insert.
+pub(crate) enum KeyedInsert {
+    /// The key was free; this job now holds it.
+    Inserted,
+    /// The key is already held by this LIVE job.
+    Live(JobId),
+    /// The key was taken, but its holder is no longer visible — it went
+    /// terminal between the conflict and the read. The caller should retry.
+    Contended,
+}
+
+/// Insert a keyed execution row, resolving a live-key conflict in the SAME
+/// round trip rather than following up with a separate lookup.
+///
+/// `ON CONFLICT DO NOTHING` (inferring the partial live-key index) turns the
+/// conflict into data instead of an error, so the holder's id comes back
+/// alongside it and there is no constraint-name string matching to keep in
+/// sync with the schema. The holder is read at this statement's snapshot, so a
+/// key claimed by a transaction that committed after it reports
+/// [`KeyedInsert::Contended`] rather than a stale id.
+#[instrument(name = "job.insert_keyed_execution", skip_all)]
+pub(crate) async fn insert_keyed_execution(
+    repo: &JobRepo,
+    notifier: &Arc<JobEventNotifier>,
+    op: &mut impl es_entity::AtomicOperation,
+    job: &mut Job,
+    schedule_at: DateTime<Utc>,
+    unique_key: &str,
+) -> Result<KeyedInsert, JobError> {
+    let row = sqlx::query!(
+        r#"
+        WITH ins AS (
+            INSERT INTO job_executions
+                (id, job_type, queue_id, unique_key, execute_at, alive_at, created_at)
+            VALUES ($1, $2, NULL, $3, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
+            ON CONFLICT (job_type, unique_key) WHERE unique_key IS NOT NULL
+            DO NOTHING
+            RETURNING id
+        )
+        SELECT (SELECT id FROM ins) AS "inserted?: JobId",
+               (SELECT id FROM job_executions
+                WHERE job_type = $2 AND unique_key = $3) AS "live?: JobId"
+        "#,
+        job.id as JobId,
+        &job.job_type as &JobType,
+        unique_key,
+        schedule_at,
+        op.maybe_now(),
+    )
+    .fetch_one(op.as_executor())
+    .await?;
+
+    if row.inserted.is_some() {
+        notifier.execution_ready_in_op(op, &job.job_type).await?;
+        job.schedule_execution(schedule_at);
+        repo.update_in_op(op, job).await?;
+        return Ok(KeyedInsert::Inserted);
+    }
+    Ok(match row.live {
+        Some(id) => KeyedInsert::Live(id),
+        None => KeyedInsert::Contended,
+    })
+}

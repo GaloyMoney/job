@@ -1,7 +1,7 @@
 //! Registry storing job initializers and retry settings.
 
 use es_entity::clock::ClockHandle;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{
@@ -129,6 +129,9 @@ pub struct JobRegistry {
     batched_initializers: HashMap<JobType, Box<dyn AnyBatchedJobInitializer>>,
     batch_policies: HashMap<JobType, BatchPolicy>,
     concurrency: HashMap<JobType, Option<usize>>,
+    /// Keyed types whose execution state outlives the generation that wrote
+    /// it (`KeyedJobInitializer::inherits_state`).
+    retains_state: HashSet<JobType>,
     retry_settings: HashMap<JobType, RetrySettings>,
     tracker: Arc<JobTracker>,
 }
@@ -140,6 +143,7 @@ impl JobRegistry {
             batched_initializers: HashMap::new(),
             batch_policies: HashMap::new(),
             concurrency: HashMap::new(),
+            retains_state: HashSet::new(),
             retry_settings: HashMap::new(),
             tracker,
         }
@@ -167,6 +171,9 @@ impl JobRegistry {
         let retry_settings = initializer.retry_on_error_settings();
         let concurrency = initializer.max_concurrent_per_process().map(|c| c.max(1));
         let inherits_state = initializer.inherits_state();
+        if inherits_state {
+            self.retains_state.insert(job_type.clone());
+        }
         self.initializers.insert(
             job_type.clone(),
             Box::new(ErasedKeyedInitializer::new(initializer, inherits_state)),
@@ -228,6 +235,12 @@ impl JobRegistry {
             .ok_or(JobError::NoInitializerPresent)?
             .init(job, repo, router, clock, notifier)
             .map_err(|e| JobError::JobInitError(e.to_string()))
+    }
+
+    /// Whether this type keeps its execution state past terminal. True only
+    /// for keyed types with `inherits_state`; see `dispatcher.rs`.
+    pub(super) fn retains_state(&self, job_type: &JobType) -> bool {
+        self.retains_state.contains(job_type)
     }
 
     /// Whether jobs of this type are dispatched in batches.

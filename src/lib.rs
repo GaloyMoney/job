@@ -273,13 +273,13 @@
 //! shard_spawner.spawn(format!("shard-{shard_id}"), ShardConfig { shard_id }).await?;
 //! ```
 //!
-//! A keyed job's execution state (see [`CurrentJob::update_execution_state`])
-//! outlives its own generation: once a generation goes terminal its state
-//! row is retained (readable via [`JobSnapshot::execution_state`]) rather
-//! than deleted, and is compacted away at the key's next spawn. Set
-//! [`KeyedJobInitializer::inherits_state`] to seed a new generation's state
-//! from its predecessor's — useful when a respawn should resume from a
-//! checkpoint instead of starting cold.
+//! By default a keyed generation's execution state (see
+//! [`CurrentJob::update_execution_state`]) is deleted when it terminates, just
+//! like a regular job's. Set [`KeyedJobInitializer::inherits_state`] to make it
+//! outlive the generation instead: it is kept (readable via
+//! [`JobSnapshot::execution_state`]), seeded into the next generation of that
+//! key, and older generations are compacted away at the next spawn — useful
+//! when a respawn should resume from a checkpoint rather than start cold.
 //!
 //! ### Resident jobs
 //!

@@ -28,7 +28,7 @@ use super::{
     notifier::JobEventNotifier,
     repo::JobRepo,
     runner::{JobRunner, RetrySettings},
-    spawner::insert_execution,
+    spawner::{KeyedInsert, insert_keyed_execution},
 };
 
 /// Describes how to construct a [`crate::JobRunner`] for a keyed job type.
@@ -54,18 +54,16 @@ pub trait KeyedJobInitializer: Send + Sync + 'static {
         None
     }
 
-    /// Whether a new generation's execution state should be seeded from the
-    /// previous generation's final state before it starts. Defaults to
-    /// `false` — most keyed jobs start each generation fresh; opt in when a
-    /// respawn should resume where the last generation left off (e.g. a
-    /// sharded listener's checkpoint carrying across a respawn).
+    /// Whether this key's execution state outlives the generation that wrote
+    /// it. Defaults to `false` — each generation starts fresh and its state is
+    /// deleted when it terminates, exactly like a regular job.
     ///
-    /// When `false` (the default), a terminal generation's execution state
-    /// is still retained and readable (see
-    /// [`crate::JobSnapshot::execution_state`]) until the key's next spawn
-    /// compacts it away — this flag controls only whether the NEXT
-    /// generation inherits it as a starting point, not whether the state is
-    /// kept at all.
+    /// Set it when a respawn should resume where the last generation left off
+    /// (e.g. a sharded listener's checkpoint carrying across a respawn). Then
+    /// a terminal generation's state is kept rather than deleted, seeded into
+    /// the next generation at spawn, and older generations' rows are compacted
+    /// away — so a key holds at most one retained row. It also stays readable
+    /// after terminal via [`crate::JobSnapshot::execution_state`].
     fn inherits_state(&self) -> bool {
         false
     }
@@ -141,6 +139,15 @@ where
     /// [`JobHandle::load`]'s execution state to answer "caught up?" per
     /// shard. Does not consume the spawner: many keys of one type are
     /// expected.
+    ///
+    /// # Errors
+    ///
+    /// Spawning against a held key is not an error — it resolves to the
+    /// holder. The one failure mode of its own is
+    /// [`JobError::KeyedSpawnRace`], and it is practically unreachable: each
+    /// attempt that loses the key re-reads the holder, and only a holder that
+    /// went terminal in the instant between those two steps forces a retry.
+    /// The error means that happened on three consecutive attempts.
     #[instrument(
         name = "keyed_job_spawner.spawn",
         skip(self, config),
@@ -171,51 +178,54 @@ where
             // `job_executions`, see below) — this can no longer conflict.
             let mut job = self.repo.create_in_op(&mut op, new_job).await?;
             let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
-            match insert_execution(
+            match insert_keyed_execution(
                 &self.repo,
                 &self.notifier,
                 &mut op,
                 &mut job,
                 schedule_at,
-                None,
-                Some(&key),
+                &key,
             )
-            .await
+            .await?
             {
-                Ok(()) => {
-                    if self.inherits_state {
-                        self.seed_state_in_op(&mut op, job.id, &key).await?;
-                    }
-                    self.compact_state_in_op(&mut op, job.id, &key).await?;
+                KeyedInsert::Inserted => {
+                    self.carry_state_in_op(&mut op, job.id, &key).await?;
                     op.commit().await?;
                     return Ok(self.handle(job.id));
                 }
-                Err(e) if is_keyed_conflict(&e) => {
+                KeyedInsert::Live(live) => {
                     // Rolls back the job row too — nothing leaks.
                     drop(op);
-                    if let Some(live) = self.repo.find_live_keyed(&self.job_type, &key).await? {
-                        return Ok(self.handle(live));
-                    }
-                    // The holder went terminal between the conflict and this
-                    // lookup — retry the whole spawn.
+                    return Ok(self.handle(live));
                 }
-                Err(e) => return Err(e),
+                KeyedInsert::Contended => {
+                    // The holder went terminal between the conflict and the
+                    // read — retry the whole spawn.
+                    drop(op);
+                }
             }
         }
         Err(JobError::KeyedSpawnRace(self.job_type.clone(), key))
     }
 
-    /// Seed the new generation's (empty) state row from the previous
-    /// generation's final state, if any. Race-free without extra locking:
-    /// the new generation's execution insert (in this same `op`, just
-    /// committed logically but not yet to disk) can only have succeeded if
-    /// the previous LIVE holder's key was already released, which happens
-    /// atomically with that holder's final state write
-    /// (`dispatcher.rs::delete_execution_in_op` retains keyed state rows) —
-    /// so by the time we're here, the predecessor's last state write, if
-    /// any, is already visible. The new row has no state yet, so this
-    /// INSERT cannot conflict.
-    async fn seed_state_in_op(
+    /// Carry the previous generation's final state into the new one and drop
+    /// every older generation's row, in a single statement.
+    ///
+    /// Both halves read the same snapshot, so the seeding SELECT still sees
+    /// the predecessor's row that the DELETE removes, and the DELETE cannot
+    /// see the row the INSERT writes (they are disjoint anyway: `id = $1` vs
+    /// `id != $1`). The result is that a key's state never grows past one
+    /// row.
+    ///
+    /// Race-free without extra locking: the new generation's execution insert
+    /// (earlier in this same `op`) can only have succeeded once the previous
+    /// LIVE holder released the key, which happens atomically with that
+    /// holder's final state write — so the predecessor's last write, if any,
+    /// is already visible here.
+    ///
+    /// `$4` is [`KeyedJobInitializer::inherits_state`]: when false the seeding
+    /// half is a no-op and only compaction runs.
+    async fn carry_state_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
@@ -223,42 +233,25 @@ where
     ) -> Result<(), JobError> {
         sqlx::query!(
             r#"
-            INSERT INTO job_execution_states (id, execution_state_json)
-            SELECT $1, s.execution_state_json
-            FROM job_execution_states s
-            JOIN jobs j ON j.id = s.id
-            WHERE j.job_type = $2 AND j.unique_key = $3 AND j.id != $1
-            ORDER BY j.created_at DESC, j.id DESC
-            LIMIT 1
-            "#,
-            id as JobId,
-            &self.job_type as &JobType,
-            key,
-        )
-        .execute(op.as_executor())
-        .await?;
-        Ok(())
-    }
-
-    /// Delete every OTHER generation's state row for this key — run on every
-    /// spawn regardless of `inherits_state`, so a key's retained state never
-    /// grows past one row: the previous generation's (just possibly seeded
-    /// from, above) plus the new one this job will write as it runs.
-    async fn compact_state_in_op(
-        &self,
-        op: &mut impl es_entity::AtomicOperation,
-        id: JobId,
-        key: &str,
-    ) -> Result<(), JobError> {
-        sqlx::query!(
-            r#"
+            WITH seeded AS (
+                INSERT INTO job_execution_states (id, execution_state_json)
+                SELECT $1, s.execution_state_json
+                FROM job_execution_states s
+                JOIN jobs j ON j.id = s.id
+                WHERE j.job_type = $2 AND j.unique_key = $3 AND j.id != $1
+                  AND $4::boolean
+                ORDER BY j.created_at DESC, j.id DESC
+                LIMIT 1
+                RETURNING id
+            )
             DELETE FROM job_execution_states s
             USING jobs j
-            WHERE s.id = j.id AND j.job_type = $1 AND j.unique_key = $2 AND j.id != $3
+            WHERE s.id = j.id AND j.job_type = $2 AND j.unique_key = $3 AND j.id != $1
             "#,
+            id as JobId,
             &self.job_type as &JobType,
             key,
-            id as JobId,
+            self.inherits_state,
         )
         .execute(op.as_executor())
         .await?;
@@ -273,18 +266,4 @@ where
             self.clock.clone(),
         )
     }
-}
-
-/// Detects the `job_executions`-level live-key conflict raised by
-/// [`KeyedJobSpawner::spawn`]'s execution insert. This is a raw `sqlx`
-/// insert (not the entity repo), so the constraint name is reliable — unlike
-/// es_entity's version-dependent column attribution for composite indexes on
-/// `jobs` (see `error.rs`), so match it narrowly by name rather than broadly.
-pub(crate) fn is_keyed_conflict(err: &JobError) -> bool {
-    matches!(
-        err,
-        JobError::Sqlx(e)
-            if e.as_database_error().and_then(|d| d.constraint())
-                == Some("idx_job_executions_job_type_unique_key")
-    )
 }

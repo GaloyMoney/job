@@ -36,6 +36,9 @@ pub(crate) struct JobDispatcher {
     tracker: Arc<JobTracker>,
     notifier: Arc<JobEventNotifier>,
     job_type: JobType,
+    /// Whether this type keeps its execution state past terminal, i.e. it is
+    /// keyed with `inherits_state`. See `delete_execution_in_op`.
+    retains_state: bool,
     rescheduled: bool,
     dispatched: bool,
     id: JobId,
@@ -61,6 +64,7 @@ impl JobDispatcher {
         retry_settings: RetrySettings,
         id: JobId,
         job_type: JobType,
+        retains_state: bool,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
@@ -73,6 +77,7 @@ impl JobDispatcher {
             tracker,
             notifier,
             job_type,
+            retains_state,
             rescheduled: false,
             dispatched: true,
             id,
@@ -346,14 +351,15 @@ impl JobDispatcher {
     /// since a job going back to `pending` is exactly the ordinary case every
     /// instance already polls for. Reports nothing when no row was deleted.
     ///
-    /// The `job_execution_states` cleanup is conditional on `unique_key IS
-    /// NULL`: a KEYED job's state row is deliberately RETAINED here (rather
-    /// than deleted alongside its execution row) so it stays readable after
-    /// terminal and can seed the next generation under
-    /// `KeyedJobInitializer::inherits_state` (see `keyed.rs`) — the retained
-    /// row is compacted away at that key's next spawn. Every other flavor's
-    /// execution never carries a `unique_key`, so this changes nothing for
-    /// them.
+    /// The `job_execution_states` row is deleted with the execution unless
+    /// this type sets [`KeyedJobInitializer::inherits_state`], which is the
+    /// only reason to keep one: the next generation of that key seeds from it
+    /// (and the key's next spawn compacts older rows away). Retention is
+    /// therefore something a type opts into, not a side effect of being keyed
+    /// — a keyed type that does not inherit state cleans up exactly like every
+    /// other flavor.
+    ///
+    /// [`KeyedJobInitializer::inherits_state`]: crate::KeyedJobInitializer::inherits_state
     async fn delete_execution_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -365,15 +371,16 @@ impl JobDispatcher {
           WITH deleted AS (
               DELETE FROM job_executions
               WHERE id = $1 AND poller_instance_id = $2
-              RETURNING id, queue_id, unique_key
+              RETURNING id, queue_id
           ), cleanup AS (
               DELETE FROM job_execution_states s USING deleted d
-              WHERE s.id = d.id AND d.unique_key IS NULL
+              WHERE s.id = d.id AND NOT $3::boolean
           )
           SELECT queue_id AS "queue_id?" FROM deleted
         "#,
             id as JobId,
-            self.instance_id
+            self.instance_id,
+            self.retains_state,
         )
         .fetch_optional(op.as_executor())
         .await?;

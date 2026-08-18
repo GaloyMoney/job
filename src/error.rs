@@ -57,11 +57,9 @@ pub enum JobError {
     TimedOut(JobId),
     #[error("JobError - RouterNotStarted: await called before Jobs::start_poll")]
     RouterNotStarted,
-    /// Practically unreachable: every one of `KeyedJobSpawner::spawn`'s
-    /// bounded retry attempts hit a live-key conflict whose holder had
-    /// already gone terminal by the time of the follow-up lookup. Requires
-    /// the holder to complete/error at exactly that instant on 3 consecutive
-    /// attempts.
+    /// Practically unreachable; raised by
+    /// [`KeyedJobSpawner::spawn`](crate::KeyedJobSpawner::spawn), which
+    /// documents the race it exhausts.
     #[error(
         "JobError - KeyedSpawnRace: exhausted retries resolving a live-keyed conflict for job_type '{0}' key '{1}'"
     )]

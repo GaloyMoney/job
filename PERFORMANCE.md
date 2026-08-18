@@ -82,6 +82,32 @@ three concurrently-running jobs. Measured: 27 queues with more than one running
 job. The queue walk is deliberately **global**, not per type, because queue
 exclusion is global.
 
+Two things the walk must get right, both of which reintroduce starvation if
+they are treated as details:
+
+- **The budget counts *claimable* queues, not merely unblocked ones.** A queue
+  whose oldest due row is future-scheduled, or belongs to a type this instance
+  has saturated, yields no candidate. Counting it lets such queues exhaust the
+  budget while claimable work further along the sweep is never examined — the
+  original disease in a new place. Eligibility is evaluated against the queue
+  already in hand rather than the one being advanced to, so a step still costs
+  one seek to advance plus its checks.
+- **`may_have_more` must account for the sweep, not just the claim.** A walk
+  that stopped on its budget leaves queues past it unexamined; one that wrapped
+  from a mid-space cursor never looked at the queues *before* that cursor. In
+  both cases there is due work this poll could not see, and reporting otherwise
+  lets the poller sleep on `next_due_at` while it sits there. Only a sweep that
+  ran off the end having started from the beginning covered everything.
+
+### Picking a queue's row deterministically
+
+Every instance must choose the *same* row for a given queue: the oldest due
+row, with the pollable-type filter applied only afterwards. Choosing the oldest
+*pollable* row instead would let two instances that have saturated different
+types select different rows of the same queue and both claim it, breaking queue
+exclusion. Deciding identically everywhere is what makes a peer's lock read as
+"this queue is taken" rather than "try the row below".
+
 ### Unqueued rows
 
 They can never be blocked by a sibling, so they come straight off

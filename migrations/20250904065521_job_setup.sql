@@ -113,14 +113,13 @@ ALTER TABLE job_executions SET (
   log_autovacuum_min_duration = 0
 );
 
--- Written by running jobs (attempt-recovery state, id-addressed). On
--- terminal: ordinary rows are deleted alongside their execution row
--- (`dispatcher.rs`'s `delete_execution_in_op`); KEYED rows are RETAINED —
--- the final state stays readable, and seeds the next generation's row when
--- `KeyedJobInitializer::inherits_state` is set (`keyed.rs`). Retained rows
--- are compacted (older generations of the same key deleted) at the next
--- spawn of that key, so the table stays O(live jobs + keys), not O(all
--- generations ever).
+-- Written by running jobs (attempt-recovery state, id-addressed). Deleted
+-- alongside the execution row on terminal (`dispatcher.rs`'s
+-- `delete_execution_in_op`), EXCEPT for keyed types that opt into
+-- `KeyedJobInitializer::inherits_state`: those rows are kept so the next
+-- generation of the key can seed from them, and older generations are
+-- compacted away at that key's next spawn (`keyed.rs`). The table therefore
+-- stays O(live jobs + inheriting keys), not O(all generations ever).
 CREATE TABLE job_execution_states (
   id UUID PRIMARY KEY,
   execution_state_json JSONB NOT NULL

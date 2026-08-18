@@ -769,6 +769,7 @@ impl JobPoller {
         let shutdown_timeout = self.config.shutdown_timeout;
         let job_id = job.id;
         let job_type = job.job_type.clone();
+        let retains_state = self.registry.retains_state(&job_type);
         #[cfg_attr(
             not(all(feature = "tokio-task-names", tokio_unstable)),
             allow(unused_variables)
@@ -786,6 +787,7 @@ impl JobPoller {
             retry_settings,
             job_id,
             job_type.clone(),
+            retains_state,
             runner,
             instance_id,
             clock,
@@ -949,14 +951,20 @@ async fn poll_jobs(
         ),
         walk AS (
             -- Enumerate QUEUES, not rows: one index seek per queue regardless
-            -- of how deep its backlog is. `found` tallies eligible queues and
-            -- the recursion ends once there are enough, so cost is
-            -- O(queues examined). $7 is the round-robin cursor.
-            SELECT s.q AS queue_id,
-                   CASE WHEN s.q IS NOT NULL AND NOT EXISTS (
-                          SELECT 1 FROM job_executions r
-                          WHERE r.state = 'running' AND r.queue_id = s.q)
-                        THEN 1 ELSE 0 END AS found
+            -- of how deep its backlog is. `found` tallies queues that would
+            -- actually yield a candidate and the recursion ends once there are
+            -- enough, so cost is O(queues examined). $7 is the round-robin
+            -- cursor.
+            --
+            -- `found` counts CLAIMABLE queues, not merely unblocked ones: a
+            -- queue whose head is future-scheduled or belongs to a saturated
+            -- type produces nothing, and counting it would let such queues
+            -- exhaust the budget while claimable work further along was never
+            -- examined. Eligibility is evaluated against `w.queue_id` (already
+            -- materialised) rather than the queue being advanced to, so the
+            -- step costs one seek to advance plus the checks -- never a second
+            -- evaluation of the advance subquery.
+            SELECT s.q AS queue_id, 0 AS found
             FROM (SELECT MIN(queue_id) AS q FROM job_executions
                   WHERE state = 'pending' AND queue_id IS NOT NULL
                     AND queue_id > $7) s
@@ -965,12 +973,15 @@ async fn poll_jobs(
               (SELECT MIN(je.queue_id) FROM job_executions je
                WHERE je.state = 'pending' AND je.queue_id IS NOT NULL
                  AND je.queue_id > w.queue_id),
-              w.found + CASE WHEN NOT EXISTS (
-                  SELECT 1 FROM job_executions r
-                  WHERE r.state = 'running' AND r.queue_id =
-                    (SELECT MIN(je2.queue_id) FROM job_executions je2
-                     WHERE je2.state = 'pending' AND je2.queue_id IS NOT NULL
-                       AND je2.queue_id > w.queue_id))
+              w.found + CASE
+                WHEN NOT EXISTS (
+                       SELECT 1 FROM job_executions r
+                       WHERE r.state = 'running' AND r.queue_id = w.queue_id)
+                 AND (SELECT je.job_type FROM job_executions je
+                      WHERE je.state = 'pending' AND je.queue_id = w.queue_id
+                        AND je.execute_at <= $2::timestamptz
+                      ORDER BY je.execute_at LIMIT 1)
+                     IN (SELECT job_type FROM limits)
                 THEN 1 ELSE 0 END
             FROM walk w
             WHERE w.queue_id IS NOT NULL AND w.found < $1::int4 * $8::int4
@@ -982,11 +993,14 @@ async fn poll_jobs(
                               WHERE r.state = 'running' AND r.queue_id = w.queue_id)
         ),
         due_queued AS (
-            -- One row per eligible queue: its head. Taking only the head is
-            -- what keeps "at most one running job per queue" true against a
-            -- concurrent poller -- a peer that already locked this head finds
-            -- it locked and skips the whole queue, rather than claiming the
-            -- row behind it.
+            -- One row per eligible queue: its oldest DUE row, chosen without
+            -- reference to `limits` and only then dropped if its type is not
+            -- pollable here. That order matters -- picking the oldest
+            -- *pollable* row instead would let two instances with different
+            -- saturated types select DIFFERENT rows of the same queue and both
+            -- claim, breaking queue exclusion. Deciding the row identically
+            -- everywhere is what makes a peer's lock on it visible as "this
+            -- queue is taken" rather than "try the next row down".
             SELECT h.id, h.execute_at, h.job_type
             FROM eligible_queues e
             CROSS JOIN LATERAL (
@@ -994,10 +1008,10 @@ async fn poll_jobs(
                 FROM job_executions je
                 WHERE je.state = 'pending' AND je.queue_id = e.queue_id
                   AND je.execute_at <= $2::timestamptz
-                  AND je.job_type IN (SELECT job_type FROM limits)
                 ORDER BY je.execute_at
                 LIMIT 1
             ) h
+            WHERE h.job_type IN (SELECT job_type FROM limits)
         ),
         due_plain AS (
             -- Unqueued rows can never be blocked by a sibling, so they come
@@ -1075,16 +1089,31 @@ async fn poll_jobs(
             AND job_type = ANY($4)
             AND execute_at > $2::timestamptz
         ),
-        next_cursor AS (
-            -- NULL means the sweep ran off the end of queue_id space, so the
-            -- caller wraps back to the start.
-            SELECT CASE WHEN bool_or(queue_id IS NULL) THEN NULL
-                        ELSE MAX(queue_id) END AS c
+        walk_state AS (
+            -- `ran_off_end`: the recursion emitted a NULL step, i.e. it
+            -- reached the end of queue_id space rather than stopping on its
+            -- budget.
+            SELECT bool_or(queue_id IS NULL) AS ran_off_end,
+                   MAX(queue_id) AS last_queue
             FROM walk
         ),
+        next_cursor AS (
+            -- Running off the end wraps the caller's cursor to the start.
+            SELECT CASE WHEN ran_off_end THEN NULL ELSE last_queue END AS c
+            FROM walk_state
+        ),
         poll_status AS (
+            -- The sweep covered every queue only if it ran off the end having
+            -- started from the beginning. If it stopped on its budget, queues
+            -- past it are unexamined; if it wrapped from a mid-space cursor,
+            -- the queues BEFORE that cursor were never looked at this poll.
+            -- Either way there may be due work this poll could not see, and
+            -- reporting otherwise would let the poller sleep on `next_due_at`
+            -- while it sat there.
             SELECT ((SELECT COUNT(*) FROM ordered_candidates) >= $1
-                 OR (SELECT COUNT(*) FROM locked) >= $1) AS may_have_more
+                 OR (SELECT COUNT(*) FROM locked) >= $1
+                 OR NOT (ws.ran_off_end AND $7 = '')) AS may_have_more
+            FROM walk_state ws
         )
         SELECT * FROM (
             SELECT

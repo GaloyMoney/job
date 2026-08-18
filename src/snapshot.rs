@@ -19,12 +19,11 @@ use crate::{
 /// synchronous (only decoding can fail). Nothing is cached on the handle: a
 /// fresh `load()` always reflects the latest committed state.
 ///
-/// [`Self::execution_state`] is read independently of `row`: a regular or
-/// resident job's state is deleted alongside its execution row on terminal,
-/// but a **keyed** job's state is retained (see
-/// [`KeyedJobInitializer::inherits_state`](crate::KeyedJobInitializer::inherits_state))
-/// and must stay readable after terminal too — which `row` alone, being
-/// `None` once terminal, cannot express.
+/// [`Self::execution_state`] is read independently of `row`: state is normally
+/// deleted alongside the execution row on terminal, but a keyed type with
+/// [`inherits_state`](crate::KeyedJobInitializer::inherits_state) keeps it, and
+/// it must stay readable then — which `row` alone, being `None` once terminal,
+/// cannot express.
 pub struct JobSnapshot {
     job: Job,
     row: Option<JobExecutionRow>,
@@ -102,12 +101,11 @@ impl JobSnapshot {
 
     /// Decode the job's committed execution state as `S`.
     ///
-    /// Honest absence: `Ok(None)` when no state has been written yet, or
-    /// (for regular/resident jobs) once the job is terminal — their state
-    /// row is deleted alongside the execution row. A **keyed** job's state
-    /// is the exception: its row is retained on terminal, so this stays
-    /// `Some` for a keyed job even after completion — see
-    /// [`KeyedJobInitializer::inherits_state`](crate::KeyedJobInitializer::inherits_state).
+    /// Honest absence: `Ok(None)` when no state has been written yet, or once
+    /// the job is terminal — the state row is deleted alongside the execution
+    /// row. The exception is a keyed type with
+    /// [`inherits_state`](crate::KeyedJobInitializer::inherits_state), whose
+    /// row is kept, so this stays `Some` even after completion.
     /// Mirrors [`CurrentJob::execution_state`](crate::CurrentJob::execution_state).
     pub fn execution_state<S: DeserializeOwned>(&self) -> Result<Option<S>, serde_json::Error> {
         match &self.execution_state_json {
