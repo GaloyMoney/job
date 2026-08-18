@@ -466,14 +466,6 @@ pub struct NewJob {
     pub(super) queue_id: Option<String>,
     #[builder(setter(into, strip_option), default)]
     pub(super) unique_key: Option<String>,
-    /// Enforcement flag for the absolutely-unique `ResidentJobSpawner::spawn`
-    /// path — a dedicated materialized column
-    /// (`idx_jobs_job_type_resident`), written once at creation and never
-    /// read back through the entity/event log, mirroring `unique_key`'s
-    /// `update(persist = false)` treatment in `repo.rs`. Not part of
-    /// `JobEvent::Initialized`: unlike `unique_key` (which is display data —
-    /// `JobSnapshot::unique_key()`, `keyed_handles`), this is pure DB-level
-    /// enforcement, so it has no reason to round-trip through hydration.
     #[builder(default)]
     pub(super) resident: bool,
 }
