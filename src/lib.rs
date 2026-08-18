@@ -181,7 +181,7 @@
 //!
 //! **Spawning and awaiting are unchanged.** Batched types use the same
 //! [`JobSpawner`] and resolve through the same
-//! [`await_completion`](Jobs::await_completion) — whether a job ran in a batch
+//! [`await_completion`](JobHandle::await_completion) — whether a job ran in a batch
 //! is invisible from both sides.
 //!
 //! Points worth knowing before opting in:

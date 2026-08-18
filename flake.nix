@@ -320,10 +320,10 @@
         cargo nextest run --workspace --verbose
 
         echo "Running doc tests..."
-        cargo test --doc --workspace
+        cargo test --doc --workspace --all-features
 
         echo "Building docs..."
-        cargo doc --no-deps --workspace
+        cargo doc --no-deps --workspace --all-features
 
         echo "Tests completed successfully!"
       '';

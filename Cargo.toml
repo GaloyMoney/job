@@ -11,6 +11,9 @@ categories = ["database"]
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 
 fail-on-warnings = []
