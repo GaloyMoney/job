@@ -1,3 +1,15 @@
+# [job release v0.12.0](https://github.com/GaloyMoney/job/releases/tag/0.12.0)
+
+
+
+### Bug Fixes
+
+- [**breaking**] Correct breaking-change marker for keyed/resident API split (#170)
+
+### Documentation
+
+- Document DuplicateResident (#170)
+
 # [job release v0.11.3](https://github.com/GaloyMoney/job/releases/tag/0.11.3)
 
 
