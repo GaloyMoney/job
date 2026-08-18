@@ -47,17 +47,6 @@ pub trait JobInitializer: Send + Sync + 'static {
         None
     }
 
-    /// Max concurrent jobs of this type across ALL poller instances (soft).
-    /// `None` = uncapped. Bounds load on a downstream dependency ("at most N
-    /// concurrent Keycloak calls"). SOFT: instances observe the running count
-    /// just before claiming, so concurrent polls can transiently overshoot.
-    /// Steady-state stays ≤ the cap; for a hard bound pair with
-    /// [`max_concurrent_per_process`](Self::max_concurrent_per_process)
-    /// (hard bound = per-process cap × instances).
-    fn max_concurrent_global(&self) -> Option<usize> {
-        None
-    }
-
     /// Produce a runner instance for the provided job.
     ///
     /// The spawner parameter allows the runner to spawn additional jobs of the

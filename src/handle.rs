@@ -19,8 +19,8 @@ use crate::{
 ///
 /// Obtain one from [`Jobs::handle`](crate::Jobs::handle),
 /// [`Jobs::handles`](crate::Jobs::handles),
-/// [`JobSpawner::spawn_unique`](crate::JobSpawner::spawn_unique), or
-/// [`JobSpawner::spawn_keyed`](crate::JobSpawner::spawn_keyed).
+/// [`ResidentJobSpawner::spawn`](crate::ResidentJobSpawner::spawn), or
+/// [`KeyedJobSpawner::spawn`](crate::KeyedJobSpawner::spawn).
 ///
 /// The handle is a capability, not a value: it holds no cached state and
 /// exposes exactly two operations — [`load`](Self::load) for a point-in-time
@@ -42,10 +42,15 @@ use crate::{
 ///    `Pending`/`Running` for a finished job, regardless of isolation level.
 /// 5. **Honest absence:** [`JobSnapshot::execution_state`] ⇒ `Ok(None)` on
 ///    no-row/no-state; `load()` ⇒ `Err(Find)` only if the job never existed.
-/// 6. **`spawn_unique`/`spawn_keyed` handle identity:** both generate the
-///    job's id internally; on the duplicate path the returned handle's id is
-///    the PERSISTED job's id. Either way, callers read the id back from the
-///    handle.
+/// 6. **Keyed/resident handle identity:** both
+///    [`KeyedJobSpawner::spawn`](crate::KeyedJobSpawner::spawn) and
+///    [`ResidentJobSpawner::spawn`](crate::ResidentJobSpawner::spawn)
+///    generate the job's id internally; on the duplicate path the returned
+///    handle's id is the PERSISTED job's id, not a new one — for keyed, the
+///    still-LIVE job holding the key; for resident, the job that exists at
+///    all (possibly long-terminal, though a resident job never actually
+///    reaches terminal — see [`crate::ResidentJobCompletion`]). Either way,
+///    callers read the id back from the handle.
 #[derive(Clone)]
 pub struct JobHandle {
     id: JobId,

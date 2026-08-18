@@ -466,6 +466,8 @@ pub struct NewJob {
     pub(super) queue_id: Option<String>,
     #[builder(setter(into, strip_option), default)]
     pub(super) unique_key: Option<String>,
+    #[builder(default)]
+    pub(super) resident: bool,
 }
 
 impl NewJob {

@@ -101,6 +101,12 @@ struct ShutdownCoordinator {
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
+/// How far past its admission budget a poll gathers candidates, so
+/// `FOR UPDATE ... SKIP LOCKED` has somewhere to fall through when a peer
+/// instance holds locks on the rows this poll would target. Sized for
+/// contention, not for filtering. See PERFORMANCE.md, "Contention headroom".
+const CONTENTION_HEADROOM: i32 = 4;
+
 impl JobPoller {
     pub fn new(
         config: JobPollerConfig,
@@ -199,22 +205,18 @@ impl JobPoller {
     ) {
         let mut failures = 0;
         let mut woken_up = false;
-        let debounce = self.config.poll_debounce;
-        let mut last_poll = std::time::Instant::now();
+        // Round-robin cursor over `queue_id` space, in memory and private to
+        // this instance: each poll resumes the queue walk where the previous
+        // one stopped, which bounds a queue's worst-case wait to one sweep.
+        // See PERFORMANCE.md, "Queue fairness".
+        let mut queue_cursor = String::new();
 
         loop {
             if *poll_stop_rx.borrow_and_update() {
                 break;
             }
-            if woken_up {
-                let since = last_poll.elapsed();
-                if since < debounce {
-                    tokio::time::sleep(debounce - since).await;
-                }
-            }
-            last_poll = std::time::Instant::now();
 
-            let timeout = match self.poll_and_dispatch(woken_up).await {
+            let timeout = match self.poll_and_dispatch(woken_up, &mut queue_cursor).await {
                 Ok(duration) => {
                     failures = 0;
                     duration
@@ -253,7 +255,11 @@ impl JobPoller {
         skip(self),
         fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in)
     )]
-    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
+    async fn poll_and_dispatch(
+        self: &Arc<Self>,
+        woken_up: bool,
+        queue_cursor: &mut String,
+    ) -> Result<Duration, JobError> {
         let span = Span::current();
         span.record("poller_id", tracing::field::display(self.instance_id));
         let Some(n_jobs_to_poll) = self.tracker.next_batch_size() else {
@@ -275,8 +281,7 @@ impl JobPoller {
             self.instance_id,
             &plan.types,
             &plan.row_limits,
-            &plan.global_cap_types,
-            &plan.global_caps,
+            queue_cursor,
             &self.clock,
         )
         .await?
@@ -764,7 +769,7 @@ impl JobPoller {
         let shutdown_timeout = self.config.shutdown_timeout;
         let job_id = job.id;
         let job_type = job.job_type.clone();
-        let globally_capped = self.registry.global_cap(&job_type).is_some();
+        let retains_state = self.registry.retains_state(&job_type);
         #[cfg_attr(
             not(all(feature = "tokio-task-names", tokio_unstable)),
             allow(unused_variables)
@@ -782,7 +787,7 @@ impl JobPoller {
             retry_settings,
             job_id,
             job_type.clone(),
-            globally_capped,
+            retains_state,
             runner,
             instance_id,
             clock,
@@ -896,7 +901,7 @@ async fn reclaim_lost_jobs(
 #[instrument(
     name = "job.poll_jobs",
     level = "debug",
-    skip(pool, pollable_types, row_limits, global_cap_types, global_caps, clock),
+    skip(pool, pollable_types, row_limits, queue_cursor, clock),
     fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty)
 )]
 #[allow(clippy::too_many_arguments)]
@@ -906,8 +911,7 @@ async fn poll_jobs(
     instance_id: uuid::Uuid,
     pollable_types: &[super::entity::JobType],
     row_limits: &[i32],
-    global_cap_types: &[super::entity::JobType],
-    global_caps: &[i32],
+    queue_cursor: &mut String,
     clock: &ClockHandle,
 ) -> Result<JobPollResult, sqlx::Error> {
     // sim_now drives execute_at scheduling (whatever clock the application uses);
@@ -917,135 +921,148 @@ async fn poll_jobs(
     let wall_now = chrono::Utc::now();
     Span::current().record("now", tracing::field::display(sim_now));
 
-    // Force the generic plan: auto never picks it for this statement, so
-    // every poll re-plans the 6-CTE query (35-54ms vs 0.3ms exec). SET LOCAL
-    // keeps the override off other statements on the caller-shared pool.
+    // Both overrides are scoped to this transaction so they never leak onto
+    // other statements on the caller-shared pool.
+    //
+    // Generic plan: auto never picks it here, so every poll would otherwise
+    // re-plan the whole CTE tower (35-54ms vs sub-ms exec). No bitmap scans:
+    // the queue walk and both due-scans depend on ORDERED index access, and a
+    // bitmap scan returns heap order instead. See PERFORMANCE.md, "Ordered
+    // index access is mandatory".
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL enable_bitmapscan = off")
         .execute(&mut *tx)
         .await?;
 
     let rows = sqlx::query_as!(
         JobPollRow,
         r#"
-        -- Narrowest set first: only due jobs, in execute_at order,
-        -- bounded by a small overscan of the poll limit.
-        -- idx_job_executions_pending_job_type_execute_at serves this as
-        -- an ordered index scan; future-scheduled jobs never reach the
-        -- anti-join / window-function work below.
-        WITH global_running AS (
-            -- Running-execution count of the globally-capped subset of $4
-            -- ($7, almost always empty or tiny — batched types never appear
-            -- here, see `JobInitializer::max_concurrent_global`). Feeds
-            -- `limits` below. `job_executions` is small (bounded by the
-            -- fleet's slot budgets — hundreds of rows), and the partial index
-            -- idx_job_executions_poller_instance already covers
-            -- `state = 'running'`, so with $7 empty this is a no-op scan of
-            -- zero rows; with $7 populated it's still a cheap index scan, not
-            -- a sequential one.
-            SELECT job_type, COUNT(*) AS n
-            FROM job_executions
-            WHERE state = 'running' AND job_type = ANY($7)
-            GROUP BY job_type
-        ),
-        limits AS (
-            -- One row per pollable type carrying how many rows this poll may
-            -- claim for it. For a batched type that is
-            -- `max_batch_size * free batch slots`, so no more rows are taken
-            -- than a batch is free to execute immediately; the rest of the
-            -- backlog stays unclaimed for other pollers and accumulates into
-            -- fuller later batches. A plain type's per-process concurrency
-            -- cap (`JobInitializer::max_concurrent_per_process`) is folded
-            -- into `row_limit` client-side, before this query runs, via $6 —
-            -- `units_in_flight` is in-process state no query can see. A
-            -- global cap (`max_concurrent_global`) is folded in right here,
-            -- against `global_running`, in the SAME round trip as everything
-            -- else: types not in $7 are unaffected (`g.cap IS NULL`).
-            SELECT l.job_type,
-                   CASE WHEN g.cap IS NOT NULL
-                        THEN LEAST(l.row_limit, GREATEST(g.cap - COALESCE(gr.n, 0), 0))
-                        ELSE l.row_limit
-                   END AS row_limit
+        -- Claim admission. Queued and unqueued rows are gathered separately so
+        -- that neither can starve the other, and each type is bounded by its
+        -- own budget. See PERFORMANCE.md ("Claim admission") for the
+        -- measurements behind this shape.
+        WITH RECURSIVE limits AS (
+            SELECT l.job_type, l.row_limit
             FROM UNNEST($4::text[], $6::int4[]) AS l(job_type, row_limit)
-            LEFT JOIN UNNEST($7::text[], $8::int4[]) AS g(job_type, cap)
-                   ON g.job_type = l.job_type
-            LEFT JOIN global_running gr ON gr.job_type = l.job_type
+            WHERE l.row_limit > 0
         ),
-        pollable AS (
-            -- Types with zero effective row_limit — per-process/batch-slot
-            -- saturated (never reach here, already absent from $4) or
-            -- global-budget saturated (computed above) — are dropped here,
-            -- before `due`: exactly like today, a saturated type's backlog
-            -- never floods the overscan window below. A plain row set, not
-            -- an aggregated array: `= ANY(subquery)` compares against each
-            -- ROW of a subquery, so an array-typed aggregate here would
-            -- compare `job_type` against whole arrays instead of elements.
-            SELECT job_type FROM limits WHERE row_limit > 0
+        walk AS (
+            -- Enumerate QUEUES, not rows: one index seek per queue regardless
+            -- of how deep its backlog is. `found` tallies queues that would
+            -- actually yield a candidate and the recursion ends once there are
+            -- enough, so cost is O(queues examined). $7 is the round-robin
+            -- cursor.
+            --
+            -- `found` counts CLAIMABLE queues, not merely unblocked ones: a
+            -- queue whose head is future-scheduled or belongs to a saturated
+            -- type produces nothing, and counting it would let such queues
+            -- exhaust the budget while claimable work further along was never
+            -- examined. Eligibility is evaluated against `w.queue_id` (already
+            -- materialised) rather than the queue being advanced to, so the
+            -- step costs one seek to advance plus the checks -- never a second
+            -- evaluation of the advance subquery.
+            SELECT s.q AS queue_id, 0 AS found
+            FROM (SELECT MIN(queue_id) AS q FROM job_executions
+                  WHERE state = 'pending' AND queue_id IS NOT NULL
+                    AND queue_id > $7) s
+            UNION ALL
+            SELECT
+              (SELECT MIN(je.queue_id) FROM job_executions je
+               WHERE je.state = 'pending' AND je.queue_id IS NOT NULL
+                 AND je.queue_id > w.queue_id),
+              w.found + CASE
+                WHEN NOT EXISTS (
+                       SELECT 1 FROM job_executions r
+                       WHERE r.state = 'running' AND r.queue_id = w.queue_id)
+                 AND (SELECT je.job_type FROM job_executions je
+                      WHERE je.state = 'pending' AND je.queue_id = w.queue_id
+                        AND je.execute_at <= $2::timestamptz
+                      ORDER BY je.execute_at LIMIT 1)
+                     IN (SELECT job_type FROM limits)
+                THEN 1 ELSE 0 END
+            FROM walk w
+            WHERE w.queue_id IS NOT NULL AND w.found < $1::int4 * $8::int4
         ),
-        due AS (
-            SELECT id, queue_id, execute_at, job_type
-            FROM job_executions
-            WHERE state = 'pending'
-            AND job_type IN (SELECT job_type FROM pollable)
-            AND execute_at <= $2::timestamptz
-            ORDER BY execute_at
-            LIMIT $1 * 4
+        eligible_queues AS (
+            SELECT w.queue_id FROM walk w
+            WHERE w.queue_id IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM job_executions r
+                              WHERE r.state = 'running' AND r.queue_id = w.queue_id)
         ),
-        candidates AS (
-            -- The 1-at-a-time-per-queue anti-join and the queue-dedup
-            -- window run only over the bounded due set instead of every
-            -- pending row.
+        due_queued AS (
+            -- One row per eligible queue: its oldest DUE row, chosen without
+            -- reference to `limits` and only then dropped if its type is not
+            -- pollable here. That order matters -- picking the oldest
+            -- *pollable* row instead would let two instances with different
+            -- saturated types select DIFFERENT rows of the same queue and both
+            -- claim, breaking queue exclusion. Deciding the row identically
+            -- everywhere is what makes a peer's lock on it visible as "this
+            -- queue is taken" rather than "try the next row down".
+            SELECT h.id, h.execute_at, h.job_type
+            FROM eligible_queues e
+            CROSS JOIN LATERAL (
+                SELECT je.id, je.execute_at, je.job_type
+                FROM job_executions je
+                WHERE je.state = 'pending' AND je.queue_id = e.queue_id
+                  AND je.execute_at <= $2::timestamptz
+                ORDER BY je.execute_at
+                LIMIT 1
+            ) h
+            WHERE h.job_type IN (SELECT job_type FROM limits)
+        ),
+        due_plain AS (
+            -- Unqueued rows can never be blocked by a sibling, so they come
+            -- straight off their own partial index in execute_at order,
+            -- bounded per type.
+            SELECT d.id, d.execute_at, d.job_type
+            FROM limits t
+            CROSS JOIN LATERAL (
+                SELECT je.id, je.execute_at, je.job_type
+                FROM job_executions je
+                WHERE je.state = 'pending' AND je.queue_id IS NULL
+                  AND je.job_type = t.job_type
+                  AND je.execute_at <= $2::timestamptz
+                ORDER BY je.execute_at
+                LIMIT LEAST(t.row_limit, $1::int4) * $8::int4
+            ) d
+        ),
+        ordered_candidates AS (
+            -- Interleave types round-robin: every type's oldest candidate
+            -- ranks ahead of any type's second, so the global LIMIT below
+            -- cannot be consumed end-to-end by one backlogged type. Within a
+            -- rank it is still oldest-first.
             SELECT id, execute_at, job_type,
                    ROW_NUMBER() OVER (
-                       PARTITION BY COALESCE(queue_id, id::text)
-                       ORDER BY execute_at
-                   ) AS rn
-            FROM due
-            WHERE NOT EXISTS (
-                SELECT 1 FROM job_executions AS running
-                WHERE running.state = 'running'
-                AND running.queue_id IS NOT NULL
-                AND running.queue_id = due.queue_id
-            )
+                       PARTITION BY job_type ORDER BY execute_at
+                   ) AS type_rn
+            FROM (SELECT * FROM due_plain UNION ALL SELECT * FROM due_queued) u
         ),
         locked AS (
-            -- execution_state_json comes from job_execution_states via this
-            -- LEFT JOIN, fetched only for the ~$1 winners.
-            --
-            -- Every queue-head is eligible here, deliberately: the per-type
-            -- cap is applied *after* this lock, never before it. Filtering to
-            -- each type's cap first would make every instance rank the same
-            -- global candidate set and target an identical head slice, so a
-            -- poller that lost the race would skip that whole slice and fall
-            -- through to nothing while due work sat unclaimed. SKIP LOCKED can
-            -- only route around a concurrent poller if there is something
-            -- past its rows left to see.
+            -- The join to job_executions sits BELOW the LIMIT so it runs
+            -- lazily: only rows LockRows actually pulls get probed. The sort
+            -- above is a blocking node, so the full candidate set is still
+            -- materialised and SKIP LOCKED falls through a contended head
+            -- exactly as before.
             --
             -- FOR UPDATE OF je: bare FOR UPDATE errors on a nullable join side.
-            SELECT je.id, cp.execution_state_json AS data_json, je.attempt_index,
-                   c.job_type, je.execute_at
-            FROM candidates c
+            SELECT je.id, je.attempt_index, c.job_type, c.execute_at
+            FROM ordered_candidates c
             JOIN job_executions je ON je.id = c.id
-            LEFT JOIN job_execution_states cp ON cp.id = c.id
-            WHERE c.rn = 1
-            ORDER BY je.execute_at ASC
+            ORDER BY c.type_rn ASC, c.execute_at ASC
             LIMIT $1
             FOR UPDATE OF je SKIP LOCKED
         ),
         selected_jobs AS (
-            -- Enforce each type's cap on the rows this poller actually holds.
-            -- Rows over the cap are simply not claimed: they stay `pending`
-            -- and their lock is released when this short poll transaction
-            -- commits, so they remain visible to other instances and
-            -- accumulate into fuller later batches.
-            --
-            -- Every type `locked` can contain came through `due`, which only
-            -- admits types `pollable` kept — i.e. row_limit >= 1 in `limits`
-            -- (`limits` itself may still hold saturated, row_limit = 0 rows;
-            -- `pollable` is what filters those out before `due`). So the
-            -- first row of any type present here always survives —
-            -- `selected_jobs` is never empty while `locked` isn't.
-            SELECT t.id, t.data_json, t.attempt_index
+            -- The budget is enforced HERE, on rows actually held: the scans
+            -- above deliberately over-gather (see $8) so there is something to
+            -- fall through to when a peer holds the head. Rows over a type's
+            -- cap are simply not claimed; their locks release at commit.
+            -- execution_state_json is joined after the LIMIT, so it is fetched
+            -- only for winners.
+            SELECT t.id, cp.execution_state_json AS data_json, t.attempt_index
             FROM (
                 SELECT l.*,
                        ROW_NUMBER() OVER (
@@ -1054,12 +1071,10 @@ async fn poll_jobs(
                 FROM locked l
             ) t
             JOIN limits lim ON lim.job_type = t.job_type
+            LEFT JOIN job_execution_states cp ON cp.id = t.id
             WHERE t.type_rn <= lim.row_limit
         ),
         updated AS (
-            -- queue_id rides along in the projection (it is already read by
-            -- `due`): batch formation needs it as the canonical ordering key,
-            -- and batched runners surface it per item.
             UPDATE job_executions AS je
             SET state = 'running', alive_at = $5, execute_at = NULL, poller_instance_id = $3
             FROM selected_jobs
@@ -1068,24 +1083,37 @@ async fn poll_jobs(
             RETURNING je.id, selected_jobs.data_json, je.attempt_index, je.queue_id
         ),
         min_wait AS (
-            -- Index-only scan over the pending partial index, no
-            -- anti-join. May wake slightly early when the nearest
-            -- future job is queue-blocked — one wasted wake-up at
-            -- worst, only while its queue stays busy.
-            --
-            -- Absolute timestamp; excludes already-due rows (see overscan_status).
             SELECT MIN(execute_at) AS next_due_at
             FROM job_executions
             WHERE state = 'pending'
             AND job_type = ANY($4)
             AND execute_at > $2::timestamptz
         ),
-        overscan_status AS (
-            -- Whether `due` or `locked` hit its LIMIT — if so, re-poll rather than trust next_due_at.
-            SELECT
-                (SELECT COUNT(*) FROM due) >= $1 * 4
-                OR (SELECT COUNT(*) FROM locked) >= $1
-                AS may_have_more
+        walk_state AS (
+            -- `ran_off_end`: the recursion emitted a NULL step, i.e. it
+            -- reached the end of queue_id space rather than stopping on its
+            -- budget.
+            SELECT bool_or(queue_id IS NULL) AS ran_off_end,
+                   MAX(queue_id) AS last_queue
+            FROM walk
+        ),
+        next_cursor AS (
+            -- Running off the end wraps the caller's cursor to the start.
+            SELECT CASE WHEN ran_off_end THEN NULL ELSE last_queue END AS c
+            FROM walk_state
+        ),
+        poll_status AS (
+            -- The sweep covered every queue only if it ran off the end having
+            -- started from the beginning. If it stopped on its budget, queues
+            -- past it are unexamined; if it wrapped from a mid-space cursor,
+            -- the queues BEFORE that cursor were never looked at this poll.
+            -- Either way there may be due work this poll could not see, and
+            -- reporting otherwise would let the poller sleep on `next_due_at`
+            -- while it sat there.
+            SELECT ((SELECT COUNT(*) FROM ordered_candidates) >= $1
+                 OR (SELECT COUNT(*) FROM locked) >= $1
+                 OR NOT (ws.ran_off_end AND $7 = '')) AS may_have_more
+            FROM walk_state ws
         )
         SELECT * FROM (
             SELECT
@@ -1094,8 +1122,9 @@ async fn poll_jobs(
                 u.attempt_index AS "attempt_index?",
                 u.queue_id AS "queue_id?",
                 NULL::TIMESTAMPTZ AS "next_due_at?",
-                os.may_have_more AS "may_have_more!"
-            FROM updated u, overscan_status os
+                ps.may_have_more AS "may_have_more!",
+                nc.c AS "next_queue_cursor?"
+            FROM updated u, poll_status ps, next_cursor nc
             UNION ALL
             SELECT
                 NULL::UUID AS "id?: JobId",
@@ -1103,8 +1132,9 @@ async fn poll_jobs(
                 NULL::INT AS "attempt_index?",
                 NULL::VARCHAR AS "queue_id?",
                 mw.next_due_at AS "next_due_at?",
-                os.may_have_more AS "may_have_more!"
-            FROM min_wait mw, overscan_status os
+                ps.may_have_more AS "may_have_more!",
+                nc.c AS "next_queue_cursor?"
+            FROM min_wait mw, poll_status ps, next_cursor nc
         ) AS result
         "#,
         n_jobs_to_poll as i32,
@@ -1113,12 +1143,22 @@ async fn poll_jobs(
         pollable_types as _,
         wall_now,
         row_limits,
-        global_cap_types as _,
-        global_caps,
+        queue_cursor.as_str(),
+        CONTENTION_HEADROOM,
     )
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
+
+    // Advance the round-robin cursor. An exhausted sweep reports NULL, which
+    // wraps us back to the start of queue_id space.
+    match rows.iter().find_map(|row| row.next_queue_cursor.as_deref()) {
+        Some(cursor) => {
+            queue_cursor.clear();
+            queue_cursor.push_str(cursor);
+        }
+        None => queue_cursor.clear(),
+    }
 
     Span::current().record("n_jobs_found", rows.len());
     Ok(JobPollResult::from_rows(rows))
@@ -1161,6 +1201,9 @@ struct JobPollRow {
     queue_id: Option<String>,
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
+    /// Where the queue sweep stopped; `None` once it has run off the end of
+    /// queue_id space, which wraps the caller's cursor back to the start.
+    next_queue_cursor: Option<String>,
 }
 
 impl JobPollResult {
@@ -1639,19 +1682,26 @@ mod tests {
         Ok(id)
     }
 
-    /// A capped type's backlog can saturate the `due`/`locked` windows and
-    /// hide an uncapped type's due row; `may_have_more` must catch that.
+    /// A backlogged capped type must NOT be able to consume another type's
+    /// admission budget.
+    ///
+    /// This is the regression that the per-type budget replaced the old
+    /// `n_claim * 4` overscan window to fix: previously every pollable type
+    /// competed for one shared, globally-ordered candidate window, so type A's
+    /// 10 older rows filled it completely and type B's due row was never even
+    /// seen — the poll returned only A's single capped row and left B starved
+    /// behind it. Each type now scans under its own budget, so both are
+    /// claimed in the same poll.
     #[tokio::test]
-    async fn may_have_more_when_capped_type_saturates_the_overscan_window() -> anyhow::Result<()> {
+    async fn capped_type_backlog_does_not_starve_another_type() -> anyhow::Result<()> {
         let pool = init_pool().await?;
         let instance_id = uuid::Uuid::now_v7();
-        let type_a = format!("overscan-dominant-{}", uuid::Uuid::now_v7());
-        let type_b = format!("overscan-starved-{}", uuid::Uuid::now_v7());
+        let type_a = format!("budget-dominant-{}", uuid::Uuid::now_v7());
+        let type_b = format!("budget-starved-{}", uuid::Uuid::now_v7());
 
-        // n_jobs_to_poll = 2 -> due overscan LIMIT = 8, locked LIMIT = 2.
         let n_jobs_to_poll = 2usize;
 
-        // A: 10 due rows, all older than B's — saturates the overscan window alone.
+        // A: 10 due rows, ALL older than B's single row.
         let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
         let mut a_ids = Vec::new();
         for i in 0..10i64 {
@@ -1673,6 +1723,7 @@ mod tests {
         // A capped to 1; B uncapped (row_limit = n_jobs_to_poll).
         let row_limits = vec![1, n_jobs_to_poll as i32];
         let clock = ClockHandle::realtime();
+        let mut cursor = String::new();
 
         let result = poll_jobs(
             &pool,
@@ -1680,34 +1731,27 @@ mod tests {
             instance_id,
             &pollable_types,
             &row_limits,
-            &[],
-            &[],
+            &mut cursor,
             &clock,
         )
         .await?;
 
         match result {
-            JobPollResult::Jobs { jobs, window } => {
+            JobPollResult::Jobs { jobs, .. } => {
+                let claimed: std::collections::HashSet<JobId> = jobs.iter().map(|j| j.id).collect();
+                assert!(
+                    claimed.contains(&b_id),
+                    "B's due row must be claimed: A's older backlog can no \
+                     longer consume the window B's budget entitles it to"
+                );
                 assert_eq!(
-                    jobs.len(),
+                    claimed.iter().filter(|id| a_ids.contains(id)).count(),
                     1,
-                    "only A's single capped slot should be claimed this poll"
+                    "A is capped at 1 and must claim exactly one row"
                 );
-                assert!(
-                    a_ids.contains(&jobs[0].id),
-                    "the one claimed row must be A's (oldest); B's row must \
-                     stay unclaimed, pushed out of the overscan window"
-                );
-                assert_ne!(jobs[0].id, b_id);
-                assert!(
-                    window.may_have_more,
-                    "the due/locked windows were saturated by A alone — B's \
-                     due row (and A's own remaining 9) are still out there, \
-                     unseen by this poll; min_wait cannot detect that, only \
-                     may_have_more can"
-                );
+                assert_eq!(claimed.len(), 2, "one row per type, both claimed");
             }
-            other => panic!("expected a partial Jobs claim, got {other:?}"),
+            other => panic!("expected a Jobs claim, got {other:?}"),
         }
 
         Ok(())

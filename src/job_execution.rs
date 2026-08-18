@@ -9,7 +9,6 @@
 //! [`Job`]: crate::Job
 
 use chrono::{DateTime, Utc};
-use serde::de::DeserializeOwned;
 
 /// Rust-side mirror of the `JobExecutionState` Postgres enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
@@ -59,16 +58,6 @@ impl JobExecutionRow {
                 alive_at: self.alive_at,
                 queue_id,
             },
-        }
-    }
-
-    /// Decode the committed execution state as `S` (`Ok(None)` when unset).
-    pub(crate) fn execution_state<S: DeserializeOwned>(
-        &self,
-    ) -> Result<Option<S>, serde_json::Error> {
-        match &self.execution_state_json {
-            Some(json) => serde_json::from_value(json.clone()).map(Some),
-            None => Ok(None),
         }
     }
 }

@@ -3,9 +3,10 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, DEFAULT_UNIQUE_KEY, Job, JobCompletion, JobId, JobInitializer,
-    JobOutcomes, JobRunner, JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState,
-    JobType, Jobs, RetrySettings, error::JobError,
+    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobRunner,
+    JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs,
+    KeyedJobInitializer, KeyedJobSpawner, ResidentJobCompletion, ResidentJobInitializer,
+    ResidentJobRunner, RetrySettings, error::JobError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,6 +54,60 @@ impl JobRunner for TestJobRunner {
         // Simulate some work
         tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
         Ok(JobCompletion::Complete)
+    }
+}
+
+struct TestKeyedInitializer {
+    job_type: JobType,
+}
+
+impl KeyedJobInitializer for TestKeyedInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: KeyedJobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: TestJobConfig = job.config()?;
+        Ok(Box::new(TestJobRunner { config }))
+    }
+}
+
+struct TestResidentInitializer {
+    job_type: JobType,
+}
+
+impl ResidentJobInitializer for TestResidentInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(&self, job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
+        let config: TestJobConfig = job.config()?;
+        Ok(Box::new(TestResidentRunner { config }))
+    }
+}
+
+struct TestResidentRunner {
+    config: TestJobConfig,
+}
+
+#[async_trait]
+impl ResidentJobRunner for TestResidentRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+        // Simulate some work, then reschedule — a resident job never completes.
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
+        Ok(ResidentJobCompletion::RescheduleIn(Duration::from_secs(60)))
     }
 }
 
@@ -811,6 +866,33 @@ impl JobRunner for FailingJobRunner {
         _current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         Err("intentional failure".into())
+    }
+}
+
+struct FailingKeyedInitializer {
+    job_type: JobType,
+}
+
+impl KeyedJobInitializer for FailingKeyedInitializer {
+    type Config = FailingJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            n_attempts: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: KeyedJobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(FailingJobRunner))
     }
 }
 
@@ -2434,10 +2516,10 @@ impl JobRunner for TrackingJobRunner {
 
 // -- JobHandle / JobHandles tests --
 
-/// Contract 6: on the duplicate path `spawn_unique` returns a handle whose id
-/// is the PERSISTED job's id — and no second row is created.
+/// Contract 6: on the duplicate path a resident job's `spawn` returns a
+/// handle whose id is the PERSISTED job's id — and no second row is created.
 #[tokio::test]
-async fn spawn_unique_returns_existing_handle_on_duplicate() -> anyhow::Result<()> {
+async fn resident_spawn_returns_existing_handle_on_duplicate() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool.clone())
@@ -2446,22 +2528,20 @@ async fn spawn_unique_returns_existing_handle_on_duplicate() -> anyhow::Result<(
 
     let mut jobs = Jobs::init(config).await?;
     // Unique-per-run job type so the test is repeatable against a persistent
-    // DB (unique jobs are never deleted).
+    // DB (resident jobs are never deleted).
     let job_type: &'static str =
-        Box::leak(format!("spawn-unique-dup-{}", uuid::Uuid::now_v7()).into_boxed_str());
-    let spawner = jobs.add_initializer(TestJobInitializer {
+        Box::leak(format!("resident-dup-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_resident_initializer(TestResidentInitializer {
         job_type: JobType::new(job_type),
     });
     jobs.start_poll().await?;
 
     let second_spawner = spawner.clone();
-    let first_handle = spawner.spawn_unique(TestJobConfig { delay_ms: 10 }).await?;
+    let first_handle = spawner.spawn(TestJobConfig { delay_ms: 10 }).await?;
     let first_id = first_handle.id();
 
     // A second spawn of the same type resolves to the persisted job.
-    let second_handle = second_spawner
-        .spawn_unique(TestJobConfig { delay_ms: 10 })
-        .await?;
+    let second_handle = second_spawner.spawn(TestJobConfig { delay_ms: 10 }).await?;
     assert_eq!(
         second_handle.id(),
         first_id,
@@ -3396,12 +3476,12 @@ async fn load_prefers_terminal_entity_over_stale_execution_row() -> anyhow::Resu
     Ok(())
 }
 
-/// `handle_unique(job_type)` mirrors `handle(id)` for at-most-one-per-type
-/// jobs: it resolves the persisted job's id from the DB — `Some` once the
-/// unique job is spawned (even after it completes, since the `jobs` row
-/// persists), `None` for a type that has none.
+/// `resident_handle(job_type)` mirrors `handle(id)` for resident jobs: it
+/// resolves the persisted job's id from the DB — `Some` once the resident
+/// job is spawned (the `jobs` row persists forever), `None` for a type that
+/// has none.
 #[tokio::test]
-async fn handle_unique_resolves_the_unique_job() -> anyhow::Result<()> {
+async fn resident_handle_resolves_the_resident_job() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder()
         .pool(pool)
@@ -3410,29 +3490,31 @@ async fn handle_unique_resolves_the_unique_job() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let job_type: &'static str =
-        Box::leak(format!("handle-unique-{}", uuid::Uuid::now_v7()).into_boxed_str());
-    let spawner = jobs.add_initializer(TestJobInitializer {
+        Box::leak(format!("resident-handle-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_resident_initializer(TestResidentInitializer {
         job_type: JobType::new(job_type),
     });
     jobs.start_poll().await?;
 
-    // No unique job of this type yet ⇒ None.
+    // No resident job of this type yet ⇒ None.
     assert!(
-        jobs.handle_unique(JobType::new(job_type)).await?.is_none(),
-        "no unique job spawned yet"
+        jobs.resident_handle(JobType::new(job_type))
+            .await?
+            .is_none(),
+        "no resident job spawned yet"
     );
 
-    // Spawn the unique job; handle_unique now resolves to its persisted id.
-    let spawned = spawner.spawn_unique(TestJobConfig { delay_ms: 10 }).await?;
+    // Spawn the resident job; resident_handle now resolves to its persisted id.
+    let spawned = spawner.spawn(TestJobConfig { delay_ms: 10 }).await?;
     let handle = jobs
-        .handle_unique(JobType::new(job_type))
+        .resident_handle(JobType::new(job_type))
         .await?
-        .expect("unique job should resolve");
+        .expect("resident job should resolve");
     assert_eq!(handle.id(), spawned.id());
 
     // A type that was never spawned ⇒ None.
     assert!(
-        jobs.handle_unique(JobType::new("handle-unique-never-spawned"))
+        jobs.resident_handle(JobType::new("resident-handle-never-spawned"))
             .await?
             .is_none()
     );
@@ -3628,7 +3710,6 @@ async fn execution_state_point_read() -> anyhow::Result<()> {
 struct ConcurrencyProbeInitializer {
     job_type: JobType,
     max_concurrent_per_process: Option<usize>,
-    max_concurrent_global: Option<usize>,
     running: Arc<AtomicUsize>,
     high_water: Arc<AtomicUsize>,
     release: Arc<AtomicBool>,
@@ -3643,10 +3724,6 @@ impl JobInitializer for ConcurrencyProbeInitializer {
 
     fn max_concurrent_per_process(&self) -> Option<usize> {
         self.max_concurrent_per_process
-    }
-
-    fn max_concurrent_global(&self) -> Option<usize> {
-        self.max_concurrent_global
     }
 
     fn init(
@@ -3704,7 +3781,6 @@ async fn per_process_cap_bounds_concurrency() -> anyhow::Result<()> {
     let spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
         job_type: JobType::new("per-process-cap-bounds-concurrency"),
         max_concurrent_per_process: Some(2),
-        max_concurrent_global: None,
         running: Arc::clone(&running),
         high_water: Arc::clone(&high_water),
         release: Arc::clone(&release),
@@ -3769,7 +3845,6 @@ async fn capped_type_does_not_starve_others() -> anyhow::Result<()> {
     let capped_spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
         job_type: JobType::new("capped-does-not-starve-capped"),
         max_concurrent_per_process: Some(1),
-        max_concurrent_global: None,
         running: Arc::clone(&capped_running),
         high_water: Arc::clone(&capped_high_water),
         release: Arc::clone(&capped_release),
@@ -3819,175 +3894,11 @@ async fn capped_type_does_not_starve_others() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// D3/D4/D17: `max_concurrent_global` bounds concurrency across the fleet,
-/// enforced via the poller's running-execution pre-count. In a single
-/// process the pre-count/claim sequence is not interleaved by a concurrent
-/// poll, so the cap is effectively exact here (see the softness caveat on
-/// `JobInitializer::max_concurrent_global`, which only applies across
-/// multiple instances).
-#[tokio::test]
-async fn global_cap_bounds_concurrency_single_instance() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let config = JobSvcConfig::builder()
-        .pool(pool)
-        .build()
-        .expect("Failed to build JobsConfig");
-    let mut jobs = Jobs::init(config).await?;
+// -- Keyed jobs --
 
-    let running = Arc::new(AtomicUsize::new(0));
-    let high_water = Arc::new(AtomicUsize::new(0));
-    let release = Arc::new(AtomicBool::new(false));
-    let spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
-        job_type: JobType::new("global-cap-bounds-concurrency"),
-        max_concurrent_per_process: None,
-        max_concurrent_global: Some(2),
-        running: Arc::clone(&running),
-        high_water: Arc::clone(&high_water),
-        release: Arc::clone(&release),
-    });
-
-    let ids: Vec<JobId> = (0..6).map(|_| JobId::new()).collect();
-    for id in &ids {
-        spawner.spawn(*id, ()).await?;
-    }
-    jobs.start_poll().await?;
-
-    let mut peak = 0;
-    for _ in 0..100 {
-        peak = high_water.load(Ordering::SeqCst);
-        if peak >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(peak, 2, "global cap must be reached given a backlog of 6");
-
-    release.store(true, Ordering::SeqCst);
-    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
-    assert!(
-        outcomes
-            .iter()
-            .all(|o| o.state() == JobTerminalState::Completed)
-    );
-    assert_eq!(high_water.load(Ordering::SeqCst), 2);
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// A freed global-cap slot must wake a PEER instance too, not just the
-/// instance that completed the job. Instance A holds the type's only global
-/// slot (cap = 1); instance B registers the same type after the budget is
-/// already exhausted, so B's own first poll observes zero room and drops the
-/// type entirely — nothing else is queued for B, so absent a cross-instance
-/// notification it would only rediscover the freed slot on the 60s
-/// `MAX_WAIT` backstop. Releasing A's job must let B claim and complete its
-/// own job well within that.
-#[tokio::test]
-async fn global_cap_freed_slot_wakes_peer_instance() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let job_type = JobType::new("global-cap-wakes-peer");
-
-    let config_a = JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .expect("Failed to build JobsConfig");
-    let mut jobs_a = Jobs::init(config_a).await?;
-    let release_a = Arc::new(AtomicBool::new(false));
-    let running_a = Arc::new(AtomicUsize::new(0));
-    let high_water_a = Arc::new(AtomicUsize::new(0));
-    let spawner_a = jobs_a.add_initializer(ConcurrencyProbeInitializer {
-        job_type: job_type.clone(),
-        max_concurrent_per_process: None,
-        max_concurrent_global: Some(1),
-        running: Arc::clone(&running_a),
-        high_water: Arc::clone(&high_water_a),
-        release: Arc::clone(&release_a),
-    });
-
-    let job1 = JobId::new();
-    spawner_a.spawn(job1, ()).await?;
-    jobs_a.start_poll().await?;
-
-    let mut attempts = 0;
-    while running_a.load(Ordering::SeqCst) < 1 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        attempts += 1;
-        assert!(attempts < 200, "instance A never claimed job1");
-    }
-
-    // Instance B: same globally-capped type, started only once the budget
-    // is already exhausted by A.
-    let config_b = JobSvcConfig::builder()
-        .pool(pool)
-        .build()
-        .expect("Failed to build JobsConfig");
-    let mut jobs_b = Jobs::init(config_b).await?;
-    let release_b = Arc::new(AtomicBool::new(true));
-    let running_b = Arc::new(AtomicUsize::new(0));
-    let high_water_b = Arc::new(AtomicUsize::new(0));
-    let spawner_b = jobs_b.add_initializer(ConcurrencyProbeInitializer {
-        job_type: job_type.clone(),
-        max_concurrent_per_process: None,
-        max_concurrent_global: Some(1),
-        running: Arc::clone(&running_b),
-        high_water: Arc::clone(&high_water_b),
-        release: Arc::clone(&release_b),
-    });
-    let job2 = JobId::new();
-    spawner_b.spawn(job2, ()).await?;
-    jobs_b.start_poll().await?;
-
-    // Give B at least one poll cycle to observe the exhausted budget and
-    // drop the type, settling into its long (MAX_WAIT-bound) sleep.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        running_b.load(Ordering::SeqCst),
-        0,
-        "B must not have claimed job2 while the global budget was exhausted"
-    );
-
-    // Shut A's poller down (job1 still running, blocked on `release_a`),
-    // then release job1 shortly after so it completes gracefully within the
-    // shutdown grace period. This is deliberate, not incidental: A ALSO
-    // polls this job_type, and A completing job1 triggers A's own
-    // pre-existing local capped-type notify (unrelated to this PR's fix) —
-    // without shutting A's poll loop down first, A could simply reclaim
-    // job2 itself, which would make this test pass regardless of whether
-    // the peer-wake fix under test does anything at all. Shutting A's main
-    // loop down first (it stops claiming new work immediately, before the
-    // in-flight job1 is asked to wrap up) removes A as a competitor, so
-    // job2 can only be claimed by a poller that was actually notified.
-    let shutdown_a = jobs_a.shutdown();
-    let release_job1 = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        release_a.store(true, Ordering::SeqCst);
-    };
-    let (shutdown_result, ()) = tokio::join!(shutdown_a, release_job1);
-    shutdown_result?;
-
-    // Without this PR's peer-wake fix, B only rediscovers the freed budget
-    // on its MAX_WAIT (60s) backstop — the 10s timeout below is what proves
-    // the notification reached it.
-    let outcome = jobs_b
-        .handle(job2)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Completed);
-    assert!(
-        high_water_b.load(Ordering::SeqCst) >= 1,
-        "job2 must have run through B's own runner, not been reclaimed by A"
-    );
-
-    jobs_b.shutdown().await?;
-    Ok(())
-}
-
-// -- Keyed singletons --
-
-/// `spawn_keyed` twice with the same key: the second call must resolve to
-/// the first job's persisted id, and no second row is created (mirrors
-/// `spawn_unique_returns_existing_handle_on_duplicate`).
+/// `KeyedJobSpawner::spawn` twice with the same key: the second call must
+/// resolve to the first job's persisted id, and no second row is created
+/// (mirrors `resident_spawn_returns_existing_handle_on_duplicate`).
 #[tokio::test]
 async fn spawn_keyed_duplicate_returns_persisted_handle() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -3998,16 +3909,16 @@ async fn spawn_keyed_duplicate_returns_persisted_handle() -> anyhow::Result<()> 
     let mut jobs = Jobs::init(config).await?;
     let job_type: &'static str =
         Box::leak(format!("spawn-keyed-dup-{}", uuid::Uuid::now_v7()).into_boxed_str());
-    let spawner = jobs.add_initializer(TestJobInitializer {
+    let spawner = jobs.add_keyed_initializer(TestKeyedInitializer {
         job_type: JobType::new(job_type),
     });
     jobs.start_poll().await?;
 
     let first_handle = spawner
-        .spawn_keyed("shard-1", TestJobConfig { delay_ms: 10 })
+        .spawn("shard-1", TestJobConfig { delay_ms: 10 })
         .await?;
     let second_handle = spawner
-        .spawn_keyed("shard-1", TestJobConfig { delay_ms: 10 })
+        .spawn("shard-1", TestJobConfig { delay_ms: 10 })
         .await?;
     assert_eq!(
         second_handle.id(),
@@ -4027,7 +3938,7 @@ async fn spawn_keyed_duplicate_returns_persisted_handle() -> anyhow::Result<()> 
 }
 
 /// Distinct keys of one type are distinct jobs and run (and complete)
-/// concurrently — `spawn_keyed` does not consume the spawner.
+/// concurrently — `KeyedJobSpawner::spawn` does not consume the spawner.
 #[tokio::test]
 async fn spawn_keyed_distinct_keys_run_concurrently() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -4038,17 +3949,13 @@ async fn spawn_keyed_distinct_keys_run_concurrently() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
     let job_type: &'static str =
         Box::leak(format!("spawn-keyed-distinct-{}", uuid::Uuid::now_v7()).into_boxed_str());
-    let spawner = jobs.add_initializer(TestJobInitializer {
+    let spawner = jobs.add_keyed_initializer(TestKeyedInitializer {
         job_type: JobType::new(job_type),
     });
     jobs.start_poll().await?;
 
-    let a = spawner
-        .spawn_keyed("a", TestJobConfig { delay_ms: 10 })
-        .await?;
-    let b = spawner
-        .spawn_keyed("b", TestJobConfig { delay_ms: 10 })
-        .await?;
+    let a = spawner.spawn("a", TestJobConfig { delay_ms: 10 }).await?;
+    let b = spawner.spawn("b", TestJobConfig { delay_ms: 10 }).await?;
     assert_ne!(a.id(), b.id());
 
     let outcomes = jobs
@@ -4065,42 +3972,8 @@ async fn spawn_keyed_distinct_keys_run_concurrently() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// D11: `spawn_unique` is sugar for `spawn_keyed(DEFAULT_UNIQUE_KEY, …)` — a
-/// second spawner calling `spawn_keyed` with the default key on the same
-/// type resolves to the same persisted job.
-#[tokio::test]
-async fn spawn_unique_is_default_key() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let config = JobSvcConfig::builder()
-        .pool(pool)
-        .build()
-        .expect("Failed to build JobsConfig");
-    let mut jobs = Jobs::init(config).await?;
-    let job_type: &'static str =
-        Box::leak(format!("spawn-unique-default-key-{}", uuid::Uuid::now_v7()).into_boxed_str());
-    let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new(job_type),
-    });
-    let second_spawner = spawner.clone();
-    jobs.start_poll().await?;
-
-    let unique_handle = spawner.spawn_unique(TestJobConfig { delay_ms: 10 }).await?;
-    let keyed_handle = second_spawner
-        .spawn_keyed(DEFAULT_UNIQUE_KEY, TestJobConfig { delay_ms: 10 })
-        .await?;
-    assert_eq!(
-        keyed_handle.id(),
-        unique_handle.id(),
-        "spawn_unique and spawn_keyed(DEFAULT_UNIQUE_KEY) share one job"
-    );
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// `keyed_handle` mirrors `handle_unique` for an explicit key, and
-/// `keyed_handles` lists every key of a type — including the default key
-/// once `spawn_unique` has been used — ordered by key.
+/// `keyed_handle` resolves an explicit key, and `keyed_handles` lists every
+/// key of a type, ordered by key.
 #[tokio::test]
 async fn keyed_handle_and_keyed_handles() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -4111,7 +3984,7 @@ async fn keyed_handle_and_keyed_handles() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
     let job_type: &'static str =
         Box::leak(format!("keyed-handles-{}", uuid::Uuid::now_v7()).into_boxed_str());
-    let spawner = jobs.add_initializer(TestJobInitializer {
+    let spawner = jobs.add_keyed_initializer(TestKeyedInitializer {
         job_type: JobType::new(job_type),
     });
     jobs.start_poll().await?;
@@ -4124,12 +3997,11 @@ async fn keyed_handle_and_keyed_handles() -> anyhow::Result<()> {
     );
 
     let a = spawner
-        .spawn_keyed("shard-a", TestJobConfig { delay_ms: 10 })
+        .spawn("shard-a", TestJobConfig { delay_ms: 10 })
         .await?;
     let b = spawner
-        .spawn_keyed("shard-b", TestJobConfig { delay_ms: 10 })
+        .spawn("shard-b", TestJobConfig { delay_ms: 10 })
         .await?;
-    let default = spawner.spawn_unique(TestJobConfig { delay_ms: 10 }).await?;
 
     let handle_a = jobs
         .keyed_handle(JobType::new(job_type), "shard-a")
@@ -4143,8 +4015,8 @@ async fn keyed_handle_and_keyed_handles() -> anyhow::Result<()> {
     let keys: Vec<Option<&str>> = snapshots.iter().map(|s| s.unique_key()).collect();
     assert_eq!(
         keys,
-        vec![Some(DEFAULT_UNIQUE_KEY), Some("shard-a"), Some("shard-b")],
-        "keyed_handles is ordered by key and includes the default key"
+        vec![Some("shard-a"), Some("shard-b")],
+        "keyed_handles is ordered by key"
     );
     let ids: HashMap<&str, JobId> = snapshots
         .iter()
@@ -4152,7 +4024,6 @@ async fn keyed_handle_and_keyed_handles() -> anyhow::Result<()> {
         .collect();
     assert_eq!(ids["shard-a"], a.id());
     assert_eq!(ids["shard-b"], b.id());
-    assert_eq!(ids[DEFAULT_UNIQUE_KEY], default.id());
 
     jobs.shutdown().await?;
     Ok(())
@@ -4163,25 +4034,31 @@ struct KeyedCheckpointConfig {
     processed: u32,
 }
 
-/// A runner that commits a per-key checkpoint then parks (spin-polling a
-/// shared flag) so the execution row stays alive for `execution_state` to
-/// read back.
+/// A runner that records whatever execution state it observed at the start
+/// of its run as its own return value (for `inherits_state` assertions),
+/// commits a per-key checkpoint, then parks (spin-polling a shared flag) so
+/// the execution row stays alive for `execution_state` to read back.
 struct KeyedCheckpointInitializer {
     job_type: JobType,
     release: Arc<AtomicBool>,
+    inherits_state: bool,
 }
 
-impl JobInitializer for KeyedCheckpointInitializer {
+impl KeyedJobInitializer for KeyedCheckpointInitializer {
     type Config = KeyedCheckpointConfig;
 
     fn job_type(&self) -> JobType {
         self.job_type.clone()
     }
 
+    fn inherits_state(&self) -> bool {
+        self.inherits_state
+    }
+
     fn init(
         &self,
         job: &Job,
-        _: JobSpawner<Self::Config>,
+        _: KeyedJobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let config: KeyedCheckpointConfig = job.config()?;
         Ok(Box::new(KeyedCheckpointRunner {
@@ -4202,6 +4079,8 @@ impl JobRunner for KeyedCheckpointRunner {
         &self,
         mut current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let observed: Option<CheckpointState> = current_job.execution_state()?;
+        current_job.set_result(&observed).await?;
         current_job
             .update_execution_state(CheckpointState {
                 processed: self.processed,
@@ -4228,17 +4107,18 @@ async fn keyed_singletons_report_execution_state() -> anyhow::Result<()> {
     let job_type: &'static str =
         Box::leak(format!("keyed-caught-up-{}", uuid::Uuid::now_v7()).into_boxed_str());
     let release = Arc::new(AtomicBool::new(false));
-    let spawner = jobs.add_initializer(KeyedCheckpointInitializer {
+    let spawner = jobs.add_keyed_initializer(KeyedCheckpointInitializer {
         job_type: JobType::new(job_type),
         release: Arc::clone(&release),
+        inherits_state: false,
     });
     jobs.start_poll().await?;
 
     spawner
-        .spawn_keyed("shard-0", KeyedCheckpointConfig { processed: 10 })
+        .spawn("shard-0", KeyedCheckpointConfig { processed: 10 })
         .await?;
     spawner
-        .spawn_keyed("shard-1", KeyedCheckpointConfig { processed: 20 })
+        .spawn("shard-1", KeyedCheckpointConfig { processed: 20 })
         .await?;
 
     let mut cursors: HashMap<String, u32> = HashMap::new();
@@ -4268,6 +4148,538 @@ async fn keyed_singletons_report_execution_state() -> anyhow::Result<()> {
         outcomes
             .iter()
             .all(|o| o.state() == JobTerminalState::Completed)
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+// -- Live-keyed jobs (respawn after terminal) --
+
+/// NEW: once a keyed job's generation reaches a terminal state, the key
+/// becomes respawnable — the next `spawn` call creates a new generation
+/// (new internally-generated id) that actually runs.
+#[tokio::test]
+async fn spawn_keyed_respawns_after_completion() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("spawn-keyed-respawn-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_keyed_initializer(TestKeyedInitializer {
+        job_type: JobType::new(job_type),
+    });
+    jobs.start_poll().await?;
+
+    let first_handle = spawner.spawn("k", TestJobConfig { delay_ms: 10 }).await?;
+    let outcome = jobs
+        .handle(first_handle.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Completed);
+
+    let second_handle = spawner.spawn("k", TestJobConfig { delay_ms: 10 }).await?;
+    assert_ne!(
+        second_handle.id(),
+        first_handle.id(),
+        "respawn after terminal must create a new generation"
+    );
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE job_type = $1 AND unique_key = 'k'")
+            .bind(job_type)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(count, 2, "two generations of the key exist");
+
+    let outcome = jobs
+        .handle(second_handle.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(
+        outcome.state(),
+        JobTerminalState::Completed,
+        "the new generation actually ran"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// NEW: a keyed job that goes terminal via error (not just completion) also
+/// frees its key.
+#[tokio::test]
+async fn spawn_keyed_respawns_after_error() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("spawn-keyed-respawn-error-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_keyed_initializer(FailingKeyedInitializer {
+        job_type: JobType::new(job_type),
+    });
+    jobs.start_poll().await?;
+
+    let first_handle = spawner.spawn("k", FailingJobConfig).await?;
+    let outcome = jobs
+        .handle(first_handle.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+
+    let second_handle = spawner.spawn("k", FailingJobConfig).await?;
+    assert_ne!(
+        second_handle.id(),
+        first_handle.id(),
+        "respawn after terminal must create a new generation"
+    );
+    let outcome = jobs
+        .handle(second_handle.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// NEW: `keyed_handle`/`keyed_handles` resolve the LIVE generation when one
+/// exists, else the LATEST generation — not the first ever spawned.
+#[tokio::test]
+async fn keyed_lookups_track_latest_generation() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-latest-gen-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let release = Arc::new(AtomicBool::new(true));
+    let spawner = jobs.add_keyed_initializer(KeyedCheckpointInitializer {
+        job_type: JobType::new(job_type),
+        release: Arc::clone(&release),
+        inherits_state: false,
+    });
+    jobs.start_poll().await?;
+
+    // Generation 1: let it complete immediately.
+    let gen1 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 1 })
+        .await?;
+    jobs.handle(gen1.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+
+    // Generation 2: let it complete too.
+    let gen2 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 2 })
+        .await?;
+    jobs.handle(gen2.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_ne!(gen2.id(), gen1.id());
+
+    // No generation live: lookups resolve to the latest (gen2), not gen1.
+    let resolved = jobs
+        .keyed_handle(JobType::new(job_type), "k")
+        .await?
+        .expect("key was spawned");
+    assert_eq!(resolved.id(), gen2.id(), "no live generation: latest wins");
+    let listed = jobs.keyed_handles(JobType::new(job_type)).await?;
+    let listed_ids: Vec<JobId> = listed
+        .load_all()
+        .await?
+        .into_iter()
+        .map(|s| s.job().id)
+        .collect();
+    assert_eq!(listed_ids, vec![gen2.id()]);
+
+    // Generation 3: park it live — an execution row exists the instant
+    // `spawn` returns, regardless of whether the poller has claimed it yet,
+    // so this is deterministically "live" without racing the runner.
+    release.store(false, Ordering::SeqCst);
+    let gen3 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 3 })
+        .await?;
+    assert_ne!(gen3.id(), gen2.id());
+
+    let resolved = jobs
+        .keyed_handle(JobType::new(job_type), "k")
+        .await?
+        .expect("key was spawned");
+    assert_eq!(resolved.id(), gen3.id(), "gen3 is live: it wins over gen2");
+    let listed = jobs.keyed_handles(JobType::new(job_type)).await?;
+    let listed_ids: Vec<JobId> = listed
+        .load_all()
+        .await?
+        .into_iter()
+        .map(|s| s.job().id)
+        .collect();
+    assert_eq!(listed_ids, vec![gen3.id()]);
+
+    release.store(true, Ordering::SeqCst);
+    jobs.handle(gen3.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// NEW: a race between two concurrent `KeyedJobSpawner::spawn` calls on one
+/// key resolves to exactly one live job and leaks no `jobs` row for the
+/// loser — its insert is rolled back inside `spawn`'s conflict-retry loop.
+#[tokio::test]
+async fn keyed_conflict_leaks_no_job_row() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-conflict-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_keyed_initializer(TestKeyedInitializer {
+        job_type: JobType::new(job_type),
+    });
+    jobs.start_poll().await?;
+
+    let a = spawner.clone();
+    let b = spawner.clone();
+    let (ra, rb) = tokio::join!(
+        a.spawn("k", TestJobConfig { delay_ms: 200 }),
+        b.spawn("k", TestJobConfig { delay_ms: 200 })
+    );
+    let handle_a = ra?;
+    let handle_b = rb?;
+    assert_eq!(
+        handle_a.id(),
+        handle_b.id(),
+        "both concurrent spawns must resolve to the one live job"
+    );
+
+    let (jobs_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE job_type = $1 AND unique_key = 'k'")
+            .bind(job_type)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(jobs_count, 1, "the loser's job row must not leak");
+
+    let (executions_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM job_executions WHERE job_type = $1 AND unique_key = 'k'",
+    )
+    .bind(job_type)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(executions_count, 1, "exactly one live execution");
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+struct CountingResidentInitializer {
+    job_type: JobType,
+    runs: Arc<AtomicUsize>,
+}
+
+impl ResidentJobInitializer for CountingResidentInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(CountingResidentRunner {
+            runs: Arc::clone(&self.runs),
+        }))
+    }
+}
+
+struct CountingResidentRunner {
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ResidentJobRunner for CountingResidentRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(ResidentJobCompletion::RescheduleIn(Duration::from_millis(
+            20,
+        )))
+    }
+}
+
+/// NEW: unlike a keyed job, a resident job never terminates — it stays
+/// absolutely unique for the type's whole lifetime. There is no `Complete`
+/// variant for `ResidentJobCompletion` to express, so this observes liveness
+/// via the run counter advancing (and `await_completion` timing out) rather
+/// than a terminal state, and confirms a second `spawn` while it is (forever)
+/// running still resolves to the same persisted job.
+#[tokio::test]
+async fn resident_runner_keeps_rescheduling_and_stays_unique() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("resident-keeps-going-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let spawner = jobs.add_resident_initializer(CountingResidentInitializer {
+        job_type: JobType::new(job_type),
+        runs: Arc::clone(&runs),
+    });
+    jobs.start_poll().await?;
+
+    let first_handle = spawner.spawn(TestJobConfig { delay_ms: 0 }).await?;
+
+    for _ in 0..100 {
+        if runs.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        runs.load(Ordering::SeqCst) >= 3,
+        "a resident job must keep rescheduling itself instead of completing"
+    );
+
+    // A resident job never reaches terminal — awaiting completion only ever
+    // times out.
+    let timed_out = jobs
+        .handle(first_handle.id())
+        .await_completion(Duration::from_millis(50))
+        .await;
+    assert!(matches!(timed_out, Err(JobError::TimedOut(_))));
+
+    // Still absolutely unique: `resident_handle` resolves to the same job.
+    let resolved = jobs
+        .resident_handle(JobType::new(job_type))
+        .await?
+        .expect("resident job exists");
+    assert_eq!(resolved.id(), first_handle.id());
+
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE job_type = $1")
+        .bind(job_type)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1, "at most one resident job of a type ever exists");
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+// -- Keyed jobs: `inherits_state` --
+
+/// NEW: `KeyedJobInitializer::inherits_state` seeds a new generation's
+/// execution state from its predecessor's final state.
+#[tokio::test]
+async fn keyed_inherits_state_seeds_next_generation() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-inherits-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_keyed_initializer(KeyedCheckpointInitializer {
+        job_type: JobType::new(job_type),
+        release: Arc::new(AtomicBool::new(true)),
+        inherits_state: true,
+    });
+    jobs.start_poll().await?;
+
+    let gen1 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 1 })
+        .await?;
+    let outcome1 = jobs
+        .handle(gen1.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    let observed1 = outcome1.result::<Option<CheckpointState>>()?.flatten();
+    assert_eq!(observed1, None, "gen1 starts with no inherited state");
+
+    let gen2 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 2 })
+        .await?;
+    assert_ne!(gen2.id(), gen1.id());
+    let outcome2 = jobs
+        .handle(gen2.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    let observed2 = outcome2.result::<Option<CheckpointState>>()?.flatten();
+    assert_eq!(
+        observed2,
+        Some(CheckpointState { processed: 1 }),
+        "gen2 must inherit gen1's final state"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// NEW: with `inherits_state` left at its `false` default, a new generation
+/// starts with no observed state, and the predecessor's retained state row
+/// is compacted away once the new generation has spawned.
+#[tokio::test]
+async fn keyed_without_inherits_state_starts_fresh() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-no-inherit-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_keyed_initializer(KeyedCheckpointInitializer {
+        job_type: JobType::new(job_type),
+        release: Arc::new(AtomicBool::new(true)),
+        inherits_state: false,
+    });
+    jobs.start_poll().await?;
+
+    let gen1 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 1 })
+        .await?;
+    jobs.handle(gen1.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+
+    let gen2 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 2 })
+        .await?;
+    let outcome2 = jobs
+        .handle(gen2.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    let observed2 = outcome2.result::<Option<CheckpointState>>()?.flatten();
+    assert_eq!(
+        observed2, None,
+        "gen2 must not inherit gen1's state when inherits_state is false"
+    );
+
+    // Without `inherits_state` each generation's state dies with it, so once
+    // both have completed the key holds nothing at all — no row survives to
+    // be compacted later.
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM job_execution_states s JOIN jobs j ON j.id = s.id \
+         WHERE j.job_type = $1 AND j.unique_key = 'k'",
+    )
+    .bind(job_type)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        count, 0,
+        "a key that does not inherit state retains nothing once its generations are terminal"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// With `inherits_state`, a keyed job's execution state survives terminal —
+/// readable even before any respawn — unlike a regular job's, which is
+/// deleted alongside its execution row.
+#[tokio::test]
+async fn keyed_terminal_state_retained_when_inherited() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-state-retained-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_keyed_initializer(KeyedCheckpointInitializer {
+        job_type: JobType::new(job_type),
+        release: Arc::new(AtomicBool::new(true)),
+        inherits_state: true,
+    });
+    jobs.start_poll().await?;
+
+    let gen1 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 7 })
+        .await?;
+    jobs.handle(gen1.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+
+    let state: Option<CheckpointState> = jobs.handle(gen1.id()).execution_state().await?;
+    assert_eq!(
+        state,
+        Some(CheckpointState { processed: 7 }),
+        "a terminal keyed job's state row is retained and readable via JobHandle::execution_state"
+    );
+
+    // Also readable through the snapshot/`load()` path (`keyed_handles(...)
+    // .load_all()`'s "caught up?" pattern) — this is the path that
+    // previously silently discarded a terminal job's execution state
+    // regardless of flavor.
+    let snapshot = jobs.handle(gen1.id()).load().await?;
+    let snapshot_state: Option<CheckpointState> = snapshot.execution_state()?;
+    assert_eq!(
+        snapshot_state,
+        Some(CheckpointState { processed: 7 }),
+        "a terminal keyed job's state must also be readable via JobSnapshot::execution_state"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Without `inherits_state` (the default), a keyed job cleans up exactly like
+/// every other flavor: its state row is deleted with its execution row.
+/// Retention is something a type opts into, not a side effect of being keyed.
+#[tokio::test]
+async fn keyed_terminal_state_deleted_without_inherits_state() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let job_type: &'static str =
+        Box::leak(format!("keyed-state-dropped-{}", uuid::Uuid::now_v7()).into_boxed_str());
+    let spawner = jobs.add_keyed_initializer(KeyedCheckpointInitializer {
+        job_type: JobType::new(job_type),
+        release: Arc::new(AtomicBool::new(true)),
+        inherits_state: false,
+    });
+    jobs.start_poll().await?;
+
+    let gen1 = spawner
+        .spawn("k", KeyedCheckpointConfig { processed: 7 })
+        .await?;
+    jobs.handle(gen1.id())
+        .await_completion(Duration::from_secs(10))
+        .await?;
+
+    let state: Option<CheckpointState> = jobs.handle(gen1.id()).execution_state().await?;
+    assert_eq!(
+        state, None,
+        "a keyed job that does not inherit state must not retain it past terminal"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_execution_states WHERE id = $1")
+        .bind(uuid::Uuid::from(gen1.id()))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        rows, 0,
+        "the state row itself must be gone, not just unread"
     );
 
     jobs.shutdown().await?;

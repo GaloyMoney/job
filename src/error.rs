@@ -41,8 +41,8 @@ pub enum JobError {
     BatchOutcomeMismatch(String),
     #[error("JobError - DuplicateId: {0:?}")]
     DuplicateId(Option<String>),
-    #[error("JobError - DuplicateUniqueKey: {0:?}")]
-    DuplicateUniqueKey(Option<String>),
+    #[error("JobError - DuplicateResident: {0:?}")]
+    DuplicateResident(Option<String>),
     #[error("JobError - Config: {0}")]
     Config(String),
     #[error("JobError - Migration: {0}")]
@@ -57,6 +57,13 @@ pub enum JobError {
     TimedOut(JobId),
     #[error("JobError - RouterNotStarted: await called before Jobs::start_poll")]
     RouterNotStarted,
+    /// Practically unreachable; raised by
+    /// [`KeyedJobSpawner::spawn`](crate::KeyedJobSpawner::spawn), which
+    /// documents the race it exhausts.
+    #[error(
+        "JobError - KeyedSpawnRace: exhausted retries resolving a live-keyed conflict for job_type '{0}' key '{1}'"
+    )]
+    KeyedSpawnRace(JobType, String),
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {
@@ -73,23 +80,17 @@ impl From<JobCreateError> for JobError {
                 value,
                 ..
             } => Self::DuplicateId(value),
-            // The `(job_type, unique_key)` composite index's violation is
-            // attributed to whichever of its columns es_entity's index
-            // catalog resolves it to — its last key column (`unique_key`) as
-            // of the pinned version, but the mapping is version-dependent
-            // (see `repo.rs`'s `unique_per_job_type_and_key` test), so both
-            // are covered here. An unattributed violation falls through to
-            // `Create` below rather than being guessed at.
+            // `idx_jobs_job_type_resident` (the absolutely-unique
+            // `ResidentJobSpawner::spawn` enforcement,
+            // migrations/20250904065521_job_setup.sql) is a single-column
+            // index on `job_type` — its partial predicate (`WHERE
+            // resident`) isn't itself an indexed column, so es_entity
+            // attributes the violation deterministically to `JobType`.
             JobCreateError::ConstraintViolation {
-                column: Some(super::repo::JobColumn::UniqueKey),
-                value,
-                ..
-            }
-            | JobCreateError::ConstraintViolation {
                 column: Some(super::repo::JobColumn::JobType),
                 value,
                 ..
-            } => Self::DuplicateUniqueKey(value),
+            } => Self::DuplicateResident(value),
             other => Self::Create(other),
         }
     }

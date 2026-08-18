@@ -16,6 +16,7 @@ use crate::{
     columns(
         job_type(ty = "JobType", update(persist = false)),
         unique_key(ty = "Option<String>", update(persist = false)),
+        resident(ty = "bool", update(persist = false)),
         queue_id(ty = "Option<String>", update(persist = false)),
     ),
     persist_event_context = false
@@ -29,21 +30,23 @@ impl JobRepo {
         Self { pool: pool.clone() }
     }
 
-    /// Resolve the single keyed singleton of `(job_type, key)`, if one exists.
+    /// Resolve the keyed singleton of `(job_type, key)`: the LIVE job if one
+    /// exists, else the latest generation (for terminal read-back). `None`
+    /// only when the key has never been spawned.
     ///
-    /// Direct index-table query (via `es_query!`): the partial unique index
-    /// `idx_jobs_job_type_unique_key ON jobs (job_type, unique_key) WHERE
-    /// unique_key IS NOT NULL` (migrations/20250904065521_job_setup.sql)
-    /// guarantees at most one match, and `jobs` rows are never deleted — so
-    /// this is a race-free single-row lookup used to resolve
-    /// `spawn_keyed`/`spawn_unique`'s duplicate path.
+    /// A single read of `jobs`, no live/terminal branch: `jobs` accumulates
+    /// one row per generation and is never deleted, and a new generation can
+    /// only be created once the previous one is no longer LIVE (enforced by
+    /// `idx_job_executions_job_type_unique_key`; a losing spawn rolls its
+    /// `jobs` row back). So the newest generation IS the live one whenever any
+    /// is live, and the latest-generation answer is correct either way.
     pub(super) async fn find_keyed(
         &self,
         job_type: &JobType,
         key: &str,
     ) -> Result<Option<Job>, JobError> {
         Ok(es_query!(
-            "SELECT id FROM jobs WHERE job_type = $1 AND unique_key = $2",
+            "SELECT id, created_at FROM jobs WHERE job_type = $1 AND unique_key = $2 ORDER BY created_at DESC, id DESC LIMIT 1",
             job_type as &JobType,
             key,
         )
@@ -51,18 +54,43 @@ impl JobRepo {
         .await?)
     }
 
+    /// Resolve the id of the resident job of `job_type`, if one exists.
+    ///
+    /// There is at most one, ever — enforced by `idx_jobs_job_type_resident`
+    /// (migrations/20250904065521_job_setup.sql). `jobs` rows are never
+    /// deleted, so this is a point-read on `jobs` itself, not `job_executions`.
+    pub(super) async fn find_resident_id(
+        &self,
+        job_type: &JobType,
+    ) -> Result<Option<JobId>, JobError> {
+        let id = sqlx::query_scalar!(
+            r#"SELECT id AS "id: JobId" FROM jobs WHERE job_type = $1 AND resident"#,
+            job_type as &JobType,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
     /// `(unique_key, id)` of every keyed singleton of `job_type`, ordered by
-    /// key. The entry point for [`Jobs::keyed_handles`](crate::Jobs::keyed_handles).
+    /// key — one entry per key, the live-or-latest generation. The entry
+    /// point for [`Jobs::keyed_handles`](crate::Jobs::keyed_handles).
+    ///
+    /// `jobs` rows alone suffice here (no join against `job_executions`
+    /// needed): a new generation can only be created after the prior one
+    /// went terminal, so the latest generation by `created_at` is always the
+    /// live one when a live one exists.
     pub(super) async fn list_keyed_ids_by_job_type(
         &self,
         job_type: &JobType,
     ) -> Result<Vec<(String, JobId)>, JobError> {
         let rows = sqlx::query!(
             r#"
-            SELECT unique_key AS "unique_key!", id AS "id: JobId"
+            SELECT DISTINCT ON (unique_key)
+                unique_key AS "unique_key!", id AS "id: JobId"
             FROM jobs
             WHERE job_type = $1 AND unique_key IS NOT NULL
-            ORDER BY unique_key
+            ORDER BY unique_key, created_at DESC, id DESC
             "#,
             job_type as &JobType,
         )
@@ -91,16 +119,25 @@ impl JobRepo {
     }
 
     /// Load a point-in-time [`JobSnapshot`] for `id`: the execution row (if the
-    /// job is still schedulable/running) paired with the durable entity.
+    /// job is still schedulable/running) paired with the durable entity, plus
+    /// the execution state.
     ///
-    /// Both reads run inside a single internally-opened op, and the **entity is
-    /// authoritative for terminal state**: once `JobCompleted` is appended the
-    /// job is done and its execution row is logically gone, so if the entity is
-    /// terminal the row is discarded here. This keeps the snapshot internally
-    /// consistent even if a concurrent completion commits between the two
-    /// statements under `READ COMMITTED` (which could otherwise return a live
-    /// row alongside a terminal entity) — the snapshot never reports
-    /// `Pending`/`Running` for a finished job.
+    /// The row and entity reads run inside a single internally-opened op, and
+    /// the **entity is authoritative for terminal state**: once `JobCompleted`
+    /// is appended the job is done and its execution row is logically gone, so
+    /// if the entity is terminal the row is discarded here. This keeps the
+    /// snapshot internally consistent even if a concurrent completion commits
+    /// between the two statements under `READ COMMITTED` (which could
+    /// otherwise return a live row alongside a terminal entity) — the
+    /// snapshot never reports `Pending`/`Running` for a finished job.
+    ///
+    /// The execution state, however, is read independently of the row/status
+    /// pairing above: a **keyed** job's state row is retained on terminal
+    /// (`dispatcher.rs`'s `delete_execution_in_op`), so once the entity is
+    /// terminal this re-reads `job_execution_states` directly by id rather
+    /// than reusing the (now stale/absent) value the row's join produced —
+    /// otherwise a terminal keyed job's retained state would be
+    /// unreachable through this path, even though it is still in the DB.
     pub(super) async fn load_snapshot_by_id(&self, id: JobId) -> Result<JobSnapshot, JobError> {
         // Read-only op, created internally; dropped (rolled back) without a commit.
         let mut op = self.begin_op().await?;
@@ -121,26 +158,35 @@ impl JobRepo {
 
         let job = self.find_by_id_in_op(&mut op, id).await?;
 
-        let row = if job.terminal_state().is_some() {
+        let (row, execution_state_json) = if job.terminal_state().is_some() {
             // Terminal entity ⇒ the execution row is logically gone. Discard any
             // row a concurrent read caught mid-completion so the snapshot is
-            // consistent (terminal status, no live-row-derived fields).
-            None
+            // consistent (terminal status, no live-row-derived fields) — but
+            // re-read the state directly, since a keyed job's row outlives
+            // the execution row it was joined from above.
+            let execution_state_json = sqlx::query_scalar!(
+                r#"SELECT execution_state_json FROM job_execution_states WHERE id = $1"#,
+                id as JobId,
+            )
+            .fetch_optional(op.as_executor())
+            .await?;
+            (None, execution_state_json)
         } else {
             // Non-terminal entity ⇒ a live execution row must exist. Its absence
             // would be a torn write — impossible, since the terminal DELETE and
             // the terminal events commit atomically (`src/dispatcher.rs`), so a
             // visible DELETE implies visible terminal events — surfaced rather
             // than silently returning a bogus snapshot.
-            if row.is_none() {
+            let Some(row) = row else {
                 return Err(JobError::JobExecutionError(format!(
                     "job {id} has no execution row but its entity is not terminal"
                 )));
-            }
-            row
+            };
+            let execution_state_json = row.execution_state_json.clone();
+            (Some(row), execution_state_json)
         };
 
-        Ok(JobSnapshot::from_parts(job, row))
+        Ok(JobSnapshot::from_parts(job, row, execution_state_json))
     }
 }
 
@@ -155,13 +201,82 @@ mod tests {
         Ok(pool)
     }
 
-    /// D13: a duplicate `(job_type, unique_key)` insert must map to
-    /// `JobError::DuplicateUniqueKey`. es_entity's composite-index column
-    /// attribution resolves it to the last key column (`unique_key`) as of
-    /// the pinned version — this pins that assumption; if a future es_entity
-    /// bump ever attributes it to `job_type` (or leaves it unattributed) the
-    /// `From<JobCreateError>` arm in `error.rs` (and, on total
-    /// unattribution, this assertion) needs adjusting alongside it.
+    /// Pins `ResidentJobSpawner::spawn`'s absolutely-unique enforcement:
+    /// `idx_jobs_job_type_resident` (a dedicated boolean column — not the
+    /// `unique_key` string column, so DB-level enforcement doesn't depend on
+    /// a sentinel value) rejects a second `resident = true` row of one
+    /// `job_type`, forever — unlike keyed rows (see
+    /// `unique_per_job_type_and_key` below), there is no terminal/respawn
+    /// escape hatch here.
+    #[tokio::test]
+    async fn resident_is_absolutely_unique() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = JobRepo::new(&pool);
+        let type_a = JobType::from_owned(uuid::Uuid::now_v7().to_string());
+        let type_b = JobType::from_owned(uuid::Uuid::now_v7().to_string());
+
+        let a_id = JobId::new();
+        let new_job = NewJob::builder()
+            .id(a_id)
+            .resident(true)
+            .job_type(type_a.clone())
+            .config(serde_json::json!({}))?
+            .build()
+            .expect("Could not build new job");
+        repo.create(new_job).await?;
+
+        // Same type, resident again: conflicts, even with a different id.
+        let new_job = NewJob::builder()
+            .id(JobId::new())
+            .resident(true)
+            .job_type(type_a.clone())
+            .config(serde_json::json!({}))?
+            .build()
+            .expect("Could not build new job");
+        let err: JobError = repo
+            .create(new_job)
+            .await
+            .err()
+            .expect("expected error")
+            .into();
+        assert!(matches!(err, JobError::DuplicateResident(_)));
+
+        // Different type: ok, not a collision — the flag is per-type.
+        let new_job = NewJob::builder()
+            .id(JobId::new())
+            .resident(true)
+            .job_type(type_b)
+            .config(serde_json::json!({}))?
+            .build()
+            .expect("Could not build new job");
+        repo.create(new_job).await?;
+
+        // A non-resident job of the same type never collides with the
+        // resident row (the index is partial: `WHERE resident`).
+        let new_job = NewJob::builder()
+            .id(JobId::new())
+            .job_type(type_a)
+            .config(serde_json::json!({}))?
+            .build()
+            .expect("Could not build new job");
+        repo.create(new_job).await?;
+
+        Ok(())
+    }
+
+    /// D13 (rewritten for live-keyed semantics): `jobs` no longer enforces
+    /// per-arbitrary-key uniqueness — it accumulates one row per generation
+    /// of a keyed singleton, and liveness enforcement moved to
+    /// `job_executions` (`idx_job_executions_job_type_unique_key`, see
+    /// `migrations/20250904065521_job_setup.sql`). The absolutely-unique
+    /// `resident` slot (`ResidentJobSpawner::spawn`) is unaffected by this —
+    /// see `resident_is_absolutely_unique` above. This test pins both
+    /// halves of the ordinary-key story: (a) two `jobs` rows for one
+    /// arbitrary key coexist fine (the generation model), and (b) a second
+    /// LIVE `job_executions` row for one `(job_type, unique_key)` conflicts
+    /// on that index by name, while a second row inserted after the first
+    /// goes terminal (its row deleted, mirroring `dispatcher.rs`'s
+    /// completion path) succeeds.
     #[tokio::test]
     async fn unique_per_job_type_and_key() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -180,7 +295,8 @@ mod tests {
             .expect("Could not build new job");
         repo.create(new_job).await?;
 
-        // Same type, same key.
+        // Same type, same key: `jobs` itself no longer conflicts — a second
+        // generation is an ordinary row.
         let new_job = NewJob::builder()
             .id(JobId::new())
             .unique_key("k1")
@@ -188,13 +304,7 @@ mod tests {
             .config(serde_json::json!({}))?
             .build()
             .expect("Could not build new job");
-        let err: JobError = repo
-            .create(new_job)
-            .await
-            .err()
-            .expect("expected error")
-            .into();
-        assert!(matches!(err, JobError::DuplicateUniqueKey(_)));
+        repo.create(new_job).await?;
 
         // Same type, different key: ok, not a collision.
         let new_job = NewJob::builder()
@@ -263,6 +373,69 @@ mod tests {
             .expect("expected error")
             .into();
         assert!(matches!(err, JobError::DuplicateId(_)));
+
+        // -- `job_executions`-level liveness enforcement (the new invariant) --
+        let type_d = JobType::from_owned(uuid::Uuid::now_v7().to_string());
+
+        let live_id = uuid::Uuid::now_v7();
+        sqlx::query!(
+            "INSERT INTO jobs (id, unique_key, job_type) VALUES ($1, $2, $3)",
+            live_id,
+            "k-live",
+            &type_d as &JobType,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query!(
+            r#"INSERT INTO job_executions (id, job_type, unique_key, alive_at, created_at)
+               VALUES ($1, $2, $3, NOW(), NOW())"#,
+            live_id,
+            &type_d as &JobType,
+            "k-live",
+        )
+        .execute(&pool)
+        .await?;
+
+        // A second LIVE execution of the same `(job_type, unique_key)` conflicts.
+        let other_id = uuid::Uuid::now_v7();
+        sqlx::query!(
+            "INSERT INTO jobs (id, unique_key, job_type) VALUES ($1, $2, $3)",
+            other_id,
+            "k-live",
+            &type_d as &JobType,
+        )
+        .execute(&pool)
+        .await?;
+        let conflict = sqlx::query!(
+            r#"INSERT INTO job_executions (id, job_type, unique_key, alive_at, created_at)
+               VALUES ($1, $2, $3, NOW(), NOW())"#,
+            other_id,
+            &type_d as &JobType,
+            "k-live",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("second live execution of the same key must conflict");
+        assert_eq!(
+            conflict.as_database_error().and_then(|d| d.constraint()),
+            Some("idx_job_executions_job_type_unique_key")
+        );
+
+        // Once the first generation's execution goes terminal (row deleted,
+        // mirroring `dispatcher.rs`'s completion path), the key is
+        // respawnable — a second row for the same key now succeeds.
+        sqlx::query!("DELETE FROM job_executions WHERE id = $1", live_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query!(
+            r#"INSERT INTO job_executions (id, job_type, unique_key, alive_at, created_at)
+               VALUES ($1, $2, $3, NOW(), NOW())"#,
+            other_id,
+            &type_d as &JobType,
+            "k-live",
+        )
+        .execute(&pool)
+        .await?;
 
         Ok(())
     }

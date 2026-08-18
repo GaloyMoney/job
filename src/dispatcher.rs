@@ -36,11 +36,9 @@ pub(crate) struct JobDispatcher {
     tracker: Arc<JobTracker>,
     notifier: Arc<JobEventNotifier>,
     job_type: JobType,
-    /// Whether `job_type` carries a `max_concurrent_global` cap. A freed
-    /// global slot only becomes claimable by a PEER instance if that peer
-    /// learns about it — unlike the local case, which the tracker's
-    /// capped-type notify rule already covers. See `delete_execution_in_op`.
-    globally_capped: bool,
+    /// Whether this type keeps its execution state past terminal, i.e. it is
+    /// keyed with `inherits_state`. See `delete_execution_in_op`.
+    retains_state: bool,
     rescheduled: bool,
     dispatched: bool,
     id: JobId,
@@ -66,7 +64,7 @@ impl JobDispatcher {
         retry_settings: RetrySettings,
         id: JobId,
         job_type: JobType,
-        globally_capped: bool,
+        retains_state: bool,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
@@ -79,7 +77,7 @@ impl JobDispatcher {
             tracker,
             notifier,
             job_type,
-            globally_capped,
+            retains_state,
             rescheduled: false,
             dispatched: true,
             id,
@@ -344,19 +342,24 @@ impl JobDispatcher {
     }
 
     /// Delete the execution row and report what its removal makes true: the job
-    /// is terminal, and its type may now have claimable backlog it didn't
-    /// before — because it held a `queue_id` and that queue's next job is now
-    /// eligible, or because `job_type` carries a global cap and this was the
-    /// slot that saturated it. The queue case only unblocks work THIS process
-    /// can already see (any instance may claim it on its next ordinary poll),
-    /// but the global-cap case is different: a PEER instance may have already
-    /// dropped `job_type` from its own poll entirely, having observed the cap
-    /// as saturated, and — absent this report — would only rediscover the
-    /// freed slot on its next unrelated poll or the 60s `MAX_WAIT` backstop.
+    /// is terminal, and — if it held a `queue_id` — that queue's next job just
+    /// became eligible. Freeing a queue is worth reporting because the queue's
+    /// backlog was, until this moment, invisible to every poller's claim scan:
+    /// the queue walk skips a queue outright while any of its jobs is running.
     /// The reschedule paths (`reschedule_job`, the retry branch of
     /// `fail_job`) don't need this: they always report unconditionally,
     /// since a job going back to `pending` is exactly the ordinary case every
     /// instance already polls for. Reports nothing when no row was deleted.
+    ///
+    /// The `job_execution_states` row is deleted with the execution unless
+    /// this type sets [`KeyedJobInitializer::inherits_state`], which is the
+    /// only reason to keep one: the next generation of that key seeds from it
+    /// (and the key's next spawn compacts older rows away). Retention is
+    /// therefore something a type opts into, not a side effect of being keyed
+    /// — a keyed type that does not inherit state cleans up exactly like every
+    /// other flavor.
+    ///
+    /// [`KeyedJobInitializer::inherits_state`]: crate::KeyedJobInitializer::inherits_state
     async fn delete_execution_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -370,12 +373,14 @@ impl JobDispatcher {
               WHERE id = $1 AND poller_instance_id = $2
               RETURNING id, queue_id
           ), cleanup AS (
-              DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+              DELETE FROM job_execution_states s USING deleted d
+              WHERE s.id = d.id AND NOT $3::boolean
           )
           SELECT queue_id AS "queue_id?" FROM deleted
         "#,
             id as JobId,
-            self.instance_id
+            self.instance_id,
+            self.retains_state,
         )
         .fetch_optional(op.as_executor())
         .await?;
@@ -386,7 +391,7 @@ impl JobDispatcher {
 
         self.notifier.job_terminal_in_op(op, id).await?;
 
-        if freed_queue_id.is_some() || self.globally_capped {
+        if freed_queue_id.is_some() {
             self.notifier.execution_ready_in_op(op, job_type).await?;
         }
 

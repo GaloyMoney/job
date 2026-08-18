@@ -14,12 +14,12 @@
 //! - Durable Postgres-backed storage so jobs survive restarts and crashes.
 //! - Automatic exponential backoff with jitter, plus opt-in infinite retries.
 //! - Concurrency controls that let many worker instances share the workload,
-//!   configurable through [`JobPollerConfig`], plus per-type concurrency caps
-//!   via [`JobInitializer::max_concurrent_per_process`] /
-//!   [`max_concurrent_global`](JobInitializer::max_concurrent_global).
-//! - Keyed singletons — at most one job per `(job_type, key)` ever — via
-//!   [`JobSpawner::spawn_keyed`], with [`JobSpawner::spawn_unique`] as the
-//!   at-most-one-per-type special case.
+//!   configurable through [`JobPollerConfig`], plus a per-type concurrency cap
+//!   via [`JobInitializer::max_concurrent_per_process`].
+//! - Two singleton *flavors* beyond the default: keyed jobs — at most one
+//!   LIVE job per `(job_type, key)`, respawnable once terminal — via
+//!   [`KeyedJobSpawner`], and resident jobs — at most one job per type,
+//!   ever, that never terminates — via [`ResidentJobSpawner`].
 //! - Built-in migrations that you can run automatically or embed into your own
 //!   migration workflow.
 //!
@@ -222,58 +222,86 @@
 //! confiscating [`JobPollerConfig::max_jobs_per_process`] from every other
 //! job type.
 //!
-//! [`JobInitializer::max_concurrent_global`] additionally bounds the type's
-//! concurrency across ALL poller instances — useful for rate-limiting a
-//! downstream dependency itself ("at most N concurrent calls to service X").
-//! It is **soft**: each instance pre-counts the type's running executions just
-//! before claiming, so concurrent polls across instances can transiently
-//! overshoot; steady-state stays at or below the cap. For a hard bound, pair
-//! it with `max_concurrent_per_process` (hard bound = per-process cap ×
-//! instance count).
-//!
 //! ```ignore
 //! impl JobInitializer for KeycloakSyncInitializer {
 //!     // ...
 //!     fn max_concurrent_per_process(&self) -> Option<usize> { Some(20) }
-//!     fn max_concurrent_global(&self) -> Option<usize> { Some(50) }
 //! }
 //! ```
+//!
+//! There is deliberately no cross-instance cap: the former
+//! `max_concurrent_global` made every poll pre-count the fleet's running
+//! executions, for a bound that was only ever soft. `max_concurrent_per_process`
+//! is exact, free at the database, and multiplied by a known instance count
+//! gives a real fleet-wide ceiling. See `PERFORMANCE.md` for the measurements.
 //!
 //! A capped type's backlog is observable the same way any pending backlog is:
 //! via the crate's existing stale-pending warnings
 //! (`job.check_stale_pending_jobs`), which fire regardless of *why* a type's
 //! rows are sitting `pending`.
 //!
-//! ## Keyed singletons
+//! ## Job flavors
 //!
-//! For at-most-one-per-key semantics, use [`JobSpawner::spawn_keyed`]: at
-//! most one job of `(job_type, key)` EVER exists (`jobs` rows are never
-//! deleted, so revival needs a fresh key, e.g. a generation-scoped `g2:3`).
-//! Enumerate every key of a type — the entry point for a "have my listeners
-//! caught up?" check — with [`Jobs::keyed_handles`].
+//! Every job is one of three **flavors** — regular (what [`JobInitializer`]
+//! registers, optionally [`BatchedJobInitializer`] or spawned with a
+//! `queue_id`), keyed, or resident. "Flavor" is this crate's umbrella term
+//! for the three whenever a doc comment or diagnostic needs to name them
+//! collectively.
+//!
+//! | flavor | admission invariant | terminates? | id |
+//! |---|---|---|---|
+//! | regular | none (`queue_id` = at most one RUNNING per queue at a time — a scheduling-time mutual exclusion, not a FIFO ordering guarantee) | yes | caller-chosen |
+//! | keyed | at most one LIVE job per `(job_type, key)`; respawnable after terminal | yes | internal |
+//! | resident | at most one job per `job_type`, EVER | cannot (no `Complete` variant exists) | internal |
+//!
+//! ### Keyed jobs
+//!
+//! For at-most-one-live-per-key semantics, register with
+//! [`Jobs::add_keyed_initializer`] and spawn with [`KeyedJobSpawner::spawn`]:
+//! at most one LIVE (pending/running) job of `(job_type, key)` at a time. A
+//! key becomes respawnable once its job reaches a terminal state — the next
+//! spawn creates a new generation under the same key. Enumerate every key of
+//! a type — the entry point for a "have my listeners caught up?" check —
+//! with [`Jobs::keyed_handles`].
 //!
 //! ```ignore
-//! let shard_spawner = jobs.add_initializer(ShardListenerInitializer);
+//! let shard_spawner = jobs.add_keyed_initializer(ShardListenerInitializer);
 //!
-//! // One singleton per shard; re-spawning the same shard is a no-op that
-//! // returns the existing job's handle.
-//! shard_spawner.spawn_keyed(format!("shard-{shard_id}"), ShardConfig { shard_id }).await?;
+//! // One job per shard; re-spawning a live shard is a no-op that returns
+//! // the existing job's handle. Once a shard's job goes terminal, spawning
+//! // it again starts a new generation.
+//! shard_spawner.spawn(format!("shard-{shard_id}"), ShardConfig { shard_id }).await?;
 //! ```
 //!
-//! [`JobSpawner::spawn_unique`] is the type-level special case — at most one
-//! job of a type — implemented as sugar for `spawn_keyed(DEFAULT_UNIQUE_KEY,
-//! …)`. It consumes the spawner, enforcing at the type level that only one job
-//! of this type can be created:
+//! By default a keyed generation's execution state (see
+//! [`CurrentJob::update_execution_state`]) is deleted when it terminates, just
+//! like a regular job's. Set [`KeyedJobInitializer::inherits_state`] to make it
+//! outlive the generation instead: it is kept (readable via
+//! [`JobSnapshot::execution_state`]), seeded into the next generation of that
+//! key, and older generations are compacted away at the next spawn — useful
+//! when a respawn should resume from a checkpoint rather than start cold.
+//!
+//! ### Resident jobs
+//!
+//! For a process-wide singleton that just keeps running — a poller, a
+//! periodic sweep — register with [`Jobs::add_resident_initializer`] and
+//! spawn with [`ResidentJobSpawner::spawn`]: absolutely unique, at most one
+//! job of a type EVER exists. Once created it can never be spawned again —
+//! there is no respawn/new-generation escape hatch, unlike keyed jobs — and
+//! it can never complete either: [`ResidentJobRunner::run`] returns
+//! [`ResidentJobCompletion`], a reschedule-only mirror of [`JobCompletion`]
+//! with no `Complete` variant, so a resident job finishing for good is a
+//! compile error, not a runtime surprise. Registration also forces eternal
+//! retry regardless of the initializer's settings, for the same reason.
+//! `spawn` consumes the spawner, enforcing at the type level that only one
+//! job of this type can be created:
 //!
 //! ```ignore
-//! let cleanup_spawner = jobs.add_initializer(CleanupInitializer);
+//! let cleanup_spawner = jobs.add_resident_initializer(CleanupInitializer);
 //!
 //! // Consumes spawner - can't accidentally spawn twice
-//! cleanup_spawner.spawn_unique(CleanupConfig::default()).await?;
+//! cleanup_spawner.spawn(CleanupConfig::default()).await?;
 //! ```
-//!
-//! `spawn_unique` and `spawn_keyed` share one key namespace per type, so
-//! calling both on the same job type collides by design.
 //!
 //! ## Parameterized Job Types
 //!
@@ -338,6 +366,7 @@ mod dispatcher;
 mod entity;
 mod handle;
 mod job_execution;
+mod keyed;
 mod migrate;
 mod notification_router;
 mod notifier;
@@ -345,6 +374,7 @@ mod outcome;
 mod poller;
 mod registry;
 mod repo;
+mod resident;
 mod runner;
 mod snapshot;
 mod spawner;
@@ -368,9 +398,13 @@ pub use error::JobError;
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use handle::{JobHandle, JobHandles};
 pub use job_execution::JobStatus;
+pub use keyed::{KeyedJobInitializer, KeyedJobSpawner};
 pub use migrate::*;
 pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;
+pub use resident::{
+    ResidentJobCompletion, ResidentJobInitializer, ResidentJobRunner, ResidentJobSpawner,
+};
 pub use runner::*;
 pub use snapshot::JobSnapshot;
 pub use spawner::*;
@@ -649,7 +683,6 @@ impl Jobs {
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
-            Arc::clone(&self.router),
             self.clock.clone(),
             Arc::clone(&self.notifier),
         )
@@ -687,6 +720,77 @@ impl Jobs {
                 .add_batched_initializer(initializer)
         };
         JobSpawner::new(
+            Arc::clone(&self.repo),
+            job_type,
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )
+    }
+
+    /// Register a [`KeyedJobInitializer`] and return a [`KeyedJobSpawner`]
+    /// for creating jobs of that type.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let spawner = jobs.add_keyed_initializer(ShardListenerInitializer);
+    /// spawner.spawn(format!("shard-{shard_id}"), ShardConfig { shard_id }).await?;
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after [`start_poll`](Self::start_poll).
+    pub fn add_keyed_initializer<I: KeyedJobInitializer>(
+        &mut self,
+        initializer: I,
+    ) -> KeyedJobSpawner<I::Config> {
+        // Read before `initializer` moves into the registry below — the
+        // returned spawner needs its own copy to drive the seed/compact
+        // machinery in `KeyedJobSpawner::spawn`.
+        let inherits_state = initializer.inherits_state();
+        let job_type = {
+            let mut registry = self.registry.lock().expect("Couldn't lock Registry Mutex");
+            registry
+                .as_mut()
+                .expect("Registry has been consumed by executor")
+                .add_keyed_initializer(initializer)
+        };
+        KeyedJobSpawner::new(
+            Arc::clone(&self.repo),
+            job_type,
+            Arc::clone(&self.router),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+            inherits_state,
+        )
+    }
+
+    /// Register a [`ResidentJobInitializer`] and return a
+    /// [`ResidentJobSpawner`] for creating the (at most one) job of that
+    /// type.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let spawner = jobs.add_resident_initializer(CleanupInitializer);
+    /// spawner.spawn(CleanupConfig::default()).await?;
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after [`start_poll`](Self::start_poll).
+    pub fn add_resident_initializer<I: ResidentJobInitializer>(
+        &mut self,
+        initializer: I,
+    ) -> ResidentJobSpawner<I::Config> {
+        let job_type = {
+            let mut registry = self.registry.lock().expect("Couldn't lock Registry Mutex");
+            registry
+                .as_mut()
+                .expect("Registry has been consumed by executor")
+                .add_resident_initializer(initializer)
+        };
+        ResidentJobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
             Arc::clone(&self.router),
@@ -829,16 +933,13 @@ impl Jobs {
         ids.into_iter().map(|id| self.handle(id)).collect()
     }
 
-    /// Mint a [`JobHandle`] for the single unique job of `job_type`, if one
+    /// Mint a [`JobHandle`] for the resident job of `job_type`, if one
     /// exists.
     ///
-    /// The counterpart of [`handle`](Self::handle) for at-most-one-per-type
-    /// jobs (see [`JobSpawner::spawn_unique`]): unlike `handle(id)`, this
-    /// resolves the persisted job's id from the database, so it is async and
-    /// returns `None` when no unique job of that type has been spawned.
-    /// Sugar for [`keyed_handle`](Self::keyed_handle) with
-    /// [`DEFAULT_UNIQUE_KEY`] — `spawn_unique` is a keyed singleton under the
-    /// hood, spawned with that same key.
+    /// The counterpart of [`handle`](Self::handle) for resident jobs (see
+    /// [`ResidentJobSpawner::spawn`]): unlike `handle(id)`, this resolves
+    /// the persisted job's id from the database, so it is async and returns
+    /// `None` when no resident job of that type has been spawned.
     ///
     /// # Errors
     ///
@@ -848,8 +949,8 @@ impl Jobs {
     ///
     /// ```no_run
     /// # use job::{
-    /// #     Jobs, JobSvcConfig, Job, JobId, JobInitializer, JobRunner, JobType, JobCompletion,
-    /// #     CurrentJob, JobSpawner,
+    /// #     Jobs, JobSvcConfig, Job, JobId, JobType, ResidentJobInitializer,
+    /// #     ResidentJobRunner, ResidentJobCompletion, CurrentJob,
     /// # };
     /// # use job::error::JobError;
     /// # use async_trait::async_trait;
@@ -860,18 +961,18 @@ impl Jobs {
     /// # #[derive(Debug, Serialize, Deserialize)]
     /// # struct MyConfig { value: i32 }
     /// # struct MyInitializer;
-    /// # impl JobInitializer for MyInitializer {
+    /// # impl ResidentJobInitializer for MyInitializer {
     /// #     type Config = MyConfig;
     /// #     fn job_type(&self) -> JobType { JobType::new("cleanup") }
-    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    /// #     fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn Error>> {
     /// #         Ok(Box::new(MyRunner))
     /// #     }
     /// # }
     /// # struct MyRunner;
     /// # #[async_trait]
-    /// # impl JobRunner for MyRunner {
-    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error>> {
-    /// #         Ok(JobCompletion::Complete)
+    /// # impl ResidentJobRunner for MyRunner {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<ResidentJobCompletion, Box<dyn Error>> {
+    /// #         Ok(ResidentJobCompletion::RescheduleIn(Duration::from_secs(60)))
     /// #     }
     /// # }
     /// # async fn example() -> Result<(), JobError> {
@@ -879,27 +980,29 @@ impl Jobs {
     /// #     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
     /// # let config = JobSvcConfig::builder().pool(pool).build().unwrap();
     /// # let mut jobs = Jobs::init(config).await?;
-    /// # let spawner: JobSpawner<MyConfig> = jobs.add_initializer(MyInitializer);
+    /// # let spawner = jobs.add_resident_initializer(MyInitializer);
     /// # jobs.start_poll().await?;
     /// // Observe the (at most one) cleanup job without knowing its id.
-    /// if let Some(handle) = jobs.handle_unique(JobType::new("cleanup")).await? {
+    /// if let Some(handle) = jobs.resident_handle(JobType::new("cleanup")).await? {
     ///     let snapshot = handle.load().await?;
     ///     let _state = snapshot.state();
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(name = "job.handle_unique", skip(self))]
-    pub async fn handle_unique(
+    #[instrument(name = "job.resident_handle", skip(self))]
+    pub async fn resident_handle(
         &self,
         job_type: impl Into<JobType> + std::fmt::Debug,
     ) -> Result<Option<JobHandle>, JobError> {
-        self.keyed_handle(job_type, DEFAULT_UNIQUE_KEY).await
+        let id = self.repo.find_resident_id(&job_type.into()).await?;
+        Ok(id.map(|id| self.handle(id)))
     }
 
-    /// Mint a [`JobHandle`] for the keyed singleton of `(job_type, key)`, if
-    /// one exists (see [`JobSpawner::spawn_keyed`]). `None` when no job of
-    /// that type has ever been spawned under `key`.
+    /// Mint a [`JobHandle`] for the keyed job of `(job_type, key)`, if one
+    /// exists (see [`KeyedJobSpawner::spawn`]). Resolves the LIVE generation
+    /// when one exists, else the latest terminal generation. `None` when no
+    /// job of that type has ever been spawned under `key`.
     ///
     /// # Errors
     ///
@@ -914,12 +1017,12 @@ impl Jobs {
         Ok(job.map(|job| self.handle(job.id)))
     }
 
-    /// Every keyed singleton of `job_type`, ordered by key — includes the
-    /// [`DEFAULT_UNIQUE_KEY`] job if one was spawned via
-    /// [`JobSpawner::spawn_unique`]. The entry point for "have my listeners
-    /// caught up?": [`JobHandles::load_all`] batch-loads every job's
-    /// [`JobSnapshot`], and [`JobSnapshot::unique_key`] reads the key back
-    /// off each one — no separate bookkeeping of which handle is which key.
+    /// Every keyed job of `job_type`, ordered by key — one handle per key
+    /// (the live-or-latest generation). The entry point for "have my
+    /// listeners caught up?": [`JobHandles::load_all`] batch-loads every
+    /// job's [`JobSnapshot`], and [`JobSnapshot::unique_key`] reads the key
+    /// back off each one — no separate bookkeeping of which handle is which
+    /// key.
     ///
     /// Returns a plain [`JobHandles`], the same type [`Jobs::handles`]
     /// returns: `await_all`'s [`JobOutcome`] doesn't carry the key (it's

@@ -110,7 +110,6 @@ async fn shutdown_drains_self_rescheduling_jobs() -> anyhow::Result<()> {
             .poller_config(JobPollerConfig {
                 // Poll as fast as the churn allows: the tighter the cadence,
                 // the likelier a poll is in flight when shutdown starts.
-                poll_debounce: Duration::from_millis(1),
                 ..Default::default()
             })
             .build()
