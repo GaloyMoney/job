@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        -- Claim admission. Queued and unqueued rows are gathered separately so\n        -- that neither can starve the other, and each type is bounded by its\n        -- own budget. See PERFORMANCE.md (\"Claim admission\") for the\n        -- measurements behind this shape.\n        WITH RECURSIVE limits AS (\n            SELECT l.job_type, l.row_limit\n            FROM UNNEST($4::text[], $6::int4[]) AS l(job_type, row_limit)\n            WHERE l.row_limit > 0\n        ),\n        walk AS (\n            -- Enumerate QUEUES, not rows: one index seek per queue regardless\n            -- of how deep its backlog is. `found` tallies eligible queues and\n            -- the recursion ends once there are enough, so cost is\n            -- O(queues examined). $7 is the round-robin cursor.\n            SELECT s.q AS queue_id,\n                   CASE WHEN s.q IS NOT NULL AND NOT EXISTS (\n                          SELECT 1 FROM job_executions r\n                          WHERE r.state = 'running' AND r.queue_id = s.q)\n                        THEN 1 ELSE 0 END AS found\n            FROM (SELECT MIN(queue_id) AS q FROM job_executions\n                  WHERE state = 'pending' AND queue_id IS NOT NULL\n                    AND queue_id > $7) s\n            UNION ALL\n            SELECT\n              (SELECT MIN(je.queue_id) FROM job_executions je\n               WHERE je.state = 'pending' AND je.queue_id IS NOT NULL\n                 AND je.queue_id > w.queue_id),\n              w.found + CASE WHEN NOT EXISTS (\n                  SELECT 1 FROM job_executions r\n                  WHERE r.state = 'running' AND r.queue_id =\n                    (SELECT MIN(je2.queue_id) FROM job_executions je2\n                     WHERE je2.state = 'pending' AND je2.queue_id IS NOT NULL\n                       AND je2.queue_id > w.queue_id))\n                THEN 1 ELSE 0 END\n            FROM walk w\n            WHERE w.queue_id IS NOT NULL AND w.found < $1::int4 * $8::int4\n        ),\n        eligible_queues AS (\n            SELECT w.queue_id FROM walk w\n            WHERE w.queue_id IS NOT NULL\n              AND NOT EXISTS (SELECT 1 FROM job_executions r\n                              WHERE r.state = 'running' AND r.queue_id = w.queue_id)\n        ),\n        due_queued AS (\n            -- One row per eligible queue: its head. Taking only the head is\n            -- what keeps \"at most one running job per queue\" true against a\n            -- concurrent poller -- a peer that already locked this head finds\n            -- it locked and skips the whole queue, rather than claiming the\n            -- row behind it.\n            SELECT h.id, h.execute_at, h.job_type\n            FROM eligible_queues e\n            CROSS JOIN LATERAL (\n                SELECT je.id, je.execute_at, je.job_type\n                FROM job_executions je\n                WHERE je.state = 'pending' AND je.queue_id = e.queue_id\n                  AND je.execute_at <= $2::timestamptz\n                  AND je.job_type IN (SELECT job_type FROM limits)\n                ORDER BY je.execute_at\n                LIMIT 1\n            ) h\n        ),\n        due_plain AS (\n            -- Unqueued rows can never be blocked by a sibling, so they come\n            -- straight off their own partial index in execute_at order,\n            -- bounded per type.\n            SELECT d.id, d.execute_at, d.job_type\n            FROM limits t\n            CROSS JOIN LATERAL (\n                SELECT je.id, je.execute_at, je.job_type\n                FROM job_executions je\n                WHERE je.state = 'pending' AND je.queue_id IS NULL\n                  AND je.job_type = t.job_type\n                  AND je.execute_at <= $2::timestamptz\n                ORDER BY je.execute_at\n                LIMIT LEAST(t.row_limit, $1::int4) * $8::int4\n            ) d\n        ),\n        ordered_candidates AS (\n            -- Interleave types round-robin: every type's oldest candidate\n            -- ranks ahead of any type's second, so the global LIMIT below\n            -- cannot be consumed end-to-end by one backlogged type. Within a\n            -- rank it is still oldest-first.\n            SELECT id, execute_at, job_type,\n                   ROW_NUMBER() OVER (\n                       PARTITION BY job_type ORDER BY execute_at\n                   ) AS type_rn\n            FROM (SELECT * FROM due_plain UNION ALL SELECT * FROM due_queued) u\n        ),\n        locked AS (\n            -- The join to job_executions sits BELOW the LIMIT so it runs\n            -- lazily: only rows LockRows actually pulls get probed. The sort\n            -- above is a blocking node, so the full candidate set is still\n            -- materialised and SKIP LOCKED falls through a contended head\n            -- exactly as before.\n            --\n            -- FOR UPDATE OF je: bare FOR UPDATE errors on a nullable join side.\n            SELECT je.id, je.attempt_index, c.job_type, c.execute_at\n            FROM ordered_candidates c\n            JOIN job_executions je ON je.id = c.id\n            ORDER BY c.type_rn ASC, c.execute_at ASC\n            LIMIT $1\n            FOR UPDATE OF je SKIP LOCKED\n        ),\n        selected_jobs AS (\n            -- The budget is enforced HERE, on rows actually held: the scans\n            -- above deliberately over-gather (see $8) so there is something to\n            -- fall through to when a peer holds the head. Rows over a type's\n            -- cap are simply not claimed; their locks release at commit.\n            -- execution_state_json is joined after the LIMIT, so it is fetched\n            -- only for winners.\n            SELECT t.id, cp.execution_state_json AS data_json, t.attempt_index\n            FROM (\n                SELECT l.*,\n                       ROW_NUMBER() OVER (\n                           PARTITION BY l.job_type ORDER BY l.execute_at\n                       ) AS type_rn\n                FROM locked l\n            ) t\n            JOIN limits lim ON lim.job_type = t.job_type\n            LEFT JOIN job_execution_states cp ON cp.id = t.id\n            WHERE t.type_rn <= lim.row_limit\n        ),\n        updated AS (\n            UPDATE job_executions AS je\n            SET state = 'running', alive_at = $5, execute_at = NULL, poller_instance_id = $3\n            FROM selected_jobs\n            WHERE je.id = selected_jobs.id\n              AND je.state = 'pending'\n            RETURNING je.id, selected_jobs.data_json, je.attempt_index, je.queue_id\n        ),\n        min_wait AS (\n            SELECT MIN(execute_at) AS next_due_at\n            FROM job_executions\n            WHERE state = 'pending'\n            AND job_type = ANY($4)\n            AND execute_at > $2::timestamptz\n        ),\n        next_cursor AS (\n            -- NULL means the sweep ran off the end of queue_id space, so the\n            -- caller wraps back to the start.\n            SELECT CASE WHEN bool_or(queue_id IS NULL) THEN NULL\n                        ELSE MAX(queue_id) END AS c\n            FROM walk\n        ),\n        poll_status AS (\n            SELECT ((SELECT COUNT(*) FROM ordered_candidates) >= $1\n                 OR (SELECT COUNT(*) FROM locked) >= $1) AS may_have_more\n        )\n        SELECT * FROM (\n            SELECT\n                u.id AS \"id?: JobId\",\n                u.data_json AS \"data_json?: JsonValue\",\n                u.attempt_index AS \"attempt_index?\",\n                u.queue_id AS \"queue_id?\",\n                NULL::TIMESTAMPTZ AS \"next_due_at?\",\n                ps.may_have_more AS \"may_have_more!\",\n                nc.c AS \"next_queue_cursor?\"\n            FROM updated u, poll_status ps, next_cursor nc\n            UNION ALL\n            SELECT\n                NULL::UUID AS \"id?: JobId\",\n                NULL::JSONB AS \"data_json?: JsonValue\",\n                NULL::INT AS \"attempt_index?\",\n                NULL::VARCHAR AS \"queue_id?\",\n                mw.next_due_at AS \"next_due_at?\",\n                ps.may_have_more AS \"may_have_more!\",\n                nc.c AS \"next_queue_cursor?\"\n            FROM min_wait mw, poll_status ps, next_cursor nc\n        ) AS result\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id?: JobId",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "data_json?: JsonValue",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_index?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "queue_id?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "next_due_at?",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "may_have_more!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "next_queue_cursor?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Timestamptz",
+        "Uuid",
+        "TextArray",
+        "Timestamptz",
+        "Int4Array",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "c700889cd392642f672a4905c5ea9e9c4eedb2348bc9bb04707676e78718d89c"
+}

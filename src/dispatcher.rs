@@ -36,11 +36,6 @@ pub(crate) struct JobDispatcher {
     tracker: Arc<JobTracker>,
     notifier: Arc<JobEventNotifier>,
     job_type: JobType,
-    /// Whether `job_type` carries a `max_concurrent_global` cap. A freed
-    /// global slot only becomes claimable by a PEER instance if that peer
-    /// learns about it — unlike the local case, which the tracker's
-    /// capped-type notify rule already covers. See `delete_execution_in_op`.
-    globally_capped: bool,
     rescheduled: bool,
     dispatched: bool,
     id: JobId,
@@ -66,7 +61,6 @@ impl JobDispatcher {
         retry_settings: RetrySettings,
         id: JobId,
         job_type: JobType,
-        globally_capped: bool,
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
@@ -79,7 +73,6 @@ impl JobDispatcher {
             tracker,
             notifier,
             job_type,
-            globally_capped,
             rescheduled: false,
             dispatched: true,
             id,
@@ -344,15 +337,10 @@ impl JobDispatcher {
     }
 
     /// Delete the execution row and report what its removal makes true: the job
-    /// is terminal, and its type may now have claimable backlog it didn't
-    /// before — because it held a `queue_id` and that queue's next job is now
-    /// eligible, or because `job_type` carries a global cap and this was the
-    /// slot that saturated it. The queue case only unblocks work THIS process
-    /// can already see (any instance may claim it on its next ordinary poll),
-    /// but the global-cap case is different: a PEER instance may have already
-    /// dropped `job_type` from its own poll entirely, having observed the cap
-    /// as saturated, and — absent this report — would only rediscover the
-    /// freed slot on its next unrelated poll or the 60s `MAX_WAIT` backstop.
+    /// is terminal, and — if it held a `queue_id` — that queue's next job just
+    /// became eligible. Freeing a queue is worth reporting because the queue's
+    /// backlog was, until this moment, invisible to every poller's claim scan:
+    /// the queue walk skips a queue outright while any of its jobs is running.
     /// The reschedule paths (`reschedule_job`, the retry branch of
     /// `fail_job`) don't need this: they always report unconditionally,
     /// since a job going back to `pending` is exactly the ordinary case every
@@ -396,7 +384,7 @@ impl JobDispatcher {
 
         self.notifier.job_terminal_in_op(op, id).await?;
 
-        if freed_queue_id.is_some() || self.globally_capped {
+        if freed_queue_id.is_some() {
             self.notifier.execution_ready_in_op(op, job_type).await?;
         }
 

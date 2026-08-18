@@ -117,20 +117,10 @@ pub(crate) struct BatchPolicy {
     pub max_concurrent_per_process: usize,
 }
 
-/// Concurrency bounds of one PLAIN (non-batched) job type.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TypeConcurrency {
-    pub per_process: Option<usize>,
-    pub global: Option<usize>,
-}
-
 /// One poll's per-type claim plan.
 pub(super) struct ClaimPlan {
     pub types: Vec<JobType>,
     pub row_limits: Vec<i32>,
-    /// The subset of `types` that also carries a global (cross-instance) cap.
-    pub global_cap_types: Vec<JobType>,
-    pub global_caps: Vec<i32>,
 }
 
 /// Keeps track of registered job types and their retry behaviour.
@@ -138,7 +128,7 @@ pub struct JobRegistry {
     initializers: HashMap<JobType, Box<dyn AnyJobInitializer>>,
     batched_initializers: HashMap<JobType, Box<dyn AnyBatchedJobInitializer>>,
     batch_policies: HashMap<JobType, BatchPolicy>,
-    concurrency: HashMap<JobType, TypeConcurrency>,
+    concurrency: HashMap<JobType, Option<usize>>,
     retry_settings: HashMap<JobType, RetrySettings>,
     tracker: Arc<JobTracker>,
 }
@@ -160,10 +150,7 @@ impl JobRegistry {
     pub fn add_initializer<I: JobInitializer>(&mut self, initializer: I) -> JobType {
         let job_type = initializer.job_type();
         let retry_settings = initializer.retry_on_error_settings();
-        let concurrency = TypeConcurrency {
-            per_process: initializer.max_concurrent_per_process().map(|c| c.max(1)),
-            global: initializer.max_concurrent_global().map(|c| c.max(1)),
-        };
+        let concurrency = initializer.max_concurrent_per_process().map(|c| c.max(1));
         self.initializers
             .insert(job_type.clone(), Box::new(initializer));
         self.concurrency.insert(job_type.clone(), concurrency);
@@ -178,10 +165,7 @@ impl JobRegistry {
     pub fn add_keyed_initializer<I: KeyedJobInitializer>(&mut self, initializer: I) -> JobType {
         let job_type = initializer.job_type();
         let retry_settings = initializer.retry_on_error_settings();
-        let concurrency = TypeConcurrency {
-            per_process: initializer.max_concurrent_per_process().map(|c| c.max(1)),
-            global: initializer.max_concurrent_global().map(|c| c.max(1)),
-        };
+        let concurrency = initializer.max_concurrent_per_process().map(|c| c.max(1));
         let inherits_state = initializer.inherits_state();
         self.initializers.insert(
             job_type.clone(),
@@ -298,32 +282,27 @@ impl JobRegistry {
     /// Per-process concurrency cap of a PLAIN job type, if any. `None` for
     /// batched types (see [`Self::batch_policy`]) and uncapped plain types.
     pub(super) fn per_process_cap(&self, job_type: &JobType) -> Option<usize> {
-        self.concurrency.get(job_type).and_then(|c| c.per_process)
+        self.concurrency.get(job_type).copied().flatten()
     }
 
-    /// Global (cross-process, soft) concurrency cap of a job type, if any.
-    pub(super) fn global_cap(&self, job_type: &JobType) -> Option<usize> {
-        self.concurrency.get(job_type).and_then(|c| c.global)
-    }
-
-    /// Every job type the tracker must notify on for a freed slot: plain
-    /// types with a per-process cap, plus every globally-capped type (a freed
-    /// global slot also only becomes claimable again on the next poll).
+    /// Every job type the tracker must notify on for a freed slot: the plain
+    /// types carrying a per-process cap, whose backlog only becomes claimable
+    /// again on the next poll.
     pub(super) fn capped_types(&self) -> Vec<JobType> {
         self.concurrency
             .iter()
-            .filter(|(_, c)| c.per_process.is_some() || c.global.is_some())
+            .filter(|(_, cap)| cap.is_some())
             .map(|(job_type, _)| job_type.clone())
             .collect()
     }
 
-    /// Row limit for each registered type this poll. A type with no free
-    /// slot is dropped; global caps are split out but resolved in `poll_jobs`.
+    /// Row limit for each registered type this poll; a type with no free slot
+    /// is dropped. This is the ONLY admission budget the claim query gets —
+    /// each type's queued and unqueued scans are bounded by it directly, so
+    /// there is no overscan multiplier and no type can crowd out another.
     pub(super) fn plan_claim(&self, n_jobs_to_poll: usize) -> ClaimPlan {
         let mut types = Vec::new();
         let mut row_limits = Vec::new();
-        let mut global_cap_types = Vec::new();
-        let mut global_caps = Vec::new();
         for job_type in self.registered_job_types() {
             let limit = match self.batch_policy(&job_type) {
                 Some(policy) => policy
@@ -339,19 +318,10 @@ impl JobRegistry {
             if limit == 0 {
                 continue;
             }
-            if let Some(cap) = self.global_cap(&job_type) {
-                global_cap_types.push(job_type.clone());
-                global_caps.push(cap as i32);
-            }
             types.push(job_type);
             row_limits.push(limit as i32);
         }
-        ClaimPlan {
-            types,
-            row_limits,
-            global_cap_types,
-            global_caps,
-        }
+        ClaimPlan { types, row_limits }
     }
 }
 
@@ -372,10 +342,6 @@ mod tests {
             Some(0)
         }
 
-        fn max_concurrent_global(&self) -> Option<usize> {
-            Some(0)
-        }
-
         fn init(
             &self,
             _job: &Job,
@@ -393,6 +359,5 @@ mod tests {
         let job_type = registry.add_initializer(ZeroCapInitializer);
 
         assert_eq!(registry.per_process_cap(&job_type), Some(1));
-        assert_eq!(registry.global_cap(&job_type), Some(1));
     }
 }

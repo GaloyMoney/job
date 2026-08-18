@@ -3710,7 +3710,6 @@ async fn execution_state_point_read() -> anyhow::Result<()> {
 struct ConcurrencyProbeInitializer {
     job_type: JobType,
     max_concurrent_per_process: Option<usize>,
-    max_concurrent_global: Option<usize>,
     running: Arc<AtomicUsize>,
     high_water: Arc<AtomicUsize>,
     release: Arc<AtomicBool>,
@@ -3725,10 +3724,6 @@ impl JobInitializer for ConcurrencyProbeInitializer {
 
     fn max_concurrent_per_process(&self) -> Option<usize> {
         self.max_concurrent_per_process
-    }
-
-    fn max_concurrent_global(&self) -> Option<usize> {
-        self.max_concurrent_global
     }
 
     fn init(
@@ -3786,7 +3781,6 @@ async fn per_process_cap_bounds_concurrency() -> anyhow::Result<()> {
     let spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
         job_type: JobType::new("per-process-cap-bounds-concurrency"),
         max_concurrent_per_process: Some(2),
-        max_concurrent_global: None,
         running: Arc::clone(&running),
         high_water: Arc::clone(&high_water),
         release: Arc::clone(&release),
@@ -3851,7 +3845,6 @@ async fn capped_type_does_not_starve_others() -> anyhow::Result<()> {
     let capped_spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
         job_type: JobType::new("capped-does-not-starve-capped"),
         max_concurrent_per_process: Some(1),
-        max_concurrent_global: None,
         running: Arc::clone(&capped_running),
         high_water: Arc::clone(&capped_high_water),
         release: Arc::clone(&capped_release),
@@ -3898,170 +3891,6 @@ async fn capped_type_does_not_starve_others() -> anyhow::Result<()> {
         .await?;
 
     jobs.shutdown().await?;
-    Ok(())
-}
-
-/// D3/D4/D17: `max_concurrent_global` bounds concurrency across the fleet,
-/// enforced via the poller's running-execution pre-count. In a single
-/// process the pre-count/claim sequence is not interleaved by a concurrent
-/// poll, so the cap is effectively exact here (see the softness caveat on
-/// `JobInitializer::max_concurrent_global`, which only applies across
-/// multiple instances).
-#[tokio::test]
-async fn global_cap_bounds_concurrency_single_instance() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let config = JobSvcConfig::builder()
-        .pool(pool)
-        .build()
-        .expect("Failed to build JobsConfig");
-    let mut jobs = Jobs::init(config).await?;
-
-    let running = Arc::new(AtomicUsize::new(0));
-    let high_water = Arc::new(AtomicUsize::new(0));
-    let release = Arc::new(AtomicBool::new(false));
-    let spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
-        job_type: JobType::new("global-cap-bounds-concurrency"),
-        max_concurrent_per_process: None,
-        max_concurrent_global: Some(2),
-        running: Arc::clone(&running),
-        high_water: Arc::clone(&high_water),
-        release: Arc::clone(&release),
-    });
-
-    let ids: Vec<JobId> = (0..6).map(|_| JobId::new()).collect();
-    for id in &ids {
-        spawner.spawn(*id, ()).await?;
-    }
-    jobs.start_poll().await?;
-
-    let mut peak = 0;
-    for _ in 0..100 {
-        peak = high_water.load(Ordering::SeqCst);
-        if peak >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(peak, 2, "global cap must be reached given a backlog of 6");
-
-    release.store(true, Ordering::SeqCst);
-    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
-    assert!(
-        outcomes
-            .iter()
-            .all(|o| o.state() == JobTerminalState::Completed)
-    );
-    assert_eq!(high_water.load(Ordering::SeqCst), 2);
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// A freed global-cap slot must wake a PEER instance too, not just the
-/// instance that completed the job. Instance A holds the type's only global
-/// slot (cap = 1); instance B registers the same type after the budget is
-/// already exhausted, so B's own first poll observes zero room and drops the
-/// type entirely — nothing else is queued for B, so absent a cross-instance
-/// notification it would only rediscover the freed slot on the 60s
-/// `MAX_WAIT` backstop. Releasing A's job must let B claim and complete its
-/// own job well within that.
-#[tokio::test]
-async fn global_cap_freed_slot_wakes_peer_instance() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let job_type = JobType::new("global-cap-wakes-peer");
-
-    let config_a = JobSvcConfig::builder()
-        .pool(pool.clone())
-        .build()
-        .expect("Failed to build JobsConfig");
-    let mut jobs_a = Jobs::init(config_a).await?;
-    let release_a = Arc::new(AtomicBool::new(false));
-    let running_a = Arc::new(AtomicUsize::new(0));
-    let high_water_a = Arc::new(AtomicUsize::new(0));
-    let spawner_a = jobs_a.add_initializer(ConcurrencyProbeInitializer {
-        job_type: job_type.clone(),
-        max_concurrent_per_process: None,
-        max_concurrent_global: Some(1),
-        running: Arc::clone(&running_a),
-        high_water: Arc::clone(&high_water_a),
-        release: Arc::clone(&release_a),
-    });
-
-    let job1 = JobId::new();
-    spawner_a.spawn(job1, ()).await?;
-    jobs_a.start_poll().await?;
-
-    let mut attempts = 0;
-    while running_a.load(Ordering::SeqCst) < 1 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        attempts += 1;
-        assert!(attempts < 200, "instance A never claimed job1");
-    }
-
-    // Instance B: same globally-capped type, started only once the budget
-    // is already exhausted by A.
-    let config_b = JobSvcConfig::builder()
-        .pool(pool)
-        .build()
-        .expect("Failed to build JobsConfig");
-    let mut jobs_b = Jobs::init(config_b).await?;
-    let release_b = Arc::new(AtomicBool::new(true));
-    let running_b = Arc::new(AtomicUsize::new(0));
-    let high_water_b = Arc::new(AtomicUsize::new(0));
-    let spawner_b = jobs_b.add_initializer(ConcurrencyProbeInitializer {
-        job_type: job_type.clone(),
-        max_concurrent_per_process: None,
-        max_concurrent_global: Some(1),
-        running: Arc::clone(&running_b),
-        high_water: Arc::clone(&high_water_b),
-        release: Arc::clone(&release_b),
-    });
-    let job2 = JobId::new();
-    spawner_b.spawn(job2, ()).await?;
-    jobs_b.start_poll().await?;
-
-    // Give B at least one poll cycle to observe the exhausted budget and
-    // drop the type, settling into its long (MAX_WAIT-bound) sleep.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        running_b.load(Ordering::SeqCst),
-        0,
-        "B must not have claimed job2 while the global budget was exhausted"
-    );
-
-    // Shut A's poller down (job1 still running, blocked on `release_a`),
-    // then release job1 shortly after so it completes gracefully within the
-    // shutdown grace period. This is deliberate, not incidental: A ALSO
-    // polls this job_type, and A completing job1 triggers A's own
-    // pre-existing local capped-type notify (unrelated to this PR's fix) —
-    // without shutting A's poll loop down first, A could simply reclaim
-    // job2 itself, which would make this test pass regardless of whether
-    // the peer-wake fix under test does anything at all. Shutting A's main
-    // loop down first (it stops claiming new work immediately, before the
-    // in-flight job1 is asked to wrap up) removes A as a competitor, so
-    // job2 can only be claimed by a poller that was actually notified.
-    let shutdown_a = jobs_a.shutdown();
-    let release_job1 = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        release_a.store(true, Ordering::SeqCst);
-    };
-    let (shutdown_result, ()) = tokio::join!(shutdown_a, release_job1);
-    shutdown_result?;
-
-    // Without this PR's peer-wake fix, B only rediscovers the freed budget
-    // on its MAX_WAIT (60s) backstop — the 10s timeout below is what proves
-    // the notification reached it.
-    let outcome = jobs_b
-        .handle(job2)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Completed);
-    assert!(
-        high_water_b.load(Ordering::SeqCst) >= 1,
-        "job2 must have run through B's own runner, not been reclaimed by A"
-    );
-
-    jobs_b.shutdown().await?;
     Ok(())
 }
 

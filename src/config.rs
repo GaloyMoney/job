@@ -38,11 +38,6 @@ pub struct JobPollerConfig {
     #[serde(default = "default_pending_jobs_check_interval")]
     /// How often to check for pending jobs that are past their scheduled execution time.
     pub pending_jobs_check_interval: Duration,
-    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
-    #[serde(default = "default_poll_debounce")]
-    /// Minimum spacing between notify-triggered polls. Wall clock, not the
-    /// application [`ClockHandle`] — a manual/sim clock must not busy-loop.
-    pub poll_debounce: Duration,
 }
 
 impl Default for JobPollerConfig {
@@ -55,7 +50,6 @@ impl Default for JobPollerConfig {
             terminal_channel_size: default_terminal_channel_size(),
             sweep_interval: default_sweep_interval(),
             pending_jobs_check_interval: default_pending_jobs_check_interval(),
-            poll_debounce: default_poll_debounce(),
         }
     }
 }
@@ -195,8 +189,4 @@ fn default_sweep_interval() -> Duration {
 
 fn default_pending_jobs_check_interval() -> Duration {
     Duration::from_secs(5 * 60)
-}
-
-fn default_poll_debounce() -> Duration {
-    Duration::from_millis(20)
 }

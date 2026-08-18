@@ -54,12 +54,6 @@ pub trait KeyedJobInitializer: Send + Sync + 'static {
         None
     }
 
-    /// Max concurrent jobs of this type across ALL poller instances (soft).
-    /// See [`crate::JobInitializer::max_concurrent_global`].
-    fn max_concurrent_global(&self) -> Option<usize> {
-        None
-    }
-
     /// Whether a new generation's execution state should be seeded from the
     /// previous generation's final state before it starts. Defaults to
     /// `false` — most keyed jobs start each generation fresh; opt in when a

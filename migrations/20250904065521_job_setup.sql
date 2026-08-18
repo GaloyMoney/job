@@ -73,14 +73,33 @@ CREATE INDEX idx_job_executions_poller_instance
   ON job_executions(poller_instance_id)
   WHERE state = 'running';
 
+-- The claim path's index set is measured, not assumed: see PERFORMANCE.md
+-- ("Indexes: the write-path trade-off") for why it is these three and not a
+-- merged or covering variant.
+
+-- Serves `min_wait` and the stale-pending reporter. Global execute_at order,
+-- which neither claim index below provides.
 CREATE INDEX idx_job_executions_pending_execute_at
   ON job_executions(execute_at)
   WHERE state = 'pending';
 
-CREATE INDEX idx_job_executions_pending_job_type_execute_at
-  ON job_executions(job_type, execute_at)
-  WHERE state = 'pending';
+-- CLAIM PATH, queued half. Supports both queue-walk seeks
+-- (`MIN(queue_id) > cursor`) and each queue's head row
+-- (`queue_id = ? ORDER BY execute_at LIMIT 1`), which is what makes claim
+-- cost O(queues examined) rather than O(pending rows).
+CREATE INDEX idx_job_executions_pending_queue_head
+  ON job_executions(queue_id, execute_at)
+  WHERE state = 'pending' AND queue_id IS NOT NULL;
 
+-- CLAIM PATH, unqueued half. Rows without a queue_id can never be blocked by
+-- a running sibling, so they are claimed in plain execute_at order, per type.
+-- `job_type` MUST lead, or a registered type with no pending work scans every
+-- unqueued row instead of costing one empty probe.
+CREATE INDEX idx_job_executions_pending_unqueued
+  ON job_executions(job_type, execute_at)
+  WHERE state = 'pending' AND queue_id IS NULL;
+
+-- Queue eligibility: does this queue already have a job running?
 CREATE INDEX idx_job_executions_running_queue_id
   ON job_executions(queue_id)
   WHERE state = 'running' AND queue_id IS NOT NULL;

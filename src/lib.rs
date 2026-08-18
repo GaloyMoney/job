@@ -14,9 +14,8 @@
 //! - Durable Postgres-backed storage so jobs survive restarts and crashes.
 //! - Automatic exponential backoff with jitter, plus opt-in infinite retries.
 //! - Concurrency controls that let many worker instances share the workload,
-//!   configurable through [`JobPollerConfig`], plus per-type concurrency caps
-//!   via [`JobInitializer::max_concurrent_per_process`] /
-//!   [`max_concurrent_global`](JobInitializer::max_concurrent_global).
+//!   configurable through [`JobPollerConfig`], plus a per-type concurrency cap
+//!   via [`JobInitializer::max_concurrent_per_process`].
 //! - Two singleton *flavors* beyond the default: keyed jobs — at most one
 //!   LIVE job per `(job_type, key)`, respawnable once terminal — via
 //!   [`KeyedJobSpawner`], and resident jobs — at most one job per type,
@@ -223,22 +222,18 @@
 //! confiscating [`JobPollerConfig::max_jobs_per_process`] from every other
 //! job type.
 //!
-//! [`JobInitializer::max_concurrent_global`] additionally bounds the type's
-//! concurrency across ALL poller instances — useful for rate-limiting a
-//! downstream dependency itself ("at most N concurrent calls to service X").
-//! It is **soft**: each instance pre-counts the type's running executions just
-//! before claiming, so concurrent polls across instances can transiently
-//! overshoot; steady-state stays at or below the cap. For a hard bound, pair
-//! it with `max_concurrent_per_process` (hard bound = per-process cap ×
-//! instance count).
-//!
 //! ```ignore
 //! impl JobInitializer for KeycloakSyncInitializer {
 //!     // ...
 //!     fn max_concurrent_per_process(&self) -> Option<usize> { Some(20) }
-//!     fn max_concurrent_global(&self) -> Option<usize> { Some(50) }
 //! }
 //! ```
+//!
+//! There is deliberately no cross-instance cap: the former
+//! `max_concurrent_global` made every poll pre-count the fleet's running
+//! executions, for a bound that was only ever soft. `max_concurrent_per_process`
+//! is exact, free at the database, and multiplied by a known instance count
+//! gives a real fleet-wide ceiling. See `PERFORMANCE.md` for the measurements.
 //!
 //! A capped type's backlog is observable the same way any pending backlog is:
 //! via the crate's existing stale-pending warnings
