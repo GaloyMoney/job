@@ -38,7 +38,6 @@ impl JobType {
         &self.0
     }
 
-    #[cfg(test)]
     pub(crate) fn from_owned(job_type: String) -> Self {
         JobType(Cow::Owned(job_type))
     }

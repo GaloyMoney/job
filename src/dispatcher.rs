@@ -332,8 +332,7 @@ impl JobDispatcher {
             );
             span.record("will_retry", false);
 
-            self.delete_execution_in_op(&mut op, id, &job.job_type)
-                .await?;
+            self.delete_execution_in_op(&mut op, id).await?;
         }
 
         self.repo.update_in_op(&mut op, &mut job).await?;
@@ -344,8 +343,10 @@ impl JobDispatcher {
     /// Delete the execution row and report what its removal makes true: the job
     /// is terminal, and — if it held a `queue_id` — that queue's next job just
     /// became eligible. Freeing a queue is worth reporting because the queue's
-    /// backlog was, until this moment, invisible to every poller's claim scan:
-    /// the queue walk skips a queue outright while any of its jobs is running.
+    /// backlog was, until this moment, invisible to every poller's claim scan,
+    /// which drops a queue outright while any of its jobs is running. It is
+    /// also the only wake for that backlog: the poll loop sleeps on
+    /// `next_due_at`, and these rows are already due.
     /// The reschedule paths (`reschedule_job`, the retry branch of
     /// `fail_job`) don't need this: they always report unconditionally,
     /// since a job going back to `pending` is exactly the ordinary case every
@@ -364,9 +365,8 @@ impl JobDispatcher {
         &self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
-        job_type: &JobType,
     ) -> Result<(), JobError> {
-        let deleted = sqlx::query_scalar!(
+        let deleted = sqlx::query!(
             r#"
           WITH deleted AS (
               DELETE FROM job_executions
@@ -376,7 +376,17 @@ impl JobDispatcher {
               DELETE FROM job_execution_states s USING deleted d
               WHERE s.id = d.id AND NOT $3::boolean
           )
-          SELECT queue_id AS "queue_id?" FROM deleted
+          SELECT d.queue_id AS "queue_id?",
+                 -- Same head definition the claim uses, tiebreak included:
+                 -- ordering by execute_at alone would let this report a
+                 -- different row - and so a different TYPE - than the one
+                 -- step 2 will treat as the head, waking pollers that cannot
+                 -- claim the queue and not the one that can.
+                 (SELECT je.job_type FROM job_executions je
+                  WHERE je.state = 'pending' AND je.queue_id = d.queue_id
+                  ORDER BY je.execute_at, je.id
+                  LIMIT 1) AS "next_in_queue?"
+          FROM deleted d
         "#,
             id as JobId,
             self.instance_id,
@@ -385,14 +395,24 @@ impl JobDispatcher {
         .fetch_optional(op.as_executor())
         .await?;
 
-        let Some(freed_queue_id) = deleted else {
+        let Some(row) = deleted else {
             return Ok(());
         };
 
         self.notifier.job_terminal_in_op(op, id).await?;
 
-        if freed_queue_id.is_some() {
-            self.notifier.execution_ready_in_op(op, job_type).await?;
+        // Report the type of the job the freed queue just made claimable, not
+        // the type of the job that vacated it: a poller only wakes for types
+        // it polls, and the two are frequently different. Reporting the
+        // completing type instead leaves the queue's next job to wait for an
+        // unrelated poll — invisible while `may_have_more` was permanently
+        // true, load-bearing now that it isn't.
+        if row.queue_id.is_some()
+            && let Some(next) = row.next_in_queue
+        {
+            self.notifier
+                .execution_ready_in_op(op, &JobType::from_owned(next))
+                .await?;
         }
 
         Ok(())
@@ -405,7 +425,7 @@ impl JobDispatcher {
         id: JobId,
     ) -> Result<(), JobError> {
         let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
-        self.delete_execution_in_op(op, id, &job.job_type).await?;
+        self.delete_execution_in_op(op, id).await?;
         job.complete_job();
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())

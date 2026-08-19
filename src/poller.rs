@@ -105,7 +105,17 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 /// `FOR UPDATE ... SKIP LOCKED` has somewhere to fall through when a peer
 /// instance holds locks on the rows this poll would target. Sized for
 /// contention, not for filtering. See PERFORMANCE.md, "Contention headroom".
+///
+/// This is the resting value. The candidate window bounds ROWS while the
+/// budget counts QUEUES, so a poll that lands on deep queues under-fills;
+/// `MAX_CONTENTION_HEADROOM` is how far the poll loop may widen in response.
 const CONTENTION_HEADROOM: i32 = 4;
+
+/// Ceiling for the adaptive widening described on [`CONTENTION_HEADROOM`].
+/// Reached only where every widening step still came up short -- queues deep
+/// enough that eight rows are scanned per claimable head. See PERFORMANCE.md,
+/// "Contention headroom".
+const MAX_CONTENTION_HEADROOM: i32 = 32;
 
 impl JobPoller {
     pub fn new(
@@ -205,18 +215,16 @@ impl JobPoller {
     ) {
         let mut failures = 0;
         let mut woken_up = false;
-        // Round-robin cursor over `queue_id` space, in memory and private to
-        // this instance: each poll resumes the queue walk where the previous
-        // one stopped, which bounds a queue's worst-case wait to one sweep.
-        // See PERFORMANCE.md, "Queue fairness".
-        let mut queue_cursor = String::new();
-
+        // Candidate-window multiplier, in memory and private to this instance.
+        // Rests at `CONTENTION_HEADROOM` and widens only while polls report
+        // that the window itself was the binding constraint.
+        let mut headroom = CONTENTION_HEADROOM;
         loop {
             if *poll_stop_rx.borrow_and_update() {
                 break;
             }
 
-            let timeout = match self.poll_and_dispatch(woken_up, &mut queue_cursor).await {
+            let timeout = match self.poll_and_dispatch(woken_up, &mut headroom).await {
                 Ok(duration) => {
                     failures = 0;
                     duration
@@ -258,7 +266,7 @@ impl JobPoller {
     async fn poll_and_dispatch(
         self: &Arc<Self>,
         woken_up: bool,
-        queue_cursor: &mut String,
+        headroom: &mut i32,
     ) -> Result<Duration, JobError> {
         let span = Span::current();
         span.record("poller_id", tracing::field::display(self.instance_id));
@@ -275,18 +283,42 @@ impl JobPoller {
             return Ok(MAX_WAIT);
         }
 
-        let (rows, window) = match poll_jobs(
+        let result = poll_jobs(
             self.repo.pool(),
             n_jobs_to_poll,
             self.instance_id,
             &plan.types,
             &plan.row_limits,
-            queue_cursor,
+            *headroom,
             &self.clock,
         )
-        .await?
-        {
-            JobPollResult::WaitTillNextJob(window) => {
+        .await?;
+
+        // Widen only while the WINDOW was the binding constraint -- it filled
+        // and still produced fewer candidates than the budget, which is what
+        // deep or clustered queues do to a row-bounded scan. A budget lost to
+        // peers or to type caps does not set this, because widening would only
+        // buy a bigger scan for the same result. One saturated poll drops it
+        // straight back, so the common shallow-queue case never pays for the
+        // deep one. See PERFORMANCE.md, "Contention headroom".
+        let short = result.window().candidates_short;
+        // A poll that is about to widen must not sleep first. A full window
+        // read only a PREFIX of the due pollable rows, so claimable heads may
+        // sit past it -- already due, and therefore invisible to
+        // `next_due_at`. Re-polling at the SAME width would spin at zero
+        // yield, so the re-poll is conditioned on the width actually growing:
+        // that bounds it to the widening ladder (4 -> 8 -> 16 -> 32), and each
+        // step looks strictly further than the last.
+        let widening = short && *headroom < MAX_CONTENTION_HEADROOM;
+        *headroom = if short {
+            (*headroom * 2).min(MAX_CONTENTION_HEADROOM)
+        } else {
+            CONTENTION_HEADROOM
+        };
+
+        let (rows, mut window) = match result {
+            JobPollResult::WaitTillNextJob(mut window) => {
+                window.may_have_more |= widening;
                 // Fresh clock read: a duration captured earlier can go stale under a manual clock.
                 let duration = window.sleep_for(self.clock.now());
                 span.record("next_poll_in", tracing::field::debug(duration));
@@ -295,6 +327,7 @@ impl JobPoller {
             }
             JobPollResult::Jobs { jobs, window } => (jobs, window),
         };
+        window.may_have_more |= widening;
         let jobs_len = rows.len();
         span.record("n_jobs_to_start", jobs_len);
         if !rows.is_empty() {
@@ -901,7 +934,7 @@ async fn reclaim_lost_jobs(
 #[instrument(
     name = "job.poll_jobs",
     level = "debug",
-    skip(pool, pollable_types, row_limits, queue_cursor, clock),
+    skip(pool, pollable_types, row_limits, clock),
     fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty)
 )]
 #[allow(clippy::too_many_arguments)]
@@ -911,7 +944,7 @@ async fn poll_jobs(
     instance_id: uuid::Uuid,
     pollable_types: &[super::entity::JobType],
     row_limits: &[i32],
-    queue_cursor: &mut String,
+    headroom: i32,
     clock: &ClockHandle,
 ) -> Result<JobPollResult, sqlx::Error> {
     // sim_now drives execute_at scheduling (whatever clock the application uses);
@@ -926,8 +959,8 @@ async fn poll_jobs(
     //
     // Generic plan: auto never picks it here, so every poll would otherwise
     // re-plan the whole CTE tower (35-54ms vs sub-ms exec). No bitmap scans:
-    // the queue walk and both due-scans depend on ORDERED index access, and a
-    // bitmap scan returns heap order instead. See PERFORMANCE.md, "Ordered
+    // the candidate window and the unqueued scan depend on ORDERED index
+    // access, and a bitmap scan returns heap order instead. See PERFORMANCE.md, "Ordered
     // index access is mandatory".
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
@@ -944,57 +977,47 @@ async fn poll_jobs(
         -- that neither can starve the other, and each type is bounded by its
         -- own budget. See PERFORMANCE.md ("Claim admission") for the
         -- measurements behind this shape.
-        WITH RECURSIVE limits AS (
+        WITH limits AS (
             SELECT l.job_type, l.row_limit
             FROM UNNEST($4::text[], $6::int4[]) AS l(job_type, row_limit)
             WHERE l.row_limit > 0
         ),
-        walk AS (
-            -- Enumerate QUEUES, not rows: one index seek per queue regardless
-            -- of how deep its backlog is. `found` tallies queues that would
-            -- actually yield a candidate and the recursion ends once there are
-            -- enough, so cost is O(queues examined). $7 is the round-robin
-            -- cursor.
+        queued_window AS (
+            -- WHICH QUEUES TO EXAMINE, bounded by what this poll can ADMIT
+            -- ($1 x $7 rows), never by how much is pending: cost is O(budget),
+            -- flat in backlog and in queue count.
             --
-            -- `found` counts CLAIMABLE queues, not merely unblocked ones: a
-            -- queue whose head is future-scheduled or belongs to a saturated
-            -- type produces nothing, and counting it would let such queues
-            -- exhaust the budget while claimable work further along was never
-            -- examined. Eligibility is evaluated against `w.queue_id` (already
-            -- materialised) rather than the queue being advanced to, so the
-            -- step costs one seek to advance plus the checks -- never a second
-            -- evaluation of the advance subquery.
-            SELECT s.q AS queue_id, 0 AS found
-            FROM (SELECT MIN(queue_id) AS q FROM job_executions
-                  WHERE state = 'pending' AND queue_id IS NOT NULL
-                    AND queue_id > $7) s
-            UNION ALL
-            SELECT
-              (SELECT MIN(je.queue_id) FROM job_executions je
-               WHERE je.state = 'pending' AND je.queue_id IS NOT NULL
-                 AND je.queue_id > w.queue_id),
-              w.found + CASE
-                WHEN NOT EXISTS (
-                       SELECT 1 FROM job_executions r
-                       WHERE r.state = 'running' AND r.queue_id = w.queue_id)
-                 AND (SELECT je.job_type FROM job_executions je
-                      WHERE je.state = 'pending' AND je.queue_id = w.queue_id
-                        AND je.execute_at <= $2::timestamptz
-                      ORDER BY je.execute_at LIMIT 1)
-                     IN (SELECT job_type FROM limits)
-                THEN 1 ELSE 0 END
-            FROM walk w
-            WHERE w.queue_id IS NOT NULL AND w.found < $1::int4 * $8::int4
-        ),
-        eligible_queues AS (
-            SELECT w.queue_id FROM walk w
-            WHERE w.queue_id IS NOT NULL
-              AND NOT EXISTS (SELECT 1 FROM job_executions r
-                              WHERE r.state = 'running' AND r.queue_id = w.queue_id)
+            -- The blocked-queue anti-join runs INSIDE the window, below the
+            -- LIMIT. That placement is the whole design: a queue whose job is
+            -- already running contributes no rows at all, so its backlog can
+            -- never crowd claimable work out of the budget. Filtering after a
+            -- LIMIT instead is what produced the zero-claim cliff. See
+            -- PERFORMANCE.md, "Queued rows: two steps, both bounded by the budget".
+            --
+            -- Ordering is `(execute_at, id)` and the tiebreak is load-bearing:
+            -- it makes the order TOTAL, so the window is a well-defined prefix
+            -- rather than an arbitrary cut through a group of rows sharing a
+            -- timestamp (bulk spawns give a whole batch one).
+            --
+            -- Filtering by type is safe HERE, and only here: this decides
+            -- which queues get looked at, not which row of a queue is its
+            -- head. $4 is instance-dependent -- `plan_claim` drops saturated
+            -- types -- so two instances legitimately examine different queues.
+            SELECT je.queue_id, je.execute_at, je.id
+            FROM job_executions je
+            WHERE je.state = 'pending'
+              AND je.queue_id IS NOT NULL
+              AND je.execute_at <= $2::timestamptz
+              AND je.job_type = ANY($4)
+              AND NOT EXISTS (
+                    SELECT 1 FROM job_executions r
+                    WHERE r.state = 'running' AND r.queue_id = je.queue_id)
+            ORDER BY je.execute_at, je.id
+            LIMIT $1::int4 * $7::int4
         ),
         due_queued AS (
-            -- One row per eligible queue: its oldest DUE row, chosen without
-            -- reference to `limits` and only then dropped if its type is not
+            -- One row per examined queue: its oldest due row, chosen WITHOUT
+            -- reference to type and only then dropped if that type is not
             -- pollable here. That order matters -- picking the oldest
             -- *pollable* row instead would let two instances with different
             -- saturated types select DIFFERENT rows of the same queue and both
@@ -1002,13 +1025,13 @@ async fn poll_jobs(
             -- everywhere is what makes a peer's lock on it visible as "this
             -- queue is taken" rather than "try the next row down".
             SELECT h.id, h.execute_at, h.job_type
-            FROM eligible_queues e
+            FROM (SELECT DISTINCT queue_id FROM queued_window) e
             CROSS JOIN LATERAL (
                 SELECT je.id, je.execute_at, je.job_type
                 FROM job_executions je
                 WHERE je.state = 'pending' AND je.queue_id = e.queue_id
                   AND je.execute_at <= $2::timestamptz
-                ORDER BY je.execute_at
+                ORDER BY je.execute_at, je.id
                 LIMIT 1
             ) h
             WHERE h.job_type IN (SELECT job_type FROM limits)
@@ -1016,7 +1039,8 @@ async fn poll_jobs(
         due_plain AS (
             -- Unqueued rows can never be blocked by a sibling, so they come
             -- straight off their own partial index in execute_at order,
-            -- bounded per type.
+            -- bounded per type. Pre-filtering by type is safe here precisely
+            -- because there is no queue exclusion to agree on.
             SELECT d.id, d.execute_at, d.job_type
             FROM limits t
             CROSS JOIN LATERAL (
@@ -1026,7 +1050,7 @@ async fn poll_jobs(
                   AND je.job_type = t.job_type
                   AND je.execute_at <= $2::timestamptz
                 ORDER BY je.execute_at
-                LIMIT LEAST(t.row_limit, $1::int4) * $8::int4
+                LIMIT LEAST(t.row_limit, $1::int4) * $7::int4
             ) d
         ),
         ordered_candidates AS (
@@ -1057,7 +1081,7 @@ async fn poll_jobs(
         ),
         selected_jobs AS (
             -- The budget is enforced HERE, on rows actually held: the scans
-            -- above deliberately over-gather (see $8) so there is something to
+            -- above deliberately over-gather (see $7) so there is something to
             -- fall through to when a peer holds the head. Rows over a type's
             -- cap are simply not claimed; their locks release at commit.
             -- execution_state_json is joined after the LIMIT, so it is fetched
@@ -1089,31 +1113,40 @@ async fn poll_jobs(
             AND job_type = ANY($4)
             AND execute_at > $2::timestamptz
         ),
-        walk_state AS (
-            -- `ran_off_end`: the recursion emitted a NULL step, i.e. it
-            -- reached the end of queue_id space rather than stopping on its
-            -- budget.
-            SELECT bool_or(queue_id IS NULL) AS ran_off_end,
-                   MAX(queue_id) AS last_queue
-            FROM walk
-        ),
-        next_cursor AS (
-            -- Running off the end wraps the caller's cursor to the start.
-            SELECT CASE WHEN ran_off_end THEN NULL ELSE last_queue END AS c
-            FROM walk_state
-        ),
         poll_status AS (
-            -- The sweep covered every queue only if it ran off the end having
-            -- started from the beginning. If it stopped on its budget, queues
-            -- past it are unexamined; if it wrapped from a mid-space cursor,
-            -- the queues BEFORE that cursor were never looked at this poll.
-            -- Either way there may be due work this poll could not see, and
-            -- reporting otherwise would let the poller sleep on `next_due_at`
-            -- while it sat there.
-            SELECT ((SELECT COUNT(*) FROM ordered_candidates) >= $1
-                 OR (SELECT COUNT(*) FROM locked) >= $1
-                 OR NOT (ws.ran_off_end AND $7 = '')) AS may_have_more
-            FROM walk_state ws
+            -- Re-poll immediately only when this poll provably left claimable
+            -- work behind: it filled its budget, or it saw candidates it could
+            -- not take because a peer held them.
+            --
+            -- A window that came back short means every claimable due row was
+            -- examined, so `next_due_at` is the honest next deadline. Blocked
+            -- queues are covered by a wake rather than a spin:
+            -- `delete_execution_in_op` reports `execution_ready` when it frees
+            -- one.
+            --
+            -- A FULL window that yielded no pollable head does NOT report here
+            -- -- but it must not sleep either, and `poll_and_dispatch` is what
+            -- keeps it awake. Hitting the LIMIT only means a PREFIX of due
+            -- pollable rows was read: rows sitting behind a head this instance
+            -- has saturated still consume the window, so claimable heads past
+            -- it went unseen. Those are already due, so `next_due_at` does not
+            -- cover them. Re-polling at the same width would spin at zero
+            -- yield, which is why the answer is to widen and re-poll rather
+            -- than either sleep or spin -- see `candidates_short` below.
+            --
+            -- `candidates_short` drives the adaptive window (see
+            -- `poll_and_dispatch`). The window bounds ROWS but candidates are
+            -- QUEUES, so its yield is divided by the average depth of the
+            -- queues it lands on. When those rows cluster into few queues the
+            -- poll under-fills its budget while claimable work sits just past
+            -- the window; widening is the only thing that helps, and this is
+            -- the signal that distinguishes it from a budget lost to peers or
+            -- to type caps, which widening would not fix.
+            SELECT ((SELECT COUNT(*) FROM locked) >= $1
+                 OR ((SELECT COUNT(*) FROM queued_window) >= $1::int4 * $7::int4
+                     AND (SELECT COUNT(*) FROM due_queued) > 0)) AS may_have_more,
+                   ((SELECT COUNT(*) FROM queued_window) >= $1::int4 * $7::int4
+                AND (SELECT COUNT(*) FROM ordered_candidates) < $1) AS candidates_short
         )
         SELECT * FROM (
             SELECT
@@ -1123,8 +1156,8 @@ async fn poll_jobs(
                 u.queue_id AS "queue_id?",
                 NULL::TIMESTAMPTZ AS "next_due_at?",
                 ps.may_have_more AS "may_have_more!",
-                nc.c AS "next_queue_cursor?"
-            FROM updated u, poll_status ps, next_cursor nc
+                ps.candidates_short AS "candidates_short!"
+            FROM updated u, poll_status ps
             UNION ALL
             SELECT
                 NULL::UUID AS "id?: JobId",
@@ -1133,8 +1166,8 @@ async fn poll_jobs(
                 NULL::VARCHAR AS "queue_id?",
                 mw.next_due_at AS "next_due_at?",
                 ps.may_have_more AS "may_have_more!",
-                nc.c AS "next_queue_cursor?"
-            FROM min_wait mw, poll_status ps, next_cursor nc
+                ps.candidates_short AS "candidates_short!"
+            FROM min_wait mw, poll_status ps
         ) AS result
         "#,
         n_jobs_to_poll as i32,
@@ -1143,22 +1176,11 @@ async fn poll_jobs(
         pollable_types as _,
         wall_now,
         row_limits,
-        queue_cursor.as_str(),
-        CONTENTION_HEADROOM,
+        headroom,
     )
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
-
-    // Advance the round-robin cursor. An exhausted sweep reports NULL, which
-    // wraps us back to the start of queue_id space.
-    match rows.iter().find_map(|row| row.next_queue_cursor.as_deref()) {
-        Some(cursor) => {
-            queue_cursor.clear();
-            queue_cursor.push_str(cursor);
-        }
-        None => queue_cursor.clear(),
-    }
 
     Span::current().record("n_jobs_found", rows.len());
     Ok(JobPollResult::from_rows(rows))
@@ -1170,6 +1192,9 @@ async fn poll_jobs(
 struct PollWindow {
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
+    /// The candidate window hit its LIMIT and still yielded fewer candidates
+    /// than the budget -- the poll was bounded by the window, not by the work.
+    candidates_short: bool,
 }
 
 impl PollWindow {
@@ -1201,12 +1226,18 @@ struct JobPollRow {
     queue_id: Option<String>,
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
-    /// Where the queue sweep stopped; `None` once it has run off the end of
-    /// queue_id space, which wraps the caller's cursor back to the start.
-    next_queue_cursor: Option<String>,
+    candidates_short: bool,
 }
 
 impl JobPollResult {
+    /// The poll window, whichever variant this is.
+    fn window(&self) -> &PollWindow {
+        match self {
+            JobPollResult::Jobs { window, .. } => window,
+            JobPollResult::WaitTillNextJob(window) => window,
+        }
+    }
+
     /// Convert raw query rows into a JobPollResult. The min-wait row (`id`
     /// NULL) is present in every result set; row order is not assumed.
     pub fn from_rows(rows: Vec<JobPollRow>) -> Self {
@@ -1214,9 +1245,11 @@ impl JobPollResult {
         let mut window = PollWindow {
             next_due_at: None,
             may_have_more: false,
+            candidates_short: false,
         };
         for row in rows {
             window.may_have_more = row.may_have_more;
+            window.candidates_short = row.candidates_short;
             match (row.id, row.attempt_index) {
                 (Some(id), Some(attempt_index)) => jobs.push(PolledJob {
                     id,
@@ -1723,7 +1756,6 @@ mod tests {
         // A capped to 1; B uncapped (row_limit = n_jobs_to_poll).
         let row_limits = vec![1, n_jobs_to_poll as i32];
         let clock = ClockHandle::realtime();
-        let mut cursor = String::new();
 
         let result = poll_jobs(
             &pool,
@@ -1731,7 +1763,7 @@ mod tests {
             instance_id,
             &pollable_types,
             &row_limits,
-            &mut cursor,
+            CONTENTION_HEADROOM,
             &clock,
         )
         .await?;
@@ -1810,6 +1842,458 @@ mod tests {
         assert_eq!(row.0, "running");
         assert_eq!(row.1, Some(self_id));
         assert_eq!(row.2, 1);
+
+        Ok(())
+    }
+    async fn seed_queued_job(
+        pool: &PgPool,
+        job_type: &str,
+        queue_id: &str,
+        execute_at: DateTime<Utc>,
+        state: &str,
+    ) -> anyhow::Result<JobId> {
+        let id = JobId::new();
+        let uuid = uuid::Uuid::from(id);
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO jobs (id, job_type, queue_id, created_at) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(uuid)
+        .bind(job_type)
+        .bind(queue_id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, queue_id, state, attempt_index, execute_at, alive_at, \
+              poller_instance_id, created_at) \
+             VALUES ($1, $2, $3, $4::JobExecutionState, 1, \
+                     CASE WHEN $4 = 'running' THEN NULL ELSE $5 END, $6, \
+                     CASE WHEN $4 = 'running' THEN gen_random_uuid() END, $7)",
+        )
+        .bind(uuid)
+        .bind(job_type)
+        .bind(queue_id)
+        .bind(state)
+        .bind(execute_at)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// A blocked queue's backlog must not consume the admission budget.
+    ///
+    /// This is the zero-claim cliff, and it is the reason the blocked-queue
+    /// anti-join sits INSIDE the candidate window rather than after its LIMIT.
+    /// A queue with a job already running yields nothing no matter how many
+    /// due rows it holds, so if its rows are allowed to fill the window first
+    /// and get filtered afterwards, a single deep queue starves every other
+    /// queue — and worse, it re-fills the window on the next poll, so the
+    /// poller spins at zero yield. See PERFORMANCE.md, "Queued rows: two
+    /// steps, both bounded by the budget".
+    #[tokio::test]
+    async fn blocked_queue_backlog_does_not_consume_the_budget() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let instance_id = uuid::Uuid::now_v7();
+        let job_type = format!("cliff-{}", uuid::Uuid::now_v7());
+        let hot_queue = format!("hot-{}", uuid::Uuid::now_v7());
+
+        let n_jobs_to_poll = 2usize;
+        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
+
+        // The blocked queue already has a job running, and holds far more due
+        // rows than the whole candidate window (n * CONTENTION_HEADROOM), all
+        // of them OLDER than the claimable work below.
+        seed_queued_job(&pool, &job_type, &hot_queue, base, "running").await?;
+        for i in 0..(n_jobs_to_poll as i64 * CONTENTION_HEADROOM as i64 * 3) {
+            seed_queued_job(
+                &pool,
+                &job_type,
+                &hot_queue,
+                base + chrono::Duration::seconds(i),
+                "pending",
+            )
+            .await?;
+        }
+
+        // Two ordinary queues, younger than every row above.
+        let recent = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let mut claimable = Vec::new();
+        for _ in 0..2 {
+            let q = format!("cold-{}", uuid::Uuid::now_v7());
+            claimable.push(seed_queued_job(&pool, &job_type, &q, recent, "pending").await?);
+        }
+
+        let pollable_types = vec![JobType::from_owned(job_type.clone())];
+        let row_limits = vec![n_jobs_to_poll as i32];
+        let clock = ClockHandle::realtime();
+
+        let result = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            instance_id,
+            &pollable_types,
+            &row_limits,
+            CONTENTION_HEADROOM,
+            &clock,
+        )
+        .await?;
+
+        match result {
+            JobPollResult::Jobs { jobs, .. } => {
+                let claimed: std::collections::HashSet<JobId> = jobs.iter().map(|j| j.id).collect();
+                assert_eq!(
+                    claimed.len(),
+                    2,
+                    "the blocked queue's backlog must not crowd out claimable queues"
+                );
+                for id in &claimable {
+                    assert!(
+                        claimed.contains(id),
+                        "every unblocked queue head is claimed"
+                    );
+                }
+            }
+            other => panic!("expected a Jobs claim, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    /// A queue's head is resolved WITHOUT reference to which types this
+    /// instance can currently poll — the exclusion-critical property.
+    ///
+    /// Instances saturate different types at different moments, so `$4` and
+    /// `limits` are instance-local. If the head were picked as "oldest
+    /// *pollable* row", an instance with type X saturated would pick a queue's
+    /// X-blocked second row while a peer picked its first, and both would
+    /// claim from one queue. Picking the oldest row outright and only then
+    /// dropping it if its type is unpollable makes a peer's lock read as "this
+    /// queue is taken" rather than "try the next row down".
+    #[tokio::test]
+    async fn queue_head_is_resolved_independently_of_saturated_types() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let saturated = format!("sat-{}", uuid::Uuid::now_v7());
+        let pollable = format!("poll-{}", uuid::Uuid::now_v7());
+        let queue = format!("shared-{}", uuid::Uuid::now_v7());
+
+        let base = chrono::Utc::now() - chrono::Duration::seconds(600);
+        // The queue's HEAD belongs to the type this instance cannot poll.
+        let head = seed_queued_job(&pool, &saturated, &queue, base, "pending").await?;
+        // Behind it, a row this instance could otherwise run.
+        let behind = seed_queued_job(
+            &pool,
+            &pollable,
+            &queue,
+            base + chrono::Duration::seconds(1),
+            "pending",
+        )
+        .await?;
+
+        // Only the pollable type is offered — exactly what `plan_claim`
+        // produces once `saturated` is at its cap.
+        let pollable_types = vec![JobType::from_owned(pollable.clone())];
+        let row_limits = vec![4i32];
+        let clock = ClockHandle::realtime();
+
+        let result = poll_jobs(
+            &pool,
+            4,
+            uuid::Uuid::now_v7(),
+            &pollable_types,
+            &row_limits,
+            CONTENTION_HEADROOM,
+            &clock,
+        )
+        .await?;
+
+        let claimed: std::collections::HashSet<JobId> = match result {
+            JobPollResult::Jobs { ref jobs, .. } => jobs.iter().map(|j| j.id).collect(),
+            JobPollResult::WaitTillNextJob(_) => Default::default(),
+        };
+        assert!(
+            !claimed.contains(&behind),
+            "claiming past an unpollable head would let a peer that CAN poll \
+             that head claim the same queue concurrently"
+        );
+        assert!(
+            !claimed.contains(&head),
+            "the head's type is not pollable here"
+        );
+
+        Ok(())
+    }
+
+    /// Rows sharing an `execute_at` — which bulk spawns produce by the batch —
+    /// must still resolve one stable head per queue, whatever admission budget
+    /// the poll is running with.
+    #[tokio::test]
+    async fn tied_execute_at_resolves_one_stable_queue_head() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("tie-{}", uuid::Uuid::now_v7());
+        let queue = format!("tied-{}", uuid::Uuid::now_v7());
+
+        // One queue, several rows, all sharing an execute_at to the microsecond.
+        let tied = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            ids.push(seed_queued_job(&pool, &job_type, &queue, tied, "pending").await?);
+        }
+        // Younger filler queues, so the window boundary lands inside the tie
+        // group for the smaller budgets.
+        for _ in 0..40 {
+            let q = format!("filler-{}", uuid::Uuid::now_v7());
+            seed_queued_job(
+                &pool,
+                &job_type,
+                &q,
+                tied + chrono::Duration::seconds(1),
+                "pending",
+            )
+            .await?;
+        }
+
+        let pollable_types = vec![JobType::from_owned(job_type.clone())];
+        let clock = ClockHandle::realtime();
+        let expected = ids.iter().copied().min().expect("seeded rows");
+
+        for n in [1usize, 3, 10] {
+            let result = poll_jobs(
+                &pool,
+                n,
+                uuid::Uuid::now_v7(),
+                &pollable_types,
+                &[n as i32],
+                CONTENTION_HEADROOM,
+                &clock,
+            )
+            .await?;
+            let JobPollResult::Jobs { jobs, .. } = result else {
+                panic!("expected a claim at budget {n}");
+            };
+            let from_queue: Vec<JobId> = jobs
+                .iter()
+                .map(|j| j.id)
+                .filter(|id| ids.contains(id))
+                .collect();
+            assert_eq!(
+                from_queue.len(),
+                1,
+                "budget {n} must take exactly one row from the tied queue"
+            );
+            assert_eq!(
+                from_queue[0], expected,
+                "budget {n} must resolve the same head as every other budget"
+            );
+            sqlx::query(
+                "UPDATE job_executions SET state = 'pending', execute_at = $2, \
+                 poller_instance_id = NULL WHERE id = $1",
+            )
+            .bind(uuid::Uuid::from(from_queue[0]))
+            .bind(tied)
+            .execute(&pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+    /// Deep queues under-fill a ROW-bounded window, and the poll must say so.
+    ///
+    /// The window admits `n_claim * headroom` rows but candidates are queues,
+    /// so its yield is divided by the depth of the queues it lands on. At
+    /// depth > headroom the poll comes back short with claimable work sitting
+    /// just past the window — the one case where widening is the only thing
+    /// that helps, and the one `candidates_short` has to identify. Widening is
+    /// then verified to actually recover the budget. See PERFORMANCE.md,
+    /// "Contention headroom".
+    #[tokio::test]
+    async fn deep_queues_report_a_short_window_and_widening_recovers_it() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("depth-{}", uuid::Uuid::now_v7());
+        let n_jobs_to_poll = 4usize;
+        // Depth per queue is double the resting headroom, so a window of
+        // `n * CONTENTION_HEADROOM` rows lands on half as many queues as the
+        // budget wants. Every queue is unblocked — a blocked one contributes
+        // no rows at all, so depth there costs nothing.
+        let depth = (CONTENTION_HEADROOM * 2) as i64;
+        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        // Rows of a queue are CONSECUTIVE in execute_at order: the clustering
+        // is what makes depth bite. Scattered rows draw from many queues and
+        // the window saturates regardless of depth.
+        let mut seq = 0i64;
+        for q in 0..(n_jobs_to_poll as i64 * 2) {
+            let queue = format!("deep-{q}-{}", uuid::Uuid::now_v7());
+            for _ in 0..depth {
+                seed_queued_job(
+                    &pool,
+                    &job_type,
+                    &queue,
+                    base + chrono::Duration::milliseconds(seq),
+                    "pending",
+                )
+                .await?;
+                seq += 1;
+            }
+        }
+
+        let pollable_types = vec![JobType::from_owned(job_type.clone())];
+        let row_limits = vec![n_jobs_to_poll as i32];
+        let clock = ClockHandle::realtime();
+
+        let narrow = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            uuid::Uuid::now_v7(),
+            &pollable_types,
+            &row_limits,
+            CONTENTION_HEADROOM,
+            &clock,
+        )
+        .await?;
+        let JobPollResult::Jobs { jobs, window } = narrow else {
+            panic!("expected a claim at the resting headroom");
+        };
+        assert!(
+            jobs.len() < n_jobs_to_poll,
+            "a window of {} rows over depth-{depth} queues cannot fill a \
+             budget of {n_jobs_to_poll}",
+            n_jobs_to_poll as i32 * CONTENTION_HEADROOM
+        );
+        assert!(
+            window.candidates_short,
+            "the poll must report that the WINDOW bound it, not the work"
+        );
+
+        // Release the claim and re-poll wider: the same data must now saturate.
+        sqlx::query(
+            "UPDATE job_executions SET state = 'pending', execute_at = $2, \
+             poller_instance_id = NULL WHERE state = 'running' AND job_type = $1",
+        )
+        .bind(&job_type)
+        .bind(base)
+        .execute(&pool)
+        .await?;
+
+        let wide = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            uuid::Uuid::now_v7(),
+            &pollable_types,
+            &row_limits,
+            MAX_CONTENTION_HEADROOM,
+            &clock,
+        )
+        .await?;
+        let JobPollResult::Jobs { jobs, window } = wide else {
+            panic!("expected a claim at the widened headroom");
+        };
+        assert_eq!(
+            jobs.len(),
+            n_jobs_to_poll,
+            "widening the window must recover the budget"
+        );
+        assert!(
+            !window.candidates_short,
+            "a saturated poll must drop the headroom back to resting"
+        );
+
+        Ok(())
+    }
+    /// A window filled entirely by rows behind SATURATED heads must not read
+    /// as "nothing more to see".
+    ///
+    /// Step 1 admits rows of pollable types, but step 2 resolves each queue's
+    /// head type-agnostically and drops it when that head belongs to a type
+    /// this instance has saturated. Those queues therefore consume window
+    /// slots and yield nothing, and if enough of them do it the window fills
+    /// having read only a PREFIX of the due pollable rows — claimable heads
+    /// past it are unseen. They are already due, so `next_due_at` does not
+    /// cover them, and sleeping here strands them until an unrelated wake.
+    ///
+    /// `candidates_short` is what keeps the loop awake: `poll_and_dispatch`
+    /// re-polls while it can still widen. See PERFORMANCE.md, "When the poller
+    /// may sleep".
+    #[tokio::test]
+    async fn window_full_of_saturated_heads_does_not_read_as_exhausted() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let saturated = format!("sat-{}", uuid::Uuid::now_v7());
+        let pollable = format!("poll-{}", uuid::Uuid::now_v7());
+        let n_jobs_to_poll = 2usize;
+
+        // Every queue: an unpollable head, then a pollable row behind it. The
+        // pollable rows are what enter the window; none of them can be claimed
+        // because each queue's head is the saturated type.
+        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let mut seq = 0i64;
+        let queues = (n_jobs_to_poll as i32 * CONTENTION_HEADROOM) as i64;
+        for q in 0..queues {
+            let queue = format!("blocked-head-{q}-{}", uuid::Uuid::now_v7());
+            seed_queued_job(
+                &pool,
+                &saturated,
+                &queue,
+                base + chrono::Duration::milliseconds(seq),
+                "pending",
+            )
+            .await?;
+            seq += 1;
+            seed_queued_job(
+                &pool,
+                &pollable,
+                &queue,
+                base + chrono::Duration::milliseconds(seq),
+                "pending",
+            )
+            .await?;
+            seq += 1;
+        }
+
+        // Only the pollable type is offered — `plan_claim`'s output once
+        // `saturated` is at its cap.
+        let pollable_types = vec![JobType::from_owned(pollable.clone())];
+        let row_limits = vec![n_jobs_to_poll as i32];
+        let clock = ClockHandle::realtime();
+
+        let result = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            uuid::Uuid::now_v7(),
+            &pollable_types,
+            &row_limits,
+            CONTENTION_HEADROOM,
+            &clock,
+        )
+        .await?;
+
+        let window = result.window();
+        // The query alone WOULD sleep here: it saw no claimable head, and
+        // `may_have_more` is deliberately false so that re-polling at the same
+        // width cannot spin at zero yield.
+        assert!(
+            !window.may_have_more,
+            "re-polling at the same width would spin at zero yield"
+        );
+        // `candidates_short` is the whole safety net -- `poll_and_dispatch`
+        // ORs it into the sleep decision while the width can still grow. If
+        // this ever goes false, the loop sleeps on `next_due_at` while
+        // already-due claimable work sits just past the window.
+        assert!(
+            window.candidates_short,
+            "a full window that yielded no claimable head must say so, or the \
+             loop sleeps on next_due_at while already-due work sits past it"
+        );
+        match result {
+            JobPollResult::WaitTillNextJob(_) => {}
+            JobPollResult::Jobs { ref jobs, .. } => {
+                assert!(
+                    jobs.is_empty(),
+                    "every head here belongs to a saturated type"
+                );
+            }
+        }
 
         Ok(())
     }
