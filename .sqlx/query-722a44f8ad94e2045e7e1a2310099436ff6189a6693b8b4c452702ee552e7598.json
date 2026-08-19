@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO job_executions\n            (id, job_type, queue_id, unique_key, poller_instance_id, state,\n             attempt_index, execute_at, alive_at, created_at)\n        VALUES ($1, $2, $3, $4, $5, 'running', 1, NULL, $6, $6)\n        ON CONFLICT (queue_id) WHERE state IN ('pending','running') AND queue_id IS NOT NULL\n        DO NOTHING\n        RETURNING id AS \"id!: JobId\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: JobId",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "722a44f8ad94e2045e7e1a2310099436ff6189a6693b8b4c452702ee552e7598"
+}

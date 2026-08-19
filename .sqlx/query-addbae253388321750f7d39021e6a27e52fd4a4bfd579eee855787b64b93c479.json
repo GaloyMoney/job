@@ -1,0 +1,57 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            -- `parked` is purely a claim-time implementation detail (see\n            -- migrations, PERFORMANCE.md \"Claim admission\"): a parked row is\n            -- a queued job blocked behind its queue's active row, which is\n            -- exactly what \"pending, not yet claimable\" already meant to\n            -- every caller before this state existed. Masking it here keeps\n            -- `JobExecutionState`/`JobStatus` a two-value public contract\n            -- (`Pending`/`Running`) with no API surface change for it.\n            SELECT (CASE WHEN je.state = 'parked' THEN 'pending' ELSE je.state END)\n                       AS \"state!: JobExecutionState\",\n                   je.execute_at, je.attempt_index,\n                   je.alive_at, cp.execution_state_json AS \"execution_state_json?\"\n            FROM job_executions je\n            LEFT JOIN job_execution_states cp ON cp.id = je.id\n            WHERE je.id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state!: JobExecutionState",
+        "type_info": {
+          "Custom": {
+            "name": "jobexecutionstate",
+            "kind": {
+              "Enum": [
+                "pending",
+                "parked",
+                "running"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "execute_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "alive_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "execution_state_json?",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "addbae253388321750f7d39021e6a27e52fd4a4bfd579eee855787b64b93c479"
+}
