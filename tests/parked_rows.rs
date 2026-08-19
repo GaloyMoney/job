@@ -538,3 +538,243 @@ async fn short_circuit_disabled_lands_pending() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// FAIRNESS (handoff addendum §7.1, revert-to-red per §7.5 test 1): the
+/// head-swap claim must serve an OLDER due row of the same type before the
+/// row a fresh spawn just inserted -- a spawn is never guaranteed to
+/// dispatch itself. Verified failing under the born-claimed design this
+/// addendum replaces: that design claimed the SPAWNED row unconditionally
+/// (landed `running` directly on insert), so an older unqueued backlog row
+/// -- which can never conflict with anything at insert time, the only way to
+/// build backlog for an uncapped type -- would sit `pending` behind a
+/// strictly younger row that jumped straight to `running`.
+#[tokio::test]
+async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let jt = job_type("fairness");
+    let spawner = jobs.add_initializer(ImmediateInitializer {
+        job_type: jt.clone(),
+        completed: Arc::new(Notify::new()),
+        short_circuit: true,
+    });
+    jobs.start_poll().await?;
+
+    // Hand-construct an OLDER due `pending` row directly, unqueued so it can
+    // never conflict with anything at insert time -- an ordinary spawn of an
+    // uncapped type always short-circuits itself immediately when nothing
+    // else is due, so this is the only way to put backlog in front of it.
+    let old_id = JobId::new();
+    let old_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+    sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, $2, NOW())")
+        .bind(uuid::Uuid::from(old_id))
+        .bind(jt.as_str())
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO job_executions (id, job_type, state, attempt_index, execute_at, alive_at, created_at) \
+         VALUES ($1, $2, 'pending', 1, $3, NOW(), NOW())",
+    )
+    .bind(uuid::Uuid::from(old_id))
+    .bind(jt.as_str())
+    .bind(old_at)
+    .execute(&pool)
+    .await?;
+
+    let new_id = JobId::new();
+    spawner.spawn(new_id, Cfg).await?;
+
+    // Read both rows in ONE query, immediately after the spawning
+    // transaction committed and with no sleep: the background poll loop
+    // (also running, `start_poll` above) cannot see either row until that
+    // commit lands, so a single combined read right after `spawn` returns
+    // captures the state the head-swap claim itself produced, before the
+    // background loop gets an independent chance to also claim the now
+    // uncontested `new_id` (which -- once `old_id` is already `running` --
+    // would be a legitimate, separate claim, not a fairness violation;
+    // splitting this into two sequential awaited reads was observed to
+    // occasionally let exactly that happen, making the assertion below
+    // flaky rather than wrong).
+    let (old_state, new_state): (String, String) = sqlx::query_as(
+        "SELECT \
+           (SELECT state::text FROM job_executions WHERE id = $1), \
+           (SELECT state::text FROM job_executions WHERE id = $2)",
+    )
+    .bind(uuid::Uuid::from(old_id))
+    .bind(uuid::Uuid::from(new_id))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        old_state, "running",
+        "the OLDER due row must be the one claimed"
+    );
+    assert_eq!(
+        new_state, "pending",
+        "a fresh spawn must not cut ahead of older same-type backlog"
+    );
+
+    Ok(())
+}
+
+/// CHAIN HOP (handoff addendum §7.3 site 2, revert-to-red per §7.5 test 4):
+/// completing A must not just promote its queue's parked sibling B to
+/// `pending` -- the completion-time recycle claim must dispatch it
+/// synchronously, in the same transaction, with no poll needed in between.
+/// Verified failing by temporarily removing the recycle block from
+/// `delete_execution_in_op`: B then sits `pending`, picked up only by the
+/// ordinary (much slower, and here entirely absent -- see below) poll path.
+#[tokio::test]
+async fn completion_recycles_into_a_promoted_sibling_with_no_poll_needed() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("chain-hop-queue");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("chain-hop"),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+    jobs.start_poll().await?;
+
+    let a = JobId::new();
+    spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
+    started.notified().await; // A's run() is live, blocked on `release`.
+    assert_eq!(row_state(&pool, a).await?, "running");
+
+    let b = JobId::new();
+    spawner.spawn_with_queue_id(b, Cfg, queue.clone()).await?;
+    assert_eq!(
+        row_state(&pool, b).await?,
+        "parked",
+        "B must park behind A's active slot"
+    );
+
+    // Release A: it completes, `delete_execution_in_op` promotes B, and (the
+    // point of this test) recycles A's freed unit straight into dispatching
+    // B -- no NOTIFY-triggered poll cycle needed to pick B up.
+    release.notify_one();
+
+    wait_until(
+        async || Ok(row_state(&pool, b).await? == "running"),
+        "B to be recycled straight to running once A completes",
+    )
+    .await?;
+
+    let a_gone: i64 = sqlx::query_scalar("SELECT count(*) FROM job_executions WHERE id = $1")
+        .bind(uuid::Uuid::from(a))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(a_gone, 0, "A must be deleted on completion");
+    let b_owner: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT poller_instance_id FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(b))
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        b_owner.is_some(),
+        "a recycled claim must be owned by an instance, byte-identical to a poll claim"
+    );
+
+    // Drive B to completion too, confirming the recycled dispatch is a real,
+    // working dispatcher and not just a state flip.
+    started.notified().await; // B's own run() call.
+    release.notify_one();
+    wait_until(
+        async || {
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM job_executions WHERE id = $1")
+                    .bind(uuid::Uuid::from(b))
+                    .fetch_one(&pool)
+                    .await?;
+            Ok(remaining == 0)
+        },
+        "B to complete",
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// SHUTDOWN GUARD (handoff addendum §7.4, revert-to-red per §7.5 test 6): a
+/// completion during an in-flight shutdown drain must NOT recycle into new
+/// work -- doing so would re-admit a dispatch after the drain has started
+/// collecting acks, exactly the #169 hazard this addendum must not reopen (a
+/// late-spawned task never subscribes to the shutdown broadcast in time and
+/// gets force-aborted instead of drained). Verified failing by temporarily
+/// removing the `is_shutting_down()` check from `try_claim_for_recycle`: B
+/// then races straight to `running` while `jobs.shutdown()` is still
+/// collecting acks.
+#[tokio::test]
+async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("shutdown-recycle-queue");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("shutdown-recycle"),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+    jobs.start_poll().await?;
+
+    let a = JobId::new();
+    spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
+    started.notified().await;
+    assert_eq!(row_state(&pool, a).await?, "running");
+
+    let b = JobId::new();
+    spawner.spawn_with_queue_id(b, Cfg, queue.clone()).await?;
+    assert_eq!(row_state(&pool, b).await?, "parked");
+
+    // Start the drain while A is still blocked -- `perform()` flips
+    // `shutdown_started` as its very first step, then blocks waiting on A.
+    let shutdown_task = tokio::spawn(async move { jobs.shutdown().await });
+    // Calibration only (mirrors `shutdown_drains_self_rescheduling_jobs`'s
+    // own steady-state sleep): give the shutdown task a moment to actually
+    // run and flip the flag before A is released. Every correctness
+    // assertion below is state-based, taken only once `shutdown_task` has
+    // been fully awaited -- not timed.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    release.notify_one();
+
+    shutdown_task
+        .await?
+        .expect("shutdown must drain A and return cleanly");
+
+    // The drain is fully finished -- nothing in this process can claim
+    // anything anymore. If the recycle had not been gated on shutdown, B
+    // would already be `running`; it must instead sit exactly where the
+    // ordinary (non-recycling) promote leaves it.
+    assert_eq!(
+        row_state(&pool, b).await?,
+        "pending",
+        "a completion during shutdown must promote its sibling but not \
+         recycle-dispatch it"
+    );
+    let b_owner: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT poller_instance_id FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(b))
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        b_owner.is_none(),
+        "B must not have been claimed by the shutting-down instance"
+    );
+
+    Ok(())
+}
