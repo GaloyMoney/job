@@ -5,10 +5,14 @@ a local PostgreSQL 18 against seeded datasets shaped like production; the
 harness lives in `.claude/bench/` (not committed) and is described at the end.
 
 The short version: the poll query is the single hottest statement in the
-system, and the thing that dominates its cost is not how *expensive* it is but
-how much claimable work it *misses*. An earlier shape could return **zero**
-rows while ~20k jobs sat ready, and then immediately re-poll — burning CPU at
-zero yield.
+system, and it has failed twice for the same underlying reason — the scan was
+bounded by something other than what the poll can actually admit. One shape
+returned **zero** rows while ~20k jobs sat ready and then immediately
+re-polled, burning CPU at zero yield. Its replacement never returned zero, but
+spent up to **395 buffers per job claimed** where the current one spends 23,
+because its cost tracked the size of the backlog instead of the size of the
+batch. The current shape bounds both: what it scans, and what it can claim, are
+the same number.
 
 ---
 
@@ -28,24 +32,52 @@ queues *and* at 15,000 shallow ones.
 
 ---
 
-## The failure this replaced
+## The two failures this replaced
 
-The previous query took the `n_claim * 4` oldest **rows**, then discarded the
-ones that were queue-blocked or not their queue's head. Filtering *after* the
-window is the bug: a hot entity's blocked backlog is simultaneously the oldest
-work and entirely unclaimable, so it filled the window completely and the poll
-returned nothing. `may_have_more` then correctly fired and the poller
-immediately re-polled — into the same clogged window.
+Both previous shapes lost work to the same mistake in different places:
+**deciding what is claimable after bounding the scan, or bounding the scan by
+something other than what the poll can admit.**
+
+**Shape 1 — filter after the limit.** It took the `n_claim * 4` oldest **rows**,
+then discarded the ones that were queue-blocked or not their queue's head. A
+hot entity's blocked backlog is simultaneously the oldest work and entirely
+unclaimable, so it filled the window and the poll returned nothing.
+`may_have_more` then correctly fired and the poller immediately re-polled —
+into the same clogged window.
 
 8 pollers × 200 polls, realistic seed (85% queued, 14.9k queues, hot entities):
 
 | design | claimed of 19,720 claimable |
 |---|---|
-| old window | **0** |
+| filter-after-limit | **0** |
 | current | **19,720 (100%)** |
 
-It was not only a pathological-case problem. On a uniform seed with no hot
-queues at all, the old shape still claimed just 2,142 of 30,130 (7%).
+Not only a pathological case: on a uniform seed with no hot queues at all it
+still claimed just 2,142 of 30,130 (7%).
+
+**Shape 2 — bound the scan by queues examined.** The fix for shape 1 walked
+`queue_id` space queue-by-queue, tallying claimable queues and stopping once it
+had `n_claim * CONTENTION_HEADROOM` of them. That removed the cliff, but
+`queue_id` order carries no information about *dueness*, so every not-yet-due
+queue was visited and rejected on every poll — and because the tally counts
+*claimable* queues, a low due fraction meant the budget was never reached and
+the walk ran the entire pending-queue keyspace every time. With the job gate at
+250/150, `n_claim` is 100–250 and the target 400–1000 claimable queues, which
+production never has: the exit condition was dead code.
+
+Cost per job claimed, measured (600 queues, `n_claim = 150`):
+
+| fraction of queue heads due | queue walk | current |
+|---|---|---|
+| 100% | 55 buffers | 35 |
+| 20% | 55 | 20 |
+| 5% | 168 | 21 |
+| 2% | **395** | **23** |
+
+The walk's cost is flat in *work done* and linear in *backlog*. That is the
+wrong way round, and it is what production saw: two live sandboxes measured
+231 → 494 and 126 → 218 buffers per job claimed against the shape it replaced.
+
 
 ---
 
@@ -55,58 +87,80 @@ The query gathers candidates that are **already claimable**, so the limit
 counts useful work rather than raw rows. Queued and unqueued rows are gathered
 by separate paths because their admission rules have nothing in common.
 
-### Queued rows: enumerate queues, not rows
+### Queued rows: two steps, both bounded by the budget
 
 A queued row is claimable only if its queue has nothing running *and* it is
-that queue's oldest pending row. Evaluating that per row costs O(pending rows).
-Instead `walk` seeks queue-to-queue through
-`idx_job_executions_pending_queue_head` — one index descent per queue,
-regardless of that queue's depth — and carries a running tally of eligible
-queues so the recursion **terminates itself** once there are enough.
+that queue's oldest pending row. Those are two different questions, and
+answering them in one pass is what went wrong twice. They are now separate:
 
-That self-termination is what makes it work at both extremes. Two rejected
-alternatives:
+**Step 1 — which queues to examine.** A prefix of `(execute_at, id)` order over
+due, *unblocked*, pollable rows, `LIMIT n_claim * CONTENTION_HEADROOM`. The
+blocked-queue anti-join sits **inside** this window, below the `LIMIT`, so a
+queue with a job already running contributes nothing no matter how deep its
+backlog. That placement is the whole design — it is the difference between
+this and shape 1.
 
-| approach | 50 deep queues | 14,920 queues |
+**Step 2 — which row of each queue.** One `LATERAL` probe per examined queue
+against `idx_job_executions_pending_queue_head`, taking its oldest due row.
+One index-only descent per queue, independent of that queue's depth.
+
+Cost is therefore `O(n_claim)`, flat in backlog and in queue count. Measured
+against the queue walk, same claims in every case:
+
+| queues | due heads | queue walk | current |
+|---|---|---|---|
+| 600 | 100% | 8,316 buf / 3.8 ms | **5,290 / 2.3 ms** |
+| 600 | 20% | 6,697 / 3.1 ms | **2,445 / 1.1 ms** |
+| 600 | 5% | 5,062 / 2.5 ms | **641 / 0.5 ms** |
+| 600 | 2% | 4,746 / 2.4 ms | **285 / 0.4 ms** |
+| 3,000 | 20% | 28,879 / 12.5 ms | **7,117 / 2.6 ms** |
+| 3,000 | 2% | 23,962 / 11.0 ms | **1,411 / 0.7 ms** |
+
+`DISTINCT ON (queue_id)` was rejected as the step-2 mechanism: a `Unique` node
+cannot skip duplicates, so it reads every index entry and a 500-deep queue
+costs 500 of them. It also dedups per *(type, queue)* when run inside a
+per-type lateral, which yielded 27 queues with more than one running job.
+
+#### The one case that still degrades, and why it is left alone
+
+A single **unblocked** queue holding more due rows than the whole window
+(> `n_claim * 4`) fills step 1 by itself, so that poll claims one row. It then
+self-heals in the next poll, because claiming that row blocks the queue and
+step 1's anti-join drops all of its rows:
+
+| poll | claimed | `may_have_more` |
 |---|---|---|
-| `DISTINCT ON (queue_id)` | 17.4 ms | 1.4 ms |
-| loose scan, no early stop | 0.24 ms | 19.1 ms (walks all 14,921) |
-| **loose scan, self-terminating** | **0.49 ms** | **0.33 ms** (stops at 50) |
+| 1 | 1 | true |
+| 2 | 150 | true |
+| 3 | 50 | false |
 
-`DISTINCT ON` looks tempting but a `Unique` node cannot skip duplicates — it
-reads every index entry, so a 500-deep queue costs 500 entries.
-
-It also has a **correctness** trap. Running `DISTINCT ON` inside the per-type
-lateral dedups per *(type, queue)*, so a queue carrying three job types yields
-three concurrently-running jobs. Measured: 27 queues with more than one running
-job. The queue walk is deliberately **global**, not per type, because queue
-exclusion is global.
-
-Two things the walk must get right, both of which reintroduce starvation if
-they are treated as details:
-
-- **The budget counts *claimable* queues, not merely unblocked ones.** A queue
-  whose oldest due row is future-scheduled, or belongs to a type this instance
-  has saturated, yields no candidate. Counting it lets such queues exhaust the
-  budget while claimable work further along the sweep is never examined — the
-  original disease in a new place. Eligibility is evaluated against the queue
-  already in hand rather than the one being advanced to, so a step still costs
-  one seek to advance plus its checks.
-- **`may_have_more` must account for the sweep, not just the claim.** A walk
-  that stopped on its budget leaves queues past it unexamined; one that wrapped
-  from a mid-space cursor never looked at the queues *before* that cursor. In
-  both cases there is due work this poll could not see, and reporting otherwise
-  lets the poller sleep on `next_due_at` while it sits there. Only a sweep that
-  ran off the end having started from the beginning covered everything.
+Identical at depth 1,000 and depth 5,000 — the cost is exactly one extra poll
+of 133 buffers, not a function of depth, and `may_have_more` keeps the poller
+from sleeping through it. Closing it properly needs a "is this row its queue's
+head" anti-join inside step 1, which was measured and **rejected**: it fixes
+the case at 18,523 buffers and 30 ms for depth 5,000 — unbounded in depth,
+worse than the walk it replaced — and taxes the ordinary workload 25%.
 
 ### Picking a queue's row deterministically
 
-Every instance must choose the *same* row for a given queue: the oldest due
-row, with the pollable-type filter applied only afterwards. Choosing the oldest
-*pollable* row instead would let two instances that have saturated different
-types select different rows of the same queue and both claim it, breaking queue
-exclusion. Deciding identically everywhere is what makes a peer's lock read as
-"this queue is taken" rather than "try the row below".
+Every instance must choose the *same* row for a given queue, or a peer's lock
+on it reads as "try the row below" instead of "this queue is taken", and two
+instances claim from one queue. Two things guarantee it:
+
+- **Step 2 is type-agnostic.** The head is the queue's oldest due row outright;
+  the pollable-type filter is applied only *after*. `plan_claim` drops
+  saturated types, so the type set is instance-local — picking the oldest
+  *pollable* row would let two instances that have saturated different types
+  select different rows of one queue. Pinned by
+  `queue_head_is_resolved_independently_of_saturated_types`. Filtering by type
+  in step 1 is safe precisely because it only decides which queues get looked
+  at, never which row within one.
+- **The ordering is total.** `(execute_at, id)`, not `execute_at`. Bulk spawns
+  give a whole batch one timestamp, and ordering by `execute_at` alone leaves
+  the head of a tie group ambiguous. This is not theoretical: 8–16 concurrent
+  pollers against 5,000 queues of tied rows produced a **real exclusion
+  breach** without the tiebreak, and none with it (3 runs each). Pinned by
+  `tied_execute_at_resolves_one_stable_queue_head`.
 
 ### Unqueued rows
 
@@ -116,8 +170,8 @@ They can never be blocked by a sibling, so they come straight off
 ### Ordered index access is mandatory
 
 `SET LOCAL enable_bitmapscan = off` is not a micro-optimisation. A bitmap scan
-returns rows in heap order, destroying the index ordering the queue walk and
-both due-scans depend on, and forcing a sort of every candidate: **10.3 ms vs
+returns rows in heap order, destroying the index ordering that step 1 and the
+unqueued scan depend on, and forcing a sort of every candidate: **10.3 ms vs
 1.4 ms** on identical data. It is scoped to the poll transaction, alongside the
 `plan_cache_mode` override that already lived there.
 
@@ -129,12 +183,12 @@ both due-scans depend on, and forcing a sort of every candidate: **10.3 ms vs
 candidates. It exists so `FOR UPDATE ... SKIP LOCKED` has somewhere to fall
 through when a peer instance holds locks on the rows this poll would target.
 
-This looks like the old `* 4` overscan but is a different quantity. The old
+It reads like shape 1's `* 4` overscan and is a different quantity. That
 multiplier was sized to survive *filtering* — it had to guess how many gathered
 rows would turn out unclaimable, and a deep blocked queue could exhaust any
-guess. Everything gathered now is already claimable, so the multiplier only has
-to cover *contention*: how many candidates a concurrent poller might be
-holding.
+guess. Step 1 now gathers only rows that are already unblocked, so the
+multiplier has to cover *contention* alone: how many candidates a concurrent
+poller might be holding.
 
 Removing it entirely regresses a real case: with a type budget of 5 and a peer
 holding exactly those 5 rows, a poll gathers 5 candidates, skips all 5, and
@@ -152,34 +206,66 @@ first within a rank. Pinned by
 
 ---
 
-## Queue fairness: round-robin cursor
+## Queue fairness: oldest-first
 
-The queue walk resumes from a per-poller, in-memory cursor. Simulation over
-2000 queues, K=50, 400 rounds (perfectly fair = 10 services each):
+Fairness is a byproduct of step 1's ordering rather than a separate mechanism.
+Because the window is a prefix of `(execute_at, id)` order, a due row is
+claimed once no more than `n_claim * CONTENTION_HEADROOM` *older* claimable
+rows remain — so a job's wait is bounded by how much older work exists, and
+rows age monotonically into the front of that order. No row can be passed over
+indefinitely.
 
-| start strategy | never served | min | max | stddev | worst gap |
-|---|---|---|---|---|---|
-| fixed (lowest first) | 1950 | 0 | 400 | 62.5 | 400 (never) |
-| random | 0 | 3 | 19 | 2.84 | 262 rounds |
-| **cursor (round-robin)** | 0 | **10** | **10** | **0.00** | **40 rounds** |
-| oldest-first (`execute_at`) | 0 | 1 | 18 | 2.55 | 316 rounds |
+This replaced a per-poller round-robin cursor over `queue_id` space. That
+cursor gave a strictly bounded per-*queue* service gap (one sweep) where
+oldest-first does not, and the earlier simulation measured queue-service gaps
+of up to 316 rounds for oldest-first against 40 for the cursor. It was dropped
+anyway, for two reasons:
 
-The cursor is the only option with a *bound*: worst gap 40 rounds is exactly
-one sweep (2000 ÷ 50). Random start is unbiased in the mean but has an
-exponential tail — 6.5× a sweep, with no upper limit.
+- The cursor only had that property because the walk visited every queue, which
+  is exactly the `O(pending queues)` cost that had to go. Its fairness
+  guarantee and its cost were the same mechanism.
+- Per-queue round-robin is the wrong target. It equalises *queue* service rate,
+  which advantages a queue with one old job over a queue with ten, and lets an
+  old row wait behind newer rows in other queues. Age order is the guarantee
+  this system actually wants, and it is the one users perceive.
 
-Oldest-first optimises job latency rather than per-queue progress, and is not
-what this system wants: it leaves some queues waiting 316 rounds.
+What was given up: queue service order is not equalised, and a queue whose work
+keeps arriving is served as often as its work is old — not more.
 
-Trade-offs accepted:
 
-- Queue service order is not `execute_at` order. Among *due* jobs a queue may
-  be served out of age order, bounded by one sweep. Future-scheduled jobs are
-  still never run early. Queue admission was already documented as not FIFO.
-- The cursor is in memory and lost on restart, costing at most one skewed
-  sweep — not worth persisting.
-- Distinct cursors also decorrelate pollers, which reduces how often instances
-  target the same rows.
+---
+
+## When the poller may sleep
+
+`may_have_more` decides whether the poll loop re-polls immediately or sleeps on
+`next_due_at`. Under the queue walk it was true almost always — the walk only
+reported completeness if it ran off the end of `queue_id` space having started
+at the beginning — so the loop leaned on re-polling to find anything it had
+missed. That is affordable only when a poll is cheap, and it was not.
+
+It is now exact. A poll re-polls immediately only when it provably left
+claimable work behind:
+
+- it filled its budget, or
+- step 1's window came back full *and* yielded at least one pollable head, so
+  there is claimable work past the window.
+
+A short window means every claimable due row was examined, and `next_due_at` is
+the honest next deadline. A full window that yielded **no** pollable head means
+everything visible belongs to a saturated type — re-polling would spin at zero
+yield, so the loop sleeps and waits for the wake instead.
+
+Sleeping accurately only works if every transition that creates claimable work
+actually wakes someone, and one of them did not. `delete_execution_in_op`
+reported a freed queue under the **completing** job's type, but a poller only
+wakes for types it polls, and a queue's next job is frequently a different type
+from the one that just vacated it. It now resolves and reports the freed
+queue's next job type instead.
+
+That bug was invisible while `may_have_more` was permanently true. Fixing the
+notify took the test suite from 60 s to 7.5 s — seven tests had been sitting on
+timeouts waiting for a wake that never came, and passing anyway because a
+later poll happened to pick the work up.
 
 ---
 
@@ -236,12 +322,19 @@ Three things this settles:
   for no measurable claim-side gain — the poll touches only ~`n_claim` rows, so
   the heap fetches are free.
 
-`idx_job_executions_pending_execute_at` is kept: `min_wait` and the
-stale-pending reporter need global `execute_at` order, which neither claim
-index provides. Serving `min_wait` per-type instead — to drop it and get back
-to the previous index count — was tried and **rejected**: it cost 2.3× on the
-poll (4,342 vs 1,908 buffers, 1.39 vs 0.61 ms), with the whole regression in
-`min_wait` itself.
+`idx_job_executions_pending_execute_at` carries `(execute_at, id)` and is now
+the claim path's step-1 index, as well as what `min_wait` and the stale-pending
+reporter read. Serving `min_wait` per-type instead — to drop it and get back to
+the previous index count — was tried against the earlier design and
+**rejected**: it cost 2.3× on the poll (4,342 vs 1,908 buffers, 1.39 vs 0.61
+ms), with the whole regression in `min_wait` itself. It is no longer droppable
+on any terms: step 1 is the only ordered access path to due work.
+
+Both claim indexes carry `id` as their trailing column. That is a correctness
+requirement, not a covering trick (see "Picking a queue's row
+deterministically"); on `idx_job_executions_pending_queue_head` it also turns
+step 2 into an index-only scan, worth 10% of the poll's buffers and 21% of its
+time.
 
 ### Why `poller_instance_id` has no index
 
@@ -292,12 +385,18 @@ where to look — and it needs measuring over minutes, not milliseconds.
 
 ## Concurrency safety
 
-Verified under 8, 12 and 16 concurrent pollers across all three seeds:
+Verified under 8, 12 and 16 concurrent pollers across every seed, including
+5,000 queues whose rows all share one `execute_at`:
 
 - **0** double-claims
 - **0** queues with more than one running job
 - **0** deadlocks
 - **0** lock waits and **0** ungranted locks, sampled every 1 ms
+
+The tied-timestamp case is not decoration. Run against an `execute_at`-only
+ordering it produced a real breach on the first attempt, and zero across three
+runs once the ordering was made total. A queue-exclusion bug is invisible on
+any seed with distinct timestamps.
 
 No lock waiting is structural rather than lucky: `SKIP LOCKED` never blocks,
 and the `LIMIT` sits above `LockRows`, so skipped rows do not consume the limit
@@ -311,7 +410,9 @@ eager form did, never more.
 
 Taking only each queue's **head** row is what upholds queue exclusion against a
 concurrent poller: a peer that has already locked that head finds it locked and
-skips the entire queue, instead of claiming the row behind it.
+skips the entire queue, instead of claiming the row behind it. This only holds
+because every instance resolves the same head — see "Picking a queue's row
+deterministically" for the two things that guarantee it.
 
 ---
 
@@ -320,14 +421,27 @@ skips the entire queue, instead of claiming the row behind it.
 The harness under `.claude/bench/` is intentionally untracked; it needs a local
 dev database (`make start-deps`).
 
+Seeds:
+
 - `seed_real.sql` — realistic: 85% queued, ~15k queues, hot entities, ~34.5k pending
 - `seed_lowcard.sql` — 50 queues × 600 rows (deep-queue extreme)
 - `seed.sql` — uniform, no skew
-- `seed_fair.sql` — 2000 flat queues, for the fairness simulation
-- `stress.sh` — N concurrent pollers; reports claims, double-claims, deadlocks, lock waits
-- `fairness.sql` — selection-strategy simulation
+- `seed_due.sql` — `-v nq=N -v duepct=P`: N shallow queues with P% of heads due.
+  The due fraction is the variable the queue walk was blind to; sweep it.
+- `seed_cliff.sql` — `-v depth=D -v blocked=0|1`: one pathological queue ahead
+  of ordinary ones, for the zero-claim cliff
+
+Drivers:
+
+- `ab2.sh` — A/B against the previous shape, each arm on its own fresh seed
+- `cliff.sh` / `selfheal.sh` — cliff matrix, and the multi-poll recovery sequence
+- `race.sh` — N concurrent pollers on tied `execute_at`; asserts zero queues with
+  more than one running job. This is what caught the missing `id` tiebreak, and
+  it caught it on the *first* run — do not skip it.
+- `stress.sh` — N concurrent pollers; claims, double-claims, deadlocks, lock waits
 - `idx_sets.sql` / `writecost.sql` — index-set switcher and write-path cost
 
-When changing the claim query, re-run **all three** seeds. The low-cardinality
-seed in particular is what caught the per-type `DISTINCT ON` correctness bug;
-neither of the other two exposed it.
+When changing the claim query, re-run every seed. Each of them has caught a
+bug the others missed: `seed_lowcard` the per-type `DISTINCT ON` breach,
+`seed_due` the walk's blindness to dueness, `seed_cliff` the zero-claim cliff,
+`race.sh` the ordering tiebreak.
