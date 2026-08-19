@@ -377,9 +377,14 @@ impl JobDispatcher {
               WHERE s.id = d.id AND NOT $3::boolean
           )
           SELECT d.queue_id AS "queue_id?",
+                 -- Same head definition the claim uses, tiebreak included:
+                 -- ordering by execute_at alone would let this report a
+                 -- different row - and so a different TYPE - than the one
+                 -- step 2 will treat as the head, waking pollers that cannot
+                 -- claim the queue and not the one that can.
                  (SELECT je.job_type FROM job_executions je
                   WHERE je.state = 'pending' AND je.queue_id = d.queue_id
-                  ORDER BY je.execute_at
+                  ORDER BY je.execute_at, je.id
                   LIMIT 1) AS "next_in_queue?"
           FROM deleted d
         "#,

@@ -301,14 +301,24 @@ impl JobPoller {
         // buy a bigger scan for the same result. One saturated poll drops it
         // straight back, so the common shallow-queue case never pays for the
         // deep one. See PERFORMANCE.md, "Contention headroom".
-        *headroom = if result.window().candidates_short {
+        let short = result.window().candidates_short;
+        // A poll that is about to widen must not sleep first. A full window
+        // read only a PREFIX of the due pollable rows, so claimable heads may
+        // sit past it -- already due, and therefore invisible to
+        // `next_due_at`. Re-polling at the SAME width would spin at zero
+        // yield, so the re-poll is conditioned on the width actually growing:
+        // that bounds it to the widening ladder (4 -> 8 -> 16 -> 32), and each
+        // step looks strictly further than the last.
+        let widening = short && *headroom < MAX_CONTENTION_HEADROOM;
+        *headroom = if short {
             (*headroom * 2).min(MAX_CONTENTION_HEADROOM)
         } else {
             CONTENTION_HEADROOM
         };
 
-        let (rows, window) = match result {
-            JobPollResult::WaitTillNextJob(window) => {
+        let (rows, mut window) = match result {
+            JobPollResult::WaitTillNextJob(mut window) => {
+                window.may_have_more |= widening;
                 // Fresh clock read: a duration captured earlier can go stale under a manual clock.
                 let duration = window.sleep_for(self.clock.now());
                 span.record("next_poll_in", tracing::field::debug(duration));
@@ -317,6 +327,7 @@ impl JobPoller {
             }
             JobPollResult::Jobs { jobs, window } => (jobs, window),
         };
+        window.may_have_more |= widening;
         let jobs_len = rows.len();
         span.record("n_jobs_to_start", jobs_len);
         if !rows.is_empty() {
@@ -1108,13 +1119,20 @@ async fn poll_jobs(
             -- not take because a peer held them.
             --
             -- A window that came back short means every claimable due row was
-            -- examined, so `next_due_at` is the honest next deadline. A FULL
-            -- window that yielded no pollable head means everything visible
-            -- belongs to a saturated type -- re-polling would spin at zero
-            -- yield, and the slot that frees it reports through
-            -- `job_completed`'s capped-type wake instead. Blocked queues are
-            -- likewise covered by a wake, not a spin: `delete_execution_in_op`
-            -- reports `execution_ready` when it frees one.
+            -- examined, so `next_due_at` is the honest next deadline. Blocked
+            -- queues are covered by a wake rather than a spin:
+            -- `delete_execution_in_op` reports `execution_ready` when it frees
+            -- one.
+            --
+            -- A FULL window that yielded no pollable head does NOT report here
+            -- -- but it must not sleep either, and `poll_and_dispatch` is what
+            -- keeps it awake. Hitting the LIMIT only means a PREFIX of due
+            -- pollable rows was read: rows sitting behind a head this instance
+            -- has saturated still consume the window, so claimable heads past
+            -- it went unseen. Those are already due, so `next_due_at` does not
+            -- cover them. Re-polling at the same width would spin at zero
+            -- yield, which is why the answer is to widen and re-poll rather
+            -- than either sleep or spin -- see `candidates_short` below.
             --
             -- `candidates_short` drives the adaptive window (see
             -- `poll_and_dispatch`). The window bounds ROWS but candidates are
@@ -2181,6 +2199,101 @@ mod tests {
             !window.candidates_short,
             "a saturated poll must drop the headroom back to resting"
         );
+
+        Ok(())
+    }
+    /// A window filled entirely by rows behind SATURATED heads must not read
+    /// as "nothing more to see".
+    ///
+    /// Step 1 admits rows of pollable types, but step 2 resolves each queue's
+    /// head type-agnostically and drops it when that head belongs to a type
+    /// this instance has saturated. Those queues therefore consume window
+    /// slots and yield nothing, and if enough of them do it the window fills
+    /// having read only a PREFIX of the due pollable rows — claimable heads
+    /// past it are unseen. They are already due, so `next_due_at` does not
+    /// cover them, and sleeping here strands them until an unrelated wake.
+    ///
+    /// `candidates_short` is what keeps the loop awake: `poll_and_dispatch`
+    /// re-polls while it can still widen. See PERFORMANCE.md, "When the poller
+    /// may sleep".
+    #[tokio::test]
+    async fn window_full_of_saturated_heads_does_not_read_as_exhausted() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let saturated = format!("sat-{}", uuid::Uuid::now_v7());
+        let pollable = format!("poll-{}", uuid::Uuid::now_v7());
+        let n_jobs_to_poll = 2usize;
+
+        // Every queue: an unpollable head, then a pollable row behind it. The
+        // pollable rows are what enter the window; none of them can be claimed
+        // because each queue's head is the saturated type.
+        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let mut seq = 0i64;
+        let queues = (n_jobs_to_poll as i32 * CONTENTION_HEADROOM) as i64;
+        for q in 0..queues {
+            let queue = format!("blocked-head-{q}-{}", uuid::Uuid::now_v7());
+            seed_queued_job(
+                &pool,
+                &saturated,
+                &queue,
+                base + chrono::Duration::milliseconds(seq),
+                "pending",
+            )
+            .await?;
+            seq += 1;
+            seed_queued_job(
+                &pool,
+                &pollable,
+                &queue,
+                base + chrono::Duration::milliseconds(seq),
+                "pending",
+            )
+            .await?;
+            seq += 1;
+        }
+
+        // Only the pollable type is offered — `plan_claim`'s output once
+        // `saturated` is at its cap.
+        let pollable_types = vec![JobType::from_owned(pollable.clone())];
+        let row_limits = vec![n_jobs_to_poll as i32];
+        let clock = ClockHandle::realtime();
+
+        let result = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            uuid::Uuid::now_v7(),
+            &pollable_types,
+            &row_limits,
+            CONTENTION_HEADROOM,
+            &clock,
+        )
+        .await?;
+
+        let window = result.window();
+        // The query alone WOULD sleep here: it saw no claimable head, and
+        // `may_have_more` is deliberately false so that re-polling at the same
+        // width cannot spin at zero yield.
+        assert!(
+            !window.may_have_more,
+            "re-polling at the same width would spin at zero yield"
+        );
+        // `candidates_short` is the whole safety net -- `poll_and_dispatch`
+        // ORs it into the sleep decision while the width can still grow. If
+        // this ever goes false, the loop sleeps on `next_due_at` while
+        // already-due claimable work sits just past the window.
+        assert!(
+            window.candidates_short,
+            "a full window that yielded no claimable head must say so, or the \
+             loop sleeps on next_due_at while already-due work sits past it"
+        );
+        match result {
+            JobPollResult::WaitTillNextJob(_) => {}
+            JobPollResult::Jobs { ref jobs, .. } => {
+                assert!(
+                    jobs.is_empty(),
+                    "every head here belongs to a saturated type"
+                );
+            }
+        }
 
         Ok(())
     }

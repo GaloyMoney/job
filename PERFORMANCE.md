@@ -300,19 +300,38 @@ claimable work behind:
 
 - it filled its budget, or
 - step 1's window came back full *and* yielded at least one pollable head, so
-  there is claimable work past the window.
+  there is claimable work past the window, or
+- the window was the binding constraint and **the width just grew**.
 
 A short window means every claimable due row was examined, and `next_due_at` is
-the honest next deadline. A full window that yielded **no** pollable head means
-everything visible belongs to a saturated type — re-polling would spin at zero
-yield, so the loop sleeps and waits for the wake instead.
+the honest next deadline.
+
+The third condition is the awkward case. A full window that yielded **no**
+pollable head is not evidence of an empty queue — hitting the LIMIT only means
+a *prefix* of the due pollable rows was read, and rows sitting behind a head
+this instance has saturated still consume window slots. Claimable heads past it
+went unseen, they are already due, and `next_due_at` therefore does not cover
+them: sleeping strands them. But re-polling at the same width reads the same
+prefix — a spin at zero yield, the original disease.
+
+So the answer is neither. `candidates_short` fires, `poll_and_dispatch` widens,
+and the re-poll is conditioned on the widen having actually happened. That
+bounds it to the ladder — 4 → 8 → 16 → 32, three extra polls at most — and
+every step reads strictly further than the last. At the ceiling with still
+nothing claimable the loop does sleep, and the event that unblocks those
+saturated heads is a capped-type completion, which `job_completed` already
+wakes for. Pinned by
+`window_full_of_saturated_heads_does_not_read_as_exhausted`.
 
 Sleeping accurately only works if every transition that creates claimable work
 actually wakes someone, and one of them did not. `delete_execution_in_op`
 reported a freed queue under the **completing** job's type, but a poller only
 wakes for types it polls, and a queue's next job is frequently a different type
 from the one that just vacated it. It now resolves and reports the freed
-queue's next job type instead.
+queue's next job type instead — using the same `(execute_at, id)` head
+definition the claim uses, since ordering by `execute_at` alone would let it
+name a different row, and so a different type, than the one step 2 treats as
+the head.
 
 That bug was invisible while `may_have_more` was permanently true. Fixing the
 notify took the test suite from 60 s to 7.5 s — seven tests had been sitting on
