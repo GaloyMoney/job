@@ -845,3 +845,66 @@ async fn short_circuit_spawn_dispatch_survives_a_shutdown_race() -> anyhow::Resu
 
     Ok(())
 }
+
+/// BULK SHORT-CIRCUIT DUE-NOW GATE (found by automated review on this PR):
+/// a `spawn_all` of entirely FUTURE-scheduled work must not claim anything
+/// -- `try_claim_after_bulk_spawn`'s reservation count must be the due-now
+/// subset of the rows that landed pending, not their raw count (which
+/// includes future-scheduled rows). Verified failing by temporarily
+/// reverting the fix (passing `landed_pending.len()` again): an
+/// already-due, unrelated older backlog row of the same type -- present
+/// only because the caller happened to have one sitting around -- would
+/// then get claimed by a `spawn_all` call that itself scheduled nothing due
+/// now.
+#[tokio::test]
+async fn bulk_spawn_of_future_work_does_not_claim_unrelated_due_backlog() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let jt = job_type("bulk-future-gate");
+    let spawner = jobs.add_initializer(ImmediateInitializer {
+        job_type: jt.clone(),
+        completed: Arc::new(Notify::new()),
+        short_circuit: true,
+    });
+    jobs.start_poll().await?;
+
+    // An older, unrelated due-now backlog row of the SAME type, unqueued so
+    // it can't conflict with anything the bulk call inserts.
+    let backlog_id = JobId::new();
+    let backlog_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+    sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, $2, NOW())")
+        .bind(uuid::Uuid::from(backlog_id))
+        .bind(jt.as_str())
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO job_executions (id, job_type, state, attempt_index, execute_at, alive_at, created_at) \
+         VALUES ($1, $2, 'pending', 1, $3, NOW(), NOW())",
+    )
+    .bind(uuid::Uuid::from(backlog_id))
+    .bind(jt.as_str())
+    .bind(backlog_at)
+    .execute(&pool)
+    .await?;
+
+    // A bulk spawn entirely of FUTURE work -- nothing in it is due now.
+    let future_at = chrono::Utc::now() + chrono::Duration::hours(1);
+    let specs: Vec<JobSpec<Cfg>> = (0..3)
+        .map(|_| JobSpec::new(JobId::new(), Cfg).schedule_at(future_at))
+        .collect();
+    spawner.spawn_all(specs).await?;
+
+    // Read immediately after commit -- no sleep: only the head-swap claim
+    // (synchronous with that same transaction) could possibly have claimed
+    // anything yet.
+    assert_eq!(
+        row_state(&pool, backlog_id).await?,
+        "pending",
+        "a bulk spawn of only future-scheduled work must not claim an \
+         unrelated due-now backlog row"
+    );
+
+    Ok(())
+}

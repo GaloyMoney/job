@@ -386,15 +386,36 @@ where
 
             // Head-swap short-circuit for the bulk path (handoff addendum
             // §7.3 site 4): greedily reserve as much capacity as this call's
-            // own due-now count could use, claiming this type's oldest due
+            // own DUE-NOW count could use, claiming this type's oldest due
             // backlog per reservation. Under-reservation is not a failure --
             // every row already landed pending/parked above regardless, so
             // whatever isn't claimed here is picked up by the ordinary poll
             // exactly as before this addendum.
+            //
+            // `n_due` must be the due-now subset of `landed_pending`, not
+            // its raw length: `landed_pending` includes rows whose
+            // `schedule_at` is in the future (an explicit per-spec
+            // `JobSpec::schedule_at`), which are not claimable and must not
+            // count toward how many reservations to attempt -- mirrors the
+            // single-spawn path's own `schedule_at <= self.clock.now()`
+            // gate. Without it, a `spawn_all` of entirely future-scheduled
+            // work could still reserve and drain this type's ENTIRE
+            // unrelated due backlog, bypassing `next_batch_size`'s
+            // `min_jobs` throttle for a call that has nothing to do with
+            // due-now admission.
             if let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade()) {
                 let now = op.maybe_now().unwrap_or(default_schedule_at);
+                let due_by_id: std::collections::HashMap<JobId, DateTime<Utc>> = ids
+                    .iter()
+                    .copied()
+                    .zip(schedule_times.iter().copied())
+                    .collect();
+                let n_due = landed_pending
+                    .iter()
+                    .filter(|id| due_by_id.get(id).is_some_and(|at| *at <= now))
+                    .count();
                 poller
-                    .try_claim_after_bulk_spawn(op, &self.job_type, landed_pending.len(), now)
+                    .try_claim_after_bulk_spawn(op, &self.job_type, n_due, now)
                     .await?;
             }
         }
