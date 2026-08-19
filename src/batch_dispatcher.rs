@@ -27,6 +27,7 @@ use super::{
     notifier::JobEventNotifier,
     repo::JobRepo,
     runner::RetrySettings,
+    spawner::swap_older_parked_siblings_in_op,
     tracker::JobTracker,
 };
 
@@ -332,6 +333,13 @@ impl BatchDispatcher {
         // ordinary per-job dispatch path, not `add_batched_initializer`), so
         // every execution row a batch ever deletes already has a NULL
         // `unique_key` and this cleanup always applies.
+        //
+        // Promotes each freed queue's oldest parked sibling in the same
+        // statement — mirrors `dispatcher.rs`'s `delete_execution_in_op`
+        // exactly (same head tiebreak), rather than the coarser
+        // "notify my own type if any queue freed" this used to do: a batch
+        // can free several distinct queues in one commit, and each one's
+        // next job can be a different type than this batch's own.
         let rows = sqlx::query!(
             r#"
             WITH deleted AS (
@@ -340,8 +348,24 @@ impl BatchDispatcher {
                 RETURNING id, queue_id
             ), cleanup AS (
                 DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+            ), heads AS (
+                SELECT DISTINCT ON (d.queue_id) p.id
+                FROM deleted d
+                CROSS JOIN LATERAL (
+                    SELECT id FROM job_executions
+                    WHERE state = 'parked' AND queue_id = d.queue_id
+                    ORDER BY execute_at, id
+                    LIMIT 1
+                ) p
+                WHERE d.queue_id IS NOT NULL
+            ), promoted AS (
+                UPDATE job_executions je SET state = 'pending'
+                FROM heads h WHERE je.id = h.id
+                RETURNING je.job_type
             )
-            SELECT id AS "id!: JobId", queue_id AS "queue_id?" FROM deleted
+            SELECT id AS "id!: JobId", queue_id AS "queue_id?",
+                   (SELECT array_agg(job_type) FROM promoted) AS "promoted_types?"
+            FROM deleted
             "#,
             &uuids,
             self.instance_id,
@@ -353,7 +377,10 @@ impl BatchDispatcher {
             return Ok(());
         }
         let deleted: Vec<JobId> = rows.iter().map(|row| row.id).collect();
-        let freed_a_queue = rows.iter().any(|row| row.queue_id.is_some());
+        let promoted_types: Vec<String> = rows
+            .first()
+            .and_then(|row| row.promoted_types.clone())
+            .unwrap_or_default();
 
         let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &deleted).await?;
         let mut jobs = Vec::with_capacity(deleted.len());
@@ -368,9 +395,9 @@ impl BatchDispatcher {
         for id in &deleted {
             self.notifier.job_terminal_in_op(op, *id).await?;
         }
-        if freed_a_queue {
+        for promoted_type in promoted_types {
             self.notifier
-                .execution_ready_in_op(op, &self.job_type)
+                .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
                 .await?;
         }
         Ok(())
@@ -407,6 +434,10 @@ impl BatchDispatcher {
         )
         .execute(op.as_executor())
         .await?;
+        // Invariant B: mirrors `dispatcher.rs::reschedule_job` — each
+        // rescheduled row keeps its queue's active slot, but an older parked
+        // sibling should run first.
+        let promoted = swap_older_parked_siblings_in_op(op, &uuids).await?;
 
         let ids: Vec<JobId> = reschedules.iter().map(|(id, _)| *id).collect();
         let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?;
@@ -418,9 +449,17 @@ impl BatchDispatcher {
             }
         }
         self.repo.update_all_in_op(op, &mut jobs).await?;
-        self.notifier
-            .execution_ready_in_op(op, &self.job_type)
-            .await?;
+        if promoted.is_empty() {
+            self.notifier
+                .execution_ready_in_op(op, &self.job_type)
+                .await?;
+        } else {
+            for promoted_type in promoted {
+                self.notifier
+                    .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -488,14 +527,27 @@ impl BatchDispatcher {
             )
             .execute(op.as_executor())
             .await?;
-            self.notifier
-                .execution_ready_in_op(op, &self.job_type)
-                .await?;
+            // Invariant B: same ordering fixup as the reschedule path above.
+            let promoted = swap_older_parked_siblings_in_op(op, &retry_uuids).await?;
+            if promoted.is_empty() {
+                self.notifier
+                    .execution_ready_in_op(op, &self.job_type)
+                    .await?;
+            } else {
+                for promoted_type in promoted {
+                    self.notifier
+                        .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
+                        .await?;
+                }
+            }
         }
 
         if !terminal_uuids.is_empty() {
             // See the comment in `complete_in_op` above: batched jobs are
             // never keyed, so no `unique_key IS NULL` guard is needed here.
+            // Same per-freed-queue promotion as `complete_in_op` — mirrors
+            // `dispatcher.rs::delete_execution_in_op`'s precision rather
+            // than notifying this batch's own type.
             let rows = sqlx::query!(
                 r#"
                 WITH deleted AS (
@@ -504,8 +556,24 @@ impl BatchDispatcher {
                     RETURNING id, queue_id
                 ), cleanup AS (
                     DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+                ), heads AS (
+                    SELECT DISTINCT ON (d.queue_id) p.id
+                    FROM deleted d
+                    CROSS JOIN LATERAL (
+                        SELECT id FROM job_executions
+                        WHERE state = 'parked' AND queue_id = d.queue_id
+                        ORDER BY execute_at, id
+                        LIMIT 1
+                    ) p
+                    WHERE d.queue_id IS NOT NULL
+                ), promoted AS (
+                    UPDATE job_executions je SET state = 'pending'
+                    FROM heads h WHERE je.id = h.id
+                    RETURNING je.job_type
                 )
-                SELECT id AS "id!: JobId", queue_id AS "queue_id?" FROM deleted
+                SELECT id AS "id!: JobId", queue_id AS "queue_id?",
+                       (SELECT array_agg(job_type) FROM promoted) AS "promoted_types?"
+                FROM deleted
                 "#,
                 &terminal_uuids,
                 self.instance_id,
@@ -513,13 +581,16 @@ impl BatchDispatcher {
             .fetch_all(op.as_executor())
             .await?;
 
-            let freed_a_queue = rows.iter().any(|row| row.queue_id.is_some());
+            let promoted_types: Vec<String> = rows
+                .first()
+                .and_then(|row| row.promoted_types.clone())
+                .unwrap_or_default();
             for row in &rows {
                 self.notifier.job_terminal_in_op(op, row.id).await?;
             }
-            if freed_a_queue {
+            for promoted_type in promoted_types {
                 self.notifier
-                    .execution_ready_in_op(op, &self.job_type)
+                    .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
                     .await?;
             }
         }

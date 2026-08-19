@@ -15,7 +15,8 @@ use super::{
     notifier::JobEventNotifier,
     repo::JobRepo,
     runner::*,
-    tracker::JobTracker,
+    spawner::swap_older_parked_siblings_in_op,
+    tracker::{JobTracker, UnitReservation},
 };
 
 #[derive(Debug)]
@@ -70,6 +71,41 @@ impl JobDispatcher {
         clock: ClockHandle,
     ) -> Self {
         tracker.dispatch_job(id, &job_type);
+        Self {
+            repo,
+            retry_settings,
+            runner: Some(runner),
+            tracker,
+            notifier,
+            job_type,
+            retains_state,
+            rescheduled: false,
+            dispatched: true,
+            id,
+            instance_id,
+            clock,
+        }
+    }
+
+    /// Build from an already-taken [`UnitReservation`] (the short-circuit
+    /// spawn fast path): the reservation already accounted for this unit, so
+    /// this consumes it via [`UnitReservation::into_live`] instead of calling
+    /// `tracker.dispatch_job` a second time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_reservation(
+        reservation: UnitReservation,
+        repo: Arc<JobRepo>,
+        tracker: Arc<JobTracker>,
+        notifier: Arc<JobEventNotifier>,
+        retry_settings: RetrySettings,
+        id: JobId,
+        job_type: JobType,
+        retains_state: bool,
+        runner: Box<dyn JobRunner>,
+        instance_id: uuid::Uuid,
+        clock: ClockHandle,
+    ) -> Self {
+        reservation.into_live(id);
         Self {
             repo,
             retry_settings,
@@ -322,9 +358,22 @@ impl JobDispatcher {
             )
             .execute(op.as_executor())
             .await?;
-            self.notifier
-                .execution_ready_in_op(&mut op, &job.job_type)
-                .await?;
+            // Invariant B: the retrying row keeps its queue's active slot,
+            // but an older parked sibling should run first during the
+            // backoff.
+            let promoted =
+                swap_older_parked_siblings_in_op(&mut op, &[uuid::Uuid::from(id)]).await?;
+            if promoted.is_empty() {
+                self.notifier
+                    .execution_ready_in_op(&mut op, &job.job_type)
+                    .await?;
+            } else {
+                for promoted_type in promoted {
+                    self.notifier
+                        .execution_ready_in_op(&mut op, &JobType::from_owned(promoted_type))
+                        .await?;
+                }
+            }
         } else {
             span.record(
                 "error.level",
@@ -341,12 +390,12 @@ impl JobDispatcher {
     }
 
     /// Delete the execution row and report what its removal makes true: the job
-    /// is terminal, and — if it held a `queue_id` — that queue's next job just
-    /// became eligible. Freeing a queue is worth reporting because the queue's
-    /// backlog was, until this moment, invisible to every poller's claim scan,
-    /// which drops a queue outright while any of its jobs is running. It is
-    /// also the only wake for that backlog: the poll loop sleeps on
-    /// `next_due_at`, and these rows are already due.
+    /// is terminal, and — if it held a `queue_id` — that queue's oldest parked
+    /// sibling (if any) is promoted to `pending` in the same statement.
+    /// Promoting is worth reporting because the queue's backlog was, until
+    /// this moment, entirely unclaimable — `parked` rows never appear in the
+    /// claim scan — and it is also the only wake for that backlog: the poll
+    /// loop sleeps on `next_due_at`, and a promoted row is already due.
     /// The reschedule paths (`reschedule_job`, the retry branch of
     /// `fail_job`) don't need this: they always report unconditionally,
     /// since a job going back to `pending` is exactly the ordinary case every
@@ -375,18 +424,30 @@ impl JobDispatcher {
           ), cleanup AS (
               DELETE FROM job_execution_states s USING deleted d
               WHERE s.id = d.id AND NOT $3::boolean
+          ), head AS (
+              -- The oldest parked sibling of the freed queue, by the same
+              -- (execute_at, id) tiebreak the claim query uses -- ordering
+              -- by execute_at alone would let this promote a different row,
+              -- and so a different TYPE, than every peer would independently
+              -- agree is the head.
+              SELECT p.id FROM deleted d
+              CROSS JOIN LATERAL (
+                  SELECT id FROM job_executions
+                  WHERE state = 'parked' AND queue_id = d.queue_id
+                  ORDER BY execute_at, id
+                  LIMIT 1
+              ) p
+              WHERE d.queue_id IS NOT NULL
+          ), promoted AS (
+              -- Only the completer of a queue's single running job can ever
+              -- reach here for that queue (Invariant A), so there is exactly
+              -- one promoter at a time -- no SKIP LOCKED needed.
+              UPDATE job_executions je SET state = 'pending'
+              FROM head h WHERE je.id = h.id
+              RETURNING je.job_type
           )
-          SELECT d.queue_id AS "queue_id?",
-                 -- Same head definition the claim uses, tiebreak included:
-                 -- ordering by execute_at alone would let this report a
-                 -- different row - and so a different TYPE - than the one
-                 -- step 2 will treat as the head, waking pollers that cannot
-                 -- claim the queue and not the one that can.
-                 (SELECT je.job_type FROM job_executions je
-                  WHERE je.state = 'pending' AND je.queue_id = d.queue_id
-                  ORDER BY je.execute_at, je.id
-                  LIMIT 1) AS "next_in_queue?"
-          FROM deleted d
+          SELECT d.queue_id AS "queue_id?", p.job_type AS "next_in_queue?"
+          FROM deleted d LEFT JOIN promoted p ON TRUE
         "#,
             id as JobId,
             self.instance_id,
@@ -452,9 +513,21 @@ impl JobDispatcher {
         )
         .execute(op.as_executor())
         .await?;
-        self.notifier
-            .execution_ready_in_op(op, &job.job_type)
-            .await?;
+        // Invariant B: same ordering fixup as the retry branch of
+        // `fail_job` — the rescheduled row keeps its queue's active slot,
+        // but an older parked sibling should run first.
+        let promoted = swap_older_parked_siblings_in_op(op, &[uuid::Uuid::from(id)]).await?;
+        if promoted.is_empty() {
+            self.notifier
+                .execution_ready_in_op(op, &job.job_type)
+                .await?;
+        } else {
+            for promoted_type in promoted {
+                self.notifier
+                    .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
+                    .await?;
+            }
+        }
         job.reschedule_execution(reschedule_at);
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())

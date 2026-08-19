@@ -2,7 +2,7 @@ use tokio::sync::Notify;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Mutex, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -217,6 +217,92 @@ impl JobTracker {
 
     pub fn live_job_ids(&self) -> Vec<uuid::Uuid> {
         self.live_jobs.lock().expect("live_jobs poisoned").ids()
+    }
+
+    /// Reserve one execution unit of `job_type` BEFORE the DB write that
+    /// would consume it (the short-circuit spawn fast path's born-claimed
+    /// insert). Mirrors `dispatch_job`'s accounting exactly -- a reservation
+    /// IS a unit in flight, the same way `dispatch_job`'s claim is -- so
+    /// `next_batch_size`/`plan_claim` see it immediately, for the same
+    /// reason `JobDispatcher::new` claims its slot synchronously rather than
+    /// inside the execution task (see its doc comment).
+    ///
+    /// `None` if the process is already at `max_jobs`, or `per_type_cap` is
+    /// `Some` and `job_type` is already at it. Reserving does not require
+    /// knowing the job's id yet -- see [`UnitReservation::into_live`].
+    pub(crate) fn try_reserve(
+        self: &Arc<Self>,
+        job_type: &JobType,
+        per_type_cap: Option<usize>,
+    ) -> Option<UnitReservation> {
+        if self.running_jobs.load(Ordering::SeqCst) >= self.max_jobs {
+            return None;
+        }
+        {
+            let mut units = self
+                .units_in_flight
+                .lock()
+                .expect("units_in_flight poisoned");
+            if let Some(cap) = per_type_cap {
+                let current = units.get(job_type).copied().unwrap_or(0);
+                if current >= cap {
+                    return None;
+                }
+            }
+            *units.entry(job_type.clone()).or_insert(0) += 1;
+        }
+        self.running_jobs.fetch_add(1, Ordering::SeqCst);
+        Some(UnitReservation {
+            tracker: Arc::clone(self),
+            job_type: job_type.clone(),
+            resolved: false,
+        })
+    }
+}
+
+/// A pre-claimed unit of `job_type`'s capacity, taken via
+/// [`JobTracker::try_reserve`] before the DB write that would consume it.
+/// Exactly one of [`Self::into_live`]/[`Self::release`] should be called once
+/// the write's outcome is known; a reservation dropped without either is
+/// released automatically -- a leaked reservation would permanently eat a
+/// slot.
+pub(crate) struct UnitReservation {
+    tracker: Arc<JobTracker>,
+    job_type: JobType,
+    resolved: bool,
+}
+
+impl UnitReservation {
+    /// The born-claimed write landed and `id` is about to be dispatched.
+    /// Registers `id` in the same live-job bookkeeping [`JobTracker::dispatch_job`]
+    /// uses, WITHOUT re-incrementing the counters `try_reserve` already
+    /// incremented -- the caller must build its `JobDispatcher` from this
+    /// reservation (not via the ordinary `dispatch_job`-calling constructor)
+    /// or the unit is counted twice.
+    pub(crate) fn into_live(mut self, id: JobId) {
+        self.resolved = true;
+        self.tracker
+            .live_jobs
+            .lock()
+            .expect("live_jobs poisoned")
+            .started(id);
+    }
+
+    /// The write did not land running (conflicted and parked instead, or the
+    /// operation rolled back) -- undo the provisional claim.
+    pub(crate) fn release(mut self) {
+        self.resolved = true;
+        self.tracker.running_jobs.fetch_sub(1, Ordering::SeqCst);
+        self.tracker.release_unit(&self.job_type);
+    }
+}
+
+impl Drop for UnitReservation {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.tracker.running_jobs.fetch_sub(1, Ordering::SeqCst);
+            self.tracker.release_unit(&self.job_type);
+        }
     }
 }
 

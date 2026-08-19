@@ -47,6 +47,25 @@ pub trait JobInitializer: Send + Sync + 'static {
         None
     }
 
+    /// Whether a due-now spawn of this type may skip the pending queue
+    /// entirely: land the row already `running`-by-this-instance and hand it
+    /// to the dispatcher the moment the spawning transaction commits, with no
+    /// NOTIFY and no poll in between.
+    ///
+    /// Defaults to `true`. Trade-off to know before relying on it: a
+    /// born-claimed spawn is dispatched as soon as capacity allows,
+    /// independent of how much OLDER due backlog of this (or any) type is
+    /// still sitting `pending` — the ordinary claim path's oldest-first
+    /// admission (see PERFORMANCE.md, "Queue fairness: oldest-first") does
+    /// not apply to it. For a type whose callers rely on roughly FIFO
+    /// service against its own backlog (rather than per-queue ordering,
+    /// which is unaffected — a queue can have only one live row either way),
+    /// override this to `false` and it always lands `pending`/`parked` like
+    /// today.
+    fn short_circuit(&self) -> bool {
+        true
+    }
+
     /// Produce a runner instance for the provided job.
     ///
     /// The spawner parameter allows the runner to spawn additional jobs of the

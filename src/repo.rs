@@ -145,7 +145,16 @@ impl JobRepo {
         let row = sqlx::query_as!(
             JobExecutionRow,
             r#"
-            SELECT je.state AS "state: JobExecutionState", je.execute_at, je.attempt_index,
+            -- `parked` is purely a claim-time implementation detail (see
+            -- migrations, PERFORMANCE.md "Claim admission"): a parked row is
+            -- a queued job blocked behind its queue's active row, which is
+            -- exactly what "pending, not yet claimable" already meant to
+            -- every caller before this state existed. Masking it here keeps
+            -- `JobExecutionState`/`JobStatus` a two-value public contract
+            -- (`Pending`/`Running`) with no API surface change for it.
+            SELECT (CASE WHEN je.state = 'parked' THEN 'pending' ELSE je.state END)
+                       AS "state!: JobExecutionState",
+                   je.execute_at, je.attempt_index,
                    je.alive_at, cp.execution_state_json AS "execution_state_json?"
             FROM job_executions je
             LEFT JOIN job_execution_states cp ON cp.id = je.id

@@ -551,7 +551,16 @@ impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
         clock: ClockHandle,
         notifier: Arc<crate::notifier::JobEventNotifier>,
     ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error>> {
-        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), clock, notifier);
+        // Always-empty handle: fan-out spawns from within a batch runner
+        // take the ordinary insert path (see the identical comment on
+        // `registry.rs`'s `impl<T: JobInitializer> AnyJobInitializer`).
+        let spawner = JobSpawner::<T::Config>::new(
+            repo,
+            self.job_type(),
+            clock,
+            notifier,
+            Arc::new(std::sync::OnceLock::new()),
+        );
         let runner = BatchedJobInitializer::init(self, spawner)?;
         Ok(Box::new(ErasedBatchedRunner::new(runner)))
     }

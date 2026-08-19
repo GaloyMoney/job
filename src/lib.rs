@@ -427,6 +427,10 @@ pub struct Jobs {
     tracker: Arc<JobTracker>,
     notifier: Arc<notifier::JobEventNotifier>,
     poller_handle: Option<Arc<JobPollerHandle>>,
+    /// Shared with every [`JobSpawner`] minted via [`Self::add_initializer`]/
+    /// [`Self::add_batched_initializer`]; populated once [`Self::start_poll`]
+    /// runs. See `poller::PollerHandle`.
+    poller_ref: PollerHandle,
     clock: ClockHandle,
 }
 
@@ -479,6 +483,7 @@ impl Jobs {
             tracker,
             notifier,
             poller_handle: None,
+            poller_ref: Arc::new(std::sync::OnceLock::new()),
             clock,
         })
     }
@@ -649,14 +654,21 @@ impl Jobs {
             Arc::clone(&self.router),
             Arc::clone(&self.notifier),
             self.clock.clone(),
-        );
+        )
+        .await?;
 
         tracker.set_job_types(poller.registered_job_types());
 
         let (listener_handle, waiter_handle) = self.router.start(Arc::clone(&tracker)).await?;
 
         let poller_handle = poller.start(listener_handle, waiter_handle);
-        self.poller_handle = Some(Arc::new(poller_handle));
+        let poller_handle = Arc::new(poller_handle);
+        // Populate the short-circuit spawn handle every existing (and
+        // future) `JobSpawner` shares. `OnceLock::set` is infallible here:
+        // `start_poll` panics on a second call before reaching this point
+        // (see the registry `.take()` above), so this can only ever run once.
+        let _ = self.poller_ref.set(Arc::downgrade(poller_handle.poller()));
+        self.poller_handle = Some(poller_handle);
         Ok(())
     }
 
@@ -685,6 +697,7 @@ impl Jobs {
             job_type,
             self.clock.clone(),
             Arc::clone(&self.notifier),
+            Arc::clone(&self.poller_ref),
         )
     }
 
@@ -719,11 +732,15 @@ impl Jobs {
                 .expect("Registry has been consumed by executor")
                 .add_batched_initializer(initializer)
         };
+        // `try_short_circuit_spawn` refuses batched types itself
+        // (`registry.is_batched`), so sharing the real handle here is safe —
+        // it's simply never taken for this type.
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
             self.clock.clone(),
             Arc::clone(&self.notifier),
+            Arc::clone(&self.poller_ref),
         )
     }
 

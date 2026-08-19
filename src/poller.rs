@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use serde_json::Value as JsonValue;
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tracing::{Instrument, Span, instrument};
 
 use std::{
@@ -26,8 +26,9 @@ use super::{
     notifier::JobEventNotifier,
     registry::JobRegistry,
     repo::JobRepo,
+    spawner::swap_older_parked_siblings_in_op,
     task::OwnedTaskHandle,
-    tracker::JobTracker,
+    tracker::{JobTracker, UnitReservation},
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -61,10 +62,41 @@ pub(crate) struct JobPoller {
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
     clock: ClockHandle,
+    /// Dedicated small pool for the claim query alone (see [`build_poll_pool`]):
+    /// its session-level plan-cache/bitmap-scan overrides must never leak onto
+    /// the shared application pool, so the claim never borrows a connection
+    /// from `repo`'s pool.
+    poll_pool: PgPool,
+}
+
+/// A tiny dedicated pool for [`poll_jobs`], reusing the main pool's connect
+/// options. The claim query needs `plan_cache_mode = force_generic_plan` and
+/// `enable_bitmapscan = off` (see PERFORMANCE.md, "Ordered index access is
+/// mandatory") on every connection it runs on; setting them once per
+/// connection here — instead of `SET LOCAL` inside a `BEGIN`/`COMMIT` on every
+/// poll — turns the claim into a single autocommit statement (5 round trips
+/// down to 1) without ever touching a connection the application pool might
+/// hand to unrelated queries.
+async fn build_poll_pool(main_pool: &PgPool) -> Result<PgPool, sqlx::Error> {
+    let options: PgConnectOptions = (*main_pool.connect_options()).clone();
+    PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET plan_cache_mode = force_generic_plan")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("SET enable_bitmapscan = off")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await
 }
 
 pub(crate) struct JobPollerHandle {
-    #[allow(dead_code)]
     poller: Arc<JobPoller>,
     #[allow(dead_code)]
     handle: OwnedTaskHandle,
@@ -73,6 +105,14 @@ pub(crate) struct JobPollerHandle {
     #[allow(dead_code)]
     router_waiter_handle: OwnedTaskHandle,
     shutdown: Arc<ShutdownCoordinator>,
+}
+
+impl JobPollerHandle {
+    /// This process's poller, for populating [`PollerHandle`]s (the
+    /// short-circuit spawn fast path).
+    pub(crate) fn poller(&self) -> &Arc<JobPoller> {
+        &self.poller
+    }
 }
 
 /// Drives the shutdown sequence for one poller instance.
@@ -99,26 +139,36 @@ struct ShutdownCoordinator {
     clock: ClockHandle,
 }
 
+/// A late-bound handle to this process's `JobPoller`, shared by every
+/// [`crate::JobSpawner`] minted via `Jobs::add_initializer`/
+/// `add_batched_initializer`. Empty until [`crate::Jobs::start_poll`] runs
+/// (a spawn attempted before that has no poller to short-circuit through and
+/// simply falls back to the ordinary insert — there is nothing to dispatch
+/// with yet), and never re-set afterward. `Weak` so a spawner never keeps
+/// the poller alive on its own.
+pub(crate) type PollerHandle = Arc<std::sync::OnceLock<std::sync::Weak<JobPoller>>>;
+
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
 /// How far past its admission budget a poll gathers candidates, so
 /// `FOR UPDATE ... SKIP LOCKED` has somewhere to fall through when a peer
 /// instance holds locks on the rows this poll would target. Sized for
-/// contention, not for filtering. See PERFORMANCE.md, "Contention headroom".
+/// contention, not for filtering.
 ///
-/// This is the resting value. The candidate window bounds ROWS while the
-/// budget counts QUEUES, so a poll that lands on deep queues under-fills;
-/// `MAX_CONTENTION_HEADROOM` is how far the poll loop may widen in response.
+/// Fixed, not adaptive: under the parked-row design `state = 'pending'`
+/// contains only already-claimable rows (one per queue at most), so the
+/// window is no longer bounded by ROWS while the budget counts QUEUES --
+/// every window row is a candidate, and a queue's blocked backlog never
+/// enters the window at all (it is `parked`). The old adaptive-widening
+/// ladder existed solely to compensate for that row/queue mismatch and is
+/// gone with it; this constant now only needs to survive `SKIP LOCKED`
+/// fall-through, which a small fixed overscan does. See PERFORMANCE.md,
+/// "Contention headroom".
 const CONTENTION_HEADROOM: i32 = 4;
 
-/// Ceiling for the adaptive widening described on [`CONTENTION_HEADROOM`].
-/// Reached only where every widening step still came up short -- queues deep
-/// enough that eight rows are scanned per claimable head. See PERFORMANCE.md,
-/// "Contention headroom".
-const MAX_CONTENTION_HEADROOM: i32 = 32;
-
 impl JobPoller {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
         config: JobPollerConfig,
         repo: Arc<JobRepo>,
         registry: JobRegistry,
@@ -126,11 +176,12 @@ impl JobPoller {
         router: Arc<JobNotificationRouter>,
         notifier: Arc<JobEventNotifier>,
         clock: ClockHandle,
-    ) -> Self {
+    ) -> Result<Self, sqlx::Error> {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >(1);
-        Self {
+        let poll_pool = build_poll_pool(repo.pool()).await?;
+        Ok(Self {
             tracker,
             notifier,
             repo,
@@ -140,7 +191,8 @@ impl JobPoller {
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
             clock,
-        }
+            poll_pool,
+        })
     }
 
     pub fn registered_job_types(&self) -> Vec<JobType> {
@@ -215,16 +267,12 @@ impl JobPoller {
     ) {
         let mut failures = 0;
         let mut woken_up = false;
-        // Candidate-window multiplier, in memory and private to this instance.
-        // Rests at `CONTENTION_HEADROOM` and widens only while polls report
-        // that the window itself was the binding constraint.
-        let mut headroom = CONTENTION_HEADROOM;
         loop {
             if *poll_stop_rx.borrow_and_update() {
                 break;
             }
 
-            let timeout = match self.poll_and_dispatch(woken_up, &mut headroom).await {
+            let timeout = match self.poll_and_dispatch(woken_up).await {
                 Ok(duration) => {
                     failures = 0;
                     duration
@@ -263,11 +311,7 @@ impl JobPoller {
         skip(self),
         fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in)
     )]
-    async fn poll_and_dispatch(
-        self: &Arc<Self>,
-        woken_up: bool,
-        headroom: &mut i32,
-    ) -> Result<Duration, JobError> {
+    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
         let span = Span::current();
         span.record("poller_id", tracing::field::display(self.instance_id));
         let Some(n_jobs_to_poll) = self.tracker.next_batch_size() else {
@@ -284,41 +328,18 @@ impl JobPoller {
         }
 
         let result = poll_jobs(
-            self.repo.pool(),
+            &self.poll_pool,
             n_jobs_to_poll,
             self.instance_id,
             &plan.types,
             &plan.row_limits,
-            *headroom,
+            CONTENTION_HEADROOM,
             &self.clock,
         )
         .await?;
 
-        // Widen only while the WINDOW was the binding constraint -- it filled
-        // and still produced fewer candidates than the budget, which is what
-        // deep or clustered queues do to a row-bounded scan. A budget lost to
-        // peers or to type caps does not set this, because widening would only
-        // buy a bigger scan for the same result. One saturated poll drops it
-        // straight back, so the common shallow-queue case never pays for the
-        // deep one. See PERFORMANCE.md, "Contention headroom".
-        let short = result.window().candidates_short;
-        // A poll that is about to widen must not sleep first. A full window
-        // read only a PREFIX of the due pollable rows, so claimable heads may
-        // sit past it -- already due, and therefore invisible to
-        // `next_due_at`. Re-polling at the SAME width would spin at zero
-        // yield, so the re-poll is conditioned on the width actually growing:
-        // that bounds it to the widening ladder (4 -> 8 -> 16 -> 32), and each
-        // step looks strictly further than the last.
-        let widening = short && *headroom < MAX_CONTENTION_HEADROOM;
-        *headroom = if short {
-            (*headroom * 2).min(MAX_CONTENTION_HEADROOM)
-        } else {
-            CONTENTION_HEADROOM
-        };
-
-        let (rows, mut window) = match result {
-            JobPollResult::WaitTillNextJob(mut window) => {
-                window.may_have_more |= widening;
+        let (rows, window) = match result {
+            JobPollResult::WaitTillNextJob(window) => {
                 // Fresh clock read: a duration captured earlier can go stale under a manual clock.
                 let duration = window.sleep_for(self.clock.now());
                 span.record("next_poll_in", tracing::field::debug(duration));
@@ -327,43 +348,8 @@ impl JobPoller {
             }
             JobPollResult::Jobs { jobs, window } => (jobs, window),
         };
-        window.may_have_more |= widening;
         let jobs_len = rows.len();
         span.record("n_jobs_to_start", jobs_len);
-        if !rows.is_empty() {
-            let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
-            let mut entities = self.repo.find_all::<Job>(&ids).await?;
-            // Claims for batched types are collected here rather than
-            // dispatched one by one: the poll query guarantees at most one row
-            // per queue_id, so a type's claims from a single poll are exactly
-            // the set that may be executed together.
-            let mut batched: HashMap<JobType, Vec<RawBatchItem>> = HashMap::new();
-            for row in rows {
-                let Some(job) = entities.remove(&row.id) else {
-                    tracing::error!(
-                        job_id = %row.id,
-                        "claimed job row has no entity; skipping dispatch"
-                    );
-                    continue;
-                };
-                if self.registry.is_batched(&job.job_type) {
-                    batched
-                        .entry(job.job_type.clone())
-                        .or_default()
-                        .push(RawBatchItem {
-                            attempt: row.attempt,
-                            queue_id: row.queue_id,
-                            execution_state_json: row.data_json,
-                            job,
-                        });
-                } else {
-                    self.dispatch_job(job, row).await?;
-                }
-            }
-            for (job_type, items) in batched {
-                self.dispatch_batches(job_type, items).await?;
-            }
-        }
 
         // Full claim: budget was the limit, drain immediately. Partial claim: sleep,
         // unless `may_have_more` says the due backlog wasn't fully seen this poll.
@@ -373,7 +359,72 @@ impl JobPoller {
             window.sleep_for(self.clock.now())
         };
         span.record("next_poll_in", tracing::field::debug(next_poll_in));
+
+        // NOT detached from the poll loop, despite the handoff this
+        // implements suggesting it (§2.8's "move find_all + dispatch off the
+        // poll loop"). Tried it; reverted. `dispatch_job`/`dispatch_batches`
+        // do two things synchronously that a detached continuation makes
+        // late instead: (a) `tracker.dispatch_job`/`dispatch_batch`, which
+        // `plan_claim` reads on the NEXT poll -- late, a poll immediately
+        // following a full claim (`next_poll_in` is `Duration::ZERO`, the
+        // common case under load) can race ahead of the continuation and
+        // claim a second full batch against a slot budget the tracker hasn't
+        // heard is spoken for yet, observed unbounded under sustained load in
+        // `claims_are_capped_by_free_batch_slots`; (b) the dispatch task's
+        // `shutdown_tx.subscribe()`, which `tokio::sync::broadcast` only
+        // delivers to if it happened before `ShutdownCoordinator::perform`'s
+        // broadcast -- late, a shutdown landing between this poll returning
+        // and the continuation actually running broadcasts to no one,
+        // reproduced as force-aborted (not drained) executions in
+        // `shutdown_drains_self_rescheduling_jobs`. Both are call-site
+        // proofs that this optimization needs the slot claim AND the
+        // shutdown subscription to stay synchronous with the poll loop;
+        // deferring only `find_all` would still need threading a
+        // pre-reservation through, which is a larger, riskier change than
+        // this PR's budget covers cleanly. Left for a follow-up.
+        if !rows.is_empty() {
+            self.load_and_dispatch_claimed(rows).await?;
+        }
+
         Ok(next_poll_in)
+    }
+
+    /// Load the entities for a poll's claimed rows and hand each off to the
+    /// per-job or batched dispatcher.
+    async fn load_and_dispatch_claimed(&self, rows: Vec<PolledJob>) -> Result<(), JobError> {
+        let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
+        let mut entities = self.repo.find_all::<Job>(&ids).await?;
+        // Claims for batched types are collected here rather than
+        // dispatched one by one: the poll query guarantees at most one row
+        // per queue_id, so a type's claims from a single poll are exactly
+        // the set that may be executed together.
+        let mut batched: HashMap<JobType, Vec<RawBatchItem>> = HashMap::new();
+        for row in rows {
+            let Some(job) = entities.remove(&row.id) else {
+                tracing::error!(
+                    job_id = %row.id,
+                    "claimed job row has no entity; skipping dispatch"
+                );
+                continue;
+            };
+            if self.registry.is_batched(&job.job_type) {
+                batched
+                    .entry(job.job_type.clone())
+                    .or_default()
+                    .push(RawBatchItem {
+                        attempt: row.attempt,
+                        queue_id: row.queue_id,
+                        execution_state_json: row.data_json,
+                        job,
+                    });
+            } else {
+                self.dispatch_job(job, row).await?;
+            }
+        }
+        for (job_type, items) in batched {
+            self.dispatch_batches(job_type, items).await?;
+        }
+        Ok(())
     }
 
     fn start_lost_handler(&self) -> OwnedTaskHandle {
@@ -403,6 +454,7 @@ impl JobPoller {
                     instance_id = %instance_id,
                     n_live_jobs = self_live_ids.len(),
                     n_lost_jobs = tracing::field::Empty,
+                    n_orphaned_parked = tracing::field::Empty,
                 );
 
                 async {
@@ -433,6 +485,37 @@ impl JobPoller {
                                 "lost-handler failed to reclaim lost jobs"
                             );
                             Span::current().record("n_lost_jobs", 0);
+                        }
+                    }
+
+                    // Piggybacked on this same cadence: recover any queue
+                    // whose parked backlog has no active (pending/running)
+                    // row. In steady state this is the orphan race documented
+                    // on `insert_or_park_in_op` firing at ~0 -- a nonzero rate
+                    // here is a signal something upstream of it is wrong.
+                    match sweep_orphaned_parked_rows(&pool).await {
+                        Ok(promoted) => {
+                            Span::current().record("n_orphaned_parked", promoted.len());
+                            if !promoted.is_empty() {
+                                tracing::warn!(
+                                    n_orphaned_parked = promoted.len(),
+                                    "recovered orphaned parked rows"
+                                );
+                            }
+                            let mut reported: HashSet<String> = HashSet::new();
+                            for job_type in promoted {
+                                if reported.insert(job_type.clone()) {
+                                    notifier.execution_ready(&JobType::from_owned(job_type));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                exception.message = %e,
+                                exception.type = std::any::type_name_of_val(&e),
+                                "lost-handler failed to sweep orphaned parked rows"
+                            );
+                            Span::current().record("n_orphaned_parked", 0);
                         }
                     }
                 }
@@ -789,42 +872,164 @@ impl JobPoller {
             Arc::clone(&self.notifier),
         )?;
         let retry_settings = self.registry.retry_settings(&job.job_type).clone();
-        let repo = Arc::clone(&self.repo);
-        let tracker = self.tracker.clone();
-        let notifier = Arc::clone(&self.notifier);
-        let instance_id = self.instance_id;
-        let clock = self.clock.clone();
-        span.record("now", tracing::field::display(clock.now()));
-        span.record("poller_id", tracing::field::display(instance_id));
-
-        let shutdown_rx_job = self.shutdown_tx.subscribe();
-        let mut shutdown_rx_monitor = self.shutdown_tx.subscribe();
-        let shutdown_timeout = self.config.shutdown_timeout;
-        let job_id = job.id;
-        let job_type = job.job_type.clone();
-        let retains_state = self.registry.retains_state(&job_type);
-        #[cfg_attr(
-            not(all(feature = "tokio-task-names", tokio_unstable)),
-            allow(unused_variables)
-        )]
-        let task_name = format!("job-{}-{}", job_type, job_id);
+        let retains_state = self.registry.retains_state(&job.job_type);
+        span.record("now", tracing::field::display(self.clock.now()));
+        span.record("poller_id", tracing::field::display(self.instance_id));
 
         // Built here, not in the task: constructing the dispatcher claims the
         // type's per-process slot, and that must happen before the poll
         // loop's next iteration or it would claim rows against a slot
         // already spoken for (mirrors `dispatch_batch`).
         let dispatcher = JobDispatcher::new(
-            repo,
-            tracker,
-            notifier,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.tracker),
+            Arc::clone(&self.notifier),
             retry_settings,
-            job_id,
-            job_type.clone(),
+            job.id,
+            job.job_type.clone(),
             retains_state,
             runner,
-            instance_id,
-            clock,
+            self.instance_id,
+            self.clock.clone(),
         );
+        self.spawn_dispatch_task(dispatcher, job, polled_job);
+        Ok(())
+    }
+
+    /// Reserve capacity for a due-now spawn of `job_type`, consulting the
+    /// registry for its per-process cap. See [`JobTracker::try_reserve`].
+    fn try_reserve(self: &Arc<Self>, job_type: &JobType) -> Option<UnitReservation> {
+        let cap = self.registry.per_process_cap(job_type);
+        self.tracker.try_reserve(job_type, cap)
+    }
+
+    /// The short-circuit spawn fast path's entry point (`spawner.rs` reaches
+    /// this via the poller handle populated at
+    /// [`start_poll`](crate::Jobs::start_poll)).
+    ///
+    /// Not attempted at all (returns [`ShortCircuitOutcome::NotAttempted`],
+    /// caller does the ordinary insert) for: batched types (the collector
+    /// this would need is deferred -- see the handoff this implements),
+    /// types that opted out via `JobInitializer::short_circuit`, or when
+    /// reservation fails (process/type already at capacity -- the ordinary
+    /// path is exactly the fairness valve this falls back to).
+    pub(crate) async fn try_short_circuit_spawn(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        id: JobId,
+        job_type: &JobType,
+        queue_id: Option<&str>,
+        unique_key: Option<&str>,
+        schedule_at: DateTime<Utc>,
+    ) -> Result<ShortCircuitOutcome, JobError> {
+        if self.registry.is_batched(job_type) || !self.registry.short_circuit(job_type) {
+            return Ok(ShortCircuitOutcome::NotAttempted);
+        }
+        let Some(reservation) = self.try_reserve(job_type) else {
+            return Ok(ShortCircuitOutcome::NotAttempted);
+        };
+
+        let wall_now = chrono::Utc::now();
+        let landed_running = super::spawner::try_insert_born_claimed_in_op(
+            op,
+            id,
+            job_type,
+            queue_id,
+            unique_key,
+            self.instance_id,
+            schedule_at,
+            wall_now,
+        )
+        .await?;
+
+        if !landed_running {
+            reservation.release();
+            return Ok(ShortCircuitOutcome::Parked);
+        }
+
+        let hook = SpawnDispatchHook {
+            poller: Arc::downgrade(self),
+            reservation,
+            id,
+        };
+        // `add_commit_hook` can only fail if `op` carries no commit-hook
+        // buffer at all (mirrors `notifier.rs`'s identical fallback
+        // comment); if that ever happens here, the row is already `running`
+        // in the DB with nothing that will dispatch it until
+        // `reclaim_lost_jobs` eventually reclaims it on a stale `alive_at`
+        // -- correct, if slow, recovery, so this is not a hard error.
+        if op.add_commit_hook(hook).is_err() {
+            tracing::error!(
+                job_id = %id,
+                "short-circuit spawn could not register its dispatch hook; \
+                 the row will sit running until reclaim_lost_jobs recovers it"
+            );
+        }
+        Ok(ShortCircuitOutcome::Dispatching)
+    }
+
+    /// The short-circuit spawn fast path's dispatch entry point: called from
+    /// [`SpawnDispatchHook::post_commit`] once the born-claimed insert has
+    /// committed. Re-reads the entity by id rather than carrying the
+    /// spawner's own (at that point still being mutated with its
+    /// `ExecutionScheduled` event) `Job` value across the commit boundary --
+    /// one extra point read for the fast path only, not the `find_all` batch
+    /// the ordinary poll claim needs. Builds the runner and dispatcher
+    /// exactly like [`Self::dispatch_job`], but from an already-taken
+    /// [`UnitReservation`] rather than claiming a fresh slot.
+    async fn dispatch_job_from_reservation(
+        self: &Arc<Self>,
+        reservation: UnitReservation,
+        id: JobId,
+    ) -> Result<(), JobError> {
+        let job = self.repo.find_by_id(id).await?;
+        let polled_job = PolledJob {
+            id,
+            data_json: None,
+            attempt: 1,
+            queue_id: job.queue_id.clone(),
+        };
+        let runner = self.registry.init_job(
+            &job,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )?;
+        let retry_settings = self.registry.retry_settings(&job.job_type).clone();
+        let retains_state = self.registry.retains_state(&job.job_type);
+        let dispatcher = JobDispatcher::from_reservation(
+            reservation,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.tracker),
+            Arc::clone(&self.notifier),
+            retry_settings,
+            job.id,
+            job.job_type.clone(),
+            retains_state,
+            runner,
+            self.instance_id,
+            self.clock.clone(),
+        );
+        self.spawn_dispatch_task(dispatcher, job, polled_job);
+        Ok(())
+    }
+
+    /// Spawn the execution task and its shutdown-coordination monitor for an
+    /// already-built [`JobDispatcher`]. Shared by [`Self::dispatch_job`] and
+    /// [`Self::dispatch_job_from_reservation`] so the shutdown handshake
+    /// (`job.shutdown_coordination`, `#169`) has exactly one implementation.
+    fn spawn_dispatch_task(&self, dispatcher: JobDispatcher, job: Job, polled_job: PolledJob) {
+        let shutdown_rx_job = self.shutdown_tx.subscribe();
+        let mut shutdown_rx_monitor = self.shutdown_tx.subscribe();
+        let shutdown_timeout = self.config.shutdown_timeout;
+        let job_id = job.id;
+        let job_type = job.job_type.clone();
+        #[cfg_attr(
+            not(all(feature = "tokio-task-names", tokio_unstable)),
+            allow(unused_variables)
+        )]
+        let task_name = format!("job-{}-{}", job_type, job_id);
 
         spawn_named_task!(&task_name, async move {
             use tracing::Instrument;
@@ -896,8 +1101,66 @@ impl JobPoller {
                 }
             }
         });
+    }
+}
 
-        Ok(())
+/// Result of [`JobPoller::try_short_circuit_spawn`].
+pub(crate) enum ShortCircuitOutcome {
+    /// Nothing was inserted; the caller must perform the ordinary
+    /// `insert_or_park_in_op`.
+    NotAttempted,
+    /// The row landed `running`, byte-identical to a poll-claimed row (same
+    /// `state`/`poller_instance_id`/`alive_at`), and a commit hook is
+    /// registered to dispatch it once `op` commits. A crash between commit
+    /// and dispatch is covered exactly like any other claimed row:
+    /// `reclaim_lost_jobs` recovers it once `alive_at` goes stale.
+    Dispatching,
+    /// The queue's active slot was taken; the row already landed `parked`.
+    /// The caller must not insert again.
+    Parked,
+}
+
+/// Fires once the short-circuit spawn's `op` commits: hands the row to
+/// [`JobPoller::dispatch_job_from_reservation`]. Registered instead of
+/// dispatching inline because `post_commit` runs synchronously (mirrors
+/// `notifier.rs`'s `JobEventHook`) — the actual dispatch needs `.await`, so
+/// this spawns a detached task for it, same as the ordinary poll-claim path
+/// already does off the poll loop.
+struct SpawnDispatchHook {
+    poller: std::sync::Weak<JobPoller>,
+    reservation: UnitReservation,
+    id: JobId,
+}
+
+impl es_entity::operation::hooks::CommitHook for SpawnDispatchHook {
+    fn post_commit(self) {
+        let Some(poller) = self.poller.upgrade() else {
+            // The poller (and with it, the whole process's job service) is
+            // gone. The row is already committed `running`; nothing here can
+            // dispatch it, but nothing needs to release the reservation
+            // either -- the tracker it belonged to no longer exists.
+            return;
+        };
+        let id = self.id;
+        tokio::spawn(async move {
+            if let Err(e) = poller
+                .dispatch_job_from_reservation(self.reservation, id)
+                .await
+            {
+                tracing::error!(
+                    job_id = %id,
+                    exception.message = %e,
+                    exception.type = std::any::type_name_of_val(&e),
+                    "failed to dispatch a short-circuit-spawned job"
+                );
+            }
+        });
+    }
+
+    fn merge(&mut self, _other: &mut Self) -> bool {
+        // Never merge: each spawn's hook dispatches a distinct row and holds
+        // its own reservation, unlike `JobEventHook`'s idempotent notify set.
+        false
     }
 }
 
@@ -909,6 +1172,7 @@ async fn reclaim_lost_jobs(
     reschedule_at: DateTime<Utc>,
     self_live_ids: &[uuid::Uuid],
 ) -> Result<Vec<(JobId, JobType)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
     let rows = sqlx::query!(
         r#"
         UPDATE job_executions
@@ -925,10 +1189,59 @@ async fn reclaim_lost_jobs(
         instance_id,
         self_live_ids,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
+    // Invariant B: same ordering fixup as the dispatcher's retry/reschedule
+    // paths. A reclaimed row keeps its queue's active slot (it was already
+    // the sole `running` occupant), but an older parked sibling should run
+    // first during the reclaimed row's backoff. Applied to every queue this
+    // reclaim touched, in one statement; the promoted types don't need their
+    // own notify here since every reclaimed type is already notified below.
+    let reclaimed_uuids: Vec<uuid::Uuid> = rows.iter().map(|r| uuid::Uuid::from(r.id)).collect();
+    swap_older_parked_siblings_in_op(&mut tx, &reclaimed_uuids).await?;
+
+    tx.commit().await?;
     Ok(rows.into_iter().map(|r| (r.id, r.job_type)).collect())
+}
+
+/// Recover parked rows whose queue has no active (`pending`/`running`) row
+/// -- the orphan race documented on [`crate::spawner`]'s
+/// `insert_or_park_in_op`: a spawn conflicted against a queue's active slot
+/// and landed `parked`, but the occupant completed (and promoted nothing,
+/// since the parked row wasn't visible to it yet) before the parked insert
+/// committed. Piggybacked on the lost-handler's cadence (same task, one
+/// extra statement) rather than its own timer.
+///
+/// Returns the job type of every row promoted, so the caller can wake the
+/// pollers that cover it.
+async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        WITH orphan_queues AS (
+            SELECT DISTINCT p.queue_id
+            FROM job_executions p
+            WHERE p.state = 'parked'
+              AND NOT EXISTS (
+                  SELECT 1 FROM job_executions a
+                  WHERE a.queue_id = p.queue_id AND a.state IN ('pending', 'running')
+              )
+        ), heads AS (
+            SELECT h.id FROM orphan_queues oq
+            CROSS JOIN LATERAL (
+                SELECT id FROM job_executions
+                WHERE state = 'parked' AND queue_id = oq.queue_id
+                ORDER BY execute_at, id
+                LIMIT 1
+            ) h
+        )
+        UPDATE job_executions je SET state = 'pending'
+        FROM heads h WHERE je.id = h.id
+        RETURNING je.job_type
+        "#,
+    )
+    .fetch_all(pool)
+    .await
 }
 
 #[instrument(
@@ -954,103 +1267,53 @@ async fn poll_jobs(
     let wall_now = chrono::Utc::now();
     Span::current().record("now", tracing::field::display(sim_now));
 
-    // Both overrides are scoped to this transaction so they never leak onto
-    // other statements on the caller-shared pool.
-    //
-    // Generic plan: auto never picks it here, so every poll would otherwise
-    // re-plan the whole CTE tower (35-54ms vs sub-ms exec). No bitmap scans:
-    // the candidate window and the unqueued scan depend on ORDERED index
-    // access, and a bitmap scan returns heap order instead. See PERFORMANCE.md, "Ordered
-    // index access is mandatory".
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("SET LOCAL enable_bitmapscan = off")
-        .execute(&mut *tx)
-        .await?;
-
+    // A single autocommit statement on `pool` -- a dedicated pool
+    // (`build_poll_pool`) whose connections already carry
+    // `plan_cache_mode = force_generic_plan` / `enable_bitmapscan = off` from
+    // `after_connect`, so there is no `BEGIN`/`SET LOCAL`/`COMMIT` here to pay
+    // for on every poll (5 round trips -> 1). See PERFORMANCE.md, "Ordered
+    // index access is mandatory", for why both overrides are needed at all.
     let rows = sqlx::query_as!(
         JobPollRow,
         r#"
-        -- Claim admission. Queued and unqueued rows are gathered separately so
-        -- that neither can starve the other, and each type is bounded by its
-        -- own budget. See PERFORMANCE.md ("Claim admission") for the
-        -- measurements behind this shape.
+        -- Claim admission, head-only. `state = 'pending'` contains ONLY
+        -- already-claimable rows: a queue's blocked backlog is `parked`
+        -- instead (promoted at completion time -- see
+        -- `dispatcher.rs::delete_execution_in_op`), so queued and unqueued
+        -- rows share one ordered scan with no anti-join and no per-queue
+        -- LATERAL. See PERFORMANCE.md ("Claim admission") for the shape this
+        -- replaced and the measurements behind this one.
         WITH limits AS (
-            SELECT l.job_type, l.row_limit
+            -- `type_window_limit` is each type's OWN admission budget for
+            -- step 1, not a shared global one: a type's window is bounded by
+            -- its own row_limit (never by another type's backlog), which is
+            -- what stops one backlogged type from crowding a due row of
+            -- another type out of the window entirely. Pinned by
+            -- `capped_type_backlog_does_not_starve_another_type` and (for
+            -- batched types) `claims_are_capped_by_free_batch_slots`.
+            SELECT l.job_type, l.row_limit,
+                   LEAST(l.row_limit, $1::int4) * $7::int4 AS type_window_limit
             FROM UNNEST($4::text[], $6::int4[]) AS l(job_type, row_limit)
             WHERE l.row_limit > 0
         ),
-        queued_window AS (
-            -- WHICH QUEUES TO EXAMINE, bounded by what this poll can ADMIT
-            -- ($1 x $7 rows), never by how much is pending: cost is O(budget),
-            -- flat in backlog and in queue count.
-            --
-            -- The blocked-queue anti-join runs INSIDE the window, below the
-            -- LIMIT. That placement is the whole design: a queue whose job is
-            -- already running contributes no rows at all, so its backlog can
-            -- never crowd claimable work out of the budget. Filtering after a
-            -- LIMIT instead is what produced the zero-claim cliff. See
-            -- PERFORMANCE.md, "Queued rows: two steps, both bounded by the budget".
-            --
-            -- Ordering is `(execute_at, id)` and the tiebreak is load-bearing:
-            -- it makes the order TOTAL, so the window is a well-defined prefix
-            -- rather than an arbitrary cut through a group of rows sharing a
-            -- timestamp (bulk spawns give a whole batch one).
-            --
-            -- Filtering by type is safe HERE, and only here: this decides
-            -- which queues get looked at, not which row of a queue is its
-            -- head. $4 is instance-dependent -- `plan_claim` drops saturated
-            -- types -- so two instances legitimately examine different queues.
-            SELECT je.queue_id, je.execute_at, je.id
-            FROM job_executions je
-            WHERE je.state = 'pending'
-              AND je.queue_id IS NOT NULL
-              AND je.execute_at <= $2::timestamptz
-              AND je.job_type = ANY($4)
-              AND NOT EXISTS (
-                    SELECT 1 FROM job_executions r
-                    WHERE r.state = 'running' AND r.queue_id = je.queue_id)
-            ORDER BY je.execute_at, je.id
-            LIMIT $1::int4 * $7::int4
-        ),
-        due_queued AS (
-            -- One row per examined queue: its oldest due row, chosen WITHOUT
-            -- reference to type and only then dropped if that type is not
-            -- pollable here. That order matters -- picking the oldest
-            -- *pollable* row instead would let two instances with different
-            -- saturated types select DIFFERENT rows of the same queue and both
-            -- claim, breaking queue exclusion. Deciding the row identically
-            -- everywhere is what makes a peer's lock on it visible as "this
-            -- queue is taken" rather than "try the next row down".
-            SELECT h.id, h.execute_at, h.job_type
-            FROM (SELECT DISTINCT queue_id FROM queued_window) e
-            CROSS JOIN LATERAL (
-                SELECT je.id, je.execute_at, je.job_type
-                FROM job_executions je
-                WHERE je.state = 'pending' AND je.queue_id = e.queue_id
-                  AND je.execute_at <= $2::timestamptz
-                ORDER BY je.execute_at, je.id
-                LIMIT 1
-            ) h
-            WHERE h.job_type IN (SELECT job_type FROM limits)
-        ),
-        due_plain AS (
-            -- Unqueued rows can never be blocked by a sibling, so they come
-            -- straight off their own partial index in execute_at order,
-            -- bounded per type. Pre-filtering by type is safe here precisely
-            -- because there is no queue exclusion to agree on.
+        window_rows AS (
+            -- One LATERAL probe per type, each bounded by ITS OWN budget
+            -- ($1 x $7 rows capped at that type's own row_limit), never by
+            -- how much is pending: cost is O(budget), flat in backlog.
+            -- Ordering is `(execute_at, id)` and the tiebreak is load-bearing
+            -- for the same reason it always was -- a total order, so each
+            -- type's window is a well-defined prefix rather than an
+            -- arbitrary cut through a group of rows sharing a timestamp.
             SELECT d.id, d.execute_at, d.job_type
             FROM limits t
             CROSS JOIN LATERAL (
                 SELECT je.id, je.execute_at, je.job_type
                 FROM job_executions je
-                WHERE je.state = 'pending' AND je.queue_id IS NULL
+                WHERE je.state = 'pending'
                   AND je.job_type = t.job_type
                   AND je.execute_at <= $2::timestamptz
-                ORDER BY je.execute_at
-                LIMIT LEAST(t.row_limit, $1::int4) * $7::int4
+                ORDER BY je.execute_at, je.id
+                LIMIT t.type_window_limit
             ) d
         ),
         ordered_candidates AS (
@@ -1062,14 +1325,15 @@ async fn poll_jobs(
                    ROW_NUMBER() OVER (
                        PARTITION BY job_type ORDER BY execute_at
                    ) AS type_rn
-            FROM (SELECT * FROM due_plain UNION ALL SELECT * FROM due_queued) u
+            FROM window_rows
         ),
         locked AS (
             -- The join to job_executions sits BELOW the LIMIT so it runs
             -- lazily: only rows LockRows actually pulls get probed. The sort
             -- above is a blocking node, so the full candidate set is still
-            -- materialised and SKIP LOCKED falls through a contended head
-            -- exactly as before.
+            -- materialised and SKIP LOCKED falls through a contended row
+            -- exactly as before -- `headroom` still exists solely to give it
+            -- somewhere to fall through to; see the constant's doc comment.
             --
             -- FOR UPDATE OF je: bare FOR UPDATE errors on a nullable join side.
             SELECT je.id, je.attempt_index, c.job_type, c.execute_at
@@ -1080,12 +1344,12 @@ async fn poll_jobs(
             FOR UPDATE OF je SKIP LOCKED
         ),
         selected_jobs AS (
-            -- The budget is enforced HERE, on rows actually held: the scans
-            -- above deliberately over-gather (see $7) so there is something to
-            -- fall through to when a peer holds the head. Rows over a type's
-            -- cap are simply not claimed; their locks release at commit.
-            -- execution_state_json is joined after the LIMIT, so it is fetched
-            -- only for winners.
+            -- The budget is enforced HERE, on rows actually held: the window
+            -- deliberately over-gathers (see $7) so there is something to
+            -- fall through to when a peer holds a row. Rows over a type's cap
+            -- are simply not claimed; their locks release at commit.
+            -- execution_state_json is joined after the LIMIT, so it is
+            -- fetched only for winners.
             SELECT t.id, cp.execution_state_json AS data_json, t.attempt_index
             FROM (
                 SELECT l.*,
@@ -1113,40 +1377,30 @@ async fn poll_jobs(
             AND job_type = ANY($4)
             AND execute_at > $2::timestamptz
         ),
+        window_counts AS (
+            SELECT job_type, COUNT(*) AS cnt FROM window_rows GROUP BY job_type
+        ),
         poll_status AS (
             -- Re-poll immediately only when this poll provably left claimable
-            -- work behind: it filled its budget, or it saw candidates it could
-            -- not take because a peer held them.
-            --
-            -- A window that came back short means every claimable due row was
-            -- examined, so `next_due_at` is the honest next deadline. Blocked
-            -- queues are covered by a wake rather than a spin:
-            -- `delete_execution_in_op` reports `execution_ready` when it frees
-            -- one.
-            --
-            -- A FULL window that yielded no pollable head does NOT report here
-            -- -- but it must not sleep either, and `poll_and_dispatch` is what
-            -- keeps it awake. Hitting the LIMIT only means a PREFIX of due
-            -- pollable rows was read: rows sitting behind a head this instance
-            -- has saturated still consume the window, so claimable heads past
-            -- it went unseen. Those are already due, so `next_due_at` does not
-            -- cover them. Re-polling at the same width would spin at zero
-            -- yield, which is why the answer is to widen and re-poll rather
-            -- than either sleep or spin -- see `candidates_short` below.
-            --
-            -- `candidates_short` drives the adaptive window (see
-            -- `poll_and_dispatch`). The window bounds ROWS but candidates are
-            -- QUEUES, so its yield is divided by the average depth of the
-            -- queues it lands on. When those rows cluster into few queues the
-            -- poll under-fills its budget while claimable work sits just past
-            -- the window; widening is the only thing that helps, and this is
-            -- the signal that distinguishes it from a budget lost to peers or
-            -- to type caps, which widening would not fix.
+            -- work behind: it filled its budget, or at least one type's OWN
+            -- window came back full while still yielding at least one
+            -- pollable candidate overall (rows past that type's window are
+            -- unseen and already due). A window that came back short for
+            -- every type means every claimable due row was examined, so
+            -- `next_due_at` is the honest next deadline -- exact now, not
+            -- merely a heuristic: every window row is by construction
+            -- already a candidate (no anti-join can discard one after the
+            -- fact the way the old design required). Blocked queues are
+            -- covered by a wake rather than a spin: `delete_execution_in_op`/
+            -- the orphan sweeper report `execution_ready` when a queue's
+            -- head is promoted.
             SELECT ((SELECT COUNT(*) FROM locked) >= $1
-                 OR ((SELECT COUNT(*) FROM queued_window) >= $1::int4 * $7::int4
-                     AND (SELECT COUNT(*) FROM due_queued) > 0)) AS may_have_more,
-                   ((SELECT COUNT(*) FROM queued_window) >= $1::int4 * $7::int4
-                AND (SELECT COUNT(*) FROM ordered_candidates) < $1) AS candidates_short
+                 OR (EXISTS (
+                        SELECT 1 FROM window_counts wc
+                        JOIN limits t ON t.job_type = wc.job_type
+                        WHERE wc.cnt >= t.type_window_limit
+                     )
+                     AND (SELECT COUNT(*) FROM ordered_candidates) > 0)) AS may_have_more
         )
         SELECT * FROM (
             SELECT
@@ -1155,8 +1409,7 @@ async fn poll_jobs(
                 u.attempt_index AS "attempt_index?",
                 u.queue_id AS "queue_id?",
                 NULL::TIMESTAMPTZ AS "next_due_at?",
-                ps.may_have_more AS "may_have_more!",
-                ps.candidates_short AS "candidates_short!"
+                ps.may_have_more AS "may_have_more!"
             FROM updated u, poll_status ps
             UNION ALL
             SELECT
@@ -1165,8 +1418,7 @@ async fn poll_jobs(
                 NULL::INT AS "attempt_index?",
                 NULL::VARCHAR AS "queue_id?",
                 mw.next_due_at AS "next_due_at?",
-                ps.may_have_more AS "may_have_more!",
-                ps.candidates_short AS "candidates_short!"
+                ps.may_have_more AS "may_have_more!"
             FROM min_wait mw, poll_status ps
         ) AS result
         "#,
@@ -1178,9 +1430,8 @@ async fn poll_jobs(
         row_limits,
         headroom,
     )
-    .fetch_all(&mut *tx)
+    .fetch_all(pool)
     .await?;
-    tx.commit().await?;
 
     Span::current().record("n_jobs_found", rows.len());
     Ok(JobPollResult::from_rows(rows))
@@ -1192,9 +1443,6 @@ async fn poll_jobs(
 struct PollWindow {
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
-    /// The candidate window hit its LIMIT and still yielded fewer candidates
-    /// than the budget -- the poll was bounded by the window, not by the work.
-    candidates_short: bool,
 }
 
 impl PollWindow {
@@ -1226,18 +1474,9 @@ struct JobPollRow {
     queue_id: Option<String>,
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
-    candidates_short: bool,
 }
 
 impl JobPollResult {
-    /// The poll window, whichever variant this is.
-    fn window(&self) -> &PollWindow {
-        match self {
-            JobPollResult::Jobs { window, .. } => window,
-            JobPollResult::WaitTillNextJob(window) => window,
-        }
-    }
-
     /// Convert raw query rows into a JobPollResult. The min-wait row (`id`
     /// NULL) is present in every result set; row order is not assumed.
     pub fn from_rows(rows: Vec<JobPollRow>) -> Self {
@@ -1245,11 +1484,9 @@ impl JobPollResult {
         let mut window = PollWindow {
             next_due_at: None,
             may_have_more: false,
-            candidates_short: false,
         };
         for row in rows {
             window.may_have_more = row.may_have_more;
-            window.candidates_short = row.candidates_short;
             match (row.id, row.attempt_index) {
                 (Some(id), Some(attempt_index)) => jobs.push(PolledJob {
                     id,
@@ -1886,14 +2123,13 @@ mod tests {
 
     /// A blocked queue's backlog must not consume the admission budget.
     ///
-    /// This is the zero-claim cliff, and it is the reason the blocked-queue
-    /// anti-join sits INSIDE the candidate window rather than after its LIMIT.
-    /// A queue with a job already running yields nothing no matter how many
-    /// due rows it holds, so if its rows are allowed to fill the window first
-    /// and get filtered afterwards, a single deep queue starves every other
-    /// queue — and worse, it re-fills the window on the next poll, so the
-    /// poller spins at zero yield. See PERFORMANCE.md, "Queued rows: two
-    /// steps, both bounded by the budget".
+    /// This is the zero-claim cliff. Under the parked-row design a blocked
+    /// queue's backlog is `parked`, not `pending` — it never enters
+    /// `state = 'pending'` at all, so it structurally cannot appear in the
+    /// claim window no matter how deep it is (the old design instead relied
+    /// on an anti-join running INSIDE the window; this pins the same
+    /// user-visible guarantee under the new mechanism). See PERFORMANCE.md,
+    /// "Claim admission".
     #[tokio::test]
     async fn blocked_queue_backlog_does_not_consume_the_budget() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -1906,7 +2142,8 @@ mod tests {
 
         // The blocked queue already has a job running, and holds far more due
         // rows than the whole candidate window (n * CONTENTION_HEADROOM), all
-        // of them OLDER than the claimable work below.
+        // of them OLDER than the claimable work below -- parked, per
+        // Invariant A (only one pending/running row may exist per queue).
         seed_queued_job(&pool, &job_type, &hot_queue, base, "running").await?;
         for i in 0..(n_jobs_to_poll as i64 * CONTENTION_HEADROOM as i64 * 3) {
             seed_queued_job(
@@ -1914,7 +2151,7 @@ mod tests {
                 &job_type,
                 &hot_queue,
                 base + chrono::Duration::seconds(i),
-                "pending",
+                "parked",
             )
             .await?;
         }
@@ -1963,337 +2200,228 @@ mod tests {
         Ok(())
     }
 
-    /// A queue's head is resolved WITHOUT reference to which types this
-    /// instance can currently poll — the exclusion-critical property.
+    /// Invariant A, at the schema level: `idx_job_executions_queue_active`
+    /// (`UNIQUE (queue_id) WHERE state IN ('pending','running') AND queue_id
+    /// IS NOT NULL`) is now the ONLY enforcement of queue exclusion — this
+    /// replaces the claim-time head-resolution guarantee the two deleted
+    /// tests (`queue_head_is_resolved_independently_of_saturated_types`,
+    /// `tied_execute_at_resolves_one_stable_queue_head`) used to pin: with at
+    /// most one pending/running row per queue possible in the first place,
+    /// there is no "which row is the head" question left for differently
+    /// saturated instances to disagree about.
     ///
-    /// Instances saturate different types at different moments, so `$4` and
-    /// `limits` are instance-local. If the head were picked as "oldest
-    /// *pollable* row", an instance with type X saturated would pick a queue's
-    /// X-blocked second row while a peer picked its first, and both would
-    /// claim from one queue. Picking the oldest row outright and only then
-    /// dropping it if its type is unpollable makes a peer's lock read as "this
-    /// queue is taken" rather than "try the next row down".
+    /// Exercises the constraint directly at the SQL level (not through
+    /// `insert_or_park_in_op`, which is covered by `spawner`'s own tests):
+    /// two concurrent raw inserts racing for one queue's active slot must
+    /// leave exactly one `pending` row, with the loser's insert failing on
+    /// this exact index.
     #[tokio::test]
-    async fn queue_head_is_resolved_independently_of_saturated_types() -> anyhow::Result<()> {
+    async fn queue_active_unique_index_enforces_exclusion() -> anyhow::Result<()> {
         let pool = init_pool().await?;
-        let saturated = format!("sat-{}", uuid::Uuid::now_v7());
-        let pollable = format!("poll-{}", uuid::Uuid::now_v7());
-        let queue = format!("shared-{}", uuid::Uuid::now_v7());
+        let job_type = format!("excl-{}", uuid::Uuid::now_v7());
+        let queue = format!("excl-queue-{}", uuid::Uuid::now_v7());
+        let now = chrono::Utc::now();
 
-        let base = chrono::Utc::now() - chrono::Duration::seconds(600);
-        // The queue's HEAD belongs to the type this instance cannot poll.
-        let head = seed_queued_job(&pool, &saturated, &queue, base, "pending").await?;
-        // Behind it, a row this instance could otherwise run.
-        let behind = seed_queued_job(
-            &pool,
-            &pollable,
-            &queue,
-            base + chrono::Duration::seconds(1),
-            "pending",
-        )
-        .await?;
-
-        // Only the pollable type is offered — exactly what `plan_claim`
-        // produces once `saturated` is at its cap.
-        let pollable_types = vec![JobType::from_owned(pollable.clone())];
-        let row_limits = vec![4i32];
-        let clock = ClockHandle::realtime();
-
-        let result = poll_jobs(
-            &pool,
-            4,
-            uuid::Uuid::now_v7(),
-            &pollable_types,
-            &row_limits,
-            CONTENTION_HEADROOM,
-            &clock,
-        )
-        .await?;
-
-        let claimed: std::collections::HashSet<JobId> = match result {
-            JobPollResult::Jobs { ref jobs, .. } => jobs.iter().map(|j| j.id).collect(),
-            JobPollResult::WaitTillNextJob(_) => Default::default(),
-        };
-        assert!(
-            !claimed.contains(&behind),
-            "claiming past an unpollable head would let a peer that CAN poll \
-             that head claim the same queue concurrently"
-        );
-        assert!(
-            !claimed.contains(&head),
-            "the head's type is not pollable here"
-        );
-
-        Ok(())
-    }
-
-    /// Rows sharing an `execute_at` — which bulk spawns produce by the batch —
-    /// must still resolve one stable head per queue, whatever admission budget
-    /// the poll is running with.
-    #[tokio::test]
-    async fn tied_execute_at_resolves_one_stable_queue_head() -> anyhow::Result<()> {
-        let pool = init_pool().await?;
-        let job_type = format!("tie-{}", uuid::Uuid::now_v7());
-        let queue = format!("tied-{}", uuid::Uuid::now_v7());
-
-        // One queue, several rows, all sharing an execute_at to the microsecond.
-        let tied = chrono::Utc::now() - chrono::Duration::seconds(600);
-        let mut ids = Vec::new();
-        for _ in 0..8 {
-            ids.push(seed_queued_job(&pool, &job_type, &queue, tied, "pending").await?);
-        }
-        // Younger filler queues, so the window boundary lands inside the tie
-        // group for the smaller budgets.
-        for _ in 0..40 {
-            let q = format!("filler-{}", uuid::Uuid::now_v7());
-            seed_queued_job(
-                &pool,
-                &job_type,
-                &q,
-                tied + chrono::Duration::seconds(1),
-                "pending",
-            )
-            .await?;
-        }
-
-        let pollable_types = vec![JobType::from_owned(job_type.clone())];
-        let clock = ClockHandle::realtime();
-        let expected = ids.iter().copied().min().expect("seeded rows");
-
-        for n in [1usize, 3, 10] {
-            let result = poll_jobs(
-                &pool,
-                n,
-                uuid::Uuid::now_v7(),
-                &pollable_types,
-                &[n as i32],
-                CONTENTION_HEADROOM,
-                &clock,
-            )
-            .await?;
-            let JobPollResult::Jobs { jobs, .. } = result else {
-                panic!("expected a claim at budget {n}");
-            };
-            let from_queue: Vec<JobId> = jobs
-                .iter()
-                .map(|j| j.id)
-                .filter(|id| ids.contains(id))
-                .collect();
-            assert_eq!(
-                from_queue.len(),
-                1,
-                "budget {n} must take exactly one row from the tied queue"
-            );
-            assert_eq!(
-                from_queue[0], expected,
-                "budget {n} must resolve the same head as every other budget"
-            );
-            sqlx::query(
-                "UPDATE job_executions SET state = 'pending', execute_at = $2, \
-                 poller_instance_id = NULL WHERE id = $1",
-            )
-            .bind(uuid::Uuid::from(from_queue[0]))
-            .bind(tied)
-            .execute(&pool)
-            .await?;
-        }
-
-        Ok(())
-    }
-    /// Deep queues under-fill a ROW-bounded window, and the poll must say so.
-    ///
-    /// The window admits `n_claim * headroom` rows but candidates are queues,
-    /// so its yield is divided by the depth of the queues it lands on. At
-    /// depth > headroom the poll comes back short with claimable work sitting
-    /// just past the window — the one case where widening is the only thing
-    /// that helps, and the one `candidates_short` has to identify. Widening is
-    /// then verified to actually recover the budget. See PERFORMANCE.md,
-    /// "Contention headroom".
-    #[tokio::test]
-    async fn deep_queues_report_a_short_window_and_widening_recovers_it() -> anyhow::Result<()> {
-        let pool = init_pool().await?;
-        let job_type = format!("depth-{}", uuid::Uuid::now_v7());
-        let n_jobs_to_poll = 4usize;
-        // Depth per queue is double the resting headroom, so a window of
-        // `n * CONTENTION_HEADROOM` rows lands on half as many queues as the
-        // budget wants. Every queue is unblocked — a blocked one contributes
-        // no rows at all, so depth there costs nothing.
-        let depth = (CONTENTION_HEADROOM * 2) as i64;
-        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
-        // Rows of a queue are CONSECUTIVE in execute_at order: the clustering
-        // is what makes depth bite. Scattered rows draw from many queues and
-        // the window saturates regardless of depth.
-        let mut seq = 0i64;
-        for q in 0..(n_jobs_to_poll as i64 * 2) {
-            let queue = format!("deep-{q}-{}", uuid::Uuid::now_v7());
-            for _ in 0..depth {
-                seed_queued_job(
-                    &pool,
-                    &job_type,
-                    &queue,
-                    base + chrono::Duration::milliseconds(seq),
-                    "pending",
+        let insert = |id: uuid::Uuid| {
+            let pool = pool.clone();
+            let job_type = job_type.clone();
+            let queue = queue.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO jobs (id, job_type, queue_id, created_at) \
+                     VALUES ($1, $2, $3, $4)",
                 )
+                .bind(id)
+                .bind(&job_type)
+                .bind(&queue)
+                .bind(now)
+                .execute(&pool)
                 .await?;
-                seq += 1;
+                sqlx::query(
+                    "INSERT INTO job_executions \
+                     (id, job_type, queue_id, state, attempt_index, execute_at, alive_at, created_at) \
+                     VALUES ($1, $2, $3, 'pending', 1, $4, $4, $4)",
+                )
+                .bind(id)
+                .bind(&job_type)
+                .bind(&queue)
+                .bind(now)
+                .execute(&pool)
+                .await
             }
-        }
+        };
 
-        let pollable_types = vec![JobType::from_owned(job_type.clone())];
-        let row_limits = vec![n_jobs_to_poll as i32];
-        let clock = ClockHandle::realtime();
+        let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let (ra, rb) = tokio::join!(insert(a), insert(b));
 
-        let narrow = poll_jobs(
+        let results = [ra, rb];
+        let n_ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            n_ok, 1,
+            "exactly one concurrent insert must win the queue's active slot"
+        );
+        let err = results
+            .into_iter()
+            .find_map(|r| r.err())
+            .expect("exactly one insert must fail");
+        assert_eq!(
+            err.as_database_error().and_then(|d| d.constraint()),
+            Some("idx_job_executions_queue_active"),
+            "the loser must fail specifically on the exclusion index"
+        );
+
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_executions WHERE queue_id = $1 AND state IN ('pending','running')",
+        )
+        .bind(&queue)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(active, 1, "at most one active row per queue, ever");
+
+        Ok(())
+    }
+
+    async fn row_state(pool: &PgPool, id: JobId) -> anyhow::Result<String> {
+        let state: String =
+            sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
+                .bind(uuid::Uuid::from(id))
+                .fetch_one(pool)
+                .await?;
+        Ok(state)
+    }
+
+    /// The orphan race documented on `spawner.rs`'s `insert_or_park_in_op`:
+    /// a parked row whose queue has no active row (hand-constructed here,
+    /// rather than actually racing the insert-vs-complete window) must be
+    /// recovered by the sweep piggybacked on the lost-handler cadence.
+    #[tokio::test]
+    async fn orphan_sweeper_recovers_orphaned_parked_row() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("orphan-{}", uuid::Uuid::now_v7());
+        let queue = format!("orphan-queue-{}", uuid::Uuid::now_v7());
+        let base = chrono::Utc::now() - chrono::Duration::seconds(600);
+
+        // Parked, no active sibling for this queue -- an orphan.
+        let orphan = seed_queued_job(&pool, &job_type, &queue, base, "parked").await?;
+
+        // The sweep is a table-wide scan and this suite shares one dev DB
+        // across tests/runs, so it may also recover unrelated orphans left
+        // by other tests -- assert only on what THIS test seeded.
+        let promoted = sweep_orphaned_parked_rows(&pool).await?;
+        assert!(
+            promoted.contains(&job_type),
+            "the sweep must report the promoted row's type so a poller can be woken: {promoted:?}"
+        );
+        assert_eq!(row_state(&pool, orphan).await?, "pending");
+
+        Ok(())
+    }
+
+    /// Among several parked rows orphaned in one queue, the sweep must
+    /// promote the OLDEST by `(execute_at, id)` -- the same tiebreak the
+    /// claim query and the completion-time promote CTE use, so every
+    /// mechanism that ever resolves a queue's head agrees on which row it is.
+    #[tokio::test]
+    async fn orphan_sweeper_promotes_the_oldest_parked_sibling() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("orphan-multi-{}", uuid::Uuid::now_v7());
+        let queue = format!("orphan-multi-queue-{}", uuid::Uuid::now_v7());
+        let base = chrono::Utc::now() - chrono::Duration::seconds(600);
+
+        let oldest = seed_queued_job(&pool, &job_type, &queue, base, "parked").await?;
+        let _middle = seed_queued_job(
             &pool,
-            n_jobs_to_poll,
-            uuid::Uuid::now_v7(),
-            &pollable_types,
-            &row_limits,
-            CONTENTION_HEADROOM,
-            &clock,
+            &job_type,
+            &queue,
+            base + chrono::Duration::seconds(10),
+            "parked",
         )
         .await?;
-        let JobPollResult::Jobs { jobs, window } = narrow else {
-            panic!("expected a claim at the resting headroom");
-        };
-        assert!(
-            jobs.len() < n_jobs_to_poll,
-            "a window of {} rows over depth-{depth} queues cannot fill a \
-             budget of {n_jobs_to_poll}",
-            n_jobs_to_poll as i32 * CONTENTION_HEADROOM
-        );
-        assert!(
-            window.candidates_short,
-            "the poll must report that the WINDOW bound it, not the work"
+        let _youngest = seed_queued_job(
+            &pool,
+            &job_type,
+            &queue,
+            base + chrono::Duration::seconds(20),
+            "parked",
+        )
+        .await?;
+
+        sweep_orphaned_parked_rows(&pool).await?;
+
+        assert_eq!(row_state(&pool, oldest).await?, "pending");
+        let still_parked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_executions WHERE queue_id = $1 AND state = 'parked'",
+        )
+        .bind(&queue)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            still_parked, 2,
+            "only the oldest sibling is promoted; the rest stay parked"
         );
 
-        // Release the claim and re-poll wider: the same data must now saturate.
+        Ok(())
+    }
+
+    /// Invariant B on the reclaim path (handoff §2.5): a lost job's row keeps
+    /// its queue's active slot on reclaim (it was already the sole `running`
+    /// occupant), but an older parked sibling must run first during the
+    /// reclaimed row's backoff.
+    #[tokio::test]
+    async fn reclaim_lets_an_older_parked_sibling_run_first() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let instance_id = uuid::Uuid::now_v7();
+        let job_type = format!("reclaim-swap-{}", uuid::Uuid::now_v7());
+        let queue = format!("reclaim-swap-queue-{}", uuid::Uuid::now_v7());
+        let stale_alive_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let older = stale_alive_at - chrono::Duration::seconds(60);
+
+        // The lost job: running, alive_at stale enough to be reclaimed.
+        let lost = seed_queued_job(&pool, &job_type, &queue, stale_alive_at, "running").await?;
         sqlx::query(
-            "UPDATE job_executions SET state = 'pending', execute_at = $2, \
-             poller_instance_id = NULL WHERE state = 'running' AND job_type = $1",
+            "UPDATE job_executions SET poller_instance_id = $2, alive_at = $3 WHERE id = $1",
         )
-        .bind(&job_type)
-        .bind(base)
+        .bind(uuid::Uuid::from(lost))
+        .bind(instance_id)
+        .bind(stale_alive_at)
         .execute(&pool)
         .await?;
+        // An older parked sibling -- must run before the reclaimed row's
+        // retried attempt.
+        let sibling = seed_queued_job(&pool, &job_type, &queue, older, "parked").await?;
 
-        let wide = poll_jobs(
+        let threshold = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let reschedule_at = chrono::Utc::now();
+        let reclaimed = reclaim_lost_jobs(
             &pool,
-            n_jobs_to_poll,
-            uuid::Uuid::now_v7(),
-            &pollable_types,
-            &row_limits,
-            MAX_CONTENTION_HEADROOM,
-            &clock,
+            instance_id,
+            &[JobType::from_owned(job_type)],
+            threshold,
+            reschedule_at,
+            &[],
         )
         .await?;
-        let JobPollResult::Jobs { jobs, window } = wide else {
-            panic!("expected a claim at the widened headroom");
-        };
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].0, lost);
+
         assert_eq!(
-            jobs.len(),
-            n_jobs_to_poll,
-            "widening the window must recover the budget"
+            row_state(&pool, sibling).await?,
+            "pending",
+            "the older parked sibling must be promoted"
         );
-        assert!(
-            !window.candidates_short,
-            "a saturated poll must drop the headroom back to resting"
+        assert_eq!(
+            row_state(&pool, lost).await?,
+            "parked",
+            "the reclaimed row must yield its slot to the older sibling"
         );
 
-        Ok(())
-    }
-    /// A window filled entirely by rows behind SATURATED heads must not read
-    /// as "nothing more to see".
-    ///
-    /// Step 1 admits rows of pollable types, but step 2 resolves each queue's
-    /// head type-agnostically and drops it when that head belongs to a type
-    /// this instance has saturated. Those queues therefore consume window
-    /// slots and yield nothing, and if enough of them do it the window fills
-    /// having read only a PREFIX of the due pollable rows — claimable heads
-    /// past it are unseen. They are already due, so `next_due_at` does not
-    /// cover them, and sleeping here strands them until an unrelated wake.
-    ///
-    /// `candidates_short` is what keeps the loop awake: `poll_and_dispatch`
-    /// re-polls while it can still widen. See PERFORMANCE.md, "When the poller
-    /// may sleep".
-    #[tokio::test]
-    async fn window_full_of_saturated_heads_does_not_read_as_exhausted() -> anyhow::Result<()> {
-        let pool = init_pool().await?;
-        let saturated = format!("sat-{}", uuid::Uuid::now_v7());
-        let pollable = format!("poll-{}", uuid::Uuid::now_v7());
-        let n_jobs_to_poll = 2usize;
-
-        // Every queue: an unpollable head, then a pollable row behind it. The
-        // pollable rows are what enter the window; none of them can be claimed
-        // because each queue's head is the saturated type.
-        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
-        let mut seq = 0i64;
-        let queues = (n_jobs_to_poll as i32 * CONTENTION_HEADROOM) as i64;
-        for q in 0..queues {
-            let queue = format!("blocked-head-{q}-{}", uuid::Uuid::now_v7());
-            seed_queued_job(
-                &pool,
-                &saturated,
-                &queue,
-                base + chrono::Duration::milliseconds(seq),
-                "pending",
-            )
-            .await?;
-            seq += 1;
-            seed_queued_job(
-                &pool,
-                &pollable,
-                &queue,
-                base + chrono::Duration::milliseconds(seq),
-                "pending",
-            )
-            .await?;
-            seq += 1;
-        }
-
-        // Only the pollable type is offered — `plan_claim`'s output once
-        // `saturated` is at its cap.
-        let pollable_types = vec![JobType::from_owned(pollable.clone())];
-        let row_limits = vec![n_jobs_to_poll as i32];
-        let clock = ClockHandle::realtime();
-
-        let result = poll_jobs(
-            &pool,
-            n_jobs_to_poll,
-            uuid::Uuid::now_v7(),
-            &pollable_types,
-            &row_limits,
-            CONTENTION_HEADROOM,
-            &clock,
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_executions WHERE queue_id = $1 AND state IN ('pending','running')",
         )
+        .bind(&queue)
+        .fetch_one(&pool)
         .await?;
-
-        let window = result.window();
-        // The query alone WOULD sleep here: it saw no claimable head, and
-        // `may_have_more` is deliberately false so that re-polling at the same
-        // width cannot spin at zero yield.
-        assert!(
-            !window.may_have_more,
-            "re-polling at the same width would spin at zero yield"
-        );
-        // `candidates_short` is the whole safety net -- `poll_and_dispatch`
-        // ORs it into the sleep decision while the width can still grow. If
-        // this ever goes false, the loop sleeps on `next_due_at` while
-        // already-due claimable work sits just past the window.
-        assert!(
-            window.candidates_short,
-            "a full window that yielded no claimable head must say so, or the \
-             loop sleeps on next_due_at while already-due work sits past it"
-        );
-        match result {
-            JobPollResult::WaitTillNextJob(_) => {}
-            JobPollResult::Jobs { ref jobs, .. } => {
-                assert!(
-                    jobs.is_empty(),
-                    "every head here belongs to a saturated type"
-                );
-            }
-        }
+        assert_eq!(active, 1, "Invariant A must still hold after the swap");
 
         Ok(())
     }
