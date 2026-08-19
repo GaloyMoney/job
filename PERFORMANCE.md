@@ -136,10 +136,17 @@ step 1's anti-join drops all of its rows:
 
 Identical at depth 1,000 and depth 5,000 — the cost is exactly one extra poll
 of 133 buffers, not a function of depth, and `may_have_more` keeps the poller
-from sleeping through it. Closing it properly needs a "is this row its queue's
-head" anti-join inside step 1, which was measured and **rejected**: it fixes
-the case at 18,523 buffers and 30 ms for depth 5,000 — unbounded in depth,
-worse than the walk it replaced — and taxes the ordinary workload 25%.
+from sleeping through it.
+
+This is the degenerate end of the depth effect in "Why it has to adapt", and
+adaptive widening does fire here — one step, on a poll that then saturates and
+snaps it back. Widening cannot fix *this* shape (a wider window over one queue
+is still one candidate), but it costs a single wider scan, not a spiral.
+
+Closing it properly needs an "is this row its queue's head" anti-join inside
+step 1, which was measured and **rejected**: it fixes the case at 18,523
+buffers and 30 ms for depth 5,000 — unbounded in depth, worse than the walk it
+replaced — and taxes the ordinary workload 25%.
 
 ### Picking a queue's row deterministically
 
@@ -177,22 +184,67 @@ unqueued scan depend on, and forcing a sort of every candidate: **10.3 ms vs
 
 ---
 
-## Contention headroom
+## Contention headroom, and the adaptive window
 
-`CONTENTION_HEADROOM` (currently 4) is how far past its budget a poll gathers
-candidates. It exists so `FOR UPDATE ... SKIP LOCKED` has somewhere to fall
-through when a peer instance holds locks on the rows this poll would target.
+`CONTENTION_HEADROOM` (resting value 4) is how far past its budget a poll
+gathers candidates. Its original job is to give `FOR UPDATE ... SKIP LOCKED`
+somewhere to fall through when a peer holds the rows this poll would target.
+Removing it entirely regresses a real case: with a type budget of 5 and a peer
+holding exactly those 5 rows, a poll gathers 5 candidates, skips all 5, and
+claims nothing (`poller_falls_through_locked_head_rows_to_later_due_jobs`).
 
 It reads like shape 1's `* 4` overscan and is a different quantity. That
 multiplier was sized to survive *filtering* — it had to guess how many gathered
 rows would turn out unclaimable, and a deep blocked queue could exhaust any
-guess. Step 1 now gathers only rows that are already unblocked, so the
-multiplier has to cover *contention* alone: how many candidates a concurrent
-poller might be holding.
+guess. Step 1 now gathers only rows that are already unblocked.
 
-Removing it entirely regresses a real case: with a type budget of 5 and a peer
-holding exactly those 5 rows, a poll gathers 5 candidates, skips all 5, and
-claims nothing (`poller_falls_through_locked_head_rows_to_later_due_jobs`).
+### Why it has to adapt
+
+The window bounds **rows**; the budget counts **queues**. Its yield is
+therefore `window ÷ average depth of the queues it lands on`, and a fixed
+multiplier of 4 saturates only while that depth stays ≤ 4. Measured on 2,000
+queues at `n_claim = 150` (window 600):
+
+| clustered depth | claims per poll |
+|---|---|
+| 1, 2, 4 | 150 |
+| 8 | 75 |
+| 16 | 38 |
+| 32 | 19 |
+
+Exactly `600 ÷ depth`. Depth alone is not enough to trigger it — the rows must
+also be **adjacent in `execute_at` order**. With a queue's rows scattered
+across time the window draws from ~600 distinct queues and saturates at every
+depth tested, up to 32. And the queues must be **unblocked**: a blocked queue
+contributes no rows at all, so depth there is free.
+
+No work is lost — `may_have_more` fires and the loop re-polls — so the cost is
+**polls**, not throughput. Draining a 3,000-job backlog:
+
+| clustered depth | walk | fixed ×4 | fixed ×32 | **adaptive** |
+|---|---|---|---|---|
+| 1 | 14 polls | 14 | 14 | **14** (never widens) |
+| 8 | 20 | 24 | 20 | **22** (peak ×8) |
+| 32 | 20 | **86** | 20 | **34** (peak ×32) |
+
+A fixed ×32 is robust but costs 42% more buffers at depth 1 — the common case,
+and what production actually looks like at 1.26 rows per queue. So the window
+adapts instead: `candidates_short` reports that the window **filled and still
+produced fewer candidates than the budget**, and the poll loop doubles the
+multiplier up to `MAX_CONTENTION_HEADROOM` (32), snapping straight back to 4 on
+any saturated poll.
+
+The signal deliberately does *not* fire for a budget lost to peers or to type
+caps. Widening would buy a bigger scan for the same result in both cases. It is
+specifically "the window was the binding constraint", which is the only thing
+widening fixes. Pinned by
+`deep_queues_report_a_short_window_and_widening_recovers_it`.
+
+The regime this exists for is **recovery from a stall or a cold start** — every
+queue unblocked with its full backlog due at once, which is when throughput
+matters most and when a fixed ×4 degrades furthest.
+
+---
 
 ## Per-type budgets and interleaving
 
@@ -430,11 +482,19 @@ Seeds:
   The due fraction is the variable the queue walk was blind to; sweep it.
 - `seed_cliff.sql` — `-v depth=D -v blocked=0|1`: one pathological queue ahead
   of ordinary ones, for the zero-claim cliff
+- `seed_depth.sql` / `seed_clustered.sql` — `-v nq=N -v depth=D`: uniform depth,
+  with each queue's rows scattered across `execute_at` or consecutive in it.
+  The clustered variant is the one that under-fills a row-bounded window; the
+  scattered one saturates at every depth, and the pair is what shows that
+  clustering rather than depth is the trigger.
 
 Drivers:
 
 - `ab2.sh` — A/B against the previous shape, each arm on its own fresh seed
 - `cliff.sh` / `selfheal.sh` — cliff matrix, and the multi-poll recovery sequence
+- `depth2.sh` — claims per poll against clustered depth
+- `drain.sh` / `adaptive2.sh` — polls and buffers to drain a fixed backlog at a
+  fixed headroom, and under the real `candidates_short` adaptive loop
 - `race.sh` — N concurrent pollers on tied `execute_at`; asserts zero queues with
   more than one running job. This is what caught the missing `id` tiebreak, and
   it caught it on the *first* run — do not skip it.

@@ -105,7 +105,17 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 /// `FOR UPDATE ... SKIP LOCKED` has somewhere to fall through when a peer
 /// instance holds locks on the rows this poll would target. Sized for
 /// contention, not for filtering. See PERFORMANCE.md, "Contention headroom".
+///
+/// This is the resting value. The candidate window bounds ROWS while the
+/// budget counts QUEUES, so a poll that lands on deep queues under-fills;
+/// `MAX_CONTENTION_HEADROOM` is how far the poll loop may widen in response.
 const CONTENTION_HEADROOM: i32 = 4;
+
+/// Ceiling for the adaptive widening described on [`CONTENTION_HEADROOM`].
+/// Reached only where every widening step still came up short -- queues deep
+/// enough that eight rows are scanned per claimable head. See PERFORMANCE.md,
+/// "Contention headroom".
+const MAX_CONTENTION_HEADROOM: i32 = 32;
 
 impl JobPoller {
     pub fn new(
@@ -205,12 +215,16 @@ impl JobPoller {
     ) {
         let mut failures = 0;
         let mut woken_up = false;
+        // Candidate-window multiplier, in memory and private to this instance.
+        // Rests at `CONTENTION_HEADROOM` and widens only while polls report
+        // that the window itself was the binding constraint.
+        let mut headroom = CONTENTION_HEADROOM;
         loop {
             if *poll_stop_rx.borrow_and_update() {
                 break;
             }
 
-            let timeout = match self.poll_and_dispatch(woken_up).await {
+            let timeout = match self.poll_and_dispatch(woken_up, &mut headroom).await {
                 Ok(duration) => {
                     failures = 0;
                     duration
@@ -249,7 +263,11 @@ impl JobPoller {
         skip(self),
         fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in)
     )]
-    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
+    async fn poll_and_dispatch(
+        self: &Arc<Self>,
+        woken_up: bool,
+        headroom: &mut i32,
+    ) -> Result<Duration, JobError> {
         let span = Span::current();
         span.record("poller_id", tracing::field::display(self.instance_id));
         let Some(n_jobs_to_poll) = self.tracker.next_batch_size() else {
@@ -265,16 +283,31 @@ impl JobPoller {
             return Ok(MAX_WAIT);
         }
 
-        let (rows, window) = match poll_jobs(
+        let result = poll_jobs(
             self.repo.pool(),
             n_jobs_to_poll,
             self.instance_id,
             &plan.types,
             &plan.row_limits,
+            *headroom,
             &self.clock,
         )
-        .await?
-        {
+        .await?;
+
+        // Widen only while the WINDOW was the binding constraint -- it filled
+        // and still produced fewer candidates than the budget, which is what
+        // deep or clustered queues do to a row-bounded scan. A budget lost to
+        // peers or to type caps does not set this, because widening would only
+        // buy a bigger scan for the same result. One saturated poll drops it
+        // straight back, so the common shallow-queue case never pays for the
+        // deep one. See PERFORMANCE.md, "Contention headroom".
+        *headroom = if result.window().candidates_short {
+            (*headroom * 2).min(MAX_CONTENTION_HEADROOM)
+        } else {
+            CONTENTION_HEADROOM
+        };
+
+        let (rows, window) = match result {
             JobPollResult::WaitTillNextJob(window) => {
                 // Fresh clock read: a duration captured earlier can go stale under a manual clock.
                 let duration = window.sleep_for(self.clock.now());
@@ -900,6 +933,7 @@ async fn poll_jobs(
     instance_id: uuid::Uuid,
     pollable_types: &[super::entity::JobType],
     row_limits: &[i32],
+    headroom: i32,
     clock: &ClockHandle,
 ) -> Result<JobPollResult, sqlx::Error> {
     // sim_now drives execute_at scheduling (whatever clock the application uses);
@@ -1081,9 +1115,20 @@ async fn poll_jobs(
             -- `job_completed`'s capped-type wake instead. Blocked queues are
             -- likewise covered by a wake, not a spin: `delete_execution_in_op`
             -- reports `execution_ready` when it frees one.
+            --
+            -- `candidates_short` drives the adaptive window (see
+            -- `poll_and_dispatch`). The window bounds ROWS but candidates are
+            -- QUEUES, so its yield is divided by the average depth of the
+            -- queues it lands on. When those rows cluster into few queues the
+            -- poll under-fills its budget while claimable work sits just past
+            -- the window; widening is the only thing that helps, and this is
+            -- the signal that distinguishes it from a budget lost to peers or
+            -- to type caps, which widening would not fix.
             SELECT ((SELECT COUNT(*) FROM locked) >= $1
                  OR ((SELECT COUNT(*) FROM queued_window) >= $1::int4 * $7::int4
-                     AND (SELECT COUNT(*) FROM due_queued) > 0)) AS may_have_more
+                     AND (SELECT COUNT(*) FROM due_queued) > 0)) AS may_have_more,
+                   ((SELECT COUNT(*) FROM queued_window) >= $1::int4 * $7::int4
+                AND (SELECT COUNT(*) FROM ordered_candidates) < $1) AS candidates_short
         )
         SELECT * FROM (
             SELECT
@@ -1092,7 +1137,8 @@ async fn poll_jobs(
                 u.attempt_index AS "attempt_index?",
                 u.queue_id AS "queue_id?",
                 NULL::TIMESTAMPTZ AS "next_due_at?",
-                ps.may_have_more AS "may_have_more!"
+                ps.may_have_more AS "may_have_more!",
+                ps.candidates_short AS "candidates_short!"
             FROM updated u, poll_status ps
             UNION ALL
             SELECT
@@ -1101,7 +1147,8 @@ async fn poll_jobs(
                 NULL::INT AS "attempt_index?",
                 NULL::VARCHAR AS "queue_id?",
                 mw.next_due_at AS "next_due_at?",
-                ps.may_have_more AS "may_have_more!"
+                ps.may_have_more AS "may_have_more!",
+                ps.candidates_short AS "candidates_short!"
             FROM min_wait mw, poll_status ps
         ) AS result
         "#,
@@ -1111,7 +1158,7 @@ async fn poll_jobs(
         pollable_types as _,
         wall_now,
         row_limits,
-        CONTENTION_HEADROOM,
+        headroom,
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -1127,6 +1174,9 @@ async fn poll_jobs(
 struct PollWindow {
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
+    /// The candidate window hit its LIMIT and still yielded fewer candidates
+    /// than the budget -- the poll was bounded by the window, not by the work.
+    candidates_short: bool,
 }
 
 impl PollWindow {
@@ -1158,9 +1208,18 @@ struct JobPollRow {
     queue_id: Option<String>,
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
+    candidates_short: bool,
 }
 
 impl JobPollResult {
+    /// The poll window, whichever variant this is.
+    fn window(&self) -> &PollWindow {
+        match self {
+            JobPollResult::Jobs { window, .. } => window,
+            JobPollResult::WaitTillNextJob(window) => window,
+        }
+    }
+
     /// Convert raw query rows into a JobPollResult. The min-wait row (`id`
     /// NULL) is present in every result set; row order is not assumed.
     pub fn from_rows(rows: Vec<JobPollRow>) -> Self {
@@ -1168,9 +1227,11 @@ impl JobPollResult {
         let mut window = PollWindow {
             next_due_at: None,
             may_have_more: false,
+            candidates_short: false,
         };
         for row in rows {
             window.may_have_more = row.may_have_more;
+            window.candidates_short = row.candidates_short;
             match (row.id, row.attempt_index) {
                 (Some(id), Some(attempt_index)) => jobs.push(PolledJob {
                     id,
@@ -1684,6 +1745,7 @@ mod tests {
             instance_id,
             &pollable_types,
             &row_limits,
+            CONTENTION_HEADROOM,
             &clock,
         )
         .await?;
@@ -1857,6 +1919,7 @@ mod tests {
             instance_id,
             &pollable_types,
             &row_limits,
+            CONTENTION_HEADROOM,
             &clock,
         )
         .await?;
@@ -1924,6 +1987,7 @@ mod tests {
             uuid::Uuid::now_v7(),
             &pollable_types,
             &row_limits,
+            CONTENTION_HEADROOM,
             &clock,
         )
         .await?;
@@ -1985,6 +2049,7 @@ mod tests {
                 uuid::Uuid::now_v7(),
                 &pollable_types,
                 &[n as i32],
+                CONTENTION_HEADROOM,
                 &clock,
             )
             .await?;
@@ -2014,6 +2079,108 @@ mod tests {
             .execute(&pool)
             .await?;
         }
+
+        Ok(())
+    }
+    /// Deep queues under-fill a ROW-bounded window, and the poll must say so.
+    ///
+    /// The window admits `n_claim * headroom` rows but candidates are queues,
+    /// so its yield is divided by the depth of the queues it lands on. At
+    /// depth > headroom the poll comes back short with claimable work sitting
+    /// just past the window — the one case where widening is the only thing
+    /// that helps, and the one `candidates_short` has to identify. Widening is
+    /// then verified to actually recover the budget. See PERFORMANCE.md,
+    /// "Contention headroom".
+    #[tokio::test]
+    async fn deep_queues_report_a_short_window_and_widening_recovers_it() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("depth-{}", uuid::Uuid::now_v7());
+        let n_jobs_to_poll = 4usize;
+        // Depth per queue is double the resting headroom, so a window of
+        // `n * CONTENTION_HEADROOM` rows lands on half as many queues as the
+        // budget wants. Every queue is unblocked — a blocked one contributes
+        // no rows at all, so depth there costs nothing.
+        let depth = (CONTENTION_HEADROOM * 2) as i64;
+        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        // Rows of a queue are CONSECUTIVE in execute_at order: the clustering
+        // is what makes depth bite. Scattered rows draw from many queues and
+        // the window saturates regardless of depth.
+        let mut seq = 0i64;
+        for q in 0..(n_jobs_to_poll as i64 * 2) {
+            let queue = format!("deep-{q}-{}", uuid::Uuid::now_v7());
+            for _ in 0..depth {
+                seed_queued_job(
+                    &pool,
+                    &job_type,
+                    &queue,
+                    base + chrono::Duration::milliseconds(seq),
+                    "pending",
+                )
+                .await?;
+                seq += 1;
+            }
+        }
+
+        let pollable_types = vec![JobType::from_owned(job_type.clone())];
+        let row_limits = vec![n_jobs_to_poll as i32];
+        let clock = ClockHandle::realtime();
+
+        let narrow = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            uuid::Uuid::now_v7(),
+            &pollable_types,
+            &row_limits,
+            CONTENTION_HEADROOM,
+            &clock,
+        )
+        .await?;
+        let JobPollResult::Jobs { jobs, window } = narrow else {
+            panic!("expected a claim at the resting headroom");
+        };
+        assert!(
+            jobs.len() < n_jobs_to_poll,
+            "a window of {} rows over depth-{depth} queues cannot fill a \
+             budget of {n_jobs_to_poll}",
+            n_jobs_to_poll as i32 * CONTENTION_HEADROOM
+        );
+        assert!(
+            window.candidates_short,
+            "the poll must report that the WINDOW bound it, not the work"
+        );
+
+        // Release the claim and re-poll wider: the same data must now saturate.
+        sqlx::query(
+            "UPDATE job_executions SET state = 'pending', execute_at = $2, \
+             poller_instance_id = NULL WHERE state = 'running' AND job_type = $1",
+        )
+        .bind(&job_type)
+        .bind(base)
+        .execute(&pool)
+        .await?;
+
+        let wide = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            uuid::Uuid::now_v7(),
+            &pollable_types,
+            &row_limits,
+            MAX_CONTENTION_HEADROOM,
+            &clock,
+        )
+        .await?;
+        let JobPollResult::Jobs { jobs, window } = wide else {
+            panic!("expected a claim at the widened headroom");
+        };
+        assert_eq!(
+            jobs.len(),
+            n_jobs_to_poll,
+            "widening the window must recover the budget"
+        );
+        assert!(
+            !window.candidates_short,
+            "a saturated poll must drop the headroom back to resting"
+        );
 
         Ok(())
     }
