@@ -26,6 +26,7 @@ use super::{
     handle::JobHandle,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
+    poller::PollerHandle,
     repo::JobRepo,
     runner::{JobRunner, RetrySettings},
     spawner::{KeyedInsert, insert_keyed_execution},
@@ -68,6 +69,14 @@ pub trait KeyedJobInitializer: Send + Sync + 'static {
         false
     }
 
+    /// Whether a due-now spawn or completion of this type may take the
+    /// head-swap short-circuit path. See
+    /// [`crate::JobInitializer::short_circuit`] for the full trade-off.
+    /// Defaults to `true`.
+    fn short_circuit(&self) -> bool {
+        true
+    }
+
     /// Produce a runner instance for the provided job.
     ///
     /// The spawner parameter allows the runner to spawn further generations
@@ -90,6 +99,9 @@ pub struct KeyedJobSpawner<Config> {
     clock: ClockHandle,
     notifier: Arc<JobEventNotifier>,
     inherits_state: bool,
+    /// Reaches this process's poller for the head-swap short-circuit fast
+    /// path (handoff addendum §7.3 site 5). See [`PollerHandle`].
+    poller_ref: PollerHandle,
     _phantom: PhantomData<Config>,
 }
 
@@ -97,6 +109,7 @@ impl<Config> KeyedJobSpawner<Config>
 where
     Config: Serialize + Send + Sync,
 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         repo: Arc<JobRepo>,
         job_type: JobType,
@@ -104,6 +117,7 @@ where
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
         inherits_state: bool,
+        poller_ref: PollerHandle,
     ) -> Self {
         Self {
             repo,
@@ -112,6 +126,7 @@ where
             clock,
             notifier,
             inherits_state,
+            poller_ref,
             _phantom: PhantomData,
         }
     }
@@ -190,6 +205,21 @@ where
             {
                 KeyedInsert::Inserted => {
                     self.carry_state_in_op(&mut op, job.id, &key).await?;
+
+                    // Head-swap short-circuit (handoff addendum §7.3 site 5):
+                    // a due-now keyed spawn tries to claim capacity for this
+                    // type's oldest due backlog, same as the plain spawn
+                    // path. A later statement in this same `op`, so it sees
+                    // the insert above with guaranteed ordering.
+                    if schedule_at <= self.clock.now()
+                        && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
+                    {
+                        let now = op.maybe_now().unwrap_or(schedule_at);
+                        poller
+                            .try_claim_after_spawn(&mut op, &self.job_type, now)
+                            .await?;
+                    }
+
                     op.commit().await?;
                     return Ok(self.handle(job.id));
                 }

@@ -258,6 +258,47 @@ impl JobTracker {
             resolved: false,
         })
     }
+
+    /// Transfer an already-accounted-for unit of `job_type`'s capacity from a
+    /// job/batch that is completing to whatever this reservation goes on to
+    /// dispatch next, instead of releasing it outright -- the completion-time
+    /// counterpart of [`Self::try_reserve`] (head-swap claiming's recycle
+    /// path; see the handoff addendum this implements, §7.2).
+    ///
+    /// Unlike `try_reserve`, this can never fail and never touches
+    /// `running_jobs`/`units_in_flight`: the unit is already counted (the
+    /// completing job/batch's own `dispatch_job`/`dispatch_batch` call
+    /// counted it), so one running unit of `job_type` being replaced by
+    /// another leaves both caps unchanged -- recycling nets to zero on the
+    /// counters by construction.
+    ///
+    /// The CALLER must ensure the completing dispatcher's own ordinary
+    /// release (`job_completed`/`batch_completed`, fired from `Drop`) is
+    /// skipped for this same unit -- see
+    /// [`Self::mark_finished_without_releasing_unit`] and
+    /// `JobDispatcher::recycle_unit`/`BatchDispatcher::recycle_unit` -- or the
+    /// unit is released twice.
+    pub(crate) fn recycle(self: &Arc<Self>, job_type: &JobType) -> UnitReservation {
+        UnitReservation {
+            tracker: Arc::clone(self),
+            job_type: job_type.clone(),
+            resolved: false,
+        }
+    }
+
+    /// Clear `ids` from the live-job liveness set WITHOUT touching
+    /// `running_jobs`/`units_in_flight` -- the counterpart to a completion
+    /// that [`Self::recycle`]s its unit into a fresh dispatch instead of
+    /// releasing it. The reclaim/shutdown-drain liveness bookkeeping must
+    /// still see these jobs finish; the capacity accounting must not, since
+    /// the unit stays claimed (by whatever the recycled reservation goes on
+    /// to dispatch).
+    pub(crate) fn mark_finished_without_releasing_unit(&self, ids: &[JobId]) {
+        let mut live = self.live_jobs.lock().expect("live_jobs poisoned");
+        for id in ids {
+            live.finished(*id);
+        }
+    }
 }
 
 /// A pre-claimed unit of `job_type`'s capacity, taken via
@@ -294,6 +335,19 @@ impl UnitReservation {
         self.resolved = true;
         self.tracker.running_jobs.fetch_sub(1, Ordering::SeqCst);
         self.tracker.release_unit(&self.job_type);
+    }
+
+    /// Batch counterpart of [`Self::into_live`]: the claimed batch landed and
+    /// every id in it is about to be dispatched together as ONE unit
+    /// (mirrors [`JobTracker::dispatch_batch`]'s per-id liveness / single-unit
+    /// counter split) -- WITHOUT re-incrementing the counters `try_reserve`/
+    /// `recycle` already accounted for.
+    pub(crate) fn into_live_batch(mut self, ids: &[JobId]) {
+        self.resolved = true;
+        let mut live = self.tracker.live_jobs.lock().expect("live_jobs poisoned");
+        for id in ids {
+            live.started(*id);
+        }
     }
 }
 

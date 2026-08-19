@@ -5,7 +5,10 @@ use futures::FutureExt;
 use serde_json::Value as JsonValue;
 use tracing::{Span, instrument};
 
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{Arc, Weak},
+};
 
 use super::{
     JobId,
@@ -13,6 +16,7 @@ use super::{
     entity::{Job, JobType, RetryPolicy},
     error::JobError,
     notifier::JobEventNotifier,
+    poller::JobPoller,
     repo::JobRepo,
     runner::*,
     spawner::swap_older_parked_siblings_in_op,
@@ -31,6 +35,10 @@ pub struct PolledJob {
 }
 
 pub(crate) struct JobDispatcher {
+    /// Reaches this process's poller for the head-swap completion-recycle
+    /// claim (`delete_execution_in_op`). `Weak` so a dispatcher never keeps
+    /// the poller alive on its own -- mirrors `spawner.rs`'s `PollerHandle`.
+    poller: Weak<JobPoller>,
     repo: Arc<JobRepo>,
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
@@ -59,6 +67,7 @@ impl JobDispatcher {
     /// leak once taken.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        poller: Weak<JobPoller>,
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
         notifier: Arc<JobEventNotifier>,
@@ -72,6 +81,7 @@ impl JobDispatcher {
     ) -> Self {
         tracker.dispatch_job(id, &job_type);
         Self {
+            poller,
             repo,
             retry_settings,
             runner: Some(runner),
@@ -87,13 +97,14 @@ impl JobDispatcher {
         }
     }
 
-    /// Build from an already-taken [`UnitReservation`] (the short-circuit
-    /// spawn fast path): the reservation already accounted for this unit, so
-    /// this consumes it via [`UnitReservation::into_live`] instead of calling
-    /// `tracker.dispatch_job` a second time.
+    /// Build from an already-taken [`UnitReservation`] (the head-swap
+    /// short-circuit fast path): the reservation already accounted for this
+    /// unit, so this consumes it via [`UnitReservation::into_live`] instead
+    /// of calling `tracker.dispatch_job` a second time.
     #[allow(clippy::too_many_arguments)]
     pub fn from_reservation(
         reservation: UnitReservation,
+        poller: Weak<JobPoller>,
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
         notifier: Arc<JobEventNotifier>,
@@ -107,6 +118,7 @@ impl JobDispatcher {
     ) -> Self {
         reservation.into_live(id);
         Self {
+            poller,
             repo,
             retry_settings,
             runner: Some(runner),
@@ -120,6 +132,17 @@ impl JobDispatcher {
             instance_id,
             clock,
         }
+    }
+
+    /// Detach this dispatcher's unit from the ordinary Drop-triggered
+    /// release: `delete_execution_in_op` found due work of the same type to
+    /// [`JobTracker::recycle`] the about-to-be-freed unit into instead of
+    /// releasing it plainly. Must only be called once a recycled claim has
+    /// actually landed a row -- see `JobPoller::try_claim_for_recycle`.
+    fn recycle_unit(&mut self) {
+        self.dispatched = false;
+        self.tracker
+            .mark_finished_without_releasing_unit(&[self.id]);
     }
 
     #[instrument(name = "job.execute_job", skip_all,
@@ -411,7 +434,7 @@ impl JobDispatcher {
     ///
     /// [`KeyedJobInitializer::inherits_state`]: crate::KeyedJobInitializer::inherits_state
     async fn delete_execution_in_op(
-        &self,
+        &mut self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
     ) -> Result<(), JobError> {
@@ -474,6 +497,29 @@ impl JobDispatcher {
             self.notifier
                 .execution_ready_in_op(op, &JobType::from_owned(next))
                 .await?;
+        }
+
+        // Head-swap completion recycle (handoff addendum §7.3 site 2): this
+        // job's unit of `job_type`'s capacity is about to free (Drop fires
+        // `job_completed` below unless this recycles it first). Try to spend
+        // it on this SAME type's own oldest due backlog -- independent of
+        // the freed-queue promote above (a different queue can promote a
+        // DIFFERENT type's sibling; that case is served by the ordinary
+        // notify, unchanged). A later statement in this same `op`, so it
+        // sees the promote above with guaranteed ordering. Scoped to this
+        // deletion path only -- the retry/reschedule branches (`fail_job`'s
+        // retry branch, `reschedule_job`) keep their row `pending` rather
+        // than freeing a unit, so there is nothing to recycle there.
+        if let Some(poller) = self.poller.upgrade() {
+            let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+            if let Some(target) = poller
+                .try_claim_for_recycle(op, &self.job_type, now)
+                .await?
+            {
+                self.recycle_unit();
+                let reservation = self.tracker.recycle(&self.job_type);
+                poller.register_dispatch_hook(op, reservation, target);
+            }
         }
 
         Ok(())

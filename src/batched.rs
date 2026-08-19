@@ -120,6 +120,16 @@ pub trait BatchedJobInitializer: Send + Sync + 'static {
         DEFAULT_MAX_CONCURRENT_BATCHES
     }
 
+    /// Whether a due-now spawn or completion of this type may take the
+    /// head-swap short-circuit path (a batch slot claimed and dispatched
+    /// with no poll in between). See
+    /// [`crate::JobInitializer::short_circuit`] for the full trade-off --
+    /// identical here, just counted in batches (one unit) rather than rows.
+    /// Defaults to `true`.
+    fn short_circuit(&self) -> bool {
+        true
+    }
+
     /// Produce a runner instance for a batch.
     ///
     /// The spawner allows the runner to spawn additional jobs of the same type.

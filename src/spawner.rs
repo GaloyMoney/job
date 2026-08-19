@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use std::{marker::PhantomData, sync::Arc};
 use tracing::instrument;
 
@@ -11,7 +12,7 @@ use super::{
     entity::{JobType, NewJob},
     error::JobError,
     notifier::JobEventNotifier,
-    poller::{PollerHandle, ShortCircuitOutcome},
+    poller::PollerHandle,
     repo::JobRepo,
 };
 
@@ -382,6 +383,20 @@ where
             self.notifier
                 .execution_ready_in_op(op, &self.job_type)
                 .await?;
+
+            // Head-swap short-circuit for the bulk path (handoff addendum
+            // §7.3 site 4): greedily reserve as much capacity as this call's
+            // own due-now count could use, claiming this type's oldest due
+            // backlog per reservation. Under-reservation is not a failure --
+            // every row already landed pending/parked above regardless, so
+            // whatever isn't claimed here is picked up by the ordinary poll
+            // exactly as before this addendum.
+            if let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade()) {
+                let now = op.maybe_now().unwrap_or(default_schedule_at);
+                poller
+                    .try_claim_after_bulk_spawn(op, &self.job_type, landed_pending.len(), now)
+                    .await?;
+            }
         }
 
         for (job, schedule_at) in jobs.iter_mut().zip(&schedule_times) {
@@ -412,51 +427,33 @@ where
 
         let mut job = self.repo.create_in_op(op, new_job).await?;
 
-        // Short-circuit spawn fast path: a due-now spawn whose type allows
-        // it and whose process has spare capacity is inserted born-claimed
-        // and handed straight to the dispatcher on commit — no NOTIFY, no
-        // poll. `schedule_at` in the future (an explicit `spawn_at`) never
-        // qualifies: it isn't claimable yet regardless. See
-        // `JobPoller::try_short_circuit_spawn` for what "allows it" checks.
-        let short_circuited = if schedule_at <= self.clock.now()
+        insert_execution(
+            &self.repo,
+            &self.notifier,
+            op,
+            &mut job,
+            schedule_at,
+            queue_id.as_deref(),
+            None,
+        )
+        .await?;
+
+        // Head-swap short-circuit (handoff addendum §7.1/§7.3 site 1): a
+        // due-now spawn tries to claim capacity for this type's oldest due
+        // backlog -- which may or may not be the row inserted just above.
+        // Runs as a LATER statement in the same `op`, so it sees that insert
+        // with guaranteed ordering. `schedule_at` in the future (an explicit
+        // `spawn_at`) never qualifies -- nothing of this type is claimable
+        // sooner just because this call happened.
+        if schedule_at <= self.clock.now()
             && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
         {
-            match poller
-                .try_short_circuit_spawn(
-                    op,
-                    id,
-                    &self.job_type,
-                    queue_id.as_deref(),
-                    None,
-                    schedule_at,
-                )
-                .await?
-            {
-                ShortCircuitOutcome::NotAttempted => false,
-                ShortCircuitOutcome::Dispatching | ShortCircuitOutcome::Parked => true,
-            }
-        } else {
-            false
-        };
-
-        if !short_circuited {
-            insert_execution(
-                &self.repo,
-                &self.notifier,
-                op,
-                &mut job,
-                schedule_at,
-                queue_id.as_deref(),
-                None,
-            )
-            .await?;
-        } else {
-            // The row already exists (running or parked) — `insert_execution`
-            // would only be needed for the schedule-event bookkeeping below,
-            // which still applies either way.
-            job.schedule_execution(schedule_at);
-            self.repo.update_in_op(op, &mut job).await?;
+            let now = op.maybe_now().unwrap_or(schedule_at);
+            poller
+                .try_claim_after_spawn(op, &self.job_type, now)
+                .await?;
         }
+
         Ok(job)
     }
 }
@@ -714,145 +711,87 @@ pub(crate) async fn swap_older_parked_siblings_in_op(
     Ok(promoted)
 }
 
-/// Attempt the short-circuit spawn fast path's born-claimed insert: land the
-/// row `running`-by-`instance_id` directly instead of `pending`. Returns
-/// `true` iff it landed running; `false` means the queue's active slot was
-/// taken and the row was parked instead (mirrors [`insert_or_park_in_op`]'s
-/// step 2, minus the Invariant B swap check -- a due-now fast-path spawn is
-/// never backdated, so there is nothing to swap against).
+/// One row claimed by [`claim_due_heads_in_op`]: everything a dispatcher
+/// needs besides the `Job` entity itself (which the caller still re-fetches
+/// by id -- see `JobPoller::dispatch_job_from_reservation`'s doc comment for
+/// why).
+pub(crate) struct ClaimedRow {
+    pub id: JobId,
+    pub attempt: i32,
+    pub queue_id: Option<String>,
+    pub data_json: Option<JsonValue>,
+}
+
+/// Claim up to `limit` of the oldest due `pending` rows of `job_type`,
+/// landing them `running`-by-`instance_id` -- byte-identical to what a poll
+/// claim would produce (same `state`/`poller_instance_id`/`alive_at`/
+/// `execute_at` columns, same tiebreak). The head-swap kernel: a
+/// short-circuit event (spawn or completion) never dispatches a specific
+/// row, it claims whichever oldest due row(s) of `job_type` exist right now
+/// -- see the handoff addendum this implements (§7.1) for why that is the
+/// fairness fix over the born-claimed design it replaces.
 ///
-/// Unqueued rows always land running -- nothing can ever block them.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn try_insert_born_claimed_in_op(
+/// Always a LATER statement in the SAME transaction as the caller's write
+/// (insert, promote, reclaim) -- sees that write's uncommitted rows with
+/// guaranteed statement ordering, which is what keeps this immune to the
+/// independent-CTE ordering hazard documented on
+/// [`swap_older_parked_siblings_in_op`].
+///
+/// `FOR UPDATE SKIP LOCKED` races the ordinary poll claim (and any other
+/// concurrent caller of this function) harmlessly: each skips whatever the
+/// other already holds. Returns fewer than `limit` rows -- down to zero --
+/// whenever fewer than `limit` due rows exist; callers must treat a short
+/// claim as fully expected, not an error.
+///
+/// `fresh_only` excludes `attempt_index > 1` rows: required for a batched
+/// claim (retries always run alone -- see `dispatch_batches`' identical
+/// split of an ordinary poll claim) and irrelevant for a plain-job claim
+/// (`limit = 1`, dispatched alone regardless of attempt either way).
+pub(crate) async fn claim_due_heads_in_op(
     op: &mut impl es_entity::AtomicOperation,
-    id: JobId,
     job_type: &JobType,
-    queue_id: Option<&str>,
-    unique_key: Option<&str>,
     instance_id: uuid::Uuid,
-    schedule_at: DateTime<Utc>,
-    alive_at: DateTime<Utc>,
-) -> Result<bool, JobError> {
-    let Some(queue_id) = queue_id else {
-        sqlx::query!(
-            r#"
-            INSERT INTO job_executions
-                (id, job_type, queue_id, unique_key, poller_instance_id, state,
-                 attempt_index, execute_at, alive_at, created_at)
-            VALUES ($1, $2, NULL, $3, $4, 'running', 1, NULL, $5, $5)
-            "#,
-            id as JobId,
-            job_type as &JobType,
-            unique_key,
-            instance_id,
-            alive_at,
-        )
-        .execute(op.as_executor())
-        .await?;
-        return Ok(true);
-    };
-
-    let claimed = sqlx::query_scalar!(
+    now: DateTime<Utc>,
+    limit: i64,
+    fresh_only: bool,
+) -> Result<Vec<ClaimedRow>, sqlx::Error> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    // wall_now drives alive_at, exactly like poll_jobs -- liveness is always
+    // measured in real time, independent of manual-clock advances.
+    let wall_now = chrono::Utc::now();
+    sqlx::query_as!(
+        ClaimedRow,
         r#"
-        INSERT INTO job_executions
-            (id, job_type, queue_id, unique_key, poller_instance_id, state,
-             attempt_index, execute_at, alive_at, created_at)
-        VALUES ($1, $2, $3, $4, $5, 'running', 1, NULL, $6, $6)
-        ON CONFLICT (queue_id) WHERE state IN ('pending','running') AND queue_id IS NOT NULL
-        DO NOTHING
-        RETURNING id AS "id!: JobId"
+        WITH heads AS (
+            SELECT id FROM job_executions
+            WHERE job_type = $1 AND state = 'pending' AND execute_at <= $2
+              AND (NOT $6 OR attempt_index = 1)
+            ORDER BY execute_at, id
+            LIMIT $3
+            FOR UPDATE SKIP LOCKED
+        ),
+        updated AS (
+            UPDATE job_executions je
+            SET state = 'running', poller_instance_id = $4, alive_at = $5, execute_at = NULL
+            FROM heads WHERE je.id = heads.id
+            RETURNING je.id, je.queue_id, je.attempt_index
+        )
+        SELECT u.id AS "id!: JobId", u.attempt_index AS "attempt!", u.queue_id AS "queue_id?",
+               s.execution_state_json AS "data_json?"
+        FROM updated u
+        LEFT JOIN job_execution_states s ON s.id = u.id
         "#,
-        id as JobId,
         job_type as &JobType,
-        queue_id,
-        unique_key,
+        now,
+        limit,
         instance_id,
-        alive_at,
+        wall_now,
+        fresh_only,
     )
-    .fetch_optional(op.as_executor())
-    .await?;
-    if claimed.is_some() {
-        return Ok(true);
-    }
-
-    // Conflicted. The ordinary Invariant B ordering edge applies here too:
-    // "due-now/backdated spawn never needs to swap" assumed the occupant's
-    // `execute_at` reflects when it was FIRST scheduled, but an occupant that
-    // already rescheduled itself (retry backoff, voluntary reschedule) can
-    // carry a future `execute_at` while still being `pending` -- a fast-path
-    // spawn older than THAT is exactly the ordering edge the swap exists
-    // for. Unlike the ordinary path, a successful swap here lands the new
-    // row `running` (not `pending`): it keeps going through the fast path
-    // rather than falling back to an ordinary claim.
-    let active = sqlx::query!(
-        r#"
-        SELECT id AS "id: JobId", execute_at, (state = 'pending') AS "is_pending!"
-        FROM job_executions
-        WHERE queue_id = $1 AND state IN ('pending', 'running')
-        "#,
-        queue_id,
-    )
-    .fetch_optional(op.as_executor())
-    .await?;
-
-    let should_swap = active.as_ref().is_some_and(|active| {
-        active.is_pending
-            && (schedule_at, id)
-                < (
-                    active
-                        .execute_at
-                        .expect("pending row always has execute_at"),
-                    active.id,
-                )
-    });
-
-    if should_swap {
-        let active_id = active.expect("checked by should_swap above").id;
-        let demoted = sqlx::query!(
-            "UPDATE job_executions SET state = 'parked' WHERE id = $1 AND state = 'pending'",
-            uuid::Uuid::from(active_id),
-        )
-        .execute(op.as_executor())
-        .await?;
-        if demoted.rows_affected() == 1 {
-            sqlx::query!(
-                r#"
-                INSERT INTO job_executions
-                    (id, job_type, queue_id, unique_key, poller_instance_id, state,
-                     attempt_index, execute_at, alive_at, created_at)
-                VALUES ($1, $2, $3, $4, $5, 'running', 1, NULL, $6, $6)
-                "#,
-                id as JobId,
-                job_type as &JobType,
-                queue_id,
-                unique_key,
-                instance_id,
-                alive_at,
-            )
-            .execute(op.as_executor())
-            .await?;
-            return Ok(true);
-        }
-        // Lost the guard -- fall through to parking below, same as the
-        // non-swap case.
-    }
-
-    sqlx::query!(
-        r#"
-        INSERT INTO job_executions
-            (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-        VALUES ($1, $2, $3, $4, 'parked', 1, $5, $6, $6)
-        "#,
-        id as JobId,
-        job_type as &JobType,
-        queue_id,
-        unique_key,
-        schedule_at,
-        alive_at,
-    )
-    .execute(op.as_executor())
-    .await?;
-    Ok(false)
+    .fetch_all(op.as_executor())
+    .await
 }
 
 /// Outcome of a keyed execution insert.

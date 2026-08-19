@@ -14,7 +14,7 @@ use tracing::{Span, instrument};
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::{
     JobId,
@@ -25,13 +25,18 @@ use super::{
     entity::{Job, JobType, RetryPolicy},
     error::JobError,
     notifier::JobEventNotifier,
+    poller::JobPoller,
     repo::JobRepo,
     runner::RetrySettings,
     spawner::swap_older_parked_siblings_in_op,
-    tracker::JobTracker,
+    tracker::{JobTracker, UnitReservation},
 };
 
 pub(crate) struct BatchDispatcher {
+    /// Reaches this process's poller for the head-swap completion-recycle
+    /// claim (`try_recycle_own_type`). `Weak` so a dispatcher never keeps the
+    /// poller alive on its own -- mirrors `JobDispatcher`'s identical field.
+    poller: Weak<JobPoller>,
     repo: Arc<JobRepo>,
     retry_settings: RetrySettings,
     runner: Option<Box<dyn AnyBatchedJobRunner>>,
@@ -57,6 +62,7 @@ impl BatchDispatcher {
     /// released by `Drop`, so it cannot leak once taken.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        poller: Weak<JobPoller>,
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
         notifier: Arc<JobEventNotifier>,
@@ -74,6 +80,7 @@ impl BatchDispatcher {
             .collect();
         tracker.dispatch_batch(&job_type, &ids);
         Self {
+            poller,
             repo,
             retry_settings,
             runner: Some(runner),
@@ -87,6 +94,92 @@ impl BatchDispatcher {
             instance_id,
             clock,
         }
+    }
+
+    /// Build from an already-taken [`UnitReservation`] (the head-swap
+    /// short-circuit fast path): the reservation already accounted for this
+    /// unit, so this consumes it via [`UnitReservation::into_live_batch`]
+    /// instead of calling `tracker.dispatch_batch` a second time. Mirrors
+    /// `JobDispatcher::from_reservation`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_reservation(
+        reservation: UnitReservation,
+        poller: Weak<JobPoller>,
+        repo: Arc<JobRepo>,
+        tracker: Arc<JobTracker>,
+        notifier: Arc<JobEventNotifier>,
+        retry_settings: RetrySettings,
+        job_type: JobType,
+        runner: Box<dyn AnyBatchedJobRunner>,
+        instance_id: uuid::Uuid,
+        clock: ClockHandle,
+        items: &[RawBatchItem],
+    ) -> Self {
+        let ids: Vec<JobId> = items.iter().map(|item| item.job.id).collect();
+        let attempts = items
+            .iter()
+            .map(|item| (item.job.id, item.attempt))
+            .collect();
+        reservation.into_live_batch(&ids);
+        Self {
+            poller,
+            repo,
+            retry_settings,
+            runner: Some(runner),
+            tracker,
+            notifier,
+            job_type,
+            ids,
+            attempts,
+            rescheduled: false,
+            dispatched: true,
+            instance_id,
+            clock,
+        }
+    }
+
+    /// This batch's job type, for the shutdown-coordination spawn wrapper
+    /// (`JobPoller::spawn_batch_dispatch_task`).
+    pub(crate) fn job_type(&self) -> &JobType {
+        &self.job_type
+    }
+
+    /// Detach this batch's unit from the ordinary Drop-triggered release:
+    /// [`Self::try_recycle_own_type`] found due work of the same type to
+    /// [`JobTracker::recycle`] the about-to-be-freed unit into instead.
+    fn recycle_unit(&mut self) {
+        self.dispatched = false;
+        self.tracker.mark_finished_without_releasing_unit(&self.ids);
+    }
+
+    /// Head-swap completion recycle (handoff addendum §7.3 site 3): this
+    /// batch's unit of `job_type`'s capacity is about to free (`Drop` fires
+    /// `batch_completed` below unless this recycles it first). Try to spend
+    /// it on this SAME type's own oldest due backlog. Called exactly ONCE
+    /// per `execute_batch` -- from the end of `seal` for a disposed batch,
+    /// from `fail_batch` for a whole-batch error -- never once per
+    /// sub-outcome branch: a batch is always exactly one execution unit
+    /// (`JobTracker::dispatch_batch`), so recycling it from inside
+    /// `complete_in_op` AND the terminal branch of `fail_in_op` would try to
+    /// spend the SAME freed unit twice whenever one batch disposes items
+    /// through both branches.
+    async fn try_recycle_own_type(
+        &mut self,
+        op: &mut impl AtomicOperation,
+        now: DateTime<Utc>,
+    ) -> Result<(), JobError> {
+        let Some(poller) = self.poller.upgrade() else {
+            return Ok(());
+        };
+        if let Some(target) = poller
+            .try_claim_for_recycle(op, &self.job_type, now)
+            .await?
+        {
+            self.recycle_unit();
+            let reservation = self.tracker.recycle(&self.job_type);
+            poller.register_dispatch_hook(op, reservation, target);
+        }
+        Ok(())
     }
 
     #[instrument(name = "job.execute_batch", skip_all,
@@ -314,6 +407,7 @@ impl BatchDispatcher {
         self.complete_in_op(op, completes).await?;
         self.reschedule_in_op(op, reschedules).await?;
         self.fail_in_op(op, fails, now).await?;
+        self.try_recycle_own_type(op, now).await?;
         Ok(())
     }
 
@@ -611,6 +705,7 @@ impl BatchDispatcher {
         let fails: Vec<(JobId, String)> =
             self.ids.iter().map(|id| (*id, message.clone())).collect();
         self.fail_in_op(&mut op, fails, now).await?;
+        self.try_recycle_own_type(&mut op, now).await?;
         op.commit().await?;
         Ok(())
     }

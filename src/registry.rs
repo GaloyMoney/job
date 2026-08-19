@@ -89,6 +89,11 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        // Always-empty handle: fan-out spawns of further generations made
+        // from WITHIN a running keyed job's own runner don't get the
+        // head-swap fast path in this pass -- same deferral as the plain and
+        // batched fan-out cases (see the identical comment on
+        // `impl<T: JobInitializer> AnyJobInitializer` above).
         let spawner = KeyedJobSpawner::<I::Config>::new(
             repo,
             self.inner.job_type(),
@@ -96,6 +101,7 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
             clock,
             notifier,
             self.inherits_state,
+            Arc::new(std::sync::OnceLock::new()),
         );
         KeyedJobInitializer::init(&self.inner, job, spawner)
     }
@@ -192,6 +198,9 @@ impl JobRegistry {
         let retry_settings = initializer.retry_on_error_settings();
         let concurrency = initializer.max_concurrent_per_process().map(|c| c.max(1));
         let inherits_state = initializer.inherits_state();
+        if !initializer.short_circuit() {
+            self.short_circuit_disabled.insert(job_type.clone());
+        }
         if inherits_state {
             self.retains_state.insert(job_type.clone());
         }
@@ -236,6 +245,9 @@ impl JobRegistry {
             max_batch_size: initializer.max_batch_size().max(1),
             max_concurrent_per_process: initializer.max_concurrent_per_process().max(1),
         };
+        if !initializer.short_circuit() {
+            self.short_circuit_disabled.insert(job_type.clone());
+        }
         self.batched_initializers
             .insert(job_type.clone(), Box::new(initializer));
         self.batch_policies.insert(job_type.clone(), policy);
@@ -319,11 +331,12 @@ impl JobRegistry {
         self.concurrency.get(job_type).copied().flatten()
     }
 
-    /// Whether a due-now spawn of `job_type` may take the short-circuit
-    /// fast path (`JobInitializer::short_circuit`, default `true`). Only
-    /// meaningful for plain (non-batched, non-keyed, non-resident) types --
-    /// the fast path does not yet extend to the other flavors (see the
-    /// handoff this implements for what's deferred).
+    /// Whether a due-now spawn or completion of `job_type` may take the
+    /// head-swap short-circuit path (`JobInitializer`/`KeyedJobInitializer`/
+    /// `BatchedJobInitializer::short_circuit`, default `true` on all three).
+    /// Meaningful for plain, keyed, and batched types alike -- resident types
+    /// never reach this check (`ResidentJobSpawner` holds no poller
+    /// reference; see the handoff addendum this implements, §7.1).
     pub(super) fn short_circuit(&self, job_type: &JobType) -> bool {
         !self.short_circuit_disabled.contains(job_type)
     }
