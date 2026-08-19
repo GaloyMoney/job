@@ -230,6 +230,27 @@ impl JobTracker {
     /// `None` if the process is already at `max_jobs`, or `per_type_cap` is
     /// `Some` and `job_type` is already at it. Reserving does not require
     /// knowing the job's id yet -- see [`UnitReservation::into_live`].
+    ///
+    /// **Known bounded race** (flagged by automated review on PR #173, not
+    /// fixed there): a reservation taken here between `JobRegistry::plan_claim`
+    /// reading `units_in_flight` and the poll's claim query actually running
+    /// against Postgres is invisible to that poll -- its `row_limit` was
+    /// already baked in as a query parameter from the stale snapshot, so it
+    /// can claim up to that many rows even though this reservation just took
+    /// some of the capacity it assumed was free. The overshoot is bounded (at
+    /// most however many concurrent short-circuit reservations land inside
+    /// one poll's snapshot-to-claim window) and self-corrects on the very
+    /// next poll cycle, since `units_in_flight` is authoritative again by
+    /// then -- this is the same class of soft, self-correcting accounting
+    /// imperfection the original handoff explicitly filed rather than fixed
+    /// for `max_jobs`' own unit-vs-row mismatch. A real fix needs either a
+    /// lock spanning the whole plan-to-claim window (serializing every
+    /// short-circuit reservation behind poll latency -- a real regression
+    /// for exactly the paths this design exists to speed up) or a
+    /// post-claim backstop that re-validates and releases any row a poll
+    /// over-claimed before dispatching it. Neither was judged worth bundling
+    /// into this PR; a per-type cap that must never be exceeded even
+    /// transiently should not rely on this path alone.
     pub(crate) fn try_reserve(
         self: &Arc<Self>,
         job_type: &JobType,

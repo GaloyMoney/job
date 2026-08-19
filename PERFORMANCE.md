@@ -567,6 +567,32 @@ soft — concurrent polls on different instances could still overshoot.
 Use `max_concurrent_per_process` instead: exact, free at the database, and
 multiplied by a known instance count it gives a real fleet-wide ceiling.
 
+### A known, bounded race between reservation and poll (not fixed here)
+
+Flagged by automated review on PR #173. `JobTracker::try_reserve` (the
+head-swap short-circuit path's capacity check) and `JobRegistry::plan_claim`
+(the ordinary poll's per-type row-limit computation) both read
+`units_in_flight`, but nothing makes those two reads atomic with the DB
+claim that follows. A short-circuit reservation that lands in the narrow
+window between a poll's `plan_claim` snapshot and its claim query actually
+executing against Postgres is invisible to that poll — the `row_limit` it
+claims against was already baked into the query as a stale parameter — so a
+per-type cap can be transiently exceeded by however many concurrent
+short-circuit reservations land inside that one window.
+
+The overshoot is bounded and self-correcting: `units_in_flight` is
+authoritative again by the very next poll, and this is the same class of
+soft accounting imperfection `max_jobs`' own unit-vs-row mismatch already
+carries (filed, not fixed, in the original handoff). A real fix needs either
+a lock spanning the whole plan-to-claim window — which would serialize every
+short-circuit reservation behind poll latency, a real regression for
+exactly the paths this design exists to speed up — or a post-claim backstop
+that re-validates and releases any row a poll over-claimed before
+dispatching it. Neither was judged worth bundling into the PR that
+introduced short-circuit dispatch. A per-type cap that must never be
+exceeded even transiently should not rely on this path alone until one of
+those lands.
+
 ---
 
 ## Indexes: the write-path trade-off

@@ -121,7 +121,14 @@ async fn wait_until(
     mut f: impl AsyncFnMut() -> anyhow::Result<bool>,
     what: &str,
 ) -> anyhow::Result<()> {
-    for _ in 0..200 {
+    // 400 x 25ms = 10s. Bumped from a 5s budget: several tests in this file
+    // race a spawn's insert-time swap against a retry's fail_job-time swap,
+    // and every spawn on the head-swap path now costs one extra DB round
+    // trip for its own claim attempt -- on a slower/more contended CI
+    // runner that was enough to occasionally miss the tighter budget even
+    // though the invariant itself was never violated (see PR #173 CI run
+    // 32309538035, `retry_backoff_yields_to_an_older_parked_sibling`).
+    for _ in 0..400 {
         if f().await? {
             return Ok(());
         }
@@ -774,6 +781,66 @@ async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::
     assert!(
         b_owner.is_none(),
         "B must not have been claimed by the shutting-down instance"
+    );
+
+    Ok(())
+}
+
+/// SHUTDOWN SUBSCRIBE TIMING (found by automated review on this PR;
+/// revert-to-red verified below): a head-swap-dispatched execution's
+/// shutdown-coordination `broadcast::Receiver`s must be subscribed BEFORE
+/// the claiming transaction commits, not inside the task
+/// `DispatchHook::post_commit` spawns to run it. A late subscribe races
+/// `ShutdownCoordinator::perform`'s broadcast -- `tokio::sync::broadcast`
+/// never delivers to a subscriber that arrives after `send` -- and a
+/// dispatch that loses that race is never acked, never waited for, and gets
+/// force-aborted by `kill_remaining_jobs` mid-flight instead of drained:
+/// exactly the #169 hazard the ordinary poll path was already hardened
+/// against, reopened here for the short-circuit spawn path specifically.
+/// Verified failing by temporarily reverting `register_dispatch_hook`/
+/// `spawn_dispatch_task` to subscribe inside the post-commit task again.
+#[tokio::test]
+async fn short_circuit_spawn_dispatch_survives_a_shutdown_race() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("shutdown-race"),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    // No gap between spawn (which short-circuit-dispatches this due-now job)
+    // and racing a shutdown right after -- deliberately stressing the exact
+    // commit-to-subscribe window this test targets.
+    spawner.spawn(id, Cfg).await?;
+    started.notified().await; // the short-circuited dispatch is live.
+
+    let shutdown_task = tokio::spawn(async move { jobs.shutdown().await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    release.notify_one();
+
+    shutdown_task
+        .await?
+        .expect("shutdown must drain the short-circuited execution, not abort it");
+
+    let aborted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM job_events WHERE id = $1 AND event->>'type' = 'execution_aborted'",
+    )
+    .bind(uuid::Uuid::from(id))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        aborted, 0,
+        "the short-circuited execution must be drained, not force-aborted"
     );
 
     Ok(())

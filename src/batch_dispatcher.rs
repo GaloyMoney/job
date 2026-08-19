@@ -543,12 +543,21 @@ impl BatchDispatcher {
             }
         }
         self.repo.update_all_in_op(op, &mut jobs).await?;
-        if promoted.is_empty() {
-            self.notifier
-                .execution_ready_in_op(op, &self.job_type)
-                .await?;
-        } else {
-            for promoted_type in promoted {
+        // Unlike the per-job path (`dispatcher.rs::reschedule_job`), `uuids`
+        // can name several rows at once: a swap only demotes the ONE row
+        // whose queue actually had an older parked sibling, so any row in
+        // `uuids` that didn't swap is still `pending` and still needs its
+        // own type's wake -- "some promotion happened somewhere in this
+        // batch" is not the same as "every row in it got swapped out".
+        // Always notify `self.job_type` (every row here is that type,
+        // swapped or not), plus every promoted type -- deduplicated, and
+        // harmless to notify twice regardless (the emitter coalesces).
+        let mut notified: HashSet<String> = HashSet::from([self.job_type.to_string()]);
+        self.notifier
+            .execution_ready_in_op(op, &self.job_type)
+            .await?;
+        for promoted_type in promoted {
+            if notified.insert(promoted_type.clone()) {
                 self.notifier
                     .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
                     .await?;
@@ -621,14 +630,16 @@ impl BatchDispatcher {
             )
             .execute(op.as_executor())
             .await?;
-            // Invariant B: same ordering fixup as the reschedule path above.
+            // Invariant B: same ordering fixup as the reschedule path above,
+            // and the same all-or-nothing hazard applies -- see the comment
+            // there. Always notify `self.job_type`, plus every promoted type.
             let promoted = swap_older_parked_siblings_in_op(op, &retry_uuids).await?;
-            if promoted.is_empty() {
-                self.notifier
-                    .execution_ready_in_op(op, &self.job_type)
-                    .await?;
-            } else {
-                for promoted_type in promoted {
+            let mut notified: HashSet<String> = HashSet::from([self.job_type.to_string()]);
+            self.notifier
+                .execution_ready_in_op(op, &self.job_type)
+                .await?;
+            for promoted_type in promoted {
+                if notified.insert(promoted_type.clone()) {
                     self.notifier
                         .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
                         .await?;

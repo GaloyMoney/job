@@ -17,7 +17,7 @@ use std::{
 use super::{
     JobId,
     batch_dispatcher::BatchDispatcher,
-    batched::RawBatchItem,
+    batched::{RawBatchItem, ShutdownRx},
     config::JobPollerConfig,
     dispatcher::*,
     entity::{Job, JobType},
@@ -490,13 +490,24 @@ impl JobPoller {
                     )
                     .await
                     {
-                        Ok(reclaimed) => {
+                        Ok((reclaimed, promoted)) => {
                             Span::current().record("n_lost_jobs", reclaimed.len());
-                            let mut reported: HashSet<&JobType> = HashSet::new();
+                            let mut reported: HashSet<String> = HashSet::new();
                             for (id, job_type) in &reclaimed {
                                 tracing::error!(job_id = %id, "lost job");
-                                if reported.insert(job_type) {
+                                if reported.insert(job_type.to_string()) {
                                     notifier.execution_ready(job_type);
+                                }
+                            }
+                            // The reclaim's own swap can promote an OLDER
+                            // parked sibling of a DIFFERENT type than any
+                            // reclaimed row's own type (see
+                            // `reclaim_lost_jobs`'s doc comment) -- notify
+                            // those too, deduplicated against what the loop
+                            // above already reported.
+                            for promoted_type in promoted {
+                                if reported.insert(promoted_type.clone()) {
+                                    notifier.execution_ready(&JobType::from_owned(promoted_type));
                                 }
                             }
                         }
@@ -788,7 +799,11 @@ impl JobPoller {
             self.clock.clone(),
             &items,
         );
-        self.spawn_batch_dispatch_task(dispatcher, items);
+        let subs = ShutdownSubs {
+            job: self.shutdown_tx.subscribe(),
+            monitor: self.shutdown_tx.subscribe(),
+        };
+        self.spawn_batch_dispatch_task(dispatcher, items, subs);
         Ok(())
     }
 
@@ -796,11 +811,19 @@ impl JobPoller {
     /// for an already-built [`BatchDispatcher`]. Shared by [`Self::dispatch_batch`]
     /// and [`Self::dispatch_batch_from_reservation`] so the shutdown
     /// handshake (`job.shutdown_coordination`, `#169`) has exactly one
-    /// implementation, mirroring [`Self::spawn_dispatch_task`].
-    fn spawn_batch_dispatch_task(&self, dispatcher: BatchDispatcher, items: Vec<RawBatchItem>) {
+    /// implementation, mirroring [`Self::spawn_dispatch_task`]. Takes
+    /// already-subscribed receivers for the same reason that one does.
+    fn spawn_batch_dispatch_task(
+        &self,
+        dispatcher: BatchDispatcher,
+        items: Vec<RawBatchItem>,
+        subs: ShutdownSubs,
+    ) {
         let job_type = dispatcher.job_type().clone();
-        let shutdown_rx_batch = self.shutdown_tx.subscribe();
-        let mut shutdown_rx_monitor = self.shutdown_tx.subscribe();
+        let ShutdownSubs {
+            job: shutdown_rx_batch,
+            monitor: mut shutdown_rx_monitor,
+        } = subs;
         let shutdown_timeout = self.config.shutdown_timeout;
         let n_items = items.len();
         let dispatched_type = job_type.clone();
@@ -923,7 +946,11 @@ impl JobPoller {
             self.instance_id,
             self.clock.clone(),
         );
-        self.spawn_dispatch_task(dispatcher, job, polled_job);
+        let subs = ShutdownSubs {
+            job: self.shutdown_tx.subscribe(),
+            monitor: self.shutdown_tx.subscribe(),
+        };
+        self.spawn_dispatch_task(dispatcher, job, polled_job, subs);
         Ok(())
     }
 
@@ -979,15 +1006,31 @@ impl JobPoller {
     /// dispatch task once `op` commits, consuming `reservation`. Shared tail
     /// of every head-swap call site (spawn, bulk spawn, keyed spawn, the
     /// completion-time recycle).
+    ///
+    /// Subscribes to `shutdown_tx` HERE -- synchronously, before `op` even
+    /// commits -- rather than inside the post-commit spawned task. A
+    /// shutdown that broadcasts between commit and that task actually
+    /// running would never be seen by a receiver that only subscribes
+    /// inside it (`tokio::sync::broadcast` never delivers to a late
+    /// subscriber), and the execution would be force-aborted instead of
+    /// drained -- the exact #169 hazard `poll_and_dispatch`'s own reverted
+    /// detach experiment hit for the ordinary poll path. Subscribing here
+    /// is the earliest point architecturally available for a head-swap
+    /// dispatch, mirroring how `dispatch_job`/`dispatch_batch` subscribe
+    /// synchronously before ever spawning their task.
     pub(crate) fn register_dispatch_hook(
         self: &Arc<Self>,
         op: &mut impl es_entity::AtomicOperation,
         reservation: UnitReservation,
         target: DispatchTarget,
     ) {
+        let subs = ShutdownSubs {
+            job: self.shutdown_tx.subscribe(),
+            monitor: self.shutdown_tx.subscribe(),
+        };
         let hook = DispatchHook {
             poller: Arc::downgrade(self),
-            work: vec![(reservation, target)],
+            work: vec![(reservation, target, subs)],
         };
         // `add_commit_hook` can only fail if `op` carries no commit-hook
         // buffer at all (mirrors `notifier.rs`'s identical fallback
@@ -1115,6 +1158,7 @@ impl JobPoller {
         self: &Arc<Self>,
         reservation: UnitReservation,
         row: ClaimedRow,
+        subs: ShutdownSubs,
     ) -> Result<(), JobError> {
         let job = self.repo.find_by_id(row.id).await?;
         let polled_job = PolledJob {
@@ -1146,7 +1190,7 @@ impl JobPoller {
             self.instance_id,
             self.clock.clone(),
         );
-        self.spawn_dispatch_task(dispatcher, job, polled_job);
+        self.spawn_dispatch_task(dispatcher, job, polled_job, subs);
         Ok(())
     }
 
@@ -1160,6 +1204,7 @@ impl JobPoller {
         reservation: UnitReservation,
         job_type: JobType,
         rows: Vec<ClaimedRow>,
+        subs: ShutdownSubs,
     ) -> Result<(), JobError> {
         let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
         let mut entities = self.repo.find_all::<Job>(&ids).await?;
@@ -1207,7 +1252,7 @@ impl JobPoller {
             self.clock.clone(),
             &items,
         );
-        self.spawn_batch_dispatch_task(dispatcher, items);
+        self.spawn_batch_dispatch_task(dispatcher, items, subs);
         Ok(())
     }
 
@@ -1215,9 +1260,21 @@ impl JobPoller {
     /// already-built [`JobDispatcher`]. Shared by [`Self::dispatch_job`] and
     /// [`Self::dispatch_job_from_reservation`] so the shutdown handshake
     /// (`job.shutdown_coordination`, `#169`) has exactly one implementation.
-    fn spawn_dispatch_task(&self, dispatcher: JobDispatcher, job: Job, polled_job: PolledJob) {
-        let shutdown_rx_job = self.shutdown_tx.subscribe();
-        let mut shutdown_rx_monitor = self.shutdown_tx.subscribe();
+    /// Takes already-subscribed receivers rather than subscribing itself:
+    /// the head-swap caller must subscribe before its claiming `op` commits
+    /// (see [`Self::register_dispatch_hook`]'s doc comment) -- subscribing
+    /// in here would be too late for that path.
+    fn spawn_dispatch_task(
+        &self,
+        dispatcher: JobDispatcher,
+        job: Job,
+        polled_job: PolledJob,
+        subs: ShutdownSubs,
+    ) {
+        let ShutdownSubs {
+            job: shutdown_rx_job,
+            monitor: mut shutdown_rx_monitor,
+        } = subs;
         let shutdown_timeout = self.config.shutdown_timeout;
         let job_id = job.id;
         let job_type = job.job_type.clone();
@@ -1325,7 +1382,17 @@ pub(crate) enum DispatchTarget {
 /// transaction, and each dispatches independently on commit.
 struct DispatchHook {
     poller: std::sync::Weak<JobPoller>,
-    work: Vec<(UnitReservation, DispatchTarget)>,
+    work: Vec<(UnitReservation, DispatchTarget, ShutdownSubs)>,
+}
+
+/// The two independently-subscribed shutdown receivers one dispatch task
+/// needs (`job` for the execution future, `monitor` for the shutdown-signal
+/// arm of its `tokio::select!`) -- see [`JobPoller::register_dispatch_hook`]'s
+/// doc comment for why a head-swap dispatch must obtain these BEFORE its
+/// claiming transaction commits, not inside the task that finally runs it.
+struct ShutdownSubs {
+    job: ShutdownRx,
+    monitor: ShutdownRx,
 }
 
 impl es_entity::operation::hooks::CommitHook for DispatchHook {
@@ -1338,13 +1405,15 @@ impl es_entity::operation::hooks::CommitHook for DispatchHook {
             // exists.
             return;
         };
-        for (reservation, target) in self.work {
+        for (reservation, target, subs) in self.work {
             let poller = Arc::clone(&poller);
             tokio::spawn(async move {
                 match target {
                     DispatchTarget::Single(row) => {
                         let id = row.id;
-                        if let Err(e) = poller.dispatch_job_from_reservation(reservation, row).await
+                        if let Err(e) = poller
+                            .dispatch_job_from_reservation(reservation, row, subs)
+                            .await
                         {
                             tracing::error!(
                                 job_id = %id,
@@ -1357,7 +1426,12 @@ impl es_entity::operation::hooks::CommitHook for DispatchHook {
                     DispatchTarget::Batch(job_type, rows) => {
                         let n_items = rows.len();
                         if let Err(e) = poller
-                            .dispatch_batch_from_reservation(reservation, job_type.clone(), rows)
+                            .dispatch_batch_from_reservation(
+                                reservation,
+                                job_type.clone(),
+                                rows,
+                                subs,
+                            )
                             .await
                         {
                             tracing::error!(
@@ -1387,7 +1461,7 @@ async fn reclaim_lost_jobs(
     alive_threshold: DateTime<Utc>,
     reschedule_at: DateTime<Utc>,
     self_live_ids: &[uuid::Uuid],
-) -> Result<Vec<(JobId, JobType)>, sqlx::Error> {
+) -> Result<(Vec<(JobId, JobType)>, Vec<String>), sqlx::Error> {
     let mut tx = pool.begin().await?;
     let rows = sqlx::query!(
         r#"
@@ -1412,13 +1486,21 @@ async fn reclaim_lost_jobs(
     // paths. A reclaimed row keeps its queue's active slot (it was already
     // the sole `running` occupant), but an older parked sibling should run
     // first during the reclaimed row's backoff. Applied to every queue this
-    // reclaim touched, in one statement; the promoted types don't need their
-    // own notify here since every reclaimed type is already notified below.
+    // reclaim touched, in one statement. The promoted sibling's type is
+    // reported separately -- it can differ from every reclaimed row's own
+    // type (one `queue_id` can be shared across types), so notifying only
+    // the reclaimed types would miss it, the same failure mode
+    // `delete_execution_in_op`'s `next_in_queue` resolution and
+    // `swap_older_parked_siblings_in_op`'s own doc comment exist to prevent
+    // everywhere else this helper is called.
     let reclaimed_uuids: Vec<uuid::Uuid> = rows.iter().map(|r| uuid::Uuid::from(r.id)).collect();
-    swap_older_parked_siblings_in_op(&mut tx, &reclaimed_uuids).await?;
+    let promoted = swap_older_parked_siblings_in_op(&mut tx, &reclaimed_uuids).await?;
 
     tx.commit().await?;
-    Ok(rows.into_iter().map(|r| (r.id, r.job_type)).collect())
+    Ok((
+        rows.into_iter().map(|r| (r.id, r.job_type)).collect(),
+        promoted,
+    ))
 }
 
 /// Recover parked rows whose queue has no active (`pending`/`running`) row
@@ -2268,6 +2350,7 @@ mod tests {
             &self_live_ids,
         )
         .await?
+        .0
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -2612,10 +2695,10 @@ mod tests {
 
         let threshold = chrono::Utc::now() - chrono::Duration::seconds(300);
         let reschedule_at = chrono::Utc::now();
-        let reclaimed = reclaim_lost_jobs(
+        let (reclaimed, promoted) = reclaim_lost_jobs(
             &pool,
             instance_id,
-            &[JobType::from_owned(job_type)],
+            &[JobType::from_owned(job_type.clone())],
             threshold,
             reschedule_at,
             &[],
@@ -2623,6 +2706,13 @@ mod tests {
         .await?;
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].0, lost);
+        assert_eq!(
+            promoted,
+            vec![job_type],
+            "the reclaim must report the promoted sibling's type so its poller \
+             can be woken -- even here, where it happens to match the reclaimed \
+             row's own type"
+        );
 
         assert_eq!(
             row_state(&pool, sibling).await?,
@@ -2642,6 +2732,62 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(active, 1, "Invariant A must still hold after the swap");
+
+        Ok(())
+    }
+
+    /// Found by automated review on this PR: a reclaim's own swap can
+    /// promote an OLDER parked sibling of a DIFFERENT type than the
+    /// reclaimed row's own type (one `queue_id` can be shared across
+    /// types) -- `reclaim_lost_jobs` must report that type too, not just
+    /// the reclaimed types, or the promoted sibling's poller is never
+    /// woken. Revert-to-red verified by temporarily discarding
+    /// `swap_older_parked_siblings_in_op`'s return value again (mirroring
+    /// how the pre-fix code called it for its side effect only).
+    #[tokio::test]
+    async fn reclaim_reports_a_promoted_sibling_of_a_different_type() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let instance_id = uuid::Uuid::now_v7();
+        let lost_type = format!("reclaim-cross-lost-{}", uuid::Uuid::now_v7());
+        let sibling_type = format!("reclaim-cross-sibling-{}", uuid::Uuid::now_v7());
+        let queue = format!("reclaim-cross-queue-{}", uuid::Uuid::now_v7());
+        let stale_alive_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let older = stale_alive_at - chrono::Duration::seconds(60);
+
+        let lost = seed_queued_job(&pool, &lost_type, &queue, stale_alive_at, "running").await?;
+        sqlx::query(
+            "UPDATE job_executions SET poller_instance_id = $2, alive_at = $3 WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(lost))
+        .bind(instance_id)
+        .bind(stale_alive_at)
+        .execute(&pool)
+        .await?;
+        // Same queue, a DIFFERENT type -- the reclaim only scans for
+        // `lost_type`, but the swap must still find and promote this.
+        let sibling = seed_queued_job(&pool, &sibling_type, &queue, older, "parked").await?;
+
+        let threshold = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let reschedule_at = chrono::Utc::now();
+        let (reclaimed, promoted) = reclaim_lost_jobs(
+            &pool,
+            instance_id,
+            &[JobType::from_owned(lost_type)],
+            threshold,
+            reschedule_at,
+            &[],
+        )
+        .await?;
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].0, lost);
+        assert_eq!(
+            promoted,
+            vec![sibling_type],
+            "the reclaim must report the promoted sibling's OWN type, distinct \
+             from every reclaimed row's type, so its poller can be woken"
+        );
+        assert_eq!(row_state(&pool, sibling).await?, "pending");
+        assert_eq!(row_state(&pool, lost).await?, "parked");
 
         Ok(())
     }
