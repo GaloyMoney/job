@@ -1,3 +1,11 @@
+# [job release v0.12.1](https://github.com/GaloyMoney/job/releases/tag/0.12.1)
+
+
+
+### Performance
+
+- Bound the claim scan by admission, not by backlog (#172)
+
 # [job release v0.12.0](https://github.com/GaloyMoney/job/releases/tag/0.12.0)
 
 
