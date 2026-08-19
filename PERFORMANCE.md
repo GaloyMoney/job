@@ -94,57 +94,120 @@ implements). Owed before the validation run referenced in the PR: `exp2.sh`
 parity across `nblocked ∈ {0..1600}`, the seed matrix with blocked siblings
 seeded as `parked`, and `writecost.sql` for the insert-path delta.
 
-### Short-circuit spawn (this change, scoped)
+### Short-circuit dispatch: head-swap claiming (supersedes the born-claimed design below)
+
+**Superseded design note.** An earlier pass of this change (still visible in
+the git history of this PR) short-circuited a due-now spawn by inserting it
+**born-claimed** — `running`-by-this-instance directly, unconditionally. That
+design had a real fairness defect (see the retired write-up a few paragraphs
+down) and has been replaced by **head-swap claiming**, described here. The
+mechanism, scope, and trade-offs below are the current, authoritative state.
+
+**The idea:** a short-circuit event — a due-now spawn, or a job/batch
+completing — never dispatches a *specific* row. It obtains one unit of
+capacity for a type `T` (a fresh reservation for a spawn; a **recycled**
+unit for a completion, since the completing job's own slot is about to free
+regardless), then claims `T`'s oldest due `pending` row(s) — whoever they
+are — via `claim_due_heads_in_op`, a second statement in the SAME
+transaction as the caller's own write. If the claim finds nothing, the
+reservation releases and the caller's row (already inserted/promoted
+normally) simply waits for the ordinary poll like today.
+
+- **Fairness is structural, not a trade-off.** Within one type, admission is
+  always `(execute_at, id)`-ordered — on the fast path exactly like the poll
+  path. A short-circuited event can dispatch a DIFFERENT row than the one
+  that triggered it, whenever an older due row of the same type exists.
+  `short_circuit()` (on `JobInitializer`, `KeyedJobInitializer`, and
+  `BatchedJobInitializer` — default `true` on all three) remains a per-type
+  opt-out, but it is no longer covering for a fairness defect; it exists for
+  latency-indifferent types that would rather never pay the extra claim
+  statement.
+- **Batched types are included.** A batch slot is already one tracker unit
+  regardless of row count (`JobTracker::dispatch_batch`), so a reservation
+  maps onto a batched type unchanged; the claim just uses `limit =
+  max_batch_size` and excludes `attempt_index > 1` rows (retries always run
+  alone, mirroring `dispatch_batches`' own split of an ordinary poll claim).
+  No accumulator/collector is needed: partial batches under light load are
+  already normal behavior (`dispatch_batches` chunks with
+  `take = max_batch_size.min(fresh.len())`, no linger, no minimum), and under
+  sustained load a completion's recycle claims a FULL batch in one statement,
+  since the backlog is deep at exactly that moment.
+- **Keyed types are included.** `KeyedJobSpawner::spawn`'s `Inserted` branch
+  attempts the same claim after its ordinary insert.
+- **The completion-time chain hop is implemented**, in
+  `dispatcher.rs::delete_execution_in_op` (per-job) and
+  `batch_dispatcher.rs`'s `seal`/`fail_batch` (per-batch, exactly once per
+  `execute_batch` regardless of how many sub-outcomes it disposed — a batch
+  is one execution unit no matter how many rows terminate inside it, so
+  recycling from more than one of its internal branches would try to spend
+  the same freed unit twice). A completing job/batch recycles its
+  about-to-free unit into its OWN type's oldest due backlog — independent of
+  which queue it happened to free, and independent of whether the promoted
+  sibling (unchanged logic, still promoted unconditionally either way) is
+  even the same type. Gated on `JobPoller::is_shutting_down()`: a completion
+  during an in-flight shutdown drain never recycles, so it cannot re-admit
+  work that would miss the shutdown broadcast and get force-aborted (#169).
+- **Bulk `spawn_all` is included.** `try_claim_after_bulk_spawn` greedily
+  reserves as many units as the batch's own due-row count could plausibly
+  use and claims after each; under-reservation is not a failure — every row
+  already landed pending/parked via the ordinary bulk insert regardless, so
+  whatever isn't claimed here is picked up by the ordinary poll exactly as
+  before this design.
+- **Fan-out spawns from inside a running job's own runner still do not
+  short-circuit** — the one piece carried over unchanged from the
+  born-claimed design's scope cuts. Only spawns made from the
+  application-level spawner returned by `Jobs::add_initializer`/
+  `add_batched_initializer`/`add_keyed_initializer` do; a job calling
+  `spawner.spawn(...)` on the spawner its own `init()` was handed gets the
+  ordinary path. Contained, not a correctness issue — the plumbing (`init`/
+  `init_erased` would need a live `PollerHandle` threaded through, which
+  their signatures don't carry today) just wasn't judged worth it in this
+  pass.
+- **Cross-type fairness is explicitly not addressed**, and this is a
+  permanent design line, not a scope cut: a completion only ever recycles
+  into its OWN type's backlog. Comparing across types at claim time would
+  reintroduce most of the poll query's own machinery; cross-type sharing
+  stays the ordinary poll's job (a claim's reservation releases when nothing
+  of its type is due, and the ordinary notify still wakes other types'
+  pollers as before).
+
+**Cost worth naming:** a claimed row's `SELECT ... FOR UPDATE SKIP LOCKED`
+head stays row-locked for the remainder of the caller's own transaction
+(the insert/promote plus the claim, both in one transaction) — bounded and
+small in the ordinary case, but a caller that does unrelated slow work
+between its write and its commit extends that window. `claim_due_heads_in_op`
+is deliberately a SECOND, separate statement rather than folded into the
+write CTE — the two genuine bugs found in this PR's write paths
+(`swap_older_parked_siblings_in_op`'s CTE-ordering hazard; a missing
+ordering check in the now-deleted born-claimed conflict path) both came from
+collapsing independent writes into one statement with no guaranteed
+ordering between them. Don't re-introduce that shape here to save a round
+trip.
+
+---
+
+<details>
+<summary>Retired: the born-claimed design's scope cuts and fairness trade-off (superseded above)</summary>
 
 A due-now spawn of a non-batched, non-keyed, non-resident type whose
-initializer allows it (`JobInitializer::short_circuit`, default `true`) skips
-the pending queue entirely: `JobTracker::try_reserve` claims process/type
-capacity synchronously (mirrors the existing claimed-slot-before-dispatch
-discipline `JobDispatcher`/`BatchDispatcher` already use), the row is inserted
-`running`-by-this-instance directly, and a commit hook on the spawning
-transaction hands it to the dispatcher the instant the transaction commits —
-no `execution_ready` NOTIFY, no poll round trip. A born-claimed row is
-byte-identical to a poll-claimed one, so crash recovery (`reclaim_lost_jobs`)
-needs no new logic.
+initializer allowed it skipped the pending queue entirely: capacity was
+claimed synchronously, the row was inserted `running`-by-this-instance
+directly, and a commit hook handed it to the dispatcher the instant the
+transaction committed. Deliberately scoped down at the time: batched and
+keyed types were excluded, the completion-time chain hop was not
+implemented, fan-out spawns and bulk `spawn_all` never short-circuited.
 
-**Deliberately scoped down from the handoff this implements**, and worth
-naming so a future pass doesn't have to rediscover why:
+**The fairness trade-off that motivated the head-swap replacement:** a
+born-claimed spawn dispatched the instant capacity allowed, independent of
+how much *older* due backlog of the same (or any) type was still sitting
+`pending` — the ordinary claim path's oldest-first admission (see "Queue
+fairness: oldest-first" above) did not apply to it. That was a real behavior
+change for any type that ever accumulated backlog while spawning more work,
+not just a latency improvement, which is why `short_circuit()` existed as a
+per-type opt-out in the first place. Head-swap claiming removes the
+trade-off structurally instead of documenting around it.
 
-- **Batched types are excluded** (`registry.is_batched` check, not merely a
-  default). The handoff's `BatchCollector` (accumulate born-claimed rows,
-  dispatch when a slot frees) is real future work — every batched row still
-  takes the ordinary pending/poll path today.
-- **Keyed types are excluded.** `KeyedJobSpawner` never calls the short-circuit
-  path; only `JobInitializer`-registered (plain) spawns do. The handoff's
-  §3.2 called this "unchanged — the unique-key index is state-independent",
-  which is true, but wiring it through `insert_keyed_execution` wasn't done
-  here.
-- **The completion-time chain hop (handoff §3.3, "promote-to-claimed") is not
-  implemented.** A queue's next row, once promoted from `parked`, still lands
-  `pending` and waits for a poll — it does not skip straight to `running` the
-  way a fresh spawn can. This is the highest-value piece the handoff
-  describes ("chains serialize on their queue... zero polls") and is the
-  natural next step on top of the reservation/hook machinery landed here, but
-  it needs `JobDispatcher`/registry access from the completion path
-  (`dispatcher.rs`), which doesn't have it today the way the spawn path does
-  via `JobPoller`'s already-live registry+tracker+notifier.
-- **Fan-out spawns from inside a running job's own runner do not
-  short-circuit** — only spawns made from the application-level spawner
-  returned by `Jobs::add_initializer`/`add_batched_initializer` do. A job
-  calling `spawner.spawn(...)` on the `JobSpawner` its own `init()` was handed
-  gets the ordinary path. Contained, not a correctness issue — just a missed
-  optimization for that call site.
-- **The bulk `spawn_all` path never short-circuits.** Every row from one
-  `spawn_all` call lands `pending`/`parked` exactly as PR1 describes.
-
-**Fairness trade-off, load-bearing for the default:** a born-claimed spawn is
-dispatched the instant capacity allows, independent of how much *older* due
-backlog of the same (or any) type is still sitting `pending` — the ordinary
-claim path's oldest-first admission (see "Queue fairness: oldest-first" above)
-does not apply to it. This is a real behavior change for any type that ever
-accumulates backlog while spawning more work, not just a latency
-improvement, and is why `short_circuit()` exists as a per-type opt-out rather
-than being unconditional.
+</details>
 
 ---
 
