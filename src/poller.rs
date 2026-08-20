@@ -69,7 +69,7 @@ pub(crate) struct JobPoller {
     poll_pool: PgPool,
     /// Set once `ShutdownCoordinator::perform` begins (shared with it, not
     /// owned -- both must observe the SAME flip). Checked by the
-    /// completion-time recycle claim (`try_claim_for_recycle`) so a
+    /// completion-time recycle claim (`ClaimHook::pre_commit`) so a
     /// completing job/batch never re-admits new work once the drain is
     /// underway: recycling during shutdown would let a self-rescheduling job
     /// keep the process alive past the drain, defeating #169.
@@ -978,174 +978,128 @@ impl JobPoller {
         }
     }
 
-    /// The head-swap kernel's claim step (handoff addendum §7.2): claim
-    /// `job_type`'s due backlog per [`Self::claim_shape`] and wrap it as a
-    /// [`DispatchTarget`], or `None` if nothing was due to claim right now.
-    /// `now` must be the SAME instant the caller's own write in this `op`
-    /// used -- see the sim-clock hazard note on [`claim_due_heads_in_op`].
-    async fn claim_after(
+    /// The head-swap kernel's claim step, generalized to `n_units`
+    /// reservations in ONE statement (handoff addendum §8.2c -- this
+    /// replaces the earlier one-reservation-at-a-time `claim_after`, which
+    /// cost the bulk spawn path a claim statement PER reservation): claims
+    /// up to `n_units * claim_shape(job_type).0` of `job_type`'s due backlog
+    /// and splits the result into that many [`DispatchTarget`]s -- one row
+    /// per reservation for a plain type, up to `max_batch_size` rows per
+    /// reservation for a batched type. `now` must be the SAME instant the
+    /// caller's own write in this `op` used -- see the sim-clock hazard note
+    /// on [`claim_due_heads_in_op`]. Returns fewer than `n_units` targets --
+    /// down to zero -- whenever fewer than that many units' worth of due
+    /// work exists; callers must release whatever reservation has no
+    /// matching target.
+    async fn claim_after_many(
         self: &Arc<Self>,
         op: &mut impl es_entity::AtomicOperation,
         job_type: &JobType,
         now: DateTime<Utc>,
-    ) -> Result<Option<DispatchTarget>, JobError> {
-        let (limit, fresh_only) = self.claim_shape(job_type);
+        n_units: usize,
+    ) -> Result<Vec<DispatchTarget>, sqlx::Error> {
+        if n_units == 0 {
+            return Ok(Vec::new());
+        }
+        let (per_unit_limit, fresh_only) = self.claim_shape(job_type);
+        let limit = per_unit_limit * n_units as i64;
         let rows =
             claim_due_heads_in_op(op, job_type, self.instance_id, now, limit, fresh_only).await?;
         if rows.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        Ok(Some(if self.registry.batch_policy(job_type).is_some() {
-            DispatchTarget::Batch(job_type.clone(), rows)
+        if self.registry.batch_policy(job_type).is_some() {
+            let mut rows = rows.into_iter();
+            let mut targets = Vec::new();
+            loop {
+                let chunk: Vec<ClaimedRow> = (&mut rows).take(per_unit_limit as usize).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                targets.push(DispatchTarget::Batch(job_type.clone(), chunk));
+            }
+            Ok(targets)
         } else {
-            DispatchTarget::Single(rows.into_iter().next().expect("checked non-empty"))
-        }))
-    }
-
-    /// Register a [`DispatchHook`] on `op` that will hand `target` off to a
-    /// dispatch task once `op` commits, consuming `reservation`. Shared tail
-    /// of every head-swap call site (spawn, bulk spawn, keyed spawn, the
-    /// completion-time recycle).
-    ///
-    /// Subscribes to `shutdown_tx` HERE -- synchronously, before `op` even
-    /// commits -- rather than inside the post-commit spawned task. A
-    /// shutdown that broadcasts between commit and that task actually
-    /// running would never be seen by a receiver that only subscribes
-    /// inside it (`tokio::sync::broadcast` never delivers to a late
-    /// subscriber), and the execution would be force-aborted instead of
-    /// drained -- the exact #169 hazard `poll_and_dispatch`'s own reverted
-    /// detach experiment hit for the ordinary poll path. Subscribing here
-    /// is the earliest point architecturally available for a head-swap
-    /// dispatch, mirroring how `dispatch_job`/`dispatch_batch` subscribe
-    /// synchronously before ever spawning their task.
-    pub(crate) fn register_dispatch_hook(
-        self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
-        reservation: UnitReservation,
-        target: DispatchTarget,
-    ) {
-        let subs = ShutdownSubs {
-            job: self.shutdown_tx.subscribe(),
-            monitor: self.shutdown_tx.subscribe(),
-        };
-        let hook = DispatchHook {
-            poller: Arc::downgrade(self),
-            work: vec![(reservation, target, subs)],
-        };
-        // `add_commit_hook` can only fail if `op` carries no commit-hook
-        // buffer at all (mirrors `notifier.rs`'s identical fallback
-        // comment); if that ever happens here, every claimed row is already
-        // `running` in the DB with nothing that will dispatch it until
-        // `reclaim_lost_jobs` eventually reclaims it on a stale `alive_at`
-        // -- correct, if slow, recovery, so this is not a hard error. The
-        // hook (and the reservation(s) it holds) simply drops here on `Err`,
-        // releasing the capacity since nothing will use it.
-        if op.add_commit_hook(hook).is_err() {
-            tracing::error!(
-                "short-circuit dispatch could not register its commit hook; \
-                 the claimed row(s) will sit running until reclaim_lost_jobs recovers them"
-            );
+            Ok(rows.into_iter().map(DispatchTarget::Single).collect())
         }
     }
 
-    /// Head-swap short-circuit's SPAWN entry point (handoff addendum §7.3
-    /// site 1/5): reserve fresh capacity for `job_type`, then claim its due
-    /// backlog. Call AFTER the caller's ordinary insert has already landed
-    /// its own row pending/parked in the SAME `op` -- the claim is a later
-    /// statement in the same transaction, so it sees that insert with
-    /// guaranteed ordering. Returns `false` (no dispatch hook registered)
-    /// when the type opted out, capacity wasn't available, or nothing was
-    /// due to claim -- the caller's insert already committed correctly
-    /// either way.
-    pub(crate) async fn try_claim_after_spawn(
-        self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
-        job_type: &JobType,
-        now: DateTime<Utc>,
-    ) -> Result<bool, JobError> {
-        if !self.registry.short_circuit(job_type) {
-            return Ok(false);
-        }
-        let Some(reservation) = self.try_reserve(job_type) else {
-            return Ok(false);
-        };
-        match self.claim_after(op, job_type, now).await? {
-            Some(target) => {
-                self.register_dispatch_hook(op, reservation, target);
-                Ok(true)
-            }
-            None => {
-                reservation.release();
-                Ok(false)
-            }
-        }
-    }
-
-    /// Head-swap short-circuit's BULK SPAWN entry point (handoff addendum
-    /// §7.3 site 4): `job_type` here is always a single type (one
-    /// `JobSpawner<Config>` == one type), so this greedily reserves as many
-    /// units as `n_due` could plausibly use -- one reservation per row for a
-    /// plain type, one per `max_batch_size` rows for a batched type -- and
-    /// claims after each. Under-reservation is not a failure: every row of
-    /// the caller's bulk insert already landed pending/parked before this
-    /// runs, so whatever this loop doesn't claim is picked up by the
-    /// ordinary poll exactly as before this addendum.
-    pub(crate) async fn try_claim_after_bulk_spawn(
+    /// Registers spawn-side claim demand for `job_type` (handoff addendum
+    /// §8.2c): `n_due` is a count of due ROWS, not reservations -- at commit
+    /// time [`ClaimHook::pre_commit`] translates it into
+    /// `n_due.div_ceil(per_reservation)` fresh reservations (one row per
+    /// reservation for a plain type, up to `max_batch_size` rows per
+    /// reservation for a batched type -- see [`Self::claim_shape`]) and
+    /// claims after each. Call AFTER the caller's ordinary insert has
+    /// already landed its own row(s) pending/parked in the SAME `op` -- the
+    /// claim is a later statement in the same transaction, so it sees that
+    /// insert with guaranteed ordering. A no-op if `n_due == 0` -- nothing
+    /// to claim for zero due rows.
+    pub(crate) fn register_claim_demand(
         self: &Arc<Self>,
         op: &mut impl es_entity::AtomicOperation,
         job_type: &JobType,
         n_due: usize,
-        now: DateTime<Utc>,
-    ) -> Result<(), JobError> {
-        if n_due == 0 || !self.registry.short_circuit(job_type) {
-            return Ok(());
+    ) {
+        if n_due == 0 {
+            return;
         }
-        let per_reservation = self
-            .registry
-            .batch_policy(job_type)
-            .map(|policy| policy.max_batch_size)
-            .unwrap_or(1)
-            .max(1);
-        let max_attempts = n_due.div_ceil(per_reservation);
-        for _ in 0..max_attempts {
-            let Some(reservation) = self.try_reserve(job_type) else {
-                break;
-            };
-            match self.claim_after(op, job_type, now).await? {
-                Some(target) => self.register_dispatch_hook(op, reservation, target),
-                None => {
-                    reservation.release();
-                    break;
-                }
-            }
-        }
-        Ok(())
+        let hook = ClaimHook {
+            poller: Arc::downgrade(self),
+            fresh_demand: HashMap::from([(job_type.clone(), n_due)]),
+            recycled: Vec::new(),
+            claimed: Vec::new(),
+        };
+        Self::register_claim_hook(op, hook);
     }
 
-    /// Head-swap short-circuit's COMPLETION-RECYCLE entry point (handoff
-    /// addendum §7.3 sites 2/3): NOT a fresh reservation -- the caller
-    /// (a completing `JobDispatcher`/`BatchDispatcher`) already holds this
-    /// unit of `job_type`'s capacity and is about to release it. Claims
-    /// first; only a non-empty result means the caller should detach its own
-    /// Drop-triggered release (`recycle_unit`) and hand the now-unowned unit
-    /// to a fresh [`JobTracker::recycle`] reservation via
-    /// [`Self::register_dispatch_hook`]. `None` means: nothing due right
-    /// now (or shutdown is underway, or the type opted out) -- do the
-    /// ordinary release.
-    pub(crate) async fn try_claim_for_recycle(
+    /// Registers a completion-side recycled unit of `job_type`'s capacity
+    /// (handoff addendum §8.2c): the caller already owns this unit (it just
+    /// called [`JobTracker::recycle`], having first detached its own
+    /// Drop-triggered release) and is about to lose it. At commit time,
+    /// [`ClaimHook::pre_commit`] tries to spend it on this type's own oldest
+    /// due backlog; if nothing is due (or shutdown is underway, or the type
+    /// opted out), the reservation simply drops and performs the ordinary
+    /// release the caller's own Drop would have -- no claim-first-then-decide
+    /// at the call site, the hook decides.
+    pub(crate) fn register_claim_recycle(
         self: &Arc<Self>,
         op: &mut impl es_entity::AtomicOperation,
         job_type: &JobType,
-        now: DateTime<Utc>,
-    ) -> Result<Option<DispatchTarget>, JobError> {
-        if self.is_shutting_down() || !self.registry.short_circuit(job_type) {
-            return Ok(None);
+        reservation: UnitReservation,
+    ) {
+        let hook = ClaimHook {
+            poller: Arc::downgrade(self),
+            fresh_demand: HashMap::new(),
+            recycled: vec![(job_type.clone(), reservation)],
+            claimed: Vec::new(),
+        };
+        Self::register_claim_hook(op, hook);
+    }
+
+    /// Shared registration tail for [`Self::register_claim_demand`]/
+    /// [`Self::register_claim_recycle`]. `add_commit_hook` can only fail if
+    /// `op` carries no commit-hook buffer at all. `ClaimHook` must NEVER
+    /// `force_execute_pre_commit` in that case, unlike a hook whose work
+    /// must not be dropped -- forcing this one inline would claim rows with
+    /// no `post_commit` pass ever running to dispatch them, stranding them
+    /// `running` until `reclaim_lost_jobs` eventually recovers them on a
+    /// stale `alive_at`. Dropping the hook here is strictly the safer
+    /// failure mode: no claim happens at all, and any recycled reservation
+    /// it carried releases via `UnitReservation::Drop` exactly as an
+    /// ordinary completion would.
+    fn register_claim_hook(op: &mut impl es_entity::AtomicOperation, hook: ClaimHook) {
+        if op.add_commit_hook(hook).is_err() {
+            tracing::error!(
+                "short-circuit claim could not register its commit hook; \
+                 any recycled unit released normally, any fresh demand is simply not claimed \
+                 -- the ordinary poll covers both"
+            );
         }
-        self.claim_after(op, job_type, now).await
     }
 
     /// The head-swap dispatch fast path's SINGLE-job entry point: called
-    /// from [`DispatchHook::post_commit`] once the claiming transaction has
+    /// from [`ClaimHook::post_commit`] once the claiming transaction has
     /// committed. Re-reads the entity by id rather than carrying it across
     /// the commit boundary -- one extra point read for the fast path only,
     /// not the `find_all` batch the ordinary poll claim needs. Builds the
@@ -1262,7 +1216,7 @@ impl JobPoller {
     /// (`job.shutdown_coordination`, `#169`) has exactly one implementation.
     /// Takes already-subscribed receivers rather than subscribing itself:
     /// the head-swap caller must subscribe before its claiming `op` commits
-    /// (see [`Self::register_dispatch_hook`]'s doc comment) -- subscribing
+    /// (see [`ClaimHook::pre_commit`]'s doc comment) -- subscribing
     /// in here would be too late for that path.
     fn spawn_dispatch_task(
         &self,
@@ -1361,41 +1315,148 @@ impl JobPoller {
 /// transaction commits (handoff addendum §7.2). Carries everything
 /// [`JobPoller::dispatch_job_from_reservation`]/
 /// [`JobPoller::dispatch_batch_from_reservation`] need besides the poller
-/// itself -- see [`DispatchHook`].
+/// itself -- see [`ClaimHook`].
 pub(crate) enum DispatchTarget {
     Single(ClaimedRow),
     Batch(JobType, Vec<ClaimedRow>),
 }
 
-/// Fires once a head-swap claim's `op` commits: hands every claimed unit of
-/// work off to [`JobPoller::dispatch_job_from_reservation`]/
-/// [`JobPoller::dispatch_batch_from_reservation`]. Registered instead of
-/// dispatching inline because `post_commit` runs synchronously (mirrors
-/// `notifier.rs`'s `JobEventHook`) — the actual dispatch needs `.await`, so
-/// this spawns a detached task per entry, same as the ordinary poll-claim
-/// path already does off the poll loop.
-///
-/// Carries a `Vec` (not a single reservation/target pair) because
-/// [`Self::merge`] folds every `DispatchHook` registered on one `op` into
-/// the first: a bulk spawn's greedy reserve-and-claim loop
-/// ([`JobPoller::try_claim_after_bulk_spawn`]) can register several in one
-/// transaction, and each dispatches independently on commit.
-struct DispatchHook {
-    poller: std::sync::Weak<JobPoller>,
-    work: Vec<(UnitReservation, DispatchTarget, ShutdownSubs)>,
-}
-
 /// The two independently-subscribed shutdown receivers one dispatch task
 /// needs (`job` for the execution future, `monitor` for the shutdown-signal
-/// arm of its `tokio::select!`) -- see [`JobPoller::register_dispatch_hook`]'s
-/// doc comment for why a head-swap dispatch must obtain these BEFORE its
+/// arm of its `tokio::select!`) -- see [`ClaimHook::pre_commit`]'s doc
+/// comment for why a head-swap dispatch must obtain these BEFORE its
 /// claiming transaction commits, not inside the task that finally runs it.
 struct ShutdownSubs {
     job: ShutdownRx,
     monitor: ShutdownRx,
 }
 
-impl es_entity::operation::hooks::CommitHook for DispatchHook {
+/// The head-swap short-circuit's commit hook (handoff addendum §8.2c): does
+/// its DB work -- reserving capacity and claiming due heads -- in
+/// `pre_commit`, so the `FOR UPDATE SKIP LOCKED` head lock is held only from
+/// the claim to commit, not for the remainder of whatever transaction the
+/// caller's own write runs in. Replaces the earlier `DispatchHook` (which
+/// only dispatched an already-claimed target in `post_commit`, with the
+/// claim itself run mid-transaction by `try_claim_after_spawn`/
+/// `try_claim_after_bulk_spawn`/`try_claim_for_recycle` at the call site).
+///
+/// Two kinds of demand merge into one instance per `op` (via [`Self::merge`],
+/// which is why registration order across call sites never matters):
+/// - `fresh_demand`: a spawn-side call reports `job_type` has `n_due` more
+///   due ROWS worth claiming. Translated into `n_due.div_ceil(per_reservation)` NEW
+///   reservations of `job_type`'s capacity in `pre_commit` -- taken there,
+///   not at registration, so a reservation is never held open across the
+///   rest of the caller's transaction.
+/// - `recycled`: a completion-side call already owns a unit of `job_type`'s
+///   capacity (its own dispatcher is about to release it) and hands it over
+///   instead of releasing outright -- see [`JobTracker::recycle`].
+struct ClaimHook {
+    poller: std::sync::Weak<JobPoller>,
+    fresh_demand: HashMap<JobType, usize>,
+    recycled: Vec<(JobType, UnitReservation)>,
+    claimed: Vec<(UnitReservation, DispatchTarget, ShutdownSubs)>,
+}
+
+impl es_entity::operation::hooks::CommitHook for ClaimHook {
+    /// Subscribes to `shutdown_tx` HERE -- synchronously, inside this
+    /// pre-commit pass, before `op` even commits -- rather than inside the
+    /// post-commit spawned task. A shutdown that broadcasts between commit
+    /// and that task actually running would never be seen by a receiver
+    /// that only subscribes inside it (`tokio::sync::broadcast` never
+    /// delivers to a late subscriber), and the execution would be
+    /// force-aborted instead of drained -- the exact #169 hazard
+    /// `poll_and_dispatch`'s own reverted detach experiment hit for the
+    /// ordinary poll path. Subscribing here is the earliest point
+    /// architecturally available for a head-swap dispatch, mirroring how
+    /// `dispatch_job`/`dispatch_batch` subscribe synchronously before ever
+    /// spawning their task.
+    async fn pre_commit(
+        mut self,
+        mut op: es_entity::operation::hooks::HookOperation<'_>,
+    ) -> Result<es_entity::operation::hooks::PreCommitRet<'_, Self>, sqlx::Error> {
+        let Some(poller) = self.poller.upgrade() else {
+            // The poller is gone (process tearing down). Every recycled
+            // reservation just drops with `self` below and releases via
+            // `UnitReservation::Drop`; fresh demand was only a count, never
+            // a reservation, so there is nothing to release for it.
+            return es_entity::operation::hooks::PreCommitRet::ok(self, op);
+        };
+
+        if poller.is_shutting_down() {
+            // #169: a completion recycling into new work during drain would
+            // keep a self-rescheduling job alive past the drain. Every
+            // recycled reservation drops with `self` below and releases
+            // plainly -- identical to what the caller's own Drop would have
+            // done had it not recycled.
+            return es_entity::operation::hooks::PreCommitRet::ok(self, op);
+        }
+
+        let mut units_by_type: HashMap<JobType, Vec<UnitReservation>> = HashMap::new();
+        for (job_type, reservation) in self.recycled.drain(..) {
+            units_by_type.entry(job_type).or_default().push(reservation);
+        }
+        for (job_type, n_due) in self.fresh_demand.drain() {
+            if !poller.registry.short_circuit(&job_type) {
+                continue;
+            }
+            // `n_due` is a row count; a batched type's single reservation
+            // can claim up to `per_reservation` of them, so attempting one
+            // reservation per due row would over-reserve by up to
+            // `max_batch_size`x -- mirrors the old `try_claim_after_bulk_spawn`'s
+            // identical `div_ceil` (moved here now that spawn-site demand and
+            // completion-side recycling share one hook).
+            let per_reservation = poller.claim_shape(&job_type).0.max(1) as usize;
+            let n_reservations = n_due.div_ceil(per_reservation);
+            let entry = units_by_type.entry(job_type.clone()).or_default();
+            for _ in 0..n_reservations {
+                match poller.try_reserve(&job_type) {
+                    Some(reservation) => entry.push(reservation),
+                    None => break,
+                }
+            }
+        }
+
+        let now = op.maybe_now().unwrap_or_else(|| poller.clock.now());
+        for (job_type, reservations) in units_by_type {
+            if reservations.is_empty() {
+                continue;
+            }
+            if !poller.registry.short_circuit(&job_type) {
+                // Opted out after all -- a recycled unit reaches
+                // `units_by_type` regardless of the gate (see
+                // `register_claim_recycle`). Every reservation gathered for
+                // this type drops at the end of this iteration and releases
+                // plainly.
+                continue;
+            }
+            let targets = poller
+                .claim_after_many(&mut op, &job_type, now, reservations.len())
+                .await?;
+            for (reservation, target) in reservations.into_iter().zip(targets) {
+                let subs = ShutdownSubs {
+                    job: poller.shutdown_tx.subscribe(),
+                    monitor: poller.shutdown_tx.subscribe(),
+                };
+                self.claimed.push((reservation, target, subs));
+            }
+            // Any reservation past `targets.len()` drops here: the `for`
+            // loop's `zip` stops pulling from `reservations.into_iter()`
+            // once `targets` is exhausted, and the un-yielded tail drops
+            // with the iterator at the end of the loop, releasing plainly --
+            // exactly the "nothing due" case the old `try_claim_for_recycle`
+            // used to return `None` for.
+        }
+
+        es_entity::operation::hooks::PreCommitRet::ok(self, op)
+    }
+
+    /// Fires once a head-swap claim's `op` commits: hands every claimed unit
+    /// of work off to [`JobPoller::dispatch_job_from_reservation`]/
+    /// [`JobPoller::dispatch_batch_from_reservation`]. Dispatching from here
+    /// rather than inline in `pre_commit` because `post_commit` runs
+    /// synchronously (mirrors `notifier.rs`'s `JobEventHook`) — the actual
+    /// dispatch needs `.await`, so this spawns a detached task per entry,
+    /// same as the ordinary poll-claim path already does off the poll loop.
     fn post_commit(self) {
         let Some(poller) = self.poller.upgrade() else {
             // The poller (and with it, the whole process's job service) is
@@ -1405,7 +1466,7 @@ impl es_entity::operation::hooks::CommitHook for DispatchHook {
             // exists.
             return;
         };
-        for (reservation, target, subs) in self.work {
+        for (reservation, target, subs) in self.claimed {
             let poller = Arc::clone(&poller);
             tokio::spawn(async move {
                 match target {
@@ -1449,7 +1510,11 @@ impl es_entity::operation::hooks::CommitHook for DispatchHook {
     }
 
     fn merge(&mut self, other: &mut Self) -> bool {
-        self.work.append(&mut other.work);
+        for (job_type, demand) in other.fresh_demand.drain() {
+            *self.fresh_demand.entry(job_type).or_insert(0) += demand;
+        }
+        self.recycled.append(&mut other.recycled);
+        self.claimed.append(&mut other.claimed);
         true
     }
 }

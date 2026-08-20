@@ -214,10 +214,7 @@ where
                     if schedule_at <= self.clock.now()
                         && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
                     {
-                        let now = op.maybe_now().unwrap_or(schedule_at);
-                        poller
-                            .try_claim_after_spawn(&mut op, &self.job_type, now)
-                            .await?;
+                        poller.register_claim_demand(&mut op, &self.job_type, 1);
                     }
 
                     op.commit().await?;

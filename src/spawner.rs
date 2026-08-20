@@ -406,9 +406,7 @@ where
             if let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade()) {
                 let now = op.maybe_now().unwrap_or(default_schedule_at);
                 let n_due = count_due_now(&landed_pending, &ids, &schedule_times, now);
-                poller
-                    .try_claim_after_bulk_spawn(op, &self.job_type, n_due, now)
-                    .await?;
+                poller.register_claim_demand(op, &self.job_type, n_due);
             }
         }
 
@@ -439,6 +437,8 @@ where
             .expect("Could not build new job");
 
         let mut job = self.repo.create_in_op(op, new_job).await?;
+        // @@ I was thinking more something like:
+        // op.add_hook(InsertExecutionHook::new(...))
 
         insert_execution(
             &self.repo,
@@ -458,13 +458,12 @@ where
         // with guaranteed ordering. `schedule_at` in the future (an explicit
         // `spawn_at`) never qualifies -- nothing of this type is claimable
         // sooner just because this call happened.
+        // // @@ This should be part of the same insert hook
+        // or perhaps its own hook that insert registeres
         if schedule_at <= self.clock.now()
             && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
         {
-            let now = op.maybe_now().unwrap_or(schedule_at);
-            poller
-                .try_claim_after_spawn(op, &self.job_type, now)
-                .await?;
+            poller.register_claim_demand(op, &self.job_type, 1);
         }
 
         Ok(job)
@@ -571,6 +570,7 @@ async fn insert_or_park_in_op(
     queue_id: Option<&str>,
     unique_key: Option<&str>,
 ) -> Result<bool, JobError> {
+    // @@ So many round trips - should be condensed to 1 or 2 max - move logic into the query
     let alive_at = op.maybe_now();
 
     let Some(queue_id) = queue_id else {

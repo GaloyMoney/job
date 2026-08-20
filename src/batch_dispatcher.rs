@@ -152,34 +152,27 @@ impl BatchDispatcher {
         self.tracker.mark_finished_without_releasing_unit(&self.ids);
     }
 
-    /// Head-swap completion recycle (handoff addendum §7.3 site 3): this
-    /// batch's unit of `job_type`'s capacity is about to free (`Drop` fires
-    /// `batch_completed` below unless this recycles it first). Try to spend
-    /// it on this SAME type's own oldest due backlog. Called exactly ONCE
-    /// per `execute_batch` -- from the end of `seal` for a disposed batch,
-    /// from `fail_batch` for a whole-batch error -- never once per
-    /// sub-outcome branch: a batch is always exactly one execution unit
-    /// (`JobTracker::dispatch_batch`), so recycling it from inside
-    /// `complete_in_op` AND the terminal branch of `fail_in_op` would try to
-    /// spend the SAME freed unit twice whenever one batch disposes items
-    /// through both branches.
-    async fn try_recycle_own_type(
-        &mut self,
-        op: &mut impl AtomicOperation,
-        now: DateTime<Utc>,
-    ) -> Result<(), JobError> {
+    /// Head-swap completion recycle (handoff addendum §7.3 site 3 / §8.2c):
+    /// this batch's unit of `job_type`'s capacity is about to free (`Drop`
+    /// fires `batch_completed` below unless this recycles it first). Hands
+    /// it, unconditionally, to a `ClaimHook` that will try to spend it on
+    /// this SAME type's own oldest due backlog at commit time -- if nothing
+    /// turns out to be due (or shutdown is underway, or the type opted out),
+    /// the reservation the hook holds simply releases, identical to not
+    /// recycling at all. Called exactly ONCE per `execute_batch` -- from the
+    /// end of `seal` for a disposed batch, from `fail_batch` for a
+    /// whole-batch error -- never once per sub-outcome branch: a batch is
+    /// always exactly one execution unit (`JobTracker::dispatch_batch`), so
+    /// recycling it from inside `complete_in_op` AND the terminal branch of
+    /// `fail_in_op` would try to spend the SAME freed unit twice whenever
+    /// one batch disposes items through both branches.
+    fn try_recycle_own_type(&mut self, op: &mut impl AtomicOperation) {
         let Some(poller) = self.poller.upgrade() else {
-            return Ok(());
+            return;
         };
-        if let Some(target) = poller
-            .try_claim_for_recycle(op, &self.job_type, now)
-            .await?
-        {
-            self.recycle_unit();
-            let reservation = self.tracker.recycle(&self.job_type);
-            poller.register_dispatch_hook(op, reservation, target);
-        }
-        Ok(())
+        self.recycle_unit();
+        let reservation = self.tracker.recycle(&self.job_type);
+        poller.register_claim_recycle(op, &self.job_type, reservation);
     }
 
     #[instrument(name = "job.execute_batch", skip_all,
@@ -407,7 +400,7 @@ impl BatchDispatcher {
         self.complete_in_op(op, completes).await?;
         self.reschedule_in_op(op, reschedules).await?;
         self.fail_in_op(op, fails, now).await?;
-        self.try_recycle_own_type(op, now).await?;
+        self.try_recycle_own_type(op);
         Ok(())
     }
 
@@ -716,7 +709,7 @@ impl BatchDispatcher {
         let fails: Vec<(JobId, String)> =
             self.ids.iter().map(|id| (*id, message.clone())).collect();
         self.fail_in_op(&mut op, fails, now).await?;
-        self.try_recycle_own_type(&mut op, now).await?;
+        self.try_recycle_own_type(&mut op);
         op.commit().await?;
         Ok(())
     }

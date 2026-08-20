@@ -641,9 +641,6 @@ impl Jobs {
             .expect("Registry has been consumed by executor");
 
         let tracker = Arc::clone(&self.tracker);
-        // Read before `registry` moves into the poller below — capped_types()
-        // is a cheap scan of the registry's own concurrency map, computed
-        // here on the owned value while it's still available.
         tracker.set_capped_types(registry.capped_types().into_iter().collect());
 
         let poller = JobPoller::new(
@@ -663,10 +660,6 @@ impl Jobs {
 
         let poller_handle = poller.start(listener_handle, waiter_handle);
         let poller_handle = Arc::new(poller_handle);
-        // Populate the short-circuit spawn handle every existing (and
-        // future) `JobSpawner` shares. `OnceLock::set` is infallible here:
-        // `start_poll` panics on a second call before reaching this point
-        // (see the registry `.take()` above), so this can only ever run once.
         let _ = self.poller_ref.set(Arc::downgrade(poller_handle.poller()));
         self.poller_handle = Some(poller_handle);
         Ok(())

@@ -499,27 +499,27 @@ impl JobDispatcher {
                 .await?;
         }
 
-        // Head-swap completion recycle (handoff addendum §7.3 site 2): this
-        // job's unit of `job_type`'s capacity is about to free (Drop fires
-        // `job_completed` below unless this recycles it first). Try to spend
-        // it on this SAME type's own oldest due backlog -- independent of
-        // the freed-queue promote above (a different queue can promote a
-        // DIFFERENT type's sibling; that case is served by the ordinary
-        // notify, unchanged). A later statement in this same `op`, so it
-        // sees the promote above with guaranteed ordering. Scoped to this
-        // deletion path only -- the retry/reschedule branches (`fail_job`'s
-        // retry branch, `reschedule_job`) keep their row `pending` rather
-        // than freeing a unit, so there is nothing to recycle there.
+        // Head-swap completion recycle (handoff addendum §7.3 site 2 / §8.2c):
+        // this job's unit of `job_type`'s capacity is about to free (Drop
+        // fires `job_completed` below unless this recycles it first). Hand
+        // it, unconditionally, to a `ClaimHook` that will try to spend it on
+        // this SAME type's own oldest due backlog at commit time --
+        // independent of the freed-queue promote above (a different queue
+        // can promote a DIFFERENT type's sibling; that case is served by the
+        // ordinary notify, unchanged). The promote CTE above already ran as
+        // an earlier statement in this same still-open transaction, so
+        // whenever the hook's claim runs it sees that promote with
+        // guaranteed ordering. If nothing turns out to be due (or shutdown
+        // is underway, or the type opted out), the reservation the hook
+        // holds simply releases -- identical to not recycling at all.
+        // Scoped to this deletion path only -- the retry/reschedule branches
+        // (`fail_job`'s retry branch, `reschedule_job`) keep their row
+        // `pending` rather than freeing a unit, so there is nothing to
+        // recycle there.
         if let Some(poller) = self.poller.upgrade() {
-            let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-            if let Some(target) = poller
-                .try_claim_for_recycle(op, &self.job_type, now)
-                .await?
-            {
-                self.recycle_unit();
-                let reservation = self.tracker.recycle(&self.job_type);
-                poller.register_dispatch_hook(op, reservation, target);
-            }
+            self.recycle_unit();
+            let reservation = self.tracker.recycle(&self.job_type);
+            poller.register_claim_recycle(op, &self.job_type, reservation);
         }
 
         Ok(())
