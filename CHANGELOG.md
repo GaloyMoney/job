@@ -1,3 +1,19 @@
+# [job release v0.13.1](https://github.com/GaloyMoney/job/releases/tag/0.13.1)
+
+
+
+### Bug Fixes
+
+- Pin a parked queue's occupant so a racing completion cannot orphan it (#175)
+
+### Documentation
+
+- Cleanup PERFORMANCE.md
+
+### Testing
+
+- Stop racing the runner in spawn_keyed_duplicate_returns_persisted_handle
+
 # [job release v0.13.0](https://github.com/GaloyMoney/job/releases/tag/0.13.0)
 
 
