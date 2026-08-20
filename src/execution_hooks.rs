@@ -59,6 +59,15 @@ pub(crate) struct PromoteHeadsHook {
     pub(crate) ids: Vec<uuid::Uuid>,
 }
 
+/// One sibling promoted by [`PromoteHeadsHook::apply`]: its type (for
+/// notify) and its own `execute_at`, unchanged by the promote (for callers
+/// that need to know whether it is ACTUALLY due, not merely promoted --
+/// see [`ExecutionInsertHook::due_now_by_type`]).
+pub(crate) struct PromotedRow {
+    pub job_type: String,
+    pub execute_at: DateTime<Utc>,
+}
+
 impl PromoteHeadsHook {
     /// The swap statement itself. Set-based so one statement covers
     /// everything from a single-row retry to a bulk batch reschedule or
@@ -67,20 +76,25 @@ impl PromoteHeadsHook {
     /// happens to belong to a queue with parked siblings (nothing changed
     /// for it, so there is nothing to fix).
     ///
-    /// Returns the job type of every promoted sibling, so callers can wake
-    /// the pollers that actually cover it -- a sibling can be a different
-    /// type than the row it displaced (one `queue_id` can be shared across
-    /// types), so notifying only the caller's own type would miss it,
-    /// exactly the failure mode `delete_execution_in_op`'s `next_in_queue`
-    /// resolution exists to prevent on the completion path.
+    /// Returns the job type AND `execute_at` of every promoted sibling, so
+    /// callers can wake the pollers that actually cover it -- a sibling can
+    /// be a different type than the row it displaced (one `queue_id` can be
+    /// shared across types), so notifying only the caller's own type would
+    /// miss it, exactly the failure mode `delete_execution_in_op`'s
+    /// `next_in_queue` resolution exists to prevent on the completion path.
+    /// `execute_at` is unchanged by this statement (only `state` is set) --
+    /// it lets [`ExecutionInsertHook::due_now_by_type`] gate claim demand on
+    /// whether a promoted row is ACTUALLY due, not merely promoted (see its
+    /// doc comment: a promoted row's own `execute_at` can be in the future).
     pub(crate) async fn apply(
         op: &mut impl AtomicOperation,
         ids: &[uuid::Uuid],
-    ) -> Result<Vec<String>, sqlx::Error> {
+    ) -> Result<Vec<PromotedRow>, sqlx::Error> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        sqlx::query_scalar!(
+        sqlx::query_as!(
+            PromotedRow,
             r#"
             WITH candidates AS (
                 SELECT je.id, je.queue_id, je.execute_at
@@ -113,7 +127,7 @@ impl PromoteHeadsHook {
             FROM swaps s
             JOIN demote d ON d.id = s.pending_id
             WHERE je.id = s.parked_id
-            RETURNING je.job_type
+            RETURNING je.job_type, je.execute_at AS "execute_at!"
             "#,
             ids,
         )
@@ -156,10 +170,10 @@ impl CommitHook for PromoteHeadsHook {
                 .execution_ready_in_op(&mut op, job_type)
                 .await?;
         }
-        for promoted_type in promoted {
-            if notified.insert(promoted_type.clone()) {
+        for row in promoted {
+            if notified.insert(row.job_type.clone()) {
                 self.notifier
-                    .execution_ready_in_op(&mut op, &JobType::from_owned(promoted_type))
+                    .execution_ready_in_op(&mut op, &JobType::from_owned(row.job_type))
                     .await?;
             }
         }
@@ -358,28 +372,30 @@ impl ExecutionInsertHook {
     /// not count as due-now demand for
     /// [`crate::poller::JobPoller::register_claim_demand`].
     ///
-    /// Also counts one unit of demand per `promoted` occurrence, REGARDLESS
-    /// of whether the promoted row is due-now by its own `execute_at` --
-    /// `promoted` names rows [`PromoteHeadsHook::apply`] just swapped into
-    /// this call's queue's active `pending` slot (which may be an EXISTING
-    /// parked sibling this call never touched, not one of `rows`, so there
-    /// is nothing to cross-reference `schedule_at` against here even if we
-    /// wanted to). Necessary, not just permissive: a promoted-but-not-yet-
-    /// its-own-due-now row would otherwise get a `execution_ready` notify
-    /// (see [`Self::notify_types`]) but no accompanying claim ATTEMPT within
-    /// this SAME commit pass, silently downgrading it from "claimed
-    /// immediately" to "wait for the next poll" -- the exact regression a
-    /// live test caught (`retry_backoff_yields_to_an_older_parked_sibling`):
-    /// an older backdated sibling that displaced a `pending` occupant via
-    /// this promote must ALSO get its own immediate claim attempt, or it
-    /// sits `pending` instead of dispatching within the spawning
-    /// transaction. Safe either way: `claim_due_heads_in_op`'s own
-    /// `execute_at <= now` filter is what actually gates claimability; an
-    /// over-eager reservation here just finds nothing and releases.
+    /// Also counts one unit of demand per `promoted` row that is ITSELF
+    /// due-now (`execute_at <= now`) -- `promoted` names rows
+    /// [`PromoteHeadsHook::apply`] just swapped into this call's queue's
+    /// active `pending` slot (which may be an EXISTING parked sibling this
+    /// call never touched, not one of `rows`; its own `execute_at`, carried
+    /// on [`crate::execution_hooks::PromotedRow`], is unchanged by the
+    /// promote and is what this checks). A promoted-but-not-yet-due row
+    /// still gets a plain `execution_ready` notify (see [`Self::notify_types`],
+    /// which does NOT due-gate -- the ordinary poll will pick it up once it
+    /// actually comes due) but must NOT count as claim demand here: gating
+    /// on `landed_pending`'s own rows without also gating promoted rows was
+    /// exactly the bug automated review caught -- `claim_due_heads_in_op`
+    /// claims the type's OLDEST due row, not specifically the promoted one,
+    /// so an ungated reservation for a future promotion could still reserve
+    /// and drain a completely UNRELATED due backlog row of the same type,
+    /// bypassing `next_batch_size`'s `min_jobs` throttle for a promotion
+    /// that has nothing to do with due-now admission -- the identical
+    /// failure mode `count_due_now`'s own `landed_pending` gate exists to
+    /// prevent for future-scheduled inserts, just missed for this second
+    /// source of demand.
     fn due_now_by_type(
         inserted: &[InsertedRow],
         rows: &[NewExecutionRow],
-        promoted: &[String],
+        promoted: &[PromotedRow],
         now: DateTime<Utc>,
     ) -> HashMap<JobType, usize> {
         let by_id: HashMap<JobId, &NewExecutionRow> = rows.iter().map(|r| (r.id, r)).collect();
@@ -395,21 +411,27 @@ impl ExecutionInsertHook {
                 *due.entry(new_row.job_type.clone()).or_insert(0) += 1;
             }
         }
-        for promoted_type in promoted {
-            *due.entry(JobType::from_owned(promoted_type.clone()))
-                .or_insert(0) += 1;
+        for row in promoted {
+            if row.execute_at <= now {
+                *due.entry(JobType::from_owned(row.job_type.clone()))
+                    .or_insert(0) += 1;
+            }
         }
         due
     }
 
     /// Every type worth an `execution_ready` notify: one landed pending (so
     /// its own backlog gained a claimable row), or one got promoted by
-    /// [`PromoteHeadsHook`] (so ITS backlog did). Pure, same reasoning as
-    /// [`Self::due_now_by_type`].
+    /// [`PromoteHeadsHook`] (so ITS backlog did) -- regardless of the
+    /// promoted row's own due-ness, unlike [`Self::due_now_by_type`]: a
+    /// plain notify only ever wakes the ordinary poll (which re-checks
+    /// `execute_at <= now` itself), so over-notifying a not-yet-due
+    /// promotion is harmless, while over-COUNTING it as claim demand is not
+    /// (see that method's doc comment).
     fn notify_types(
         inserted: &[InsertedRow],
         rows: &[NewExecutionRow],
-        promoted: &[String],
+        promoted: &[PromotedRow],
     ) -> HashSet<JobType> {
         let by_id: HashMap<JobId, &NewExecutionRow> = rows.iter().map(|r| (r.id, r)).collect();
         let mut types: HashSet<JobType> = inserted
@@ -417,7 +439,11 @@ impl ExecutionInsertHook {
             .filter(|row| row.landed_pending)
             .filter_map(|row| by_id.get(&row.id).map(|new_row| new_row.job_type.clone()))
             .collect();
-        types.extend(promoted.iter().cloned().map(JobType::from_owned));
+        types.extend(
+            promoted
+                .iter()
+                .map(|row| JobType::from_owned(row.job_type.clone())),
+        );
         types
     }
 }
@@ -484,6 +510,13 @@ mod tests {
             id,
             landed_pending: false,
             occupant_id,
+        }
+    }
+
+    fn promoted_row(job_type: JobType, execute_at: DateTime<Utc>) -> PromotedRow {
+        PromotedRow {
+            job_type: job_type.to_string(),
+            execute_at,
         }
     }
 
@@ -599,13 +632,35 @@ mod tests {
         // promoted it (it's now the queue's `pending` occupant), which
         // `PromoteHeadsHook::apply` reports back as `TYPE_A.to_string()`.
         let inserted = vec![parked(backdated, Some(uuid::Uuid::from(JobId::new())))];
-        let promoted = vec![TYPE_A.to_string()];
+        let promoted = vec![promoted_row(TYPE_A.clone(), now)];
 
         let due_counts = ExecutionInsertHook::due_now_by_type(&inserted, &rows, &promoted, now);
         assert_eq!(
             due_counts.get(&TYPE_A).copied(),
             Some(1),
-            "a promoted row must contribute claim demand for its type"
+            "a promoted row that is itself due-now must contribute claim demand"
+        );
+    }
+
+    /// The bug automated review caught: a promotion whose OWN `execute_at`
+    /// is still in the future must NOT contribute claim demand, or the
+    /// resulting over-eager reservation would claim `claim_due_heads_in_op`'s
+    /// oldest due row of that type -- an UNRELATED backlog row, not the
+    /// not-yet-due promotion itself -- bypassing `next_batch_size`'s
+    /// `min_jobs` throttle for a promotion that has nothing to do with
+    /// due-now admission.
+    #[test]
+    fn due_now_excludes_a_promoted_row_that_is_not_itself_due() {
+        let now = chrono::Utc::now();
+        let promoted = vec![promoted_row(
+            TYPE_A.clone(),
+            now + chrono::Duration::hours(1),
+        )];
+
+        let due_counts = ExecutionInsertHook::due_now_by_type(&[], &[], &promoted, now);
+        assert!(
+            due_counts.is_empty(),
+            "a not-yet-due promotion must not contribute claim demand"
         );
     }
 
@@ -631,7 +686,12 @@ mod tests {
     fn notify_types_includes_promoted_types_even_with_nothing_pending() {
         let inserted: Vec<InsertedRow> = vec![];
         let rows: Vec<NewExecutionRow> = vec![];
-        let promoted = vec![TYPE_B.to_string()];
+        // Deliberately not-yet-due -- notify never due-gates, unlike claim
+        // demand (see `due_now_excludes_a_promoted_row_that_is_not_itself_due`).
+        let promoted = vec![promoted_row(
+            TYPE_B.clone(),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )];
 
         let types = ExecutionInsertHook::notify_types(&inserted, &rows, &promoted);
         assert_eq!(types, HashSet::from([TYPE_B]));

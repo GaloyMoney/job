@@ -22,7 +22,7 @@ use super::{
     dispatcher::*,
     entity::{Job, JobType},
     error::JobError,
-    execution_hooks::PromoteHeadsHook,
+    execution_hooks::{PromoteHeadsHook, PromotedRow},
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     registry::JobRegistry,
@@ -1696,11 +1696,22 @@ impl ClaimReconciler {
     async fn run(poller: Arc<JobPoller>, rows: Vec<(JobId, DateTime<Utc>, JobType)>) {
         for (attempt, backoff) in Self::BACKOFF.into_iter().enumerate() {
             match Self::reconcile_unclaimed(poller.repo.pool(), poller.instance_id, &rows).await {
-                Ok(0) => return, // the common case: a real rollback, nothing landed
-                Ok(_) => {
-                    let reset_types: HashSet<JobType> =
-                        rows.iter().map(|(_, _, t)| t.clone()).collect();
-                    for job_type in reset_types {
+                Ok((reset_ids, promoted)) if reset_ids.is_empty() && promoted.is_empty() => {
+                    return; // the common case: a real rollback, nothing landed
+                }
+                Ok((reset_ids, promoted)) => {
+                    let reset_id_set: HashSet<JobId> = reset_ids.into_iter().collect();
+                    let mut notify_types: HashSet<JobType> = rows
+                        .iter()
+                        .filter(|(id, _, _)| reset_id_set.contains(id))
+                        .map(|(_, _, job_type)| job_type.clone())
+                        .collect();
+                    notify_types.extend(
+                        promoted
+                            .into_iter()
+                            .map(|row| JobType::from_owned(row.job_type)),
+                    );
+                    for job_type in notify_types {
                         poller.notifier.execution_ready(&job_type);
                     }
                     return;
@@ -1721,36 +1732,54 @@ impl ClaimReconciler {
         );
     }
 
-    /// The actual DB work: un-claims whichever of `rows` genuinely landed
-    /// `running` under `instance_id` (the COMMIT-errored case), restoring
-    /// each to `pending` at its ORIGINAL `execute_at` -- no `attempt_index`
-    /// bump. Unlike `reclaim_lost_jobs`, which must assume a reclaimed job
-    /// MAY have executed (a dead poller, unknown progress), this claim
-    /// provably never dispatched: dispatch only ever happens from
-    /// `ClaimHook::post_commit`, and the hook system fired `on_rollback`
-    /// INSTEAD of `post_commit` for this very reason. A pure un-claim, not
-    /// a retry.
+    /// The actual DB work, in one transaction: un-claims whichever of `rows`
+    /// genuinely landed `running` under `instance_id` (the COMMIT-errored
+    /// case), restoring each to `pending` at its ORIGINAL `execute_at` -- no
+    /// `attempt_index` bump. Unlike `reclaim_lost_jobs`, which must assume a
+    /// reclaimed job MAY have executed (a dead poller, unknown progress),
+    /// this claim provably never dispatched: dispatch only ever happens
+    /// from `ClaimHook::post_commit`, and the hook system fired
+    /// `on_rollback` INSTEAD of `post_commit` for this very reason. A pure
+    /// un-claim, not a retry.
     ///
-    /// The `state = 'running' AND poller_instance_id = $3` guard makes this
-    /// a no-op against anything that beat it here -- another instance's
-    /// `reclaim_lost_jobs` already reset it, or (the common case) this was
-    /// a genuine rollback and these rows were never committed `running` at
-    /// all. Nothing else can be legitimately EXECUTING these rows: only
-    /// this never-run `post_commit` could have dispatched them. Returns how
-    /// many rows were actually reset, so `run` knows whether to notify.
+    /// The `state = 'running' AND poller_instance_id = $3` guard makes the
+    /// reset a no-op against anything that beat it here -- another
+    /// instance's `reclaim_lost_jobs` already reset it, or (the common
+    /// case) this was a genuine rollback and these rows were never
+    /// committed `running` at all. Nothing else can be legitimately
+    /// EXECUTING these rows: only this never-run `post_commit` could have
+    /// dispatched them.
+    ///
+    /// A reset row is not automatically its queue's rightful head again --
+    /// while it sat `running`, an insert could have landed an OLDER
+    /// backdated sibling into the same queue: a `running` occupant blocks a
+    /// swap at insert time exactly like an unbeaten `pending` one does (see
+    /// `ExecutionInsertHook::insert_many`'s doc comment; only a `pending`
+    /// occupant is swap-eligible), so that sibling would be sitting
+    /// `parked`, older than this row, right now. `reclaim_lost_jobs` will
+    /// never revisit this to fix it -- the row is `pending` with a fresh
+    /// `alive_at`, not a stale `running` one -- so `PromoteHeadsHook::apply`
+    /// runs here, in the SAME transaction as the reset, exactly like every
+    /// other "rows just moved to pending" call site in this crate.
+    ///
+    /// Returns the ids actually reset and the siblings actually promoted,
+    /// so `run` knows both whether anything happened and which types to
+    /// notify.
     async fn reconcile_unclaimed(
         pool: &PgPool,
         instance_id: uuid::Uuid,
         rows: &[(JobId, DateTime<Utc>, JobType)],
-    ) -> Result<usize, sqlx::Error> {
+    ) -> Result<(Vec<JobId>, Vec<PromotedRow>), sqlx::Error> {
         if rows.is_empty() {
-            return Ok(0);
+            return Ok((Vec::new(), Vec::new()));
         }
         let ids: Vec<uuid::Uuid> = rows
             .iter()
             .map(|(id, _, _)| uuid::Uuid::from(*id))
             .collect();
         let execute_ats: Vec<DateTime<Utc>> = rows.iter().map(|(_, at, _)| *at).collect();
+
+        let mut tx = pool.begin().await?;
         let reset = sqlx::query_scalar!(
             r#"
             UPDATE job_executions je
@@ -1763,9 +1792,14 @@ impl ClaimReconciler {
             &execute_ats,
             instance_id,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(reset.len())
+
+        let reset_uuids: Vec<uuid::Uuid> = reset.iter().map(|id| uuid::Uuid::from(*id)).collect();
+        let promoted = PromoteHeadsHook::apply(&mut tx, &reset_uuids).await?;
+
+        tx.commit().await?;
+        Ok((reset, promoted))
     }
 }
 
@@ -1816,7 +1850,7 @@ async fn reclaim_lost_jobs(
     tx.commit().await?;
     Ok((
         rows.into_iter().map(|r| (r.id, r.job_type)).collect(),
-        promoted,
+        promoted.into_iter().map(|row| row.job_type).collect(),
     ))
 }
 
@@ -3162,13 +3196,14 @@ mod tests {
 
         let id = seed_landed_running_row(&pool, &repo, &job_type, instance_id).await?;
 
-        let n = ClaimReconciler::reconcile_unclaimed(
+        let (reset, promoted) = ClaimReconciler::reconcile_unclaimed(
             &pool,
             instance_id,
             &[(id, original_execute_at, JobType::from_owned(job_type))],
         )
         .await?;
-        assert_eq!(n, 1);
+        assert_eq!(reset, vec![id]);
+        assert!(promoted.is_empty(), "no parked sibling exists in this test");
 
         let row = sqlx::query!(
             r#"SELECT state::text AS "state!", poller_instance_id, attempt_index, execute_at
@@ -3204,7 +3239,7 @@ mod tests {
         // it rolled back before ever committing anything.
         let phantom_id = JobId::new();
 
-        let n = ClaimReconciler::reconcile_unclaimed(
+        let (reset, promoted) = ClaimReconciler::reconcile_unclaimed(
             &pool,
             instance_id,
             &[(
@@ -3214,7 +3249,8 @@ mod tests {
             )],
         )
         .await?;
-        assert_eq!(n, 0);
+        assert!(reset.is_empty());
+        assert!(promoted.is_empty());
 
         Ok(())
     }
@@ -3234,14 +3270,83 @@ mod tests {
 
         let id = seed_landed_running_row(&pool, &repo, &job_type, owner_instance).await?;
 
-        let n = ClaimReconciler::reconcile_unclaimed(
+        let (reset, promoted) = ClaimReconciler::reconcile_unclaimed(
             &pool,
             our_instance,
             &[(id, original_execute_at, JobType::from_owned(job_type))],
         )
         .await?;
-        assert_eq!(n, 0, "must not reset a row owned by a different instance");
+        assert!(
+            reset.is_empty(),
+            "must not reset a row owned by a different instance"
+        );
+        assert!(promoted.is_empty());
         assert_eq!(row_state(&pool, id).await?, "running");
+
+        Ok(())
+    }
+
+    /// The bug automated review caught: a reset row is not automatically
+    /// its queue's rightful head again. While it sat `running`, a backdated
+    /// sibling could have landed `parked` in the same queue (a `running`
+    /// occupant blocks a swap at insert time exactly like a `pending` one
+    /// that sorts after it). `reconcile_unclaimed` must re-check and swap,
+    /// or the younger row squats on the slot until it runs to completion --
+    /// `reclaim_lost_jobs` never revisits it, since it is `pending` with a
+    /// fresh `alive_at`, not stale `running`.
+    #[tokio::test]
+    async fn reconciler_swaps_an_older_parked_sibling_ahead_of_the_reset_row() -> anyhow::Result<()>
+    {
+        let pool = init_pool().await?;
+        let repo = JobRepo::new(&pool);
+        let job_type = format!("reconciler-swap-{}", uuid::Uuid::now_v7());
+        let instance_id = uuid::Uuid::now_v7();
+        let queue = format!("reconciler-swap-queue-{}", uuid::Uuid::now_v7());
+        let younger_execute_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let older_execute_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+        // The row this reconciler call is about to reset -- it was `running`
+        // (claimed) with `younger_execute_at` before it was claimed.
+        let running_id = seed_landed_running_row(&pool, &repo, &job_type, instance_id).await?;
+        sqlx::query("UPDATE job_executions SET queue_id = $2 WHERE id = $1")
+            .bind(uuid::Uuid::from(running_id))
+            .bind(&queue)
+            .execute(&pool)
+            .await?;
+
+        // An OLDER sibling, already sitting `parked` in the same queue --
+        // it landed there because the queue's slot was occupied by the
+        // `running` row above at insert time.
+        let older_sibling =
+            seed_queued_job(&pool, &job_type, &queue, older_execute_at, "parked").await?;
+
+        let (reset, promoted) = ClaimReconciler::reconcile_unclaimed(
+            &pool,
+            instance_id,
+            &[(
+                running_id,
+                younger_execute_at,
+                JobType::from_owned(job_type),
+            )],
+        )
+        .await?;
+        assert_eq!(reset, vec![running_id]);
+        assert_eq!(
+            promoted.len(),
+            1,
+            "the older sibling must be promoted in the SAME call"
+        );
+
+        assert_eq!(
+            row_state(&pool, older_sibling).await?,
+            "pending",
+            "the older sibling must now hold the queue's active slot"
+        );
+        assert_eq!(
+            row_state(&pool, running_id).await?,
+            "parked",
+            "the reset row must yield to the genuinely older sibling"
+        );
 
         Ok(())
     }
