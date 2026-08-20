@@ -280,8 +280,8 @@ impl ExecutionInsertHook {
     /// (a) a sibling FROM THIS SAME `rows` batch that won the slot (read
     /// from `ins`'s own `RETURNING`, so it reflects this statement's own
     /// writes), or (b) a pre-existing occupant (read via a plain scan of
-    /// `job_executions`, which -- since none of this statement's own INSERTs
-    /// touch an EXISTING row -- sees exactly the statement-start snapshot,
+    /// `job_executions`, which -- since none of this statement's own insert
+    /// commands touch an EXISTING row -- sees exactly the statement-start snapshot,
     /// i.e. whoever held the slot before this call ran). At most one of (a)/
     /// (b) can ever match per queue (Invariant A), so the `COALESCE` of two
     /// scalar subqueries is safe. This is what lets a batch's own losing
