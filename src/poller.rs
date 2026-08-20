@@ -22,11 +22,12 @@ use super::{
     dispatcher::*,
     entity::{Job, JobType},
     error::JobError,
+    execution_hooks::PromoteHeadsHook,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     registry::JobRegistry,
     repo::JobRepo,
-    spawner::{ClaimedRow, claim_due_heads_in_op, swap_older_parked_siblings_in_op},
+    spawner::{ClaimedRow, claim_due_heads_in_op},
     task::OwnedTaskHandle,
     tracker::{JobTracker, UnitReservation},
 };
@@ -1517,6 +1518,21 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
         self.claimed.append(&mut other.claimed);
         true
     }
+
+    /// Deferred behind every still-pending [`PromoteHeadsHook`] instance
+    /// (handoff addendum §8.5's `runs_after` note): a caller that hand-
+    /// composes a promote AND a claim into one transaction (not any single
+    /// `_in_op` method today, but a realistic saga across several) must see
+    /// the promote's effect before this claim runs, or a row it just moved
+    /// to `pending` could be missed. Registration order across the two
+    /// hooks never needs to match call order for this to hold -- that is
+    /// the entire point of declaring the dependency instead of relying on
+    /// it. A type that never registers `PromoteHeadsHook` on this `op`, or
+    /// whose instance already executed, imposes no delay.
+    fn runs_after(&self) -> &[std::any::TypeId] {
+        static DEPS: std::sync::OnceLock<[std::any::TypeId; 1]> = std::sync::OnceLock::new();
+        DEPS.get_or_init(|| [std::any::TypeId::of::<PromoteHeadsHook>()])
+    }
 }
 
 async fn reclaim_lost_jobs(
@@ -1556,10 +1572,12 @@ async fn reclaim_lost_jobs(
     // type (one `queue_id` can be shared across types), so notifying only
     // the reclaimed types would miss it, the same failure mode
     // `delete_execution_in_op`'s `next_in_queue` resolution and
-    // `swap_older_parked_siblings_in_op`'s own doc comment exist to prevent
-    // everywhere else this helper is called.
+    // `PromoteHeadsHook::apply`'s own doc comment exist to prevent
+    // everywhere else this helper is called. Calls `apply` directly rather
+    // than registering a hook: `tx` is a raw `sqlx::Transaction`, not an
+    // `es_entity` op, so it carries no commit-hook buffer to register into.
     let reclaimed_uuids: Vec<uuid::Uuid> = rows.iter().map(|r| uuid::Uuid::from(r.id)).collect();
-    let promoted = swap_older_parked_siblings_in_op(&mut tx, &reclaimed_uuids).await?;
+    let promoted = PromoteHeadsHook::apply(&mut tx, &reclaimed_uuids).await?;
 
     tx.commit().await?;
     Ok((

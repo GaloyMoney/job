@@ -364,6 +364,7 @@ mod config;
 mod current;
 mod dispatcher;
 mod entity;
+mod execution_hooks;
 mod handle;
 mod job_execution;
 mod keyed;

@@ -15,11 +15,11 @@ use super::{
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
     error::JobError,
+    execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
     runner::*,
-    spawner::swap_older_parked_siblings_in_op,
     tracker::{JobTracker, UnitReservation},
 };
 
@@ -383,20 +383,16 @@ impl JobDispatcher {
             .await?;
             // Invariant B: the retrying row keeps its queue's active slot,
             // but an older parked sibling should run first during the
-            // backoff.
-            let promoted =
-                swap_older_parked_siblings_in_op(&mut op, &[uuid::Uuid::from(id)]).await?;
-            if promoted.is_empty() {
-                self.notifier
-                    .execution_ready_in_op(&mut op, &job.job_type)
-                    .await?;
-            } else {
-                for promoted_type in promoted {
-                    self.notifier
-                        .execution_ready_in_op(&mut op, &JobType::from_owned(promoted_type))
-                        .await?;
-                }
-            }
+            // backoff. See `PromoteHeadsHook`'s doc comment for the notify
+            // policy (always own type + promoted types, superseding this
+            // site's old if-promoted-else-own_type precision).
+            PromoteHeadsHook::register(
+                &mut op,
+                &self.notifier,
+                [job.job_type.clone()],
+                vec![uuid::Uuid::from(id)],
+            )
+            .await?;
         } else {
             span.record(
                 "error.level",
@@ -561,19 +557,15 @@ impl JobDispatcher {
         .await?;
         // Invariant B: same ordering fixup as the retry branch of
         // `fail_job` — the rescheduled row keeps its queue's active slot,
-        // but an older parked sibling should run first.
-        let promoted = swap_older_parked_siblings_in_op(op, &[uuid::Uuid::from(id)]).await?;
-        if promoted.is_empty() {
-            self.notifier
-                .execution_ready_in_op(op, &job.job_type)
-                .await?;
-        } else {
-            for promoted_type in promoted {
-                self.notifier
-                    .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
-                    .await?;
-            }
-        }
+        // but an older parked sibling should run first. See
+        // `PromoteHeadsHook`'s doc comment for the notify policy.
+        PromoteHeadsHook::register(
+            op,
+            &self.notifier,
+            [job.job_type.clone()],
+            vec![uuid::Uuid::from(id)],
+        )
+        .await?;
         job.reschedule_execution(reschedule_at);
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())

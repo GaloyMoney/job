@@ -686,78 +686,6 @@ async fn insert_or_park_in_op(
     Ok(false)
 }
 
-/// Restore Invariant B (a queue's active row is its min-`(execute_at, id)`
-/// live-or-parked row) for every id in `ids` that a caller just reset to
-/// `pending` on a queued row (retry backoff, voluntary reschedule, or a
-/// bulk reclaim sweep).
-///
-/// A row moving `running`/`parked` → `pending` keeps its queue's active slot
-/// (Invariant A never needs re-checking here — the row was already the
-/// active occupant, or reclaim just made it so), but an *older* parked
-/// sibling should run first: swap them (this row → `parked`, the sibling →
-/// `pending`) wherever one exists and is older.
-///
-/// Set-based so one statement covers everything from a single-row retry to
-/// a bulk batch reschedule or reclaim sweep. Callers pass only the ids they
-/// just moved to `pending` — a row this didn't touch is left alone even if
-/// it happens to belong to a queue with parked siblings (nothing changed for
-/// it, so there is nothing to fix).
-///
-/// Returns the job type of every promoted sibling, so callers can wake the
-/// pollers that actually cover it — a sibling can be a different type than
-/// the row it displaced (one `queue_id` can be shared across types), so
-/// notifying only the caller's own type would miss it, exactly the failure
-/// mode `delete_execution_in_op`'s `next_in_queue` resolution exists to
-/// prevent on the completion path.
-pub(crate) async fn swap_older_parked_siblings_in_op(
-    op: &mut impl es_entity::AtomicOperation,
-    ids: &[uuid::Uuid],
-) -> Result<Vec<String>, sqlx::Error> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let promoted = sqlx::query_scalar!(
-        r#"
-        WITH candidates AS (
-            SELECT je.id, je.queue_id, je.execute_at
-            FROM job_executions je
-            WHERE je.id = ANY($1) AND je.state = 'pending' AND je.queue_id IS NOT NULL
-        ), swaps AS (
-            SELECT c.id AS pending_id, sib.id AS parked_id
-            FROM candidates c
-            CROSS JOIN LATERAL (
-                SELECT id, execute_at FROM job_executions
-                WHERE state = 'parked' AND queue_id = c.queue_id
-                ORDER BY execute_at, id
-                LIMIT 1
-            ) sib
-            WHERE (sib.execute_at, sib.id) < (c.execute_at, c.id)
-        ), demote AS (
-            UPDATE job_executions SET state = 'parked'
-            WHERE id IN (SELECT pending_id FROM swaps)
-            RETURNING id
-        )
-        -- The promote UPDATE reads FROM `demote` (not `swaps`) so Postgres
-        -- has a real data dependency forcing `demote` to run to completion
-        -- first. Without it, this is two independent writes to the same
-        -- table within one statement with no ordering guarantee between
-        -- them -- observed as a live, reproducible unique-violation on
-        -- `idx_job_executions_queue_active` when the promote half committed
-        -- before the demote half, transiently making two rows active for
-        -- one queue within the statement's own execution.
-        UPDATE job_executions je SET state = 'pending'
-        FROM swaps s
-        JOIN demote d ON d.id = s.pending_id
-        WHERE je.id = s.parked_id
-        RETURNING je.job_type
-        "#,
-        ids,
-    )
-    .fetch_all(op.as_executor())
-    .await?;
-    Ok(promoted)
-}
-
 /// One row claimed by [`claim_due_heads_in_op`]: everything a dispatcher
 /// needs besides the `Job` entity itself (which the caller still re-fetches
 /// by id -- see `JobPoller::dispatch_job_from_reservation`'s doc comment for
@@ -782,7 +710,7 @@ pub(crate) struct ClaimedRow {
 /// (insert, promote, reclaim) -- sees that write's uncommitted rows with
 /// guaranteed statement ordering, which is what keeps this immune to the
 /// independent-CTE ordering hazard documented on
-/// [`swap_older_parked_siblings_in_op`].
+/// [`crate::execution_hooks::PromoteHeadsHook::apply`].
 ///
 /// `FOR UPDATE SKIP LOCKED` races the ordinary poll claim (and any other
 /// concurrent caller of this function) harmlessly: each skips whatever the
