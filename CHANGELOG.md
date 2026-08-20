@@ -1,3 +1,15 @@
+# [job release v0.13.2](https://github.com/GaloyMoney/job/releases/tag/0.13.2)
+
+
+
+### Bug Fixes
+
+- Promote a freed queue's parked head with a fresh snapshot (#176)
+
+### Miscellaneous Tasks
+
+- Bump serde_with in the all-dependencies group (#174)
+
 # [job release v0.13.1](https://github.com/GaloyMoney/job/releases/tag/0.13.1)
 
 
