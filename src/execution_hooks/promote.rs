@@ -16,7 +16,7 @@ use crate::notifier::JobEventNotifier;
 ///   voluntary reschedule, or a bulk reclaim sweep): promote an older parked
 ///   sibling ahead of them wherever one exists and is older -- swap them
 ///   (the newly-pending row → `parked`, the sibling → `pending`).
-/// - **`freed_queues`** -- queues whose active row a completer just DELETEd
+/// - **`freed_queues`** -- queues whose active row a completer just deleted
 ///   ([`crate::dispatcher::JobDispatcher::delete_execution_in_op`] and
 ///   `batch_dispatcher.rs`'s two completers): promote each one's oldest
 ///   parked sibling outright. This runs here, as a commit-hook statement
@@ -249,7 +249,7 @@ impl PromoteHeadsHook {
     }
 
     /// Builds and registers a `PromoteHeadsHook` for queues whose active row
-    /// the caller just DELETEd, with the same no-hook-buffer fallback as
+    /// the caller just deleted, with the same no-hook-buffer fallback as
     /// [`Self::register`]. `own_types` is empty on purpose: a completer only
     /// ever wakes the PROMOTED row's type (see the type-level notify policy).
     pub(crate) async fn register_freed_queues(
