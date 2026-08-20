@@ -11,6 +11,7 @@ use super::{
     Job, JobId,
     entity::{JobType, NewJob},
     error::JobError,
+    execution_hooks::{ExecutionInsertHook, NewExecutionRow},
     notifier::JobEventNotifier,
     poller::PollerHandle,
     repo::JobRepo,
@@ -330,85 +331,28 @@ where
 
         let mut jobs = self.repo.create_all_in_op(op, new_jobs).await?;
 
-        let ids: Vec<JobId> = jobs.iter().map(|j| j.id).collect();
         // `unique_key` is always NULL here: keyed and bulk spawning are
         // disjoint APIs (`JobSpec` deliberately carries no unique_key — see
         // `KeyedJobSpawner::spawn` for the keyed path).
         //
-        // Same park-or-take semantics as `insert_execution` (no swap logic
-        // for the bulk path — out of scope, see the handoff this
-        // implements): try every row as `pending`, `ON CONFLICT DO NOTHING`
-        // against the queue's active slot (this also resolves conflicts
-        // BETWEEN rows of this same bulk call that share a `queue_id`:
-        // Postgres evaluates the arbiter per row within one statement, so at
-        // most one of them lands `pending` and the rest see the first as
-        // already occupying the slot); whichever didn't land lands `parked`.
-        let landed_pending: Vec<JobId> = sqlx::query_scalar(
-            r#"
-            WITH ins AS (
-                INSERT INTO job_executions
-                    (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-                SELECT unnested.id, $2, unnested.queue_id, NULL, 'pending', 1, unnested.execute_at,
-                       COALESCE($5, NOW()), COALESCE($5, NOW())
-                FROM UNNEST($1::uuid[], $3::text[], $4::timestamptz[])
-                    AS unnested(id, queue_id, execute_at)
-                ON CONFLICT (queue_id) WHERE state IN ('pending','running') AND queue_id IS NOT NULL
-                DO NOTHING
-                RETURNING id
-            ), parked AS (
-                INSERT INTO job_executions
-                    (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-                SELECT unnested.id, $2, unnested.queue_id, NULL, 'parked', 1, unnested.execute_at,
-                       COALESCE($5, NOW()), COALESCE($5, NOW())
-                FROM UNNEST($1::uuid[], $3::text[], $4::timestamptz[])
-                    AS unnested(id, queue_id, execute_at)
-                WHERE unnested.id NOT IN (SELECT id FROM ins)
-                RETURNING id
-            )
-            SELECT id FROM ins
-            "#,
-        )
-        .bind(&ids)
-        .bind(&self.job_type)
-        .bind(&queue_ids)
-        .bind(&schedule_times)
-        .bind(op.maybe_now())
-        .fetch_all(op.as_executor())
-        .await?;
-
-        // Nothing to wake a poller for if every row of this call landed
-        // parked (rare: only when every distinct queue_id in the batch was
-        // already occupied). Otherwise at least one row is claimable.
-        if !landed_pending.is_empty() {
-            self.notifier
-                .execution_ready_in_op(op, &self.job_type)
-                .await?;
-
-            // Head-swap short-circuit for the bulk path (handoff addendum
-            // §7.3 site 4): greedily reserve as much capacity as this call's
-            // own DUE-NOW count could use, claiming this type's oldest due
-            // backlog per reservation. Under-reservation is not a failure --
-            // every row already landed pending/parked above regardless, so
-            // whatever isn't claimed here is picked up by the ordinary poll
-            // exactly as before this addendum.
-            //
-            // `n_due` must be the due-now subset of `landed_pending`, not
-            // its raw length: `landed_pending` includes rows whose
-            // `schedule_at` is in the future (an explicit per-spec
-            // `JobSpec::schedule_at`), which are not claimable and must not
-            // count toward how many reservations to attempt -- mirrors the
-            // single-spawn path's own `schedule_at <= self.clock.now()`
-            // gate. Without it, a `spawn_all` of entirely future-scheduled
-            // work could still reserve and drain this type's ENTIRE
-            // unrelated due backlog, bypassing `next_batch_size`'s
-            // `min_jobs` throttle for a call that has nothing to do with
-            // due-now admission.
-            if let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade()) {
-                let now = op.maybe_now().unwrap_or(default_schedule_at);
-                let n_due = count_due_now(&landed_pending, &ids, &schedule_times, now);
-                poller.register_claim_demand(op, &self.job_type, n_due);
-            }
-        }
+        // Head-swap kernel, insert half (handoff addendum §8.2a): one
+        // `ExecutionInsertHook` registration for the whole batch, merged
+        // into a single multi-row insert statement at commit time -- this
+        // ALSO gains the bulk path Invariant-B swap semantics it never had
+        // before (see `ExecutionInsertHook::insert_many`'s doc comment).
+        let rows: Vec<NewExecutionRow> = jobs
+            .iter()
+            .zip(&schedule_times)
+            .zip(&queue_ids)
+            .map(|((job, schedule_at), queue_id)| NewExecutionRow {
+                id: job.id,
+                job_type: self.job_type.clone(),
+                schedule_at: *schedule_at,
+                queue_id: queue_id.clone(),
+            })
+            .collect();
+        ExecutionInsertHook::register(op, &self.notifier, &self.poller_ref, &self.clock, rows)
+            .await?;
 
         for (job, schedule_at) in jobs.iter_mut().zip(&schedule_times) {
             job.schedule_execution(*schedule_at);
@@ -437,253 +381,32 @@ where
             .expect("Could not build new job");
 
         let mut job = self.repo.create_in_op(op, new_job).await?;
-        // @@ I was thinking more something like:
-        // op.add_hook(InsertExecutionHook::new(...))
 
-        insert_execution(
-            &self.repo,
-            &self.notifier,
+        // Head-swap kernel, insert half (handoff addendum §8.2a): registers
+        // an `ExecutionInsertHook` that does the actual `job_executions`
+        // insert, any Invariant-B swap, notify, and due-now claim demand --
+        // all in `pre_commit`, at commit time. Several `spawn_in_op` calls
+        // sharing one `op` merge into ONE multi-row insert statement (see
+        // `ExecutionInsertHook::merge`).
+        ExecutionInsertHook::register_one(
             op,
-            &mut job,
-            schedule_at,
-            queue_id.as_deref(),
-            None,
+            &self.notifier,
+            &self.poller_ref,
+            &self.clock,
+            NewExecutionRow {
+                id: job.id,
+                job_type: self.job_type.clone(),
+                schedule_at,
+                queue_id,
+            },
         )
         .await?;
 
-        // Head-swap short-circuit (handoff addendum §7.1/§7.3 site 1): a
-        // due-now spawn tries to claim capacity for this type's oldest due
-        // backlog -- which may or may not be the row inserted just above.
-        // Runs as a LATER statement in the same `op`, so it sees that insert
-        // with guaranteed ordering. `schedule_at` in the future (an explicit
-        // `spawn_at`) never qualifies -- nothing of this type is claimable
-        // sooner just because this call happened.
-        // // @@ This should be part of the same insert hook
-        // or perhaps its own hook that insert registeres
-        if schedule_at <= self.clock.now()
-            && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
-        {
-            poller.register_claim_demand(op, &self.job_type, 1);
-        }
+        job.schedule_execution(schedule_at);
+        self.repo.update_in_op(op, &mut job).await?;
 
         Ok(job)
     }
-}
-
-/// The due-now subset count of `landed_pending`, cross-referenced against
-/// `ids`/`schedule_times` (the parallel arrays `spawn_all_in_op` builds
-/// before its bulk insert). Extracted as a pure function -- no DB, no
-/// poller -- specifically so this counting logic is unit-testable without
-/// the live-background-poller race that made an earlier integration-test
-/// version of this check (asserting on row state after a real `spawn_all`
-/// call, with a real poll loop running) flaky: `spawn_all_in_op` always
-/// fires `execution_ready_in_op` when anything landed pending, which wakes
-/// that live poller regardless of whether THIS count is right, so it could
-/// independently claim an unrelated due backlog row before any such
-/// assertion ran -- a false failure unrelated to what this function computes.
-///
-/// `landed_pending` may include rows whose `schedule_at` is in the future
-/// (an explicit per-spec `JobSpec::schedule_at`); those must not count
-/// toward how many reservations `try_claim_after_bulk_spawn` should
-/// attempt, mirroring the single-spawn path's own
-/// `schedule_at <= self.clock.now()` gate.
-fn count_due_now(
-    landed_pending: &[JobId],
-    ids: &[JobId],
-    schedule_times: &[DateTime<Utc>],
-    now: DateTime<Utc>,
-) -> usize {
-    let due_by_id: std::collections::HashMap<JobId, DateTime<Utc>> = ids
-        .iter()
-        .copied()
-        .zip(schedule_times.iter().copied())
-        .collect();
-    landed_pending
-        .iter()
-        .filter(|id| due_by_id.get(id).is_some_and(|at| *at <= now))
-        .count()
-}
-
-/// Insert the `job_executions` row for a freshly created job and mark it
-/// scheduled. Shared by all three spawner flavors — [`JobSpawner`] passes
-/// `unique_key: None`, [`crate::KeyedJobSpawner`] passes the key,
-/// [`crate::ResidentJobSpawner`] passes `None`.
-///
-/// A `queue_id`'d row lands `pending` if the queue's active slot is free, or
-/// `parked` otherwise (see [`insert_or_park_in_op`]). An unqueued row always
-/// lands `pending` — nothing can ever block it. `execution_ready_in_op` is
-/// skipped for a row that lands `parked`: nothing can claim it yet, so there
-/// is nothing to wake a poller for.
-#[instrument(name = "job.insert_execution", skip_all)]
-pub(crate) async fn insert_execution(
-    repo: &JobRepo,
-    notifier: &Arc<JobEventNotifier>,
-    op: &mut impl es_entity::AtomicOperation,
-    job: &mut Job,
-    schedule_at: DateTime<Utc>,
-    queue_id: Option<&str>,
-    unique_key: Option<&str>,
-) -> Result<(), JobError> {
-    let landed_pending =
-        insert_or_park_in_op(op, job.id, &job.job_type, schedule_at, queue_id, unique_key).await?;
-    if landed_pending {
-        notifier.execution_ready_in_op(op, &job.job_type).await?;
-    }
-    job.schedule_execution(schedule_at);
-    repo.update_in_op(op, job).await?;
-    Ok(())
-}
-
-/// Insert one `job_executions` row, parking it instead of landing it
-/// `pending` if its queue's active slot (Invariant A: at most one
-/// `pending`/`running` row per `queue_id`) is already taken. Returns
-/// `true` iff the row landed `pending`.
-///
-/// Unqueued rows (`queue_id.is_none()`) can never conflict — always `pending`.
-///
-/// Queued rows try the active slot first (`ON CONFLICT (queue_id) WHERE
-/// state IN ('pending','running') AND queue_id IS NOT NULL DO NOTHING`,
-/// inferring `idx_job_executions_queue_active`; the arbiter clause must
-/// repeat the index predicate exactly or inference fails). On conflict:
-///
-/// - **Invariant B ordering edge**: if the occupying row is `pending` (not
-///   `running`) and this new row sorts strictly before it by
-///   `(execute_at, id)` — a backdated `spawn_at` in the past — swap: demote
-///   the occupying row to `parked`, take the slot ourselves. The demote is
-///   guarded (`WHERE id = $1 AND state = 'pending'`) so a concurrent
-///   claim/completion of that row is detected rather than clobbered; losing
-///   the guard just means landing `parked` below, which is always safe.
-/// - Otherwise (occupied by `running`, or a `pending` row that doesn't sort
-///   after us, or the swap guard lost a race): land `parked`.
-///
-/// **Orphan race**: between the failed first insert and this function's
-/// final `parked` insert, the occupying row can complete-and-promote-nothing
-/// (no parked sibling was visible to it yet, since ours hadn't landed) —
-/// this row is then orphaned (its queue has no active row) until the next
-/// orphan-sweep cycle (`poller.rs`, piggybacked on `reclaim_lost_jobs`).
-/// Real, expected, and bounded — not handled inline here.
-async fn insert_or_park_in_op(
-    op: &mut impl es_entity::AtomicOperation,
-    id: JobId,
-    job_type: &JobType,
-    schedule_at: DateTime<Utc>,
-    queue_id: Option<&str>,
-    unique_key: Option<&str>,
-) -> Result<bool, JobError> {
-    // @@ So many round trips - should be condensed to 1 or 2 max - move logic into the query
-    let alive_at = op.maybe_now();
-
-    let Some(queue_id) = queue_id else {
-        sqlx::query!(
-            r#"
-            INSERT INTO job_executions
-                (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-            VALUES ($1, $2, NULL, $3, 'pending', 1, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
-            "#,
-            id as JobId,
-            job_type as &JobType,
-            unique_key,
-            schedule_at,
-            alive_at,
-        )
-        .execute(op.as_executor())
-        .await?;
-        return Ok(true);
-    };
-
-    let inserted = sqlx::query_scalar!(
-        r#"
-        INSERT INTO job_executions
-            (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-        VALUES ($1, $2, $3, $4, 'pending', 1, $5, COALESCE($6, NOW()), COALESCE($6, NOW()))
-        ON CONFLICT (queue_id) WHERE state IN ('pending','running') AND queue_id IS NOT NULL
-        DO NOTHING
-        RETURNING id AS "id!: JobId"
-        "#,
-        id as JobId,
-        job_type as &JobType,
-        queue_id,
-        unique_key,
-        schedule_at,
-        alive_at,
-    )
-    .fetch_optional(op.as_executor())
-    .await?;
-    if inserted.is_some() {
-        return Ok(true);
-    }
-
-    // Conflicted: the queue's active slot is taken. Read who holds it to
-    // decide whether the ordering edge (Invariant B) applies.
-    let active = sqlx::query!(
-        r#"
-        SELECT id AS "id: JobId", execute_at, (state = 'pending') AS "is_pending!"
-        FROM job_executions
-        WHERE queue_id = $1 AND state IN ('pending', 'running')
-        "#,
-        queue_id,
-    )
-    .fetch_optional(op.as_executor())
-    .await?;
-
-    let should_swap = active.as_ref().is_some_and(|active| {
-        active.is_pending
-            && (schedule_at, id)
-                < (
-                    active
-                        .execute_at
-                        .expect("pending row always has execute_at"),
-                    active.id,
-                )
-    });
-
-    if should_swap {
-        let active_id = active.expect("checked by should_swap above").id;
-        let demoted = sqlx::query!(
-            "UPDATE job_executions SET state = 'parked' WHERE id = $1 AND state = 'pending'",
-            uuid::Uuid::from(active_id),
-        )
-        .execute(op.as_executor())
-        .await?;
-        if demoted.rows_affected() == 1 {
-            sqlx::query!(
-                r#"
-                INSERT INTO job_executions
-                    (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-                VALUES ($1, $2, $3, $4, 'pending', 1, $5, COALESCE($6, NOW()), COALESCE($6, NOW()))
-                "#,
-                id as JobId,
-                job_type as &JobType,
-                queue_id,
-                unique_key,
-                schedule_at,
-                alive_at,
-            )
-            .execute(op.as_executor())
-            .await?;
-            return Ok(true);
-        }
-        // Lost the guard (the occupying row was concurrently claimed,
-        // completed, or already parked by a peer) — fall through to parking
-        // below, exactly as the non-swap case does.
-    }
-
-    sqlx::query!(
-        r#"
-        INSERT INTO job_executions
-            (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-        VALUES ($1, $2, $3, $4, 'parked', 1, $5, COALESCE($6, NOW()), COALESCE($6, NOW()))
-        "#,
-        id as JobId,
-        job_type as &JobType,
-        queue_id,
-        unique_key,
-        schedule_at,
-        alive_at,
-    )
-    .execute(op.as_executor())
-    .await?;
-    Ok(false)
 }
 
 /// One row claimed by [`claim_due_heads_in_op`]: everything a dispatcher
@@ -831,82 +554,4 @@ pub(crate) async fn insert_keyed_execution(
         Some(id) => KeyedInsert::Live(id),
         None => KeyedInsert::Contended,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The exact bug an earlier version of `spawn_all_in_op` had (flagged
-    /// by automated review on PR #173): counting every row that landed
-    /// pending, including future-scheduled ones, as if it were due now.
-    #[test]
-    fn count_due_now_excludes_future_scheduled_rows() {
-        let now = chrono::Utc::now();
-        let due = JobId::new();
-        let future = JobId::new();
-        let ids = vec![due, future];
-        let schedule_times = vec![
-            now - chrono::Duration::seconds(5),
-            now + chrono::Duration::hours(1),
-        ];
-        let landed_pending = vec![due, future];
-
-        assert_eq!(
-            count_due_now(&landed_pending, &ids, &schedule_times, now),
-            1,
-            "only the due row should count, not the future-scheduled one"
-        );
-    }
-
-    /// A `spawn_all` of entirely future work must count zero -- the case
-    /// that let a bulk short-circuit reserve and drain unrelated due
-    /// backlog before this was fixed.
-    #[test]
-    fn count_due_now_is_zero_for_all_future_work() {
-        let now = chrono::Utc::now();
-        let a = JobId::new();
-        let b = JobId::new();
-        let ids = vec![a, b];
-        let schedule_times = vec![now + chrono::Duration::hours(1); 2];
-        let landed_pending = vec![a, b];
-
-        assert_eq!(
-            count_due_now(&landed_pending, &ids, &schedule_times, now),
-            0
-        );
-    }
-
-    /// A row that landed `parked` (conflicted on its queue) is absent from
-    /// `landed_pending` -- it must not count even if its own `schedule_at`
-    /// was due, since it isn't claimable.
-    #[test]
-    fn count_due_now_ignores_rows_that_did_not_land_pending() {
-        let now = chrono::Utc::now();
-        let landed = JobId::new();
-        let parked = JobId::new();
-        let ids = vec![landed, parked];
-        let schedule_times = vec![now - chrono::Duration::seconds(1); 2];
-        let landed_pending = vec![landed]; // `parked` conflicted, absent here
-
-        assert_eq!(
-            count_due_now(&landed_pending, &ids, &schedule_times, now),
-            1
-        );
-    }
-
-    #[test]
-    fn count_due_now_treats_exactly_due_as_due() {
-        let now = chrono::Utc::now();
-        let id = JobId::new();
-        let ids = vec![id];
-        let schedule_times = vec![now];
-        let landed_pending = vec![id];
-
-        assert_eq!(
-            count_due_now(&landed_pending, &ids, &schedule_times, now),
-            1,
-            "execute_at == now must count as due, matching the claim query's own `<=`"
-        );
-    }
 }

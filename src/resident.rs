@@ -21,12 +21,13 @@ use super::{
     current::CurrentJob,
     entity::{JobType, NewJob},
     error::JobError,
+    execution_hooks::{ExecutionInsertHook, NewExecutionRow},
     handle::JobHandle,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
+    poller::PollerHandle,
     repo::{JobCreateError, JobRepo},
     runner::{JobCompletion, JobRunner, RetrySettings},
-    spawner::insert_execution,
 };
 
 /// Result returned by [`ResidentJobRunner::run`] describing how to progress
@@ -218,16 +219,27 @@ where
         match self.repo.create_in_op(&mut op, new_job).await {
             Ok(mut job) => {
                 let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                insert_execution(
-                    &self.repo,
-                    &self.notifier,
+                // A resident type never wires a `PollerHandle` in -- there is
+                // at most one job of it, ever, so there is no backlog for a
+                // head-swap claim to short-circuit into; this fresh, never-
+                // populated handle just makes `ExecutionInsertHook`'s claim
+                // step a guaranteed no-op, mirroring that exclusion.
+                let poller_ref: PollerHandle = Arc::new(std::sync::OnceLock::new());
+                ExecutionInsertHook::register_one(
                     &mut op,
-                    &mut job,
-                    schedule_at,
-                    None,
-                    None,
+                    &self.notifier,
+                    &poller_ref,
+                    &self.clock,
+                    NewExecutionRow {
+                        id: job.id,
+                        job_type: self.job_type.clone(),
+                        schedule_at,
+                        queue_id: None,
+                    },
                 )
                 .await?;
+                job.schedule_execution(schedule_at);
+                self.repo.update_in_op(&mut op, &mut job).await?;
                 op.commit().await?;
                 Ok(self.handle(job.id))
             }
