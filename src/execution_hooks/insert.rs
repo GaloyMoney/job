@@ -199,7 +199,10 @@ impl ExecutionInsertHook {
     /// schema by `key_share_blocks_only_the_delete`):
     /// - It **conflicts with `DELETE`**, which is the only operation that can
     ///   remove a queue's active row -- so the completer waits out this
-    ///   transaction's commit tail and then sees the parked row.
+    ///   transaction's commit tail, and its [`PromoteHeadsHook`] freed-queue
+    ///   statement (whose FRESH statement snapshot is what actually makes
+    ///   the freshly committed parked row visible -- the blocked `DELETE`
+    ///   itself resumes with its original snapshot) then promotes it.
     /// - It does **not** conflict with a plain `UPDATE` of a non-key column,
     ///   so the keep-alive heartbeat (`poller.rs`'s `start_keep_alive`, one
     ///   bulk statement across every live job on the instance) is never

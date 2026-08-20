@@ -404,26 +404,31 @@ impl JobDispatcher {
         Ok(())
     }
 
-    /// Delete the execution row and report what its removal makes true: the job
-    /// is terminal, and — if it held a `queue_id` — that queue's oldest parked
-    /// sibling (if any) is promoted to `pending` in the same statement.
-    /// Promoting is worth reporting because the queue's backlog was, until
+    /// Delete the execution row and report what its removal makes true: the
+    /// job is terminal, and — if it held a `queue_id` — that queue's oldest
+    /// parked sibling (if any) gets promoted to `pending` by a
+    /// [`PromoteHeadsHook`] freed-queue registration on this same
+    /// transaction. Promoting matters because the queue's backlog was, until
     /// this moment, entirely unclaimable — `parked` rows never appear in the
-    /// claim scan — and it is also the only wake for that backlog: the poll
-    /// loop sleeps on `next_due_at`, and a promoted row is already due. The
-    /// notify targets the PROMOTED job's type, not this job's own type — a
-    /// poller only wakes for types it polls, and the two are frequently
-    /// different. Reports nothing when no row was deleted.
+    /// claim scan — and the hook's notify is also the only wake for that
+    /// backlog: the poll loop sleeps on `next_due_at`, and a promoted row is
+    /// already due. The hook wakes the PROMOTED job's type, not this job's
+    /// own type — a poller only wakes for types it polls, and the two are
+    /// frequently different.
     ///
     /// Also hands this job's about-to-free unit of capacity to a `ClaimHook`
     /// so it can be spent immediately on this SAME type's own oldest due
     /// backlog, independent of whichever type got promoted above.
+    /// `ClaimHook` runs after `PromoteHeadsHook` (its `RUNS_AFTER`), so a
+    /// sibling promoted here is already claimable by the short-circuit.
     ///
     /// This `DELETE` is what a spawner's `FOR KEY SHARE` on the same row
     /// blocks (see `execution_hooks::insert`'s `lock_queue_occupants`): a
     /// completion racing an in-flight spawn into this queue waits out that
-    /// spawn's commit tail, so the `heads` scan below sees the freshly parked
-    /// row instead of promoting nothing. Unlike `batch_dispatcher.rs`'s
+    /// spawn's commit tail. The promote deliberately runs as its OWN
+    /// later statement (the hook's), never as a CTE of the `DELETE` — see
+    /// [`PromoteHeadsHook`] for why folding it in silently orphans
+    /// the freshly parked row. Unlike `batch_dispatcher.rs`'s
     /// multi-row completers this needs no id-ordered pre-lock -- a
     /// single-row `DELETE` takes exactly one lock and so cannot be one side
     /// of an ordering cycle.
@@ -451,30 +456,8 @@ impl JobDispatcher {
           ), cleanup AS (
               DELETE FROM job_execution_states s USING deleted d
               WHERE s.id = d.id AND NOT $3::boolean
-          ), head AS (
-              -- The oldest parked sibling of the freed queue, by the same
-              -- (execute_at, id) tiebreak the claim query uses -- ordering
-              -- by execute_at alone would let this promote a different row,
-              -- and so a different TYPE, than every peer would independently
-              -- agree is the head.
-              SELECT p.id FROM deleted d
-              CROSS JOIN LATERAL (
-                  SELECT id FROM job_executions
-                  WHERE state = 'parked' AND queue_id = d.queue_id
-                  ORDER BY execute_at, id
-                  LIMIT 1
-              ) p
-              WHERE d.queue_id IS NOT NULL
-          ), promoted AS (
-              -- Only the completer of a queue's single running job can ever
-              -- reach here for that queue (Invariant A), so there is exactly
-              -- one promoter at a time -- no SKIP LOCKED needed.
-              UPDATE job_executions je SET state = 'pending'
-              FROM head h WHERE je.id = h.id
-              RETURNING je.job_type
           )
-          SELECT d.queue_id AS "queue_id?", p.job_type AS "next_in_queue?"
-          FROM deleted d LEFT JOIN promoted p ON TRUE
+          SELECT d.queue_id AS "queue_id?" FROM deleted d
         "#,
             id as JobId,
             self.instance_id,
@@ -489,12 +472,8 @@ impl JobDispatcher {
 
         self.notifier.job_terminal_in_op(op, id).await?;
 
-        if row.queue_id.is_some()
-            && let Some(next) = row.next_in_queue
-        {
-            self.notifier
-                .execution_ready_in_op(op, &JobType::from_owned(next))
-                .await?;
+        if let Some(queue_id) = row.queue_id {
+            PromoteHeadsHook::register_freed_queues(op, &self.notifier, vec![queue_id]).await?;
         }
 
         if let Some(poller) = self.poller.upgrade() {
