@@ -110,7 +110,13 @@ over a type's cap are simply not claimed and their locks release at commit.
 fetched only for winners.
 
 Cost is `O(n_jobs_to_poll × CONTENTION_HEADROOM)` index entries plus the
-claim `UPDATE`, regardless of how many rows or queues are pending.
+claim `UPDATE`, regardless of how many rows or queues are pending -- true
+because `idx_job_executions_pending_execute_at` leads with `job_type`, so
+each type's LATERAL probe descends straight into its own slice. Without that
+leading column the probe degrades to a filter-scan of the *entire* pending
+set per type (`O(types × pending backlog)`), which is exactly what a
+saturated single hot type does to every other type's poll -- see sb-max8,
+2026-08-20.
 
 ### The ordering must be total
 
@@ -390,7 +396,7 @@ indexes that earn their keep:
 
 | index | serves |
 |---|---|
-| `idx_job_executions_pending_execute_at` on `(execute_at, id) WHERE state = 'pending'` | the claim window (the only ordered access path to due work), `min_wait`, and the stale-pending reporter |
+| `idx_job_executions_pending_execute_at` on `(job_type, execute_at, id) WHERE state = 'pending'` | the claim window (the only ordered access path to due work), `min_wait`, and the stale-pending reporter |
 | `idx_job_executions_queue_active` — UNIQUE on `(queue_id) WHERE state IN ('pending','running') AND queue_id IS NOT NULL` | Invariant A itself, and the insert-time occupancy probe the park-or-take `ON CONFLICT` arbiter infers |
 | `idx_job_executions_parked_queue_head` on `(queue_id, execute_at, id) WHERE state = 'parked'` | the promote path: one index-only descent per freed queue, independent of that queue's parked depth |
 | `idx_job_executions_job_type_unique_key` — UNIQUE, all states | keyed-job liveness at spawn time |
@@ -400,14 +406,22 @@ Three things this settles:
 - **`INCLUDE` payloads are not worth it.** Covering the claim index with
   `INCLUDE (id, job_type)` costs roughly 9% more insert time and 25% more
   index bytes for no measurable claim-side gain — a poll touches only about
-  `n_jobs_to_poll` rows, so the heap fetches are free.
+  `n_jobs_to_poll` rows, so the heap fetches are free. `job_type` leading the
+  claim index (below) is a different thing entirely: a key column that
+  narrows *which* rows the scan visits, not a covering payload that only
+  saves a heap fetch — the two aren't in tension.
 - **`id` trailing `execute_at` is a correctness requirement**, not a
   covering trick — see "The ordering must be total". On
   `idx_job_executions_parked_queue_head` it also makes head resolution an
   index-only scan.
-- **The claim index is not droppable on any terms.** Serving `min_wait`
-  per-type instead has been tried and measured slower, and the claim path has
-  no other ordered access to due work.
+- **The claim index is not droppable on any terms.** An earlier design
+  (pre-#173, separate per-type indexes replacing the one shared index
+  entirely so `min_wait` degrades to a fan-out across them) was tried and
+  measured 2.3x the poll cost — that is a different mechanism from
+  `job_type` leading this *one* composite index, which keeps min_wait,
+  the stale-pending reporter, and the claim window on a single ordered
+  structure (see sb-max8, 2026-08-20). The claim path still has no other
+  ordered access to due work.
 
 ### Why `poller_instance_id` has no index
 

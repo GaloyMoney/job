@@ -1905,11 +1905,16 @@ async fn poll_jobs(
         window_rows AS (
             -- One LATERAL probe per type, each bounded by ITS OWN budget
             -- ($1 x $7 rows capped at that type's own row_limit), never by
-            -- how much is pending: cost is O(budget), flat in backlog.
-            -- Ordering is `(execute_at, id)` and the tiebreak is load-bearing
-            -- for the same reason it always was -- a total order, so each
-            -- type's window is a well-defined prefix rather than an
-            -- arbitrary cut through a group of rows sharing a timestamp.
+            -- how much is pending: cost is O(budget), flat in backlog --
+            -- true only because `idx_job_executions_pending_execute_at`
+            -- leads with `job_type`, so this probe is an index descent into
+            -- that type's own slice rather than a filter-scan of every
+            -- other type's pending rows too (see PERFORMANCE.md, "Claim
+            -- admission"). Ordering is `(execute_at, id)` within that slice
+            -- and the tiebreak is load-bearing for the same reason it
+            -- always was -- a total order, so each type's window is a
+            -- well-defined prefix rather than an arbitrary cut through a
+            -- group of rows sharing a timestamp.
             SELECT d.id, d.execute_at, d.job_type
             FROM limits t
             CROSS JOIN LATERAL (
