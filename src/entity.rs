@@ -301,13 +301,6 @@ impl Job {
         }
     }
 
-    pub(super) fn schedule_execution(&mut self, scheduled_at: DateTime<Utc>) {
-        self.events.push(JobEvent::ExecutionScheduled {
-            attempt: 1,
-            scheduled_at,
-        });
-    }
-
     pub(super) fn reschedule_execution(&mut self, scheduled_at: DateTime<Utc>) {
         self.events.push(JobEvent::ExecutionCompleted);
         self.events.push(JobEvent::ExecutionScheduled {
@@ -467,6 +460,11 @@ pub struct NewJob {
     pub(super) unique_key: Option<String>,
     #[builder(default)]
     pub(super) resident: bool,
+    /// The job's first `execute_at`. `into_events` appends
+    /// `ExecutionScheduled { attempt: 1, scheduled_at }` to the initial
+    /// event batch alongside `Initialized`, so a caller never needs a
+    /// second `update_in_op` round trip just to record it.
+    pub(super) schedule_at: DateTime<Utc>,
 }
 
 impl NewJob {
@@ -487,14 +485,20 @@ impl IntoEvents<JobEvent> for NewJob {
     fn into_events(self) -> EntityEvents<JobEvent> {
         EntityEvents::init(
             self.id,
-            [JobEvent::Initialized {
-                id: self.id,
-                job_type: self.job_type,
-                config: self.config,
-                tracing_context: self.tracing_context,
-                queue_id: self.queue_id,
-                unique_key: self.unique_key,
-            }],
+            [
+                JobEvent::Initialized {
+                    id: self.id,
+                    job_type: self.job_type,
+                    config: self.config,
+                    tracing_context: self.tracing_context,
+                    queue_id: self.queue_id,
+                    unique_key: self.unique_key,
+                },
+                JobEvent::ExecutionScheduled {
+                    attempt: 1,
+                    scheduled_at: self.schedule_at,
+                },
+            ],
         )
     }
 }

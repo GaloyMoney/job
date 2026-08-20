@@ -2,7 +2,7 @@ use tokio::sync::Notify;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Mutex, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -218,6 +218,163 @@ impl JobTracker {
     pub fn live_job_ids(&self) -> Vec<uuid::Uuid> {
         self.live_jobs.lock().expect("live_jobs poisoned").ids()
     }
+
+    /// Reserve one execution unit of `job_type` BEFORE the DB write that
+    /// would consume it. Mirrors `dispatch_job`'s accounting exactly -- a
+    /// reservation IS a unit in flight, the same way `dispatch_job`'s claim
+    /// is -- so `next_batch_size`/`plan_claim` see it immediately, for the
+    /// same reason `JobDispatcher::new` claims its slot synchronously rather
+    /// than inside the execution task (see its doc comment).
+    ///
+    /// `None` if the process is already at `max_jobs`, or `per_type_cap` is
+    /// `Some` and `job_type` is already at it. Reserving does not require
+    /// knowing the job's id yet -- see [`UnitReservation::into_live`].
+    ///
+    /// **Known bounded race**: a reservation taken here between
+    /// `JobRegistry::plan_claim` reading `units_in_flight` and the poll's
+    /// claim query actually running against Postgres is invisible to that
+    /// poll -- its `row_limit` was already baked in as a query parameter
+    /// from the stale snapshot, so it can claim up to that many rows even
+    /// though this reservation just took some of the capacity it assumed
+    /// was free. The overshoot is bounded (at most however many concurrent
+    /// short-circuit reservations land inside one poll's snapshot-to-claim
+    /// window) and self-corrects on the very next poll cycle, since
+    /// `units_in_flight` is authoritative again by then -- the same class of
+    /// soft, self-correcting accounting imperfection `max_jobs`' own
+    /// unit-vs-row mismatch already carries. A tighter fix needs either a
+    /// lock spanning the whole plan-to-claim window (serializing every
+    /// short-circuit reservation behind poll latency -- a real regression
+    /// for exactly the paths this design exists to speed up) or a
+    /// post-claim backstop that re-validates and releases any row a poll
+    /// over-claimed before dispatching it. A per-type cap that must never be
+    /// exceeded even transiently should not rely on this path alone.
+    pub(crate) fn try_reserve(
+        self: &Arc<Self>,
+        job_type: &JobType,
+        per_type_cap: Option<usize>,
+    ) -> Option<UnitReservation> {
+        if self.running_jobs.load(Ordering::SeqCst) >= self.max_jobs {
+            return None;
+        }
+        {
+            let mut units = self
+                .units_in_flight
+                .lock()
+                .expect("units_in_flight poisoned");
+            if let Some(cap) = per_type_cap {
+                let current = units.get(job_type).copied().unwrap_or(0);
+                if current >= cap {
+                    return None;
+                }
+            }
+            *units.entry(job_type.clone()).or_insert(0) += 1;
+        }
+        self.running_jobs.fetch_add(1, Ordering::SeqCst);
+        Some(UnitReservation {
+            tracker: Arc::clone(self),
+            job_type: job_type.clone(),
+            resolved: false,
+        })
+    }
+
+    /// Transfer an already-accounted-for unit of `job_type`'s capacity from a
+    /// job/batch that is completing to whatever this reservation goes on to
+    /// dispatch next, instead of releasing it outright -- the completion-time
+    /// counterpart of [`Self::try_reserve`].
+    ///
+    /// Unlike `try_reserve`, this can never fail and never touches
+    /// `running_jobs`/`units_in_flight`: the unit is already counted (the
+    /// completing job/batch's own `dispatch_job`/`dispatch_batch` call
+    /// counted it), so one running unit of `job_type` being replaced by
+    /// another leaves both caps unchanged -- recycling nets to zero on the
+    /// counters by construction.
+    ///
+    /// The CALLER must ensure the completing dispatcher's own ordinary
+    /// release (`job_completed`/`batch_completed`, fired from `Drop`) is
+    /// skipped for this same unit -- see
+    /// [`Self::mark_finished_without_releasing_unit`] and
+    /// `JobDispatcher::recycle_unit`/`BatchDispatcher::recycle_unit` -- or the
+    /// unit is released twice.
+    pub(crate) fn recycle(self: &Arc<Self>, job_type: &JobType) -> UnitReservation {
+        UnitReservation {
+            tracker: Arc::clone(self),
+            job_type: job_type.clone(),
+            resolved: false,
+        }
+    }
+
+    /// Clear `ids` from the live-job liveness set WITHOUT touching
+    /// `running_jobs`/`units_in_flight` -- the counterpart to a completion
+    /// that [`Self::recycle`]s its unit into a fresh dispatch instead of
+    /// releasing it. The reclaim/shutdown-drain liveness bookkeeping must
+    /// still see these jobs finish; the capacity accounting must not, since
+    /// the unit stays claimed (by whatever the recycled reservation goes on
+    /// to dispatch).
+    pub(crate) fn mark_finished_without_releasing_unit(&self, ids: &[JobId]) {
+        let mut live = self.live_jobs.lock().expect("live_jobs poisoned");
+        for id in ids {
+            live.finished(*id);
+        }
+    }
+}
+
+/// A pre-claimed unit of `job_type`'s capacity, taken via
+/// [`JobTracker::try_reserve`] before the DB write that would consume it.
+/// Exactly one of [`Self::into_live`]/[`Self::release`] should be called once
+/// the write's outcome is known; a reservation dropped without either is
+/// released automatically -- a leaked reservation would permanently eat a
+/// slot.
+pub(crate) struct UnitReservation {
+    tracker: Arc<JobTracker>,
+    job_type: JobType,
+    resolved: bool,
+}
+
+impl UnitReservation {
+    /// The reserved write landed and `id` is about to be dispatched.
+    /// Registers `id` in the same live-job bookkeeping [`JobTracker::dispatch_job`]
+    /// uses, WITHOUT re-incrementing the counters `try_reserve` already
+    /// incremented -- the caller must build its `JobDispatcher` from this
+    /// reservation (not via the ordinary `dispatch_job`-calling constructor)
+    /// or the unit is counted twice.
+    pub(crate) fn into_live(mut self, id: JobId) {
+        self.resolved = true;
+        self.tracker
+            .live_jobs
+            .lock()
+            .expect("live_jobs poisoned")
+            .started(id);
+    }
+
+    /// The write did not land running (conflicted and parked instead, or the
+    /// operation rolled back) -- undo the provisional claim.
+    pub(crate) fn release(mut self) {
+        self.resolved = true;
+        self.tracker.running_jobs.fetch_sub(1, Ordering::SeqCst);
+        self.tracker.release_unit(&self.job_type);
+    }
+
+    /// Batch counterpart of [`Self::into_live`]: the claimed batch landed and
+    /// every id in it is about to be dispatched together as ONE unit
+    /// (mirrors [`JobTracker::dispatch_batch`]'s per-id liveness / single-unit
+    /// counter split) -- WITHOUT re-incrementing the counters `try_reserve`/
+    /// `recycle` already accounted for.
+    pub(crate) fn into_live_batch(mut self, ids: &[JobId]) {
+        self.resolved = true;
+        let mut live = self.tracker.live_jobs.lock().expect("live_jobs poisoned");
+        for id in ids {
+            live.started(*id);
+        }
+    }
+}
+
+impl Drop for UnitReservation {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.tracker.running_jobs.fetch_sub(1, Ordering::SeqCst);
+            self.tracker.release_unit(&self.job_type);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -279,7 +436,7 @@ mod tests {
         );
     }
 
-    /// D7: without the capped-type notify rule this would time out — a
+    /// Without the capped-type notify rule this would time out — a
     /// single completion never crosses `min_jobs` (set high here) or carries
     /// `rescheduled`, so the capped-type check is the only thing that can
     /// wake the poll loop.

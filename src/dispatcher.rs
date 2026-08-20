@@ -5,17 +5,22 @@ use futures::FutureExt;
 use serde_json::Value as JsonValue;
 use tracing::{Span, instrument};
 
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{Arc, Weak},
+};
 
 use super::{
     JobId,
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
     error::JobError,
+    execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
+    poller::JobPoller,
     repo::JobRepo,
     runner::*,
-    tracker::JobTracker,
+    tracker::{JobTracker, UnitReservation},
 };
 
 #[derive(Debug)]
@@ -30,6 +35,10 @@ pub struct PolledJob {
 }
 
 pub(crate) struct JobDispatcher {
+    /// Reaches this process's poller for the head-swap completion-recycle
+    /// claim (`delete_execution_in_op`). `Weak` so a dispatcher never keeps
+    /// the poller alive on its own -- mirrors `spawner.rs`'s `PollerHandle`.
+    poller: Weak<JobPoller>,
     repo: Arc<JobRepo>,
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
@@ -58,6 +67,7 @@ impl JobDispatcher {
     /// leak once taken.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        poller: Weak<JobPoller>,
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
         notifier: Arc<JobEventNotifier>,
@@ -71,6 +81,7 @@ impl JobDispatcher {
     ) -> Self {
         tracker.dispatch_job(id, &job_type);
         Self {
+            poller,
             repo,
             retry_settings,
             runner: Some(runner),
@@ -84,6 +95,52 @@ impl JobDispatcher {
             instance_id,
             clock,
         }
+    }
+
+    /// Build from an already-taken [`UnitReservation`] (the head-swap
+    /// short-circuit fast path): the reservation already accounted for this
+    /// unit, so this consumes it via [`UnitReservation::into_live`] instead
+    /// of calling `tracker.dispatch_job` a second time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_reservation(
+        reservation: UnitReservation,
+        poller: Weak<JobPoller>,
+        repo: Arc<JobRepo>,
+        tracker: Arc<JobTracker>,
+        notifier: Arc<JobEventNotifier>,
+        retry_settings: RetrySettings,
+        id: JobId,
+        job_type: JobType,
+        retains_state: bool,
+        runner: Box<dyn JobRunner>,
+        instance_id: uuid::Uuid,
+        clock: ClockHandle,
+    ) -> Self {
+        reservation.into_live(id);
+        Self {
+            poller,
+            repo,
+            retry_settings,
+            runner: Some(runner),
+            tracker,
+            notifier,
+            job_type,
+            retains_state,
+            rescheduled: false,
+            dispatched: true,
+            id,
+            instance_id,
+            clock,
+        }
+    }
+
+    /// Detach this dispatcher's unit from the ordinary Drop-triggered
+    /// release: `delete_execution_in_op` is handing the about-to-be-freed
+    /// unit to [`JobTracker::recycle`] instead of releasing it plainly.
+    fn recycle_unit(&mut self) {
+        self.dispatched = false;
+        self.tracker
+            .mark_finished_without_releasing_unit(&[self.id]);
     }
 
     #[instrument(name = "job.execute_job", skip_all,
@@ -322,9 +379,16 @@ impl JobDispatcher {
             )
             .execute(op.as_executor())
             .await?;
-            self.notifier
-                .execution_ready_in_op(&mut op, &job.job_type)
-                .await?;
+            // Invariant B: the retrying row keeps its queue's active slot,
+            // but an older parked sibling should run first during the
+            // backoff.
+            PromoteHeadsHook::register(
+                &mut op,
+                &self.notifier,
+                [job.job_type.clone()],
+                vec![uuid::Uuid::from(id)],
+            )
+            .await?;
         } else {
             span.record(
                 "error.level",
@@ -341,16 +405,19 @@ impl JobDispatcher {
     }
 
     /// Delete the execution row and report what its removal makes true: the job
-    /// is terminal, and — if it held a `queue_id` — that queue's next job just
-    /// became eligible. Freeing a queue is worth reporting because the queue's
-    /// backlog was, until this moment, invisible to every poller's claim scan,
-    /// which drops a queue outright while any of its jobs is running. It is
-    /// also the only wake for that backlog: the poll loop sleeps on
-    /// `next_due_at`, and these rows are already due.
-    /// The reschedule paths (`reschedule_job`, the retry branch of
-    /// `fail_job`) don't need this: they always report unconditionally,
-    /// since a job going back to `pending` is exactly the ordinary case every
-    /// instance already polls for. Reports nothing when no row was deleted.
+    /// is terminal, and — if it held a `queue_id` — that queue's oldest parked
+    /// sibling (if any) is promoted to `pending` in the same statement.
+    /// Promoting is worth reporting because the queue's backlog was, until
+    /// this moment, entirely unclaimable — `parked` rows never appear in the
+    /// claim scan — and it is also the only wake for that backlog: the poll
+    /// loop sleeps on `next_due_at`, and a promoted row is already due. The
+    /// notify targets the PROMOTED job's type, not this job's own type — a
+    /// poller only wakes for types it polls, and the two are frequently
+    /// different. Reports nothing when no row was deleted.
+    ///
+    /// Also hands this job's about-to-free unit of capacity to a `ClaimHook`
+    /// so it can be spent immediately on this SAME type's own oldest due
+    /// backlog, independent of whichever type got promoted above.
     ///
     /// The `job_execution_states` row is deleted with the execution unless
     /// this type sets [`KeyedJobInitializer::inherits_state`], which is the
@@ -362,7 +429,7 @@ impl JobDispatcher {
     ///
     /// [`KeyedJobInitializer::inherits_state`]: crate::KeyedJobInitializer::inherits_state
     async fn delete_execution_in_op(
-        &self,
+        &mut self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
     ) -> Result<(), JobError> {
@@ -375,18 +442,30 @@ impl JobDispatcher {
           ), cleanup AS (
               DELETE FROM job_execution_states s USING deleted d
               WHERE s.id = d.id AND NOT $3::boolean
+          ), head AS (
+              -- The oldest parked sibling of the freed queue, by the same
+              -- (execute_at, id) tiebreak the claim query uses -- ordering
+              -- by execute_at alone would let this promote a different row,
+              -- and so a different TYPE, than every peer would independently
+              -- agree is the head.
+              SELECT p.id FROM deleted d
+              CROSS JOIN LATERAL (
+                  SELECT id FROM job_executions
+                  WHERE state = 'parked' AND queue_id = d.queue_id
+                  ORDER BY execute_at, id
+                  LIMIT 1
+              ) p
+              WHERE d.queue_id IS NOT NULL
+          ), promoted AS (
+              -- Only the completer of a queue's single running job can ever
+              -- reach here for that queue (Invariant A), so there is exactly
+              -- one promoter at a time -- no SKIP LOCKED needed.
+              UPDATE job_executions je SET state = 'pending'
+              FROM head h WHERE je.id = h.id
+              RETURNING je.job_type
           )
-          SELECT d.queue_id AS "queue_id?",
-                 -- Same head definition the claim uses, tiebreak included:
-                 -- ordering by execute_at alone would let this report a
-                 -- different row - and so a different TYPE - than the one
-                 -- step 2 will treat as the head, waking pollers that cannot
-                 -- claim the queue and not the one that can.
-                 (SELECT je.job_type FROM job_executions je
-                  WHERE je.state = 'pending' AND je.queue_id = d.queue_id
-                  ORDER BY je.execute_at, je.id
-                  LIMIT 1) AS "next_in_queue?"
-          FROM deleted d
+          SELECT d.queue_id AS "queue_id?", p.job_type AS "next_in_queue?"
+          FROM deleted d LEFT JOIN promoted p ON TRUE
         "#,
             id as JobId,
             self.instance_id,
@@ -401,18 +480,18 @@ impl JobDispatcher {
 
         self.notifier.job_terminal_in_op(op, id).await?;
 
-        // Report the type of the job the freed queue just made claimable, not
-        // the type of the job that vacated it: a poller only wakes for types
-        // it polls, and the two are frequently different. Reporting the
-        // completing type instead leaves the queue's next job to wait for an
-        // unrelated poll — invisible while `may_have_more` was permanently
-        // true, load-bearing now that it isn't.
         if row.queue_id.is_some()
             && let Some(next) = row.next_in_queue
         {
             self.notifier
                 .execution_ready_in_op(op, &JobType::from_owned(next))
                 .await?;
+        }
+
+        if let Some(poller) = self.poller.upgrade() {
+            self.recycle_unit();
+            let reservation = self.tracker.recycle(&self.job_type);
+            poller.register_claim_recycle(op, &self.job_type, reservation);
         }
 
         Ok(())
@@ -452,9 +531,16 @@ impl JobDispatcher {
         )
         .execute(op.as_executor())
         .await?;
-        self.notifier
-            .execution_ready_in_op(op, &job.job_type)
-            .await?;
+        // Invariant B: same ordering fixup as the retry branch of
+        // `fail_job` — the rescheduled row keeps its queue's active slot,
+        // but an older parked sibling should run first.
+        PromoteHeadsHook::register(
+            op,
+            &self.notifier,
+            [job.job_type.clone()],
+            vec![uuid::Uuid::from(id)],
+        )
+        .await?;
         job.reschedule_execution(reschedule_at);
         self.repo.update_in_op(op, &mut job).await?;
         Ok(())

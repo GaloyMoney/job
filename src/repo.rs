@@ -145,7 +145,14 @@ impl JobRepo {
         let row = sqlx::query_as!(
             JobExecutionRow,
             r#"
-            SELECT je.state AS "state: JobExecutionState", je.execute_at, je.attempt_index,
+            -- `parked` is a claim-time implementation detail: a parked row
+            -- is a queued job blocked behind its queue's active row, which
+            -- to every external caller just means "pending, not yet
+            -- claimable". Masking it here keeps `JobExecutionState`/
+            -- `JobStatus` a two-value public contract (`Pending`/`Running`).
+            SELECT (CASE WHEN je.state = 'parked' THEN 'pending' ELSE je.state END)
+                       AS "state!: JobExecutionState",
+                   je.execute_at, je.attempt_index,
                    je.alive_at, cp.execution_state_json AS "execution_state_json?"
             FROM job_executions je
             LEFT JOIN job_execution_states cp ON cp.id = je.id
@@ -221,6 +228,7 @@ mod tests {
             .resident(true)
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -231,6 +239,7 @@ mod tests {
             .resident(true)
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         let err: JobError = repo
@@ -247,6 +256,7 @@ mod tests {
             .resident(true)
             .job_type(type_b)
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -257,6 +267,7 @@ mod tests {
             .id(JobId::new())
             .job_type(type_a)
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -264,8 +275,8 @@ mod tests {
         Ok(())
     }
 
-    /// D13 (rewritten for live-keyed semantics): `jobs` no longer enforces
-    /// per-arbitrary-key uniqueness — it accumulates one row per generation
+    /// `jobs` does not enforce per-arbitrary-key uniqueness — it
+    /// accumulates one row per generation
     /// of a keyed singleton, and liveness enforcement moved to
     /// `job_executions` (`idx_job_executions_job_type_unique_key`, see
     /// `migrations/20250904065521_job_setup.sql`). The absolutely-unique
@@ -291,6 +302,7 @@ mod tests {
             .unique_key("k1")
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -302,6 +314,7 @@ mod tests {
             .unique_key("k1")
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -312,6 +325,7 @@ mod tests {
             .unique_key("k2")
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -323,6 +337,7 @@ mod tests {
             .unique_key("k3")
             .job_type(type_a.clone())
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         let err: JobError = repo
@@ -339,6 +354,7 @@ mod tests {
             .unique_key("k1")
             .job_type(type_b)
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -350,6 +366,7 @@ mod tests {
             .id(JobId::new())
             .job_type(type_c.clone())
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -357,6 +374,7 @@ mod tests {
             .id(JobId::new())
             .job_type(type_c.clone())
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         repo.create(new_job).await?;
@@ -364,6 +382,7 @@ mod tests {
             .id(a_id)
             .job_type(type_c)
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
         let err: JobError = repo

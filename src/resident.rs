@@ -21,12 +21,13 @@ use super::{
     current::CurrentJob,
     entity::{JobType, NewJob},
     error::JobError,
+    execution_hooks::{ExecutionInsertHook, NewExecutionRow},
     handle::JobHandle,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
+    poller::PollerHandle,
     repo::{JobCreateError, JobRepo},
     runner::{JobCompletion, JobRunner, RetrySettings},
-    spawner::insert_execution,
 };
 
 /// Result returned by [`ResidentJobRunner::run`] describing how to progress
@@ -206,26 +207,34 @@ where
         fields(job_type = %self.job_type)
     )]
     pub async fn spawn(self, config: Config) -> Result<JobHandle, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
         let new_job = NewJob::builder()
             .id(JobId::new())
             .resident(true)
             .job_type(self.job_type.clone())
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
+            .schedule_at(schedule_at)
             .build()
             .expect("Could not build new job");
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         match self.repo.create_in_op(&mut op, new_job).await {
-            Ok(mut job) => {
-                let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                insert_execution(
-                    &self.repo,
-                    &self.notifier,
+            Ok(job) => {
+                // At most one job of this type ever exists, so there is no
+                // backlog to short-circuit into -- this never-populated
+                // handle makes the claim step a guaranteed no-op.
+                let poller_ref: PollerHandle = Arc::new(std::sync::OnceLock::new());
+                ExecutionInsertHook::register_one(
                     &mut op,
-                    &mut job,
-                    schedule_at,
-                    None,
-                    None,
+                    &self.notifier,
+                    &poller_ref,
+                    &self.clock,
+                    NewExecutionRow {
+                        id: job.id,
+                        job_type: self.job_type.clone(),
+                        schedule_at,
+                        queue_id: None,
+                    },
                 )
                 .await?;
                 op.commit().await?;

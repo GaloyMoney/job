@@ -364,6 +364,7 @@ mod config;
 mod current;
 mod dispatcher;
 mod entity;
+mod execution_hooks;
 mod handle;
 mod job_execution;
 mod keyed;
@@ -427,6 +428,10 @@ pub struct Jobs {
     tracker: Arc<JobTracker>,
     notifier: Arc<notifier::JobEventNotifier>,
     poller_handle: Option<Arc<JobPollerHandle>>,
+    /// Shared with every [`JobSpawner`] minted via [`Self::add_initializer`]/
+    /// [`Self::add_batched_initializer`]; populated once [`Self::start_poll`]
+    /// runs. See `poller::PollerHandle`.
+    poller_ref: PollerHandle,
     clock: ClockHandle,
 }
 
@@ -479,6 +484,7 @@ impl Jobs {
             tracker,
             notifier,
             poller_handle: None,
+            poller_ref: Arc::new(std::sync::OnceLock::new()),
             clock,
         })
     }
@@ -636,9 +642,6 @@ impl Jobs {
             .expect("Registry has been consumed by executor");
 
         let tracker = Arc::clone(&self.tracker);
-        // Read before `registry` moves into the poller below — capped_types()
-        // is a cheap scan of the registry's own concurrency map, computed
-        // here on the owned value while it's still available.
         tracker.set_capped_types(registry.capped_types().into_iter().collect());
 
         let poller = JobPoller::new(
@@ -649,14 +652,17 @@ impl Jobs {
             Arc::clone(&self.router),
             Arc::clone(&self.notifier),
             self.clock.clone(),
-        );
+        )
+        .await?;
 
         tracker.set_job_types(poller.registered_job_types());
 
         let (listener_handle, waiter_handle) = self.router.start(Arc::clone(&tracker)).await?;
 
         let poller_handle = poller.start(listener_handle, waiter_handle);
-        self.poller_handle = Some(Arc::new(poller_handle));
+        let poller_handle = Arc::new(poller_handle);
+        let _ = self.poller_ref.set(Arc::downgrade(poller_handle.poller()));
+        self.poller_handle = Some(poller_handle);
         Ok(())
     }
 
@@ -685,6 +691,7 @@ impl Jobs {
             job_type,
             self.clock.clone(),
             Arc::clone(&self.notifier),
+            Arc::clone(&self.poller_ref),
         )
     }
 
@@ -719,11 +726,15 @@ impl Jobs {
                 .expect("Registry has been consumed by executor")
                 .add_batched_initializer(initializer)
         };
+        // Sharing the real handle here is what lets a due-now batched spawn
+        // claim its type's batch slot the same way a plain spawn claims a
+        // row slot.
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
             self.clock.clone(),
             Arc::clone(&self.notifier),
+            Arc::clone(&self.poller_ref),
         )
     }
 
@@ -762,6 +773,7 @@ impl Jobs {
             self.clock.clone(),
             Arc::clone(&self.notifier),
             inherits_state,
+            Arc::clone(&self.poller_ref),
         )
     }
 

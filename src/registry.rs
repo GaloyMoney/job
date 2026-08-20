@@ -41,7 +41,16 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        let spawner = JobSpawner::<T::Config>::new(repo, self.job_type(), clock, notifier);
+        // Fan-out spawns made from WITHIN a running job's own runner take
+        // the ordinary insert path: this handle is never populated, since
+        // `dispatch_job` has no `Arc<JobPoller>` to hand it here.
+        let spawner = JobSpawner::<T::Config>::new(
+            repo,
+            self.job_type(),
+            clock,
+            notifier,
+            Arc::new(std::sync::OnceLock::new()),
+        );
         JobInitializer::init(self, job, spawner)
     }
 }
@@ -77,6 +86,9 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        // Always-empty handle: fan-out spawns of further generations made
+        // from WITHIN a running keyed job's own runner take the ordinary
+        // insert path, same as the plain and batched fan-out cases above.
         let spawner = KeyedJobSpawner::<I::Config>::new(
             repo,
             self.inner.job_type(),
@@ -84,6 +96,7 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
             clock,
             notifier,
             self.inherits_state,
+            Arc::new(std::sync::OnceLock::new()),
         );
         KeyedJobInitializer::init(&self.inner, job, spawner)
     }
@@ -132,6 +145,11 @@ pub struct JobRegistry {
     /// Keyed types whose execution state outlives the generation that wrote
     /// it (`KeyedJobInitializer::inherits_state`).
     retains_state: HashSet<JobType>,
+    /// Plain (`JobInitializer`) types that opted OUT of the short-circuit
+    /// spawn fast path (`JobInitializer::short_circuit() == false`). Absence
+    /// from this set means short-circuiting is allowed -- the default -- so
+    /// this is a deny-list, not the flag itself.
+    short_circuit_disabled: HashSet<JobType>,
     retry_settings: HashMap<JobType, RetrySettings>,
     tracker: Arc<JobTracker>,
 }
@@ -144,6 +162,7 @@ impl JobRegistry {
             batch_policies: HashMap::new(),
             concurrency: HashMap::new(),
             retains_state: HashSet::new(),
+            short_circuit_disabled: HashSet::new(),
             retry_settings: HashMap::new(),
             tracker,
         }
@@ -155,6 +174,9 @@ impl JobRegistry {
         let job_type = initializer.job_type();
         let retry_settings = initializer.retry_on_error_settings();
         let concurrency = initializer.max_concurrent_per_process().map(|c| c.max(1));
+        if !initializer.short_circuit() {
+            self.short_circuit_disabled.insert(job_type.clone());
+        }
         self.initializers
             .insert(job_type.clone(), Box::new(initializer));
         self.concurrency.insert(job_type.clone(), concurrency);
@@ -171,6 +193,9 @@ impl JobRegistry {
         let retry_settings = initializer.retry_on_error_settings();
         let concurrency = initializer.max_concurrent_per_process().map(|c| c.max(1));
         let inherits_state = initializer.inherits_state();
+        if !initializer.short_circuit() {
+            self.short_circuit_disabled.insert(job_type.clone());
+        }
         if inherits_state {
             self.retains_state.insert(job_type.clone());
         }
@@ -215,6 +240,9 @@ impl JobRegistry {
             max_batch_size: initializer.max_batch_size().max(1),
             max_concurrent_per_process: initializer.max_concurrent_per_process().max(1),
         };
+        if !initializer.short_circuit() {
+            self.short_circuit_disabled.insert(job_type.clone());
+        }
         self.batched_initializers
             .insert(job_type.clone(), Box::new(initializer));
         self.batch_policies.insert(job_type.clone(), policy);
@@ -298,6 +326,16 @@ impl JobRegistry {
         self.concurrency.get(job_type).copied().flatten()
     }
 
+    /// Whether a due-now spawn or completion of `job_type` may take the
+    /// head-swap short-circuit path (`JobInitializer`/`KeyedJobInitializer`/
+    /// `BatchedJobInitializer::short_circuit`, default `true` on all three).
+    /// Meaningful for plain, keyed, and batched types alike -- resident types
+    /// never reach this check (`ResidentJobSpawner` holds no poller
+    /// reference).
+    pub(super) fn short_circuit(&self, job_type: &JobType) -> bool {
+        !self.short_circuit_disabled.contains(job_type)
+    }
+
     /// Every job type the tracker must notify on for a freed slot: the plain
     /// types carrying a per-process cap, whose backlog only becomes claimable
     /// again on the next poll.
@@ -364,7 +402,7 @@ mod tests {
         }
     }
 
-    /// D18: `Some(0)` caps are clamped to 1 rather than silently and
+    /// `Some(0)` caps are clamped to 1 rather than silently and
     /// permanently starving a type.
     #[test]
     fn zero_cap_is_clamped_to_one() {

@@ -4,6 +4,281 @@ Why the claim query looks the way it does. Every number below was measured on
 a local PostgreSQL 18 against seeded datasets shaped like production; the
 harness lives in `.claude/bench/` (not committed) and is described at the end.
 
+---
+
+## Update — parked rows (current design)
+
+Everything from here to "Reproducing" describes the design that shipped as
+`f304fb1` (#172, "bound the claim scan by admission, not by backlog") and was
+superseded by this change. It stays below for its reasoning — several of its
+conclusions (the total-order tiebreak, per-type budgets, round-robin
+interleaving, `SET enable_bitmapscan = off`) carry forward unchanged — but its
+central claim-time mechanism (the blocked-queue anti-join and per-queue
+`due_queued` LATERAL) no longer exists, replaced by the design below. Treat
+this section as the current source of truth; the rest is historical context
+for *why*.
+
+### The problem #172 didn't fix
+
+#172's claim query bounds the *candidate window* by admission (`n_claim *
+headroom` rows), which stops one type's or one poll's backlog from crowding
+out another's — but the blocked-queue anti-join (`NOT EXISTS (... state =
+'running' ...)`) still runs **inside** that window, evaluated per row as the
+index scan walks `(execute_at, id)` order. A queue whose job is already
+running contributes rows that are scanned, anti-join-probed, and discarded —
+never counted toward the window's `LIMIT`, but not free either. At 0 blocked
+rows the window fills in `n_claim * headroom` probes; at depth, every blocked
+row ahead of the next claimable one costs a probe that produces nothing. Cost
+tracks the *position* of claimable work within the blocked backlog, not just
+the backlog's size — measured locally at 228 buf/poll with no blocked rows,
+climbing to 5,026 buf/poll at 1,600 (churned, single hot queue). This is the
+exact shape of failure the "Two failures this replaced" section below
+describes for shape 1 and the queue-walk, recurring one level down: the
+window-bounding fix stopped the scan from being unbounded, but a blocked
+queue's rows are still read.
+
+### The fix: park blocked rows out of `pending` entirely
+
+New state `parked`: a queued row (`queue_id IS NOT NULL`) whose queue already
+has a live row. **Invariant A** — per `queue_id`, at most one row in state
+`pending` or `running`, ever — is now a database constraint
+(`idx_job_executions_queue_active`, a partial unique index), not an emergent
+property of claim-time locking. **Invariant B** — the active row of a queue is
+its min-`(execute_at, id)` live-or-parked row — is maintained by the write
+paths (insert-time park-or-swap, retry/reschedule/reclaim-swap) rather than
+being re-derived at claim time.
+
+With blocked rows physically out of `state = 'pending'`, the claim query needs
+no anti-join and no per-queue LATERAL: `pending` already contains only
+claimable rows, so a single per-type LATERAL prefix scan (`window_rows`,
+bounded by each type's own admission budget — kept per-type, not merged into
+one global scan, to preserve the existing "a backlogged type cannot starve
+another type's due row" guarantee) serves queued and unqueued rows together.
+`CONTENTION_HEADROOM` (still 4) exists solely so `FOR UPDATE ... SKIP LOCKED`
+has somewhere to fall through when a peer holds the rows this poll would
+target — not, as before, to compensate for a row-bounded window under-filling
+against a queue-counted budget: every window row is now a candidate, so that
+compensation has nothing left to do. The adaptive widening ladder
+(`CONTENTION_HEADROOM` → `MAX_CONTENTION_HEADROOM`, `candidates_short`) is
+gone with it.
+
+`may_have_more` simplifies correspondingly: re-poll immediately only when the
+claim filled its budget, or some type's own window came back full while still
+yielding a candidate overall. A window that comes back short means every
+claimable due row was examined — exact now, not a heuristic, since nothing can
+be discarded from the window after the fact.
+
+### What moved to completion / write time
+
+- **Promotion.** `delete_execution_in_op` (`dispatcher.rs`) now promotes the
+  freed queue's oldest `parked` sibling to `pending` in the same statement
+  that deletes the terminal row, using the identical `(execute_at, id)`
+  tiebreak the claim used to resolve via `due_queued`. The batch completion
+  paths (`batch_dispatcher.rs`) do the same per freed queue in one commit,
+  notifying each promoted row's actual type (a batch can free several queues
+  whose next job is a different type than the batch's own).
+- **Ordering edges.** A backdated `spawn`/`spawn_at` that sorts before the
+  occupying `pending` row swaps in ahead of it (demoting the occupant to
+  `parked`) at insert time. The same swap runs after a retry reschedule, a
+  voluntary reschedule, and a reclaim, so an older parked sibling is never
+  stuck behind a row that just re-entered backoff.
+- **Orphan sweep.** Piggybacked on the existing lost-job reclaim cadence: a
+  `parked` row whose queue has no active row (a real, bounded race between a
+  conflicting insert and the occupant's concurrent completion) is promoted.
+
+### Bench gates
+
+Not re-run with fresh numbers as part of this change (the harness needs
+regenerating per "Reproducing" below, from the prototype in the handoff this
+implements). Owed before the validation run referenced in the PR: `exp2.sh`
+parity across `nblocked ∈ {0..1600}`, the seed matrix with blocked siblings
+seeded as `parked`, and `writecost.sql` for the insert-path delta.
+
+### Short-circuit dispatch: head-swap claiming (supersedes the born-claimed design below)
+
+**Superseded design note.** An earlier pass of this change (still visible in
+the git history of this PR) short-circuited a due-now spawn by inserting it
+**born-claimed** — `running`-by-this-instance directly, unconditionally. That
+design had a real fairness defect (see the retired write-up a few paragraphs
+down) and has been replaced by **head-swap claiming**, described here. The
+mechanism, scope, and trade-offs below are the current, authoritative state.
+
+**The idea:** a short-circuit event — a due-now spawn, or a job/batch
+completing — never dispatches a *specific* row. It obtains one unit of
+capacity for a type `T` (a fresh reservation for a spawn; a **recycled**
+unit for a completion, since the completing job's own slot is about to free
+regardless), then claims `T`'s oldest due `pending` row(s) — whoever they
+are — via `claim_due_heads_in_op`, a second statement in the SAME
+transaction as the caller's own write. If the claim finds nothing, the
+reservation releases and the caller's row (already inserted/promoted
+normally) simply waits for the ordinary poll like today.
+
+- **Fairness is structural, not a trade-off.** Within one type, admission is
+  always `(execute_at, id)`-ordered — on the fast path exactly like the poll
+  path. A short-circuited event can dispatch a DIFFERENT row than the one
+  that triggered it, whenever an older due row of the same type exists.
+  `short_circuit()` (on `JobInitializer`, `KeyedJobInitializer`, and
+  `BatchedJobInitializer` — default `true` on all three) remains a per-type
+  opt-out, but it is no longer covering for a fairness defect; it exists for
+  latency-indifferent types that would rather never pay the extra claim
+  statement.
+- **Batched types are included.** A batch slot is already one tracker unit
+  regardless of row count (`JobTracker::dispatch_batch`), so a reservation
+  maps onto a batched type unchanged; the claim just uses `limit =
+  max_batch_size` and excludes `attempt_index > 1` rows (retries always run
+  alone, mirroring `dispatch_batches`' own split of an ordinary poll claim).
+  No accumulator/collector is needed: partial batches under light load are
+  already normal behavior (`dispatch_batches` chunks with
+  `take = max_batch_size.min(fresh.len())`, no linger, no minimum), and under
+  sustained load a completion's recycle claims a FULL batch in one statement,
+  since the backlog is deep at exactly that moment.
+- **Keyed types are included.** `KeyedJobSpawner::spawn`'s `Inserted` branch
+  attempts the same claim after its ordinary insert.
+- **The completion-time chain hop is implemented**, in
+  `dispatcher.rs::delete_execution_in_op` (per-job) and
+  `batch_dispatcher.rs`'s `seal`/`fail_batch` (per-batch, exactly once per
+  `execute_batch` regardless of how many sub-outcomes it disposed — a batch
+  is one execution unit no matter how many rows terminate inside it, so
+  recycling from more than one of its internal branches would try to spend
+  the same freed unit twice). A completing job/batch recycles its
+  about-to-free unit into its OWN type's oldest due backlog — independent of
+  which queue it happened to free, and independent of whether the promoted
+  sibling (unchanged logic, still promoted unconditionally either way) is
+  even the same type. Gated on `JobPoller::is_shutting_down()`: a completion
+  during an in-flight shutdown drain never recycles, so it cannot re-admit
+  work that would miss the shutdown broadcast and get force-aborted (#169).
+- **Bulk `spawn_all` is included.** `try_claim_after_bulk_spawn` greedily
+  reserves as many units as the batch's own due-row count could plausibly
+  use and claims after each; under-reservation is not a failure — every row
+  already landed pending/parked via the ordinary bulk insert regardless, so
+  whatever isn't claimed here is picked up by the ordinary poll exactly as
+  before this design.
+- **Fan-out spawns from inside a running job's own runner still do not
+  short-circuit** — the one piece carried over unchanged from the
+  born-claimed design's scope cuts. Only spawns made from the
+  application-level spawner returned by `Jobs::add_initializer`/
+  `add_batched_initializer`/`add_keyed_initializer` do; a job calling
+  `spawner.spawn(...)` on the spawner its own `init()` was handed gets the
+  ordinary path. Contained, not a correctness issue — the plumbing (`init`/
+  `init_erased` would need a live `PollerHandle` threaded through, which
+  their signatures don't carry today) just wasn't judged worth it in this
+  pass.
+- **Cross-type fairness is explicitly not addressed**, and this is a
+  permanent design line, not a scope cut: a completion only ever recycles
+  into its OWN type's backlog. Comparing across types at claim time would
+  reintroduce most of the poll query's own machinery; cross-type sharing
+  stays the ordinary poll's job (a claim's reservation releases when nothing
+  of its type is due, and the ordinary notify still wakes other types'
+  pollers as before).
+
+### Commit-hook pipeline (supersedes the "cost worth naming" note below)
+
+**2026-08-20 update.** The insert, promote, and claim statements described
+above no longer run inline at the call site mid-transaction — they run in
+three `CommitHook`s' `pre_commit`, at `op.commit()` time:
+
+- **`ExecutionInsertHook`** (`execution_hooks.rs`) — the `job_executions`
+  insert (single, bulk, or resident spawn alike; several `spawn_in_op` calls
+  sharing one `op` merge into ONE multi-row statement), then any
+  Invariant-B swap via `PromoteHeadsHook::apply`, then notify + due-now
+  claim demand, both staged re-entrantly.
+- **`PromoteHeadsHook`** (`execution_hooks.rs`) — the retry/reschedule/
+  reclaim swap statement, registered directly by those call sites (or
+  called via `Self::apply` where no hook buffer exists, e.g.
+  `reclaim_lost_jobs`'s raw pool transaction).
+- **`ClaimHook`** (`poller.rs`) — reserves capacity and runs
+  `claim_due_heads_in_op`, one statement per type covering however many
+  units that op's spawn/completion demand asked for (was one claim
+  statement PER reservation on the bulk spawn path before this).
+
+Ordering — Insert then Promote then Claim — is enforced by
+`ClaimHook::runs_after` declaring a dependency on `PromoteHeadsHook`'s type
+(the es-entity commit-hook queue defers a hook behind any still-pending
+instance of a declared dependency type, regardless of registration order),
+plus, within `ExecutionInsertHook::pre_commit` itself, plain sequential Rust
+code — the insert, then the promote, then the re-entrant claim-demand
+registration, in that order, so by the time a re-entrantly-staged
+`ClaimHook` instance actually runs, both statements before it already have.
+
+**The lock-hold cost inverts, for the better.** The prior write-up below
+warned that a claimed row's `FOR UPDATE SKIP LOCKED` head stayed locked for
+the remainder of the CALLER's own transaction — a caller doing unrelated
+slow work between its write and its `commit()` extended that window. Since
+the claim now runs inside the commit pass itself, the lock is held only
+from the claim to the `COMMIT`, REGARDLESS of how long the caller's own
+transaction ran beforehand. A long-running transaction that spawns early no
+longer holds a claimed head hostage against the poller for its whole
+duration.
+
+**A real, if narrow, cost moved the other way: errors now surface at
+`commit()`.** An insert that would have failed inline at a `_in_op` call
+(a constraint violation, a connection error) now fails at `op.commit()`
+instead — the entity `create_in_op` already landed (uncommitted) by the
+time the hook's `pre_commit` runs. Public `spawn()`/`spawn_all()` etc. are
+unaffected (same `Result<_, JobError>` either way, just returned from a
+different internal `await` point); `_in_op` callers composing their own
+transaction should be aware the failure point moved.
+
+**Never collapse Promote and Claim (or Insert and Promote) into one query
+to save a round trip.** CTEs within a single Postgres statement share ONE
+snapshot: a row a sibling CTE just promoted to `pending` is invisible to
+another CTE in the SAME statement scanning `state = 'pending'`, and two
+independent writes to the same table with no data-dependency edge between
+them have no ordering guarantee at all — this is not a hypothetical, it is
+the exact shape of two real, reproducible bugs earlier in this branch's
+history (the swap statement's promote-must-read-FROM-demote ordering fix;
+a missing swap check in the now-deleted born-claimed conflict path). The
+`runs_after` mechanism plus separate sequential statements is the sanctioned
+way to get "sees the prior write with guaranteed ordering" — not a shared
+statement.
+
+---
+
+<details>
+<summary>Retired: the per-call-site inline write-then-claim shape (superseded by the commit-hook pipeline above)</summary>
+
+**Cost worth naming:** a claimed row's `SELECT ... FOR UPDATE SKIP LOCKED`
+head stays row-locked for the remainder of the caller's own transaction
+(the insert/promote plus the claim, both in one transaction) — bounded and
+small in the ordinary case, but a caller that does unrelated slow work
+between its write and its commit extends that window. `claim_due_heads_in_op`
+is deliberately a SECOND, separate statement rather than folded into the
+write CTE — the two genuine bugs found in this PR's write paths
+(`swap_older_parked_siblings_in_op`'s CTE-ordering hazard; a missing
+ordering check in the now-deleted born-claimed conflict path) both came from
+collapsing independent writes into one statement with no guaranteed
+ordering between them. Don't re-introduce that shape here to save a round
+trip.
+
+</details>
+
+---
+
+<details>
+<summary>Retired: the born-claimed design's scope cuts and fairness trade-off (superseded above)</summary>
+
+A due-now spawn of a non-batched, non-keyed, non-resident type whose
+initializer allowed it skipped the pending queue entirely: capacity was
+claimed synchronously, the row was inserted `running`-by-this-instance
+directly, and a commit hook handed it to the dispatcher the instant the
+transaction committed. Deliberately scoped down at the time: batched and
+keyed types were excluded, the completion-time chain hop was not
+implemented, fan-out spawns and bulk `spawn_all` never short-circuited.
+
+**The fairness trade-off that motivated the head-swap replacement:** a
+born-claimed spawn dispatched the instant capacity allowed, independent of
+how much *older* due backlog of the same (or any) type was still sitting
+`pending` — the ordinary claim path's oldest-first admission (see "Queue
+fairness: oldest-first" above) did not apply to it. That was a real behavior
+change for any type that ever accumulated backlog while spawning more work,
+not just a latency improvement, which is why `short_circuit()` existed as a
+per-type opt-out in the first place. Head-swap claiming removes the
+trade-off structurally instead of documenting around it.
+
+</details>
+
+---
+
 The short version: the poll query is the single hottest statement in the
 system, and it has failed twice for the same underlying reason — the scan was
 bounded by something other than what the poll can actually admit. One shape
@@ -359,6 +634,32 @@ soft — concurrent polls on different instances could still overshoot.
 
 Use `max_concurrent_per_process` instead: exact, free at the database, and
 multiplied by a known instance count it gives a real fleet-wide ceiling.
+
+### A known, bounded race between reservation and poll (not fixed here)
+
+Flagged by automated review on PR #173. `JobTracker::try_reserve` (the
+head-swap short-circuit path's capacity check) and `JobRegistry::plan_claim`
+(the ordinary poll's per-type row-limit computation) both read
+`units_in_flight`, but nothing makes those two reads atomic with the DB
+claim that follows. A short-circuit reservation that lands in the narrow
+window between a poll's `plan_claim` snapshot and its claim query actually
+executing against Postgres is invisible to that poll — the `row_limit` it
+claims against was already baked into the query as a stale parameter — so a
+per-type cap can be transiently exceeded by however many concurrent
+short-circuit reservations land inside that one window.
+
+The overshoot is bounded and self-correcting: `units_in_flight` is
+authoritative again by the very next poll, and this is the same class of
+soft accounting imperfection `max_jobs`' own unit-vs-row mismatch already
+carries (filed, not fixed, in the original handoff). A real fix needs either
+a lock spanning the whole plan-to-claim window — which would serialize every
+short-circuit reservation behind poll latency, a real regression for
+exactly the paths this design exists to speed up — or a post-claim backstop
+that re-validates and releases any row a poll over-claimed before
+dispatching it. Neither was judged worth bundling into the PR that
+introduced short-circuit dispatch. A per-type cap that must never be
+exceeded even transiently should not rely on this path alone until one of
+those lands.
 
 ---
 

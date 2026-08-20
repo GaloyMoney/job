@@ -47,6 +47,22 @@ pub trait JobInitializer: Send + Sync + 'static {
         None
     }
 
+    /// Whether a due-now spawn or completion of this type may take the
+    /// head-swap short-circuit path: capacity for this type is reserved and
+    /// its oldest due `pending` row is claimed and handed to the dispatcher
+    /// the moment the transaction commits, with no NOTIFY and no poll in
+    /// between. The row claimed is always the type's oldest due row —
+    /// possibly a different one than whatever triggered the short-circuit —
+    /// so admission stays `(execute_at, id)`-ordered exactly like the
+    /// ordinary poll path; there is no fairness trade-off to opt out of.
+    ///
+    /// Defaults to `true`. Override to `false` for a type that would rather
+    /// never pay the extra claim statement and always go through the
+    /// ordinary poll instead.
+    fn short_circuit(&self) -> bool {
+        true
+    }
+
     /// Produce a runner instance for the provided job.
     ///
     /// The spawner parameter allows the runner to spawn additional jobs of the

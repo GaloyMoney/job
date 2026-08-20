@@ -10,7 +10,9 @@ use super::{
     Job, JobId,
     entity::{JobType, NewJob},
     error::JobError,
+    execution_hooks::{ExecutionInsertHook, NewExecutionRow},
     notifier::JobEventNotifier,
+    poller::PollerHandle,
     repo::JobRepo,
 };
 
@@ -81,6 +83,9 @@ pub struct JobSpawner<Config> {
     job_type: JobType,
     clock: ClockHandle,
     notifier: Arc<JobEventNotifier>,
+    /// Reaches this process's poller for the short-circuit spawn fast path
+    /// once it exists. See [`PollerHandle`].
+    poller_ref: PollerHandle,
     _phantom: PhantomData<Config>,
 }
 
@@ -93,12 +98,14 @@ where
         job_type: JobType,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
+        poller_ref: PollerHandle,
     ) -> Self {
         Self {
             repo,
             job_type,
             clock,
             notifier,
+            poller_ref,
             _phantom: PhantomData,
         }
     }
@@ -306,7 +313,8 @@ where
         let mut queue_ids: Vec<Option<String>> = Vec::with_capacity(specs.len());
 
         for spec in specs {
-            schedule_times.push(spec.schedule_at.unwrap_or(default_schedule_at));
+            let schedule_at = spec.schedule_at.unwrap_or(default_schedule_at);
+            schedule_times.push(schedule_at);
 
             let mut builder = NewJob::builder();
             builder
@@ -314,43 +322,31 @@ where
                 .job_type(self.job_type.clone())
                 .config(spec.config)?
                 .tracing_context(es_entity::context::TracingContext::current())
-                .queue_id(spec.queue_id.clone());
+                .queue_id(spec.queue_id.clone())
+                .schedule_at(schedule_at);
             let new_job = builder.build().expect("Could not build new job");
             new_jobs.push(new_job);
             queue_ids.push(spec.queue_id);
         }
 
-        let mut jobs = self.repo.create_all_in_op(op, new_jobs).await?;
+        let jobs = self.repo.create_all_in_op(op, new_jobs).await?;
 
-        let ids: Vec<JobId> = jobs.iter().map(|j| j.id).collect();
         // `unique_key` is always NULL here: keyed and bulk spawning are
         // disjoint APIs (`JobSpec` deliberately carries no unique_key — see
         // `KeyedJobSpawner::spawn` for the keyed path).
-        sqlx::query(
-            r#"
-            INSERT INTO job_executions (id, job_type, queue_id, unique_key, execute_at, alive_at, created_at)
-            SELECT unnested.id, $2, unnested.queue_id, NULL, unnested.execute_at,
-                   COALESCE($5, NOW()), COALESCE($5, NOW())
-            FROM UNNEST($1::uuid[], $3::text[], $4::timestamptz[])
-                AS unnested(id, queue_id, execute_at)
-            "#,
-        )
-        .bind(&ids)
-        .bind(&self.job_type)
-        .bind(&queue_ids)
-        .bind(&schedule_times)
-        .bind(op.maybe_now())
-        .execute(op.as_executor())
-        .await?;
-
-        self.notifier
-            .execution_ready_in_op(op, &self.job_type)
+        let rows: Vec<NewExecutionRow> = jobs
+            .iter()
+            .zip(&schedule_times)
+            .zip(&queue_ids)
+            .map(|((job, schedule_at), queue_id)| NewExecutionRow {
+                id: job.id,
+                job_type: self.job_type.clone(),
+                schedule_at: *schedule_at,
+                queue_id: queue_id.clone(),
+            })
+            .collect();
+        ExecutionInsertHook::register(op, &self.notifier, &self.poller_ref, &self.clock, rows)
             .await?;
-
-        for (job, schedule_at) in jobs.iter_mut().zip(&schedule_times) {
-            job.schedule_execution(*schedule_at);
-        }
-        self.repo.update_all_in_op(op, &mut jobs).await?;
 
         Ok(jobs)
     }
@@ -370,118 +366,26 @@ where
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
             .queue_id(queue_id.clone())
+            .schedule_at(schedule_at)
             .build()
             .expect("Could not build new job");
 
-        let mut job = self.repo.create_in_op(op, new_job).await?;
-        insert_execution(
-            &self.repo,
-            &self.notifier,
+        let job = self.repo.create_in_op(op, new_job).await?;
+
+        ExecutionInsertHook::register_one(
             op,
-            &mut job,
-            schedule_at,
-            queue_id.as_deref(),
-            None,
+            &self.notifier,
+            &self.poller_ref,
+            &self.clock,
+            NewExecutionRow {
+                id: job.id,
+                job_type: self.job_type.clone(),
+                schedule_at,
+                queue_id,
+            },
         )
         .await?;
+
         Ok(job)
     }
-}
-
-/// Insert the `job_executions` row for a freshly created job and mark it
-/// scheduled. Shared by all three spawner flavors — [`JobSpawner`] passes
-/// `unique_key: None`, [`crate::KeyedJobSpawner`] passes the key,
-/// [`crate::ResidentJobSpawner`] passes `None`.
-#[instrument(name = "job.insert_execution", skip_all)]
-pub(crate) async fn insert_execution(
-    repo: &JobRepo,
-    notifier: &Arc<JobEventNotifier>,
-    op: &mut impl es_entity::AtomicOperation,
-    job: &mut Job,
-    schedule_at: DateTime<Utc>,
-    queue_id: Option<&str>,
-    unique_key: Option<&str>,
-) -> Result<(), JobError> {
-    sqlx::query!(
-        r#"
-      INSERT INTO job_executions (id, job_type, queue_id, unique_key, execute_at, alive_at, created_at)
-      VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), COALESCE($6, NOW()))
-    "#,
-        job.id as JobId,
-        &job.job_type as &JobType,
-        queue_id,
-        unique_key,
-        schedule_at,
-        op.maybe_now()
-    )
-    .execute(op.as_executor())
-    .await?;
-    notifier.execution_ready_in_op(op, &job.job_type).await?;
-    job.schedule_execution(schedule_at);
-    repo.update_in_op(op, job).await?;
-    Ok(())
-}
-
-/// Outcome of a keyed execution insert.
-pub(crate) enum KeyedInsert {
-    /// The key was free; this job now holds it.
-    Inserted,
-    /// The key is already held by this LIVE job.
-    Live(JobId),
-    /// The key was taken, but its holder is no longer visible — it went
-    /// terminal between the conflict and the read. The caller should retry.
-    Contended,
-}
-
-/// Insert a keyed execution row, resolving a live-key conflict in the SAME
-/// round trip rather than following up with a separate lookup.
-///
-/// `ON CONFLICT DO NOTHING` (inferring the partial live-key index) turns the
-/// conflict into data instead of an error, so the holder's id comes back
-/// alongside it and there is no constraint-name string matching to keep in
-/// sync with the schema. The holder is read at this statement's snapshot, so a
-/// key claimed by a transaction that committed after it reports
-/// [`KeyedInsert::Contended`] rather than a stale id.
-#[instrument(name = "job.insert_keyed_execution", skip_all)]
-pub(crate) async fn insert_keyed_execution(
-    repo: &JobRepo,
-    notifier: &Arc<JobEventNotifier>,
-    op: &mut impl es_entity::AtomicOperation,
-    job: &mut Job,
-    schedule_at: DateTime<Utc>,
-    unique_key: &str,
-) -> Result<KeyedInsert, JobError> {
-    let row = sqlx::query!(
-        r#"
-        WITH ins AS (
-            INSERT INTO job_executions
-                (id, job_type, queue_id, unique_key, execute_at, alive_at, created_at)
-            VALUES ($1, $2, NULL, $3, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
-            ON CONFLICT (job_type, unique_key) WHERE unique_key IS NOT NULL
-            DO NOTHING
-            RETURNING id
-        )
-        SELECT (SELECT id FROM ins) AS "inserted?: JobId",
-               (SELECT id FROM job_executions
-                WHERE job_type = $2 AND unique_key = $3) AS "live?: JobId"
-        "#,
-        job.id as JobId,
-        &job.job_type as &JobType,
-        unique_key,
-        schedule_at,
-        op.maybe_now(),
-    )
-    .fetch_one(op.as_executor())
-    .await?;
-
-    if row.inserted.is_some() {
-        notifier.execution_ready_in_op(op, &job.job_type).await?;
-        job.schedule_execution(schedule_at);
-        repo.update_in_op(op, job).await?;
-        return Ok(KeyedInsert::Inserted);
-    }
-    Ok(match row.live {
-        Some(id) => KeyedInsert::Live(id),
-        None => KeyedInsert::Contended,
-    })
 }

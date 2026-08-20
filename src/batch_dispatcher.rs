@@ -14,7 +14,7 @@ use tracing::{Span, instrument};
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::{
     JobId,
@@ -24,13 +24,19 @@ use super::{
     },
     entity::{Job, JobType, RetryPolicy},
     error::JobError,
+    execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
+    poller::JobPoller,
     repo::JobRepo,
     runner::RetrySettings,
-    tracker::JobTracker,
+    tracker::{JobTracker, UnitReservation},
 };
 
 pub(crate) struct BatchDispatcher {
+    /// Reaches this process's poller for the head-swap completion-recycle
+    /// claim (`try_recycle_own_type`). `Weak` so a dispatcher never keeps the
+    /// poller alive on its own -- mirrors `JobDispatcher`'s identical field.
+    poller: Weak<JobPoller>,
     repo: Arc<JobRepo>,
     retry_settings: RetrySettings,
     runner: Option<Box<dyn AnyBatchedJobRunner>>,
@@ -56,6 +62,7 @@ impl BatchDispatcher {
     /// released by `Drop`, so it cannot leak once taken.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        poller: Weak<JobPoller>,
         repo: Arc<JobRepo>,
         tracker: Arc<JobTracker>,
         notifier: Arc<JobEventNotifier>,
@@ -73,6 +80,7 @@ impl BatchDispatcher {
             .collect();
         tracker.dispatch_batch(&job_type, &ids);
         Self {
+            poller,
             repo,
             retry_settings,
             runner: Some(runner),
@@ -86,6 +94,84 @@ impl BatchDispatcher {
             instance_id,
             clock,
         }
+    }
+
+    /// Build from an already-taken [`UnitReservation`] (the head-swap
+    /// short-circuit fast path): the reservation already accounted for this
+    /// unit, so this consumes it via [`UnitReservation::into_live_batch`]
+    /// instead of calling `tracker.dispatch_batch` a second time. Mirrors
+    /// `JobDispatcher::from_reservation`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_reservation(
+        reservation: UnitReservation,
+        poller: Weak<JobPoller>,
+        repo: Arc<JobRepo>,
+        tracker: Arc<JobTracker>,
+        notifier: Arc<JobEventNotifier>,
+        retry_settings: RetrySettings,
+        job_type: JobType,
+        runner: Box<dyn AnyBatchedJobRunner>,
+        instance_id: uuid::Uuid,
+        clock: ClockHandle,
+        items: &[RawBatchItem],
+    ) -> Self {
+        let ids: Vec<JobId> = items.iter().map(|item| item.job.id).collect();
+        let attempts = items
+            .iter()
+            .map(|item| (item.job.id, item.attempt))
+            .collect();
+        reservation.into_live_batch(&ids);
+        Self {
+            poller,
+            repo,
+            retry_settings,
+            runner: Some(runner),
+            tracker,
+            notifier,
+            job_type,
+            ids,
+            attempts,
+            rescheduled: false,
+            dispatched: true,
+            instance_id,
+            clock,
+        }
+    }
+
+    /// This batch's job type, for the shutdown-coordination spawn wrapper
+    /// (`JobPoller::spawn_batch_dispatch_task`).
+    pub(crate) fn job_type(&self) -> &JobType {
+        &self.job_type
+    }
+
+    /// Detach this batch's unit from the ordinary Drop-triggered release:
+    /// [`Self::try_recycle_own_type`] found due work of the same type to
+    /// [`JobTracker::recycle`] the about-to-be-freed unit into instead.
+    fn recycle_unit(&mut self) {
+        self.dispatched = false;
+        self.tracker.mark_finished_without_releasing_unit(&self.ids);
+    }
+
+    /// This batch's unit of `job_type`'s capacity is about to free (`Drop`
+    /// fires `batch_completed` below unless this recycles it first). Hands
+    /// it, unconditionally, to a `ClaimHook` that will try to spend it on
+    /// this SAME type's own oldest due backlog at commit time -- if nothing
+    /// turns out to be due (or shutdown is underway, or the type opted out),
+    /// the reservation the hook holds simply releases, identical to not
+    /// recycling at all. Called exactly ONCE per `execute_batch` -- from the
+    /// end of `seal` for a disposed batch, from `fail_batch` for a
+    /// whole-batch error -- never once per sub-outcome branch: a batch is
+    /// always exactly one execution unit (`JobTracker::dispatch_batch`), so
+    /// recycling it from inside `complete_in_op` AND the terminal branch of
+    /// `fail_in_op` would try to spend the SAME freed unit twice whenever
+    /// one batch disposes items through both branches.
+    fn try_recycle_own_type(&mut self, op: &mut impl AtomicOperation) {
+        let Some(poller) = self.poller.upgrade() else {
+            return;
+        };
+        self.recycle_unit();
+        let reservation = self.tracker.recycle(&self.job_type);
+        poller.register_claim_recycle(op, &self.job_type, reservation);
     }
 
     #[instrument(name = "job.execute_batch", skip_all,
@@ -313,9 +399,17 @@ impl BatchDispatcher {
         self.complete_in_op(op, completes).await?;
         self.reschedule_in_op(op, reschedules).await?;
         self.fail_in_op(op, fails, now).await?;
+        self.try_recycle_own_type(op);
         Ok(())
     }
 
+    /// Deletes every completed row's execution (batched jobs are never
+    /// keyed, so no retained-state guard is needed) and promotes each freed
+    /// queue's oldest parked sibling in the same statement, mirroring
+    /// `dispatcher.rs`'s `delete_execution_in_op`. A batch can free several
+    /// distinct queues in one commit, and each one's next job can be a
+    /// different type than this batch's own, so every promoted type gets
+    /// its own notify.
     #[instrument(name = "job.batch_complete", skip_all, fields(n = ids.len()))]
     async fn complete_in_op(
         &mut self,
@@ -326,12 +420,6 @@ impl BatchDispatcher {
             return Ok(());
         }
         let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
-        // Unlike `dispatcher.rs`'s per-job `delete_execution_in_op`, no
-        // `unique_key IS NULL` guard is needed here: batched jobs are never
-        // keyed (`KeyedJobInitializer` registers through `add_initializer`'s
-        // ordinary per-job dispatch path, not `add_batched_initializer`), so
-        // every execution row a batch ever deletes already has a NULL
-        // `unique_key` and this cleanup always applies.
         let rows = sqlx::query!(
             r#"
             WITH deleted AS (
@@ -340,8 +428,24 @@ impl BatchDispatcher {
                 RETURNING id, queue_id
             ), cleanup AS (
                 DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+            ), heads AS (
+                SELECT DISTINCT ON (d.queue_id) p.id
+                FROM deleted d
+                CROSS JOIN LATERAL (
+                    SELECT id FROM job_executions
+                    WHERE state = 'parked' AND queue_id = d.queue_id
+                    ORDER BY execute_at, id
+                    LIMIT 1
+                ) p
+                WHERE d.queue_id IS NOT NULL
+            ), promoted AS (
+                UPDATE job_executions je SET state = 'pending'
+                FROM heads h WHERE je.id = h.id
+                RETURNING je.job_type
             )
-            SELECT id AS "id!: JobId", queue_id AS "queue_id?" FROM deleted
+            SELECT id AS "id!: JobId", queue_id AS "queue_id?",
+                   (SELECT array_agg(job_type) FROM promoted) AS "promoted_types?"
+            FROM deleted
             "#,
             &uuids,
             self.instance_id,
@@ -353,7 +457,10 @@ impl BatchDispatcher {
             return Ok(());
         }
         let deleted: Vec<JobId> = rows.iter().map(|row| row.id).collect();
-        let freed_a_queue = rows.iter().any(|row| row.queue_id.is_some());
+        let promoted_types: Vec<String> = rows
+            .first()
+            .and_then(|row| row.promoted_types.clone())
+            .unwrap_or_default();
 
         let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &deleted).await?;
         let mut jobs = Vec::with_capacity(deleted.len());
@@ -368,9 +475,9 @@ impl BatchDispatcher {
         for id in &deleted {
             self.notifier.job_terminal_in_op(op, *id).await?;
         }
-        if freed_a_queue {
+        for promoted_type in promoted_types {
             self.notifier
-                .execution_ready_in_op(op, &self.job_type)
+                .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
                 .await?;
         }
         Ok(())
@@ -407,7 +514,6 @@ impl BatchDispatcher {
         )
         .execute(op.as_executor())
         .await?;
-
         let ids: Vec<JobId> = reschedules.iter().map(|(id, _)| *id).collect();
         let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?;
         let mut jobs = Vec::with_capacity(ids.len());
@@ -418,9 +524,10 @@ impl BatchDispatcher {
             }
         }
         self.repo.update_all_in_op(op, &mut jobs).await?;
-        self.notifier
-            .execution_ready_in_op(op, &self.job_type)
-            .await?;
+        // Invariant B: a swap only demotes the ONE row whose queue actually
+        // had an older parked sibling, so any other row in `uuids` is still
+        // `pending` and still needs its own type's wake.
+        PromoteHeadsHook::register(op, &self.notifier, [self.job_type.clone()], uuids).await?;
         Ok(())
     }
 
@@ -488,14 +595,14 @@ impl BatchDispatcher {
             )
             .execute(op.as_executor())
             .await?;
-            self.notifier
-                .execution_ready_in_op(op, &self.job_type)
+            // Invariant B: same ordering fixup as the reschedule path above.
+            // See `PromoteHeadsHook`'s doc comment for the notify policy.
+            PromoteHeadsHook::register(op, &self.notifier, [self.job_type.clone()], retry_uuids)
                 .await?;
         }
 
         if !terminal_uuids.is_empty() {
-            // See the comment in `complete_in_op` above: batched jobs are
-            // never keyed, so no `unique_key IS NULL` guard is needed here.
+            // Same per-freed-queue promotion as `complete_in_op`.
             let rows = sqlx::query!(
                 r#"
                 WITH deleted AS (
@@ -504,8 +611,24 @@ impl BatchDispatcher {
                     RETURNING id, queue_id
                 ), cleanup AS (
                     DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
+                ), heads AS (
+                    SELECT DISTINCT ON (d.queue_id) p.id
+                    FROM deleted d
+                    CROSS JOIN LATERAL (
+                        SELECT id FROM job_executions
+                        WHERE state = 'parked' AND queue_id = d.queue_id
+                        ORDER BY execute_at, id
+                        LIMIT 1
+                    ) p
+                    WHERE d.queue_id IS NOT NULL
+                ), promoted AS (
+                    UPDATE job_executions je SET state = 'pending'
+                    FROM heads h WHERE je.id = h.id
+                    RETURNING je.job_type
                 )
-                SELECT id AS "id!: JobId", queue_id AS "queue_id?" FROM deleted
+                SELECT id AS "id!: JobId", queue_id AS "queue_id?",
+                       (SELECT array_agg(job_type) FROM promoted) AS "promoted_types?"
+                FROM deleted
                 "#,
                 &terminal_uuids,
                 self.instance_id,
@@ -513,13 +636,16 @@ impl BatchDispatcher {
             .fetch_all(op.as_executor())
             .await?;
 
-            let freed_a_queue = rows.iter().any(|row| row.queue_id.is_some());
+            let promoted_types: Vec<String> = rows
+                .first()
+                .and_then(|row| row.promoted_types.clone())
+                .unwrap_or_default();
             for row in &rows {
                 self.notifier.job_terminal_in_op(op, row.id).await?;
             }
-            if freed_a_queue {
+            for promoted_type in promoted_types {
                 self.notifier
-                    .execution_ready_in_op(op, &self.job_type)
+                    .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
                     .await?;
             }
         }
@@ -540,6 +666,7 @@ impl BatchDispatcher {
         let fails: Vec<(JobId, String)> =
             self.ids.iter().map(|id| (*id, message.clone())).collect();
         self.fail_in_op(&mut op, fails, now).await?;
+        self.try_recycle_own_type(&mut op);
         op.commit().await?;
         Ok(())
     }

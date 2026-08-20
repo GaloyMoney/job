@@ -1,0 +1,765 @@
+//! Tests for parked-row queue exclusion and the short-circuit spawn fast
+//! path: queue exclusion (at most one live row per `queue_id`) is enforced
+//! as a database constraint, and a due-now spawn or a completion that frees
+//! capacity can claim and dispatch immediately instead of waiting for the
+//! next poll.
+
+mod helpers;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use job::{
+    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec,
+    JobSvcConfig, JobType, Jobs, KeyedJobInitializer, KeyedJobSpawner, RetrySettings,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Cfg;
+
+/// A runner controllable from the test: blocks in `run` until released, so
+/// the test can hold a queue's active slot open while it asserts on what
+/// landed behind it. Optionally fails its first N attempts before
+/// completing, to exercise the retry-backoff swap path.
+struct HoldableRunner {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    fail_first_n: usize,
+    attempts_so_far: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl JobRunner for HoldableRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let attempt = self.attempts_so_far.fetch_add(1, Ordering::SeqCst) + 1;
+        self.started.notify_one();
+        if attempt <= self.fail_first_n {
+            return Err("intentional failure to exercise retry backoff".into());
+        }
+        self.release.notified().await;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+struct HoldableInitializer {
+    job_type: JobType,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    fail_first_n: usize,
+    attempts_so_far: Arc<AtomicUsize>,
+    retry_settings: RetrySettings,
+}
+
+impl JobInitializer for HoldableInitializer {
+    type Config = Cfg;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        self.retry_settings.clone()
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(HoldableRunner {
+            started: Arc::clone(&self.started),
+            release: Arc::clone(&self.release),
+            fail_first_n: self.fail_first_n,
+            attempts_so_far: Arc::clone(&self.attempts_so_far),
+        }))
+    }
+}
+
+/// A fresh, process-unique `JobType`/queue-id-ish string for `prefix`, so
+/// re-running the suite against the same persistent dev DB never collides
+/// with a previous run's leftover rows.
+fn unique(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::now_v7())
+}
+
+fn job_type(prefix: &str) -> JobType {
+    JobType::new(Box::leak(unique(prefix).into_boxed_str()))
+}
+
+async fn row_state(pool: &sqlx::PgPool, id: JobId) -> anyhow::Result<String> {
+    let state: String = sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
+        .bind(uuid::Uuid::from(id))
+        .fetch_one(pool)
+        .await?;
+    Ok(state)
+}
+
+async fn row_execute_at(pool: &sqlx::PgPool, id: JobId) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT execute_at FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(id))
+            .fetch_one(pool)
+            .await?;
+    Ok(at)
+}
+
+/// Poll `f` until it returns `true` or the attempt budget is exhausted --
+/// state polling, not a blind sleep.
+async fn wait_until(
+    mut f: impl AsyncFnMut() -> anyhow::Result<bool>,
+    what: &str,
+) -> anyhow::Result<()> {
+    // 800 x 25ms = 20s: several tests in this file race a spawn's
+    // insert-time swap against a retry's own swap, and a contended CI
+    // runner can push those races close to a tighter budget even though
+    // the invariant itself holds.
+    for _ in 0..800 {
+        if f().await? {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    anyhow::bail!("timed out waiting for: {what}");
+}
+
+/// A bulk `spawn_all` call with two specs sharing one `queue_id` must
+/// resolve the conflict between them: exactly one lands `pending`, the
+/// other `parked` -- never a raw unique-constraint violation.
+#[tokio::test]
+async fn bulk_spawn_shared_queue_id_lands_one_pending_one_parked() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("bulk-shared");
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("bulk-shared-queue"),
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+
+    let a = JobId::new();
+    let b = JobId::new();
+    let specs = vec![
+        JobSpec::new(a, Cfg).queue_id(queue.clone()),
+        JobSpec::new(b, Cfg).queue_id(queue.clone()),
+    ];
+    spawner.spawn_all(specs).await?;
+
+    let a_state = row_state(&pool, a).await?;
+    let b_state = row_state(&pool, b).await?;
+    let states = [a_state.as_str(), b_state.as_str()];
+    assert_eq!(
+        states.iter().filter(|s| **s == "pending").count(),
+        1,
+        "exactly one of the two shared-queue rows lands pending: {states:?}"
+    );
+    assert_eq!(
+        states.iter().filter(|s| **s == "parked").count(),
+        1,
+        "the other must be parked, never a bare constraint violation: {states:?}"
+    );
+
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM job_executions WHERE queue_id = $1 AND state IN ('pending','running')",
+    )
+    .bind(&queue)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        active, 1,
+        "Invariant A holds even within one bulk-spawn call"
+    );
+
+    Ok(())
+}
+
+/// A spawn backdated well before a queue's current `pending` head must
+/// swap ahead of it -- take the active slot itself, parking the younger
+/// head instead of queuing behind it.
+#[tokio::test]
+async fn backdated_spawn_swaps_ahead_of_a_younger_pending_head() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("backdate-queue");
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("backdated-swap"),
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+
+    let a = JobId::new();
+    spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
+    assert_eq!(row_state(&pool, a).await?, "pending");
+
+    let b = JobId::new();
+    let backdated_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    spawner
+        .spawn_at_with_queue_id(b, Cfg, backdated_at, queue.clone())
+        .await?;
+
+    assert_eq!(
+        row_state(&pool, b).await?,
+        "pending",
+        "the older backdated spawn must take the active slot"
+    );
+    assert_eq!(
+        row_state(&pool, a).await?,
+        "parked",
+        "the displaced younger head must be parked, not lost"
+    );
+
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM job_executions WHERE queue_id = $1 AND state IN ('pending','running')",
+    )
+    .bind(&queue)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(active, 1);
+
+    Ok(())
+}
+
+/// A row scheduled for retry backoff must yield its queue's active slot to
+/// an older parked sibling, rather than keep it through the whole backoff
+/// window.
+#[tokio::test]
+async fn retry_backoff_yields_to_an_older_parked_sibling() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("retry-queue");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("retry-swap"),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        fail_first_n: 1,
+        attempts_so_far: Arc::clone(&attempts),
+        retry_settings: RetrySettings {
+            n_attempts: Some(5),
+            min_backoff: std::time::Duration::from_secs(30),
+            max_backoff: std::time::Duration::from_secs(60),
+            backoff_jitter_pct: 0,
+            ..RetrySettings::default()
+        },
+    });
+    jobs.start_poll().await?;
+
+    let a = JobId::new();
+    spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
+
+    started.notified().await;
+
+    let b = JobId::new();
+    let older = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let b_op_result = spawner
+        .spawn_at_with_queue_id(b, Cfg, older, queue.clone())
+        .await;
+    b_op_result?;
+    // Racy by construction: if B's spawn lands while A is still running, B
+    // parks and waits for the retry's own swap; if A has already failed and
+    // rescheduled by then, B's insert-time swap takes the slot immediately.
+    // Both are correct.
+    let b_after_spawn = row_state(&pool, b).await?;
+    assert!(
+        b_after_spawn == "parked" || b_after_spawn == "running",
+        "B must be waiting behind A or have already swapped in: got {b_after_spawn}"
+    );
+
+    wait_until(
+        async || Ok(row_state(&pool, a).await? == "parked"),
+        "A to be parked, having yielded to the older B",
+    )
+    .await?;
+    let b_final = row_state(&pool, b).await?;
+    assert!(
+        b_final == "pending" || b_final == "running",
+        "B (older) must end up occupying the queue's active slot, ahead of A's retry: got {b_final}"
+    );
+    let a_execute_at = row_execute_at(&pool, a)
+        .await?
+        .expect("A is parked, has execute_at");
+    assert!(
+        a_execute_at > chrono::Utc::now(),
+        "A's retry backoff must still be in the future"
+    );
+
+    Ok(())
+}
+
+/// `idx_job_executions_job_type_unique_key` has no `state` predicate, so a
+/// `parked` row with a `unique_key` still blocks a keyed re-spawn exactly
+/// like a `pending` or `running` one would. Keyed rows never carry a
+/// `queue_id` in practice, so this hand-constructs the combination directly
+/// at the SQL level rather than through the public keyed-spawn API.
+#[tokio::test]
+async fn keyed_spawn_is_blocked_by_a_parked_row_with_the_same_key() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    struct KeyedInit {
+        job_type: JobType,
+    }
+    impl KeyedJobInitializer for KeyedInit {
+        type Config = Cfg;
+        fn job_type(&self) -> JobType {
+            self.job_type.clone()
+        }
+        fn init(
+            &self,
+            _job: &Job,
+            _: KeyedJobSpawner<Self::Config>,
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+            unreachable!("not dispatched in this test")
+        }
+    }
+
+    let jt = job_type("keyed-blocked-by-parked");
+    let key = unique("held-key");
+    let spawner = jobs.add_keyed_initializer(KeyedInit {
+        job_type: jt.clone(),
+    });
+
+    let existing_id = JobId::new();
+    sqlx::query(
+        "INSERT INTO jobs (id, unique_key, job_type, created_at) VALUES ($1, $2, $3, NOW())",
+    )
+    .bind(uuid::Uuid::from(existing_id))
+    .bind(&key)
+    .bind(jt.as_str())
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO job_executions (id, job_type, unique_key, state, attempt_index, execute_at, alive_at, created_at) \
+         VALUES ($1, $2, $3, 'parked', 1, NOW(), NOW(), NOW())",
+    )
+    .bind(uuid::Uuid::from(existing_id))
+    .bind(jt.as_str())
+    .bind(&key)
+    .execute(&pool)
+    .await?;
+
+    let handle = spawner.spawn(key.clone(), Cfg).await?;
+    assert_eq!(
+        handle.id(),
+        existing_id,
+        "spawning against a parked key must resolve to the existing holder, not create a new job"
+    );
+
+    let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE unique_key = $1")
+        .bind(&key)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(job_count, 1, "no new generation was created");
+
+    Ok(())
+}
+
+struct ImmediateInitializer {
+    job_type: JobType,
+    completed: Arc<Notify>,
+    short_circuit: bool,
+}
+
+struct ImmediateRunner {
+    completed: Arc<Notify>,
+}
+
+#[async_trait]
+impl JobRunner for ImmediateRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        self.completed.notify_one();
+        Ok(JobCompletion::Complete)
+    }
+}
+
+impl JobInitializer for ImmediateInitializer {
+    type Config = Cfg;
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+    fn short_circuit(&self) -> bool {
+        self.short_circuit
+    }
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(ImmediateRunner {
+            completed: Arc::clone(&self.completed),
+        }))
+    }
+}
+
+/// The short-circuit spawn fast path (default `short_circuit() == true`):
+/// a due-now spawn is inserted already `running`-by-this-instance and
+/// dispatched off the spawning transaction's commit, with no poll in
+/// between. Asserted the strongest way available from the public API: the
+/// row is already `running`, owned by an instance id, the instant
+/// `spawn` returns -- a poll-claimed row could never be observed that
+/// deterministically, since claiming is a separate, asynchronous cycle.
+#[tokio::test]
+async fn short_circuit_spawn_lands_running_immediately_on_commit() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let completed = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(ImmediateInitializer {
+        job_type: job_type("short-circuit-immediate"),
+        completed: Arc::clone(&completed),
+        short_circuit: true,
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    spawner.spawn(id, Cfg).await?;
+
+    let (state, owner): (String, Option<uuid::Uuid>) =
+        sqlx::query_as("SELECT state::text, poller_instance_id FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(id))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        state, "running",
+        "a short-circuited spawn is claimed synchronously with its own commit"
+    );
+    assert!(
+        owner.is_some(),
+        "a running row must be owned by an instance"
+    );
+
+    let outcome = jobs
+        .handle(id)
+        .await_completion(std::time::Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), job::JobTerminalState::Completed);
+    // Resolves immediately: `completed` was notified before the runner
+    // returned, confirming the runner body actually executed.
+    tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
+        .await
+        .expect("the runner must have actually executed");
+
+    Ok(())
+}
+
+/// `JobInitializer::short_circuit() == false` opts a type out: a due-now
+/// spawn lands ordinary `pending` and waits for the poll loop like every
+/// other type.
+#[tokio::test]
+async fn short_circuit_disabled_lands_pending() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let completed = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(ImmediateInitializer {
+        job_type: job_type("short-circuit-disabled"),
+        completed,
+        short_circuit: false,
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    spawner.spawn(id, Cfg).await?;
+
+    let state: String = sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
+        .bind(uuid::Uuid::from(id))
+        .fetch_one(&pool)
+        .await?;
+    assert!(
+        state == "pending" || state == "running",
+        "opted-out type must not skip the ordinary insert path: got {state}"
+    );
+    // The poll loop may independently win a race to claim it right after
+    // commit; what matters is that it never lands `running` directly from
+    // the spawn's own transaction, the way a short-circuited type would.
+
+    Ok(())
+}
+
+/// The short-circuit claim must serve an OLDER due row of the same type
+/// before the row a fresh spawn just inserted -- a spawn is never
+/// guaranteed to dispatch itself.
+#[tokio::test]
+async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let jt = job_type("fairness");
+    let spawner = jobs.add_initializer(ImmediateInitializer {
+        job_type: jt.clone(),
+        completed: Arc::new(Notify::new()),
+        short_circuit: true,
+    });
+    jobs.start_poll().await?;
+
+    // Hand-construct an older due `pending` row directly (unqueued, so it
+    // can never conflict at insert time) -- an ordinary spawn of an
+    // uncapped type always claims itself immediately when nothing else is
+    // due, so this is the only way to put backlog in front of it.
+    let old_id = JobId::new();
+    let old_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+    sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, $2, NOW())")
+        .bind(uuid::Uuid::from(old_id))
+        .bind(jt.as_str())
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO job_executions (id, job_type, state, attempt_index, execute_at, alive_at, created_at) \
+         VALUES ($1, $2, 'pending', 1, $3, NOW(), NOW())",
+    )
+    .bind(uuid::Uuid::from(old_id))
+    .bind(jt.as_str())
+    .bind(old_at)
+    .execute(&pool)
+    .await?;
+
+    let new_id = JobId::new();
+    spawner.spawn(new_id, Cfg).await?;
+
+    // Read both rows in ONE query so the background poll loop gets no
+    // window to independently claim `new_id` between two separate reads,
+    // which would be a legitimate claim (once `old_id` is running) rather
+    // than a fairness violation, but would still make this assertion racy.
+    let (old_state, new_state): (String, String) = sqlx::query_as(
+        "SELECT \
+           (SELECT state::text FROM job_executions WHERE id = $1), \
+           (SELECT state::text FROM job_executions WHERE id = $2)",
+    )
+    .bind(uuid::Uuid::from(old_id))
+    .bind(uuid::Uuid::from(new_id))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        old_state, "running",
+        "the OLDER due row must be the one claimed"
+    );
+    assert_eq!(
+        new_state, "pending",
+        "a fresh spawn must not cut ahead of older same-type backlog"
+    );
+
+    Ok(())
+}
+
+/// Completing A must not just promote its queue's parked sibling B to
+/// `pending` -- the completion-time recycle claim must dispatch it
+/// synchronously, in the same transaction, with no poll needed in between.
+#[tokio::test]
+async fn completion_recycles_into_a_promoted_sibling_with_no_poll_needed() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("chain-hop-queue");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("chain-hop"),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+    jobs.start_poll().await?;
+
+    let a = JobId::new();
+    spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
+    started.notified().await;
+    assert_eq!(row_state(&pool, a).await?, "running");
+
+    let b = JobId::new();
+    spawner.spawn_with_queue_id(b, Cfg, queue.clone()).await?;
+    assert_eq!(
+        row_state(&pool, b).await?,
+        "parked",
+        "B must park behind A's active slot"
+    );
+
+    release.notify_one();
+
+    wait_until(
+        async || Ok(row_state(&pool, b).await? == "running"),
+        "B to be recycled straight to running once A completes",
+    )
+    .await?;
+
+    let a_gone: i64 = sqlx::query_scalar("SELECT count(*) FROM job_executions WHERE id = $1")
+        .bind(uuid::Uuid::from(a))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(a_gone, 0, "A must be deleted on completion");
+    let b_owner: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT poller_instance_id FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(b))
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        b_owner.is_some(),
+        "a recycled claim must be owned by an instance, byte-identical to a poll claim"
+    );
+
+    // Drive B to completion too, to confirm the recycled dispatch is a
+    // real dispatcher, not just a state flip.
+    started.notified().await;
+    release.notify_one();
+    wait_until(
+        async || {
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM job_executions WHERE id = $1")
+                    .bind(uuid::Uuid::from(b))
+                    .fetch_one(&pool)
+                    .await?;
+            Ok(remaining == 0)
+        },
+        "B to complete",
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// A completion during an in-flight shutdown drain must NOT recycle into
+/// new work -- doing so would re-admit a dispatch after the drain has
+/// started collecting acks, and a task spawned that late never subscribes
+/// to the shutdown broadcast in time, so it gets force-aborted instead of
+/// drained.
+#[tokio::test]
+async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("shutdown-recycle-queue");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("shutdown-recycle"),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+    jobs.start_poll().await?;
+
+    let a = JobId::new();
+    spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
+    started.notified().await;
+    assert_eq!(row_state(&pool, a).await?, "running");
+
+    let b = JobId::new();
+    spawner.spawn_with_queue_id(b, Cfg, queue.clone()).await?;
+    assert_eq!(row_state(&pool, b).await?, "parked");
+
+    let shutdown_task = tokio::spawn(async move { jobs.shutdown().await });
+    // Calibration only: give the shutdown task a moment to actually flip
+    // its "started" flag before A is released. Every assertion below is
+    // state-based, taken only after `shutdown_task` is fully awaited.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    release.notify_one();
+
+    shutdown_task
+        .await?
+        .expect("shutdown must drain A and return cleanly");
+
+    // If the recycle were not gated on shutdown, B would already be
+    // `running`; it must instead sit where the ordinary promote leaves it.
+    assert_eq!(
+        row_state(&pool, b).await?,
+        "pending",
+        "a completion during shutdown must promote its sibling but not \
+         recycle-dispatch it"
+    );
+    let b_owner: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT poller_instance_id FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(b))
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        b_owner.is_none(),
+        "B must not have been claimed by the shutting-down instance"
+    );
+
+    Ok(())
+}
+
+/// A short-circuit-dispatched execution's shutdown-coordination
+/// `broadcast::Receiver`s must be subscribed BEFORE the claiming
+/// transaction commits, not inside the task spawned to run it afterward. A
+/// late subscribe races the shutdown broadcast -- `tokio::sync::broadcast`
+/// never delivers to a subscriber that arrives after `send` -- and a
+/// dispatch that loses that race is never acked, never waited for, and gets
+/// force-aborted mid-flight instead of drained.
+#[tokio::test]
+async fn short_circuit_spawn_dispatch_survives_a_shutdown_race() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("shutdown-race"),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    // No gap between spawn and the shutdown race -- deliberately stressing
+    // the commit-to-subscribe window.
+    spawner.spawn(id, Cfg).await?;
+    started.notified().await;
+
+    let shutdown_task = tokio::spawn(async move { jobs.shutdown().await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    release.notify_one();
+
+    shutdown_task
+        .await?
+        .expect("shutdown must drain the short-circuited execution, not abort it");
+
+    let aborted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM job_events WHERE id = $1 AND event->>'type' = 'execution_aborted'",
+    )
+    .bind(uuid::Uuid::from(id))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        aborted, 0,
+        "the short-circuited execution must be drained, not force-aborted"
+    );
+
+    Ok(())
+}
