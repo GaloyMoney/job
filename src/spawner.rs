@@ -3,7 +3,6 @@
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use serde::Serialize;
-use serde_json::Value as JsonValue;
 use std::{marker::PhantomData, sync::Arc};
 use tracing::instrument;
 
@@ -407,99 +406,6 @@ where
 
         Ok(job)
     }
-}
-
-/// One row claimed by [`claim_due_heads_in_op`]: everything a dispatcher
-/// needs besides the `Job` entity itself (which the caller still re-fetches
-/// by id -- see `JobPoller::dispatch_job_from_reservation`'s doc comment for
-/// why).
-pub(crate) struct ClaimedRow {
-    pub id: JobId,
-    pub attempt: i32,
-    pub queue_id: Option<String>,
-    pub data_json: Option<JsonValue>,
-    /// This row's `execute_at` immediately BEFORE the claim nulled it, and
-    /// its `job_type` (constant across one [`claim_due_heads_in_op`] call,
-    /// carried per-row so a flattened `Vec<ClaimedRow>` is self-contained).
-    /// Both unused by the ordinary dispatch path; carried for
-    /// [`crate::poller::ClaimReconciler`], which needs them to restore a
-    /// row's true oldest-first position if the claiming transaction's
-    /// `COMMIT` fails after landing (see [`crate::poller::ClaimHook::on_rollback`]).
-    pub execute_at: DateTime<Utc>,
-    pub job_type: JobType,
-}
-
-/// Claim up to `limit` of the oldest due `pending` rows of `job_type`,
-/// landing them `running`-by-`instance_id` -- byte-identical to what a poll
-/// claim would produce (same `state`/`poller_instance_id`/`alive_at`/
-/// `execute_at` columns, same tiebreak). The head-swap kernel: a
-/// short-circuit event (spawn or completion) never dispatches a specific
-/// row, it claims whichever oldest due row(s) of `job_type` exist right now
-/// -- see the handoff addendum this implements (§7.1) for why that is the
-/// fairness fix over the born-claimed design it replaces.
-///
-/// Always a LATER statement in the SAME transaction as the caller's write
-/// (insert, promote, reclaim) -- sees that write's uncommitted rows with
-/// guaranteed statement ordering, which is what keeps this immune to the
-/// independent-CTE ordering hazard documented on
-/// [`crate::execution_hooks::PromoteHeadsHook::apply`].
-///
-/// `FOR UPDATE SKIP LOCKED` races the ordinary poll claim (and any other
-/// concurrent caller of this function) harmlessly: each skips whatever the
-/// other already holds. Returns fewer than `limit` rows -- down to zero --
-/// whenever fewer than `limit` due rows exist; callers must treat a short
-/// claim as fully expected, not an error.
-///
-/// `fresh_only` excludes `attempt_index > 1` rows: required for a batched
-/// claim (retries always run alone -- see `dispatch_batches`' identical
-/// split of an ordinary poll claim) and irrelevant for a plain-job claim
-/// (`limit = 1`, dispatched alone regardless of attempt either way).
-pub(crate) async fn claim_due_heads_in_op(
-    op: &mut impl es_entity::AtomicOperation,
-    job_type: &JobType,
-    instance_id: uuid::Uuid,
-    now: DateTime<Utc>,
-    limit: i64,
-    fresh_only: bool,
-) -> Result<Vec<ClaimedRow>, sqlx::Error> {
-    if limit <= 0 {
-        return Ok(Vec::new());
-    }
-    // wall_now drives alive_at, exactly like poll_jobs -- liveness is always
-    // measured in real time, independent of manual-clock advances.
-    let wall_now = chrono::Utc::now();
-    sqlx::query_as!(
-        ClaimedRow,
-        r#"
-        WITH heads AS (
-            SELECT id, execute_at FROM job_executions
-            WHERE job_type = $1 AND state = 'pending' AND execute_at <= $2
-              AND (NOT $6 OR attempt_index = 1)
-            ORDER BY execute_at, id
-            LIMIT $3
-            FOR UPDATE SKIP LOCKED
-        ),
-        updated AS (
-            UPDATE job_executions je
-            SET state = 'running', poller_instance_id = $4, alive_at = $5, execute_at = NULL
-            FROM heads WHERE je.id = heads.id
-            RETURNING je.id, je.queue_id, je.attempt_index, heads.execute_at AS original_execute_at
-        )
-        SELECT u.id AS "id!: JobId", u.attempt_index AS "attempt!", u.queue_id AS "queue_id?",
-               s.execution_state_json AS "data_json?", u.original_execute_at AS "execute_at!",
-               $1 AS "job_type!: JobType"
-        FROM updated u
-        LEFT JOIN job_execution_states s ON s.id = u.id
-        "#,
-        job_type as &JobType,
-        now,
-        limit,
-        instance_id,
-        wall_now,
-        fresh_only,
-    )
-    .fetch_all(op.as_executor())
-    .await
 }
 
 /// Outcome of a keyed execution insert.

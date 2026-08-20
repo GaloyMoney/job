@@ -171,6 +171,72 @@ normally) simply waits for the ordinary poll like today.
   of its type is due, and the ordinary notify still wakes other types'
   pollers as before).
 
+### Commit-hook pipeline (supersedes the "cost worth naming" note below)
+
+**2026-08-20 update.** The insert, promote, and claim statements described
+above no longer run inline at the call site mid-transaction — they run in
+three `CommitHook`s' `pre_commit`, at `op.commit()` time:
+
+- **`ExecutionInsertHook`** (`execution_hooks.rs`) — the `job_executions`
+  insert (single, bulk, or resident spawn alike; several `spawn_in_op` calls
+  sharing one `op` merge into ONE multi-row statement), then any
+  Invariant-B swap via `PromoteHeadsHook::apply`, then notify + due-now
+  claim demand, both staged re-entrantly.
+- **`PromoteHeadsHook`** (`execution_hooks.rs`) — the retry/reschedule/
+  reclaim swap statement, registered directly by those call sites (or
+  called via `Self::apply` where no hook buffer exists, e.g.
+  `reclaim_lost_jobs`'s raw pool transaction).
+- **`ClaimHook`** (`poller.rs`) — reserves capacity and runs
+  `claim_due_heads_in_op`, one statement per type covering however many
+  units that op's spawn/completion demand asked for (was one claim
+  statement PER reservation on the bulk spawn path before this).
+
+Ordering — Insert then Promote then Claim — is enforced by
+`ClaimHook::runs_after` declaring a dependency on `PromoteHeadsHook`'s type
+(the es-entity commit-hook queue defers a hook behind any still-pending
+instance of a declared dependency type, regardless of registration order),
+plus, within `ExecutionInsertHook::pre_commit` itself, plain sequential Rust
+code — the insert, then the promote, then the re-entrant claim-demand
+registration, in that order, so by the time a re-entrantly-staged
+`ClaimHook` instance actually runs, both statements before it already have.
+
+**The lock-hold cost inverts, for the better.** The prior write-up below
+warned that a claimed row's `FOR UPDATE SKIP LOCKED` head stayed locked for
+the remainder of the CALLER's own transaction — a caller doing unrelated
+slow work between its write and its `commit()` extended that window. Since
+the claim now runs inside the commit pass itself, the lock is held only
+from the claim to the `COMMIT`, REGARDLESS of how long the caller's own
+transaction ran beforehand. A long-running transaction that spawns early no
+longer holds a claimed head hostage against the poller for its whole
+duration.
+
+**A real, if narrow, cost moved the other way: errors now surface at
+`commit()`.** An insert that would have failed inline at a `_in_op` call
+(a constraint violation, a connection error) now fails at `op.commit()`
+instead — the entity `create_in_op` already landed (uncommitted) by the
+time the hook's `pre_commit` runs. Public `spawn()`/`spawn_all()` etc. are
+unaffected (same `Result<_, JobError>` either way, just returned from a
+different internal `await` point); `_in_op` callers composing their own
+transaction should be aware the failure point moved.
+
+**Never collapse Promote and Claim (or Insert and Promote) into one query
+to save a round trip.** CTEs within a single Postgres statement share ONE
+snapshot: a row a sibling CTE just promoted to `pending` is invisible to
+another CTE in the SAME statement scanning `state = 'pending'`, and two
+independent writes to the same table with no data-dependency edge between
+them have no ordering guarantee at all — this is not a hypothetical, it is
+the exact shape of two real, reproducible bugs earlier in this branch's
+history (the swap statement's promote-must-read-FROM-demote ordering fix;
+a missing swap check in the now-deleted born-claimed conflict path). The
+`runs_after` mechanism plus separate sequential statements is the sanctioned
+way to get "sees the prior write with guaranteed ordering" — not a shared
+statement.
+
+---
+
+<details>
+<summary>Retired: the per-call-site inline write-then-claim shape (superseded by the commit-hook pipeline above)</summary>
+
 **Cost worth naming:** a claimed row's `SELECT ... FOR UPDATE SKIP LOCKED`
 head stays row-locked for the remainder of the caller's own transaction
 (the insert/promote plus the claim, both in one transaction) — bounded and
@@ -183,6 +249,8 @@ ordering check in the now-deleted born-claimed conflict path) both came from
 collapsing independent writes into one statement with no guaranteed
 ordering between them. Don't re-introduce that shape here to save a round
 trip.
+
+</details>
 
 ---
 
