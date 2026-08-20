@@ -405,15 +405,7 @@ where
             // due-now admission.
             if let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade()) {
                 let now = op.maybe_now().unwrap_or(default_schedule_at);
-                let due_by_id: std::collections::HashMap<JobId, DateTime<Utc>> = ids
-                    .iter()
-                    .copied()
-                    .zip(schedule_times.iter().copied())
-                    .collect();
-                let n_due = landed_pending
-                    .iter()
-                    .filter(|id| due_by_id.get(id).is_some_and(|at| *at <= now))
-                    .count();
+                let n_due = count_due_now(&landed_pending, &ids, &schedule_times, now);
                 poller
                     .try_claim_after_bulk_spawn(op, &self.job_type, n_due, now)
                     .await?;
@@ -477,6 +469,40 @@ where
 
         Ok(job)
     }
+}
+
+/// The due-now subset count of `landed_pending`, cross-referenced against
+/// `ids`/`schedule_times` (the parallel arrays `spawn_all_in_op` builds
+/// before its bulk insert). Extracted as a pure function -- no DB, no
+/// poller -- specifically so this counting logic is unit-testable without
+/// the live-background-poller race that made an earlier integration-test
+/// version of this check (asserting on row state after a real `spawn_all`
+/// call, with a real poll loop running) flaky: `spawn_all_in_op` always
+/// fires `execution_ready_in_op` when anything landed pending, which wakes
+/// that live poller regardless of whether THIS count is right, so it could
+/// independently claim an unrelated due backlog row before any such
+/// assertion ran -- a false failure unrelated to what this function computes.
+///
+/// `landed_pending` may include rows whose `schedule_at` is in the future
+/// (an explicit per-spec `JobSpec::schedule_at`); those must not count
+/// toward how many reservations `try_claim_after_bulk_spawn` should
+/// attempt, mirroring the single-spawn path's own
+/// `schedule_at <= self.clock.now()` gate.
+fn count_due_now(
+    landed_pending: &[JobId],
+    ids: &[JobId],
+    schedule_times: &[DateTime<Utc>],
+    now: DateTime<Utc>,
+) -> usize {
+    let due_by_id: std::collections::HashMap<JobId, DateTime<Utc>> = ids
+        .iter()
+        .copied()
+        .zip(schedule_times.iter().copied())
+        .collect();
+    landed_pending
+        .iter()
+        .filter(|id| due_by_id.get(id).is_some_and(|at| *at <= now))
+        .count()
 }
 
 /// Insert the `job_executions` row for a freshly created job and mark it
@@ -877,4 +903,82 @@ pub(crate) async fn insert_keyed_execution(
         Some(id) => KeyedInsert::Live(id),
         None => KeyedInsert::Contended,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact bug an earlier version of `spawn_all_in_op` had (flagged
+    /// by automated review on PR #173): counting every row that landed
+    /// pending, including future-scheduled ones, as if it were due now.
+    #[test]
+    fn count_due_now_excludes_future_scheduled_rows() {
+        let now = chrono::Utc::now();
+        let due = JobId::new();
+        let future = JobId::new();
+        let ids = vec![due, future];
+        let schedule_times = vec![
+            now - chrono::Duration::seconds(5),
+            now + chrono::Duration::hours(1),
+        ];
+        let landed_pending = vec![due, future];
+
+        assert_eq!(
+            count_due_now(&landed_pending, &ids, &schedule_times, now),
+            1,
+            "only the due row should count, not the future-scheduled one"
+        );
+    }
+
+    /// A `spawn_all` of entirely future work must count zero -- the case
+    /// that let a bulk short-circuit reserve and drain unrelated due
+    /// backlog before this was fixed.
+    #[test]
+    fn count_due_now_is_zero_for_all_future_work() {
+        let now = chrono::Utc::now();
+        let a = JobId::new();
+        let b = JobId::new();
+        let ids = vec![a, b];
+        let schedule_times = vec![now + chrono::Duration::hours(1); 2];
+        let landed_pending = vec![a, b];
+
+        assert_eq!(
+            count_due_now(&landed_pending, &ids, &schedule_times, now),
+            0
+        );
+    }
+
+    /// A row that landed `parked` (conflicted on its queue) is absent from
+    /// `landed_pending` -- it must not count even if its own `schedule_at`
+    /// was due, since it isn't claimable.
+    #[test]
+    fn count_due_now_ignores_rows_that_did_not_land_pending() {
+        let now = chrono::Utc::now();
+        let landed = JobId::new();
+        let parked = JobId::new();
+        let ids = vec![landed, parked];
+        let schedule_times = vec![now - chrono::Duration::seconds(1); 2];
+        let landed_pending = vec![landed]; // `parked` conflicted, absent here
+
+        assert_eq!(
+            count_due_now(&landed_pending, &ids, &schedule_times, now),
+            1
+        );
+    }
+
+    #[test]
+    fn count_due_now_treats_exactly_due_as_due() {
+        let now = chrono::Utc::now();
+        let id = JobId::new();
+        let ids = vec![id];
+        let schedule_times = vec![now];
+        let landed_pending = vec![id];
+
+        assert_eq!(
+            count_due_now(&landed_pending, &ids, &schedule_times, now),
+            1,
+            "execute_at == now must count as due, matching the claim query's own `<=`"
+        );
+    }
 }
