@@ -106,7 +106,7 @@ impl PromoteHeadsHook {
                 -- before either UPDATE below runs. `demote` reads from this
                 -- (not from `swaps`) purely to force that dependency. See the
                 -- doc comment for why the order is load-bearing; the strength
-                -- is exactly what the two UPDATEs would take on their own --
+                -- is exactly what the two writes below would take anyway --
                 -- `state` is no index's key column -- so this changes lock
                 -- ORDER only, never what conflicts with what.
                 SELECT je.id FROM job_executions je
