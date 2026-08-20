@@ -56,6 +56,19 @@ impl PromoteHeadsHook {
     /// happens to belong to a queue with parked siblings (nothing changed
     /// for it, so there is nothing to fix).
     ///
+    /// Every row this touches is locked up front by the `locked` CTE, in id
+    /// order, matching every other multi-row locker of this table
+    /// (`execution_hooks::insert`'s `lock_queue_occupants`,
+    /// `batch_dispatcher.rs`'s two completers). Without it the `demote` and
+    /// promote `UPDATE`s acquire in planner-determined scan order, so two
+    /// concurrent multi-row callers -- two overlapping `reclaim_lost_jobs`
+    /// sweeps, or a batch reschedule racing a reclaim -- could each hold a row
+    /// the other wants. `FOR NO KEY UPDATE` rather than `FOR UPDATE` because
+    /// it is what these `state`-only `UPDATE`s already take, and because it
+    /// leaves a spawn's `FOR KEY SHARE` on the same row unblocked; `FOR
+    /// UPDATE` would make this statement serialize concurrent spawns into the
+    /// queue for no benefit.
+    ///
     /// Returns the job type AND `execute_at` of every promoted sibling, so
     /// callers can wake the pollers that actually cover it -- a sibling can
     /// be a different type than the row it displaced (one `queue_id` can be
@@ -88,9 +101,25 @@ impl PromoteHeadsHook {
                     LIMIT 1
                 ) sib
                 WHERE (sib.execute_at, sib.id) < (c.execute_at, c.id)
+            ), locked AS MATERIALIZED (
+                -- Take BOTH sides of every swap in id order, in one pass,
+                -- before either UPDATE below runs. `demote` reads from this
+                -- (not from `swaps`) purely to force that dependency. See the
+                -- doc comment for why the order is load-bearing; the strength
+                -- is exactly what the two UPDATEs would take on their own --
+                -- `state` is no index's key column -- so this changes lock
+                -- ORDER only, never what conflicts with what.
+                SELECT je.id FROM job_executions je
+                WHERE je.id IN (
+                    SELECT pending_id FROM swaps UNION SELECT parked_id FROM swaps
+                )
+                ORDER BY je.id
+                FOR NO KEY UPDATE
             ), demote AS (
                 UPDATE job_executions SET state = 'parked'
-                WHERE id IN (SELECT pending_id FROM swaps)
+                WHERE id IN (
+                    SELECT s.pending_id FROM swaps s JOIN locked l ON l.id = s.pending_id
+                )
                 RETURNING id
             )
             -- The promote UPDATE reads FROM `demote` (not `swaps`) so Postgres

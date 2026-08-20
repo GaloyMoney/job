@@ -219,31 +219,64 @@ impl ExecutionInsertHook {
     /// `Sort`, so rows are locked in id order however the scan below reached
     /// them -- an unordered bitmap scan included). Every other multi-row
     /// locker of this table locks in the same id order for the same reason;
-    /// see `batch_dispatcher.rs`'s `complete_in_op`. Without that agreement,
-    /// a multi-queue spawn and a multi-queue batch completion touching the
-    /// same two rows in opposite orders would deadlock.
+    /// see `batch_dispatcher.rs`'s `complete_in_op` and
+    /// [`PromoteHeadsHook::apply`]. Without that agreement, a multi-queue
+    /// spawn and a multi-queue batch completion touching the same two rows in
+    /// opposite orders would deadlock.
+    ///
+    /// The one thing this DOES contend with is the claim: `poll_jobs` and
+    /// `claim_due_heads_in_op` take `FOR UPDATE SKIP LOCKED`, which conflicts
+    /// with `FOR KEY SHARE`, so a poll running inside this transaction's
+    /// commit tail SKIPS a `pending` occupant it would otherwise have
+    /// claimed. Skipping is not free: `poll_jobs`' `min_wait` only considers
+    /// rows with `execute_at > now`, so a skipped DUE head contributes no
+    /// `next_due_at`, and if `may_have_more` is false that type sleeps for up
+    /// to `MAX_WAIT` with claimable work sitting there. A bare parked row
+    /// notifies nothing by itself, so nothing would wake it.
+    ///
+    /// Hence the second return value: the types of the `pending` occupants
+    /// pinned here, which the caller notifies. The notify is emitted
+    /// post-commit, i.e. strictly after these locks release, so the woken
+    /// poll finds the head claimable. `running` occupants need no such
+    /// treatment -- they are not in the claim scan to begin with. Narrowing
+    /// the lock to `running` rows would sidestep this too, but at the cost of
+    /// reopening the race for a `pending` occupant that gets claimed, run and
+    /// completed inside the commit tail -- exactly the short-job regime this
+    /// bug was first observed in -- so the lock stays broad and the wake pays
+    /// for it.
     async fn lock_queue_occupants(
         op: &mut impl AtomicOperation,
         queue_ids: &[String],
-    ) -> Result<HashSet<String>, sqlx::Error> {
+    ) -> Result<(HashSet<String>, HashSet<JobType>), sqlx::Error> {
         if queue_ids.is_empty() {
-            return Ok(HashSet::new());
+            return Ok((HashSet::new(), HashSet::new()));
         }
-        let occupied = sqlx::query_scalar!(
+        let locked = sqlx::query!(
             r#"
             WITH locked AS MATERIALIZED (
-                SELECT id, queue_id FROM job_executions
+                SELECT id, queue_id, job_type, state FROM job_executions
                 WHERE queue_id = ANY($1) AND state IN ('pending', 'running')
                 ORDER BY id
                 FOR KEY SHARE
             )
-            SELECT queue_id AS "queue_id!" FROM locked
+            SELECT queue_id AS "queue_id!", job_type AS "job_type!",
+                   (state = 'pending') AS "claimable!"
+            FROM locked
             "#,
             queue_ids,
         )
         .fetch_all(op.as_executor())
         .await?;
-        Ok(occupied.into_iter().collect())
+
+        let mut occupied = HashSet::new();
+        let mut wake_types = HashSet::new();
+        for row in locked {
+            occupied.insert(row.queue_id);
+            if row.claimable {
+                wake_types.insert(JobType::from_owned(row.job_type));
+            }
+        }
+        Ok((occupied, wake_types))
     }
 
     /// The rare other branch of [`Self::lock_queue_occupants`]: a queue this
@@ -407,7 +440,7 @@ impl CommitHook for ExecutionInsertHook {
         // Statement 2 and, only if a queue lost its occupant in the meantime,
         // the adopt path -- see `lock_queue_occupants`/`adopt_orphaned_queues`.
         let parked_queues = Self::parked_queues(&inserted, &self.rows);
-        let occupied = Self::lock_queue_occupants(&mut op, &parked_queues).await?;
+        let (occupied, wake_types) = Self::lock_queue_occupants(&mut op, &parked_queues).await?;
         let mut adopted_ids: Vec<uuid::Uuid> = Vec::new();
         if occupied.len() < parked_queues.len() {
             let parked: HashSet<JobId> = inserted
@@ -442,7 +475,13 @@ impl CommitHook for ExecutionInsertHook {
         let promoted = PromoteHeadsHook::apply(&mut op, &promote_ids).await?;
 
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-        for job_type in Self::notify_types(&inserted, &self.rows, &promoted) {
+        let mut notify = Self::notify_types(&inserted, &self.rows, &promoted);
+        // Re-wake every `pending` occupant this pass pinned: a poll that ran
+        // inside the commit tail skipped it under SKIP LOCKED and, because a
+        // skipped DUE row contributes no `next_due_at`, may now be asleep on
+        // claimable work. See `lock_queue_occupants`.
+        notify.extend(wake_types);
+        for job_type in notify {
             self.notifier
                 .execution_ready_in_op(&mut op, &job_type)
                 .await?;

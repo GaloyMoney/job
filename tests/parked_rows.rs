@@ -1029,3 +1029,106 @@ async fn concurrent_adopts_of_one_freed_queue_do_not_conflict() -> anyhow::Resul
 
     Ok(())
 }
+
+/// Await the first `job_events` payload satisfying `pred`, ignoring unrelated
+/// traffic from concurrently-running tests. Returns `None` on timeout.
+async fn next_matching(
+    listener: &mut sqlx::postgres::PgListener,
+    within: std::time::Duration,
+    mut pred: impl FnMut(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let notification = match tokio::time::timeout(remaining, listener.recv()).await {
+            Ok(Ok(notification)) => notification,
+            _ => return None,
+        };
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(notification.payload())
+            && pred(&payload)
+        {
+            return Some(payload);
+        }
+    }
+}
+
+/// Pinning a queue's occupant costs something the other lock probes don't
+/// cover: the claim takes `FOR UPDATE SKIP LOCKED`, which DOES conflict with
+/// `FOR KEY SHARE`, so a poll running inside a parking spawn's commit tail
+/// skips a `pending` occupant it would otherwise have claimed.
+///
+/// That skip is not self-healing. `poll_jobs`' `min_wait` only considers rows
+/// with `execute_at > now`, so a skipped DUE head contributes no
+/// `next_due_at`; with `may_have_more` false the type can sleep up to
+/// `MAX_WAIT` on work that is sitting right there, and a bare parked row
+/// notifies nothing that would wake it.
+///
+/// So a spawn that parks behind a `pending` occupant must notify that
+/// OCCUPANT's type — which is generally not the spawning type, and gets no
+/// notify from any other rule in `notify_types`.
+#[tokio::test]
+async fn parking_behind_a_pending_occupant_wakes_the_occupants_type() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("wake-queue");
+    let occupant_type = unique("wake-occupant");
+
+    // A due `pending` occupant, left unclaimed (no poller is started here).
+    let occupant = JobId::new();
+    sqlx::query("INSERT INTO jobs (id, job_type, queue_id, created_at) VALUES ($1, $2, $3, NOW())")
+        .bind(uuid::Uuid::from(occupant))
+        .bind(&occupant_type)
+        .bind(&queue)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO job_executions \
+         (id, job_type, queue_id, state, attempt_index, execute_at, alive_at, created_at) \
+         VALUES ($1, $2, $3, 'pending', 1, NOW(), NOW(), NOW())",
+    )
+    .bind(uuid::Uuid::from(occupant))
+    .bind(&occupant_type)
+    .bind(&queue)
+    .execute(&pool)
+    .await?;
+
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("wake-spawn"),
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+    listener.listen("job_events").await?;
+
+    let id = JobId::new();
+    spawner.spawn_with_queue_id(id, Cfg, queue.clone()).await?;
+    assert_eq!(
+        row_state(&pool, id).await?,
+        "parked",
+        "the spawn must park behind the pending occupant"
+    );
+
+    // One global channel, concurrent tests: only this occupant is evidence.
+    let woken = next_matching(
+        &mut listener,
+        std::time::Duration::from_secs(5),
+        |payload| payload["job_type"] == occupant_type.as_str(),
+    )
+    .await;
+    assert!(
+        woken.is_some(),
+        "parking behind a pending occupant must wake that occupant's type, or a \
+         poll that skipped it under SKIP LOCKED sleeps on claimable work"
+    );
+
+    Ok(())
+}
