@@ -419,6 +419,15 @@ impl JobDispatcher {
     /// so it can be spent immediately on this SAME type's own oldest due
     /// backlog, independent of whichever type got promoted above.
     ///
+    /// This `DELETE` is what a spawner's `FOR KEY SHARE` on the same row
+    /// blocks (see `execution_hooks::insert`'s `lock_queue_occupants`): a
+    /// completion racing an in-flight spawn into this queue waits out that
+    /// spawn's commit tail, so the `heads` scan below sees the freshly parked
+    /// row instead of promoting nothing. Unlike `batch_dispatcher.rs`'s
+    /// multi-row completers this needs no id-ordered pre-lock -- a
+    /// single-row `DELETE` takes exactly one lock and so cannot be one side
+    /// of an ordering cycle.
+    ///
     /// The `job_execution_states` row is deleted with the execution unless
     /// this type sets [`KeyedJobInitializer::inherits_state`], which is the
     /// only reason to keep one: the next generation of that key seeds from it

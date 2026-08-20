@@ -1801,13 +1801,23 @@ async fn reclaim_lost_jobs(
     ))
 }
 
-/// Recover parked rows whose queue has no active (`pending`/`running`) row
-/// -- the orphan race documented on [`crate::spawner`]'s
-/// `insert_or_park_in_op`: a spawn conflicted against a queue's active slot
-/// and landed `parked`, but the occupant completed (and promoted nothing,
-/// since the parked row wasn't visible to it yet) before the parked insert
-/// committed. Piggybacked on the lost-handler's cadence (same task, one
-/// extra statement) rather than its own timer.
+/// Recover parked rows whose queue has no active (`pending`/`running`) row:
+/// a spawn conflicted against a queue's active slot and landed `parked`, but
+/// the occupant completed (and promoted nothing, since the parked row wasn't
+/// visible to it yet) before the parked insert committed. Piggybacked on the
+/// lost-handler's cadence (same task, one extra statement) rather than its
+/// own timer.
+///
+/// A **backstop, no longer the mechanism**. That race is closed at the
+/// source by [`crate::execution_hooks::ExecutionInsertHook`], which pins each
+/// parked queue's occupant with `FOR KEY SHARE` and adopts the queue outright
+/// if the occupant is already gone (see its `lock_queue_occupants` /
+/// `adopt_orphaned_queues`). What remains for this sweep is rows orphaned by
+/// a peer still running a pre-lock build -- a rolling deploy, most obviously
+/// -- plus defence in depth against any future write path that frees a
+/// queue's active row without promoting behind it. In steady state on a
+/// fully-upgraded fleet it finds nothing, which is why its cadence can stay
+/// piggybacked rather than tightened.
 ///
 /// Returns the job type of every row promoted, so the caller can wake the
 /// pollers that cover it.
@@ -2875,10 +2885,11 @@ mod tests {
         Ok(state)
     }
 
-    /// The orphan race documented on `spawner.rs`'s `insert_or_park_in_op`:
-    /// a parked row whose queue has no active row (hand-constructed here,
-    /// rather than actually racing the insert-vs-complete window) must be
-    /// recovered by the sweep piggybacked on the lost-handler cadence.
+    /// A parked row whose queue has no active row (hand-constructed here,
+    /// rather than actually racing the insert-vs-complete window, which
+    /// `ExecutionInsertHook` now closes at the source) must still be
+    /// recovered by the backstop sweep piggybacked on the lost-handler
+    /// cadence -- that is what covers a peer running a pre-lock build.
     #[tokio::test]
     async fn orphan_sweeper_recovers_orphaned_parked_row() -> anyhow::Result<()> {
         let pool = init_pool().await?;

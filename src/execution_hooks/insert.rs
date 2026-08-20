@@ -20,6 +20,11 @@ use super::promote::{PromoteHeadsHook, PromotedRow};
 /// in the SAME round trip to resolve a live-key race, so it stays inline;
 /// see `keyed.rs::KeyedJobSpawner::spawn`), so nothing ever registers this
 /// hook with a `unique_key`'d row.
+///
+/// `Clone` exists for [`ExecutionInsertHook::adopt_orphaned_queues`], which
+/// re-submits a subset of these rows through [`ExecutionInsertHook::insert_many`]
+/// a second time.
+#[derive(Clone)]
 pub(crate) struct NewExecutionRow {
     pub id: JobId,
     pub job_type: JobType,
@@ -176,9 +181,172 @@ impl ExecutionInsertHook {
         .fetch_all(op.as_executor())
         .await
     }
+
+    /// Statement 2: pin the active row of every queue that just parked a row,
+    /// so that occupant cannot go terminal before this transaction's parked
+    /// rows are visible to it. Returns the queues that still HAVE an active
+    /// row, i.e. the ones now safely pinned.
+    ///
+    /// This closes the orphan race directly rather than leaving it to
+    /// `sweep_orphaned_parked_rows`' slow backstop. Without it, a parked row
+    /// is invisible (uncommitted) to the occupant's own promote-on-complete
+    /// pass, so a completion landing anywhere between statement 1 and this
+    /// transaction's `COMMIT` promotes nothing and leaves the queue with a
+    /// parked backlog and no active row -- unclaimable until the sweep.
+    ///
+    /// `FOR KEY SHARE` is the weakest strength that still does the job, and
+    /// the choice matters a great deal here (verified against the live
+    /// schema by `key_share_blocks_only_the_delete`):
+    /// - It **conflicts with `DELETE`**, which is the only operation that can
+    ///   remove a queue's active row -- so the completer waits out this
+    ///   transaction's commit tail and then sees the parked row.
+    /// - It does **not** conflict with a plain `UPDATE` of a non-key column,
+    ///   so the keep-alive heartbeat (`poller.rs`'s `start_keep_alive`, one
+    ///   bulk statement across every live job on the instance) is never
+    ///   blocked by a spawn.
+    /// - It does **not** conflict with `UPDATE ... SET state`, despite `state`
+    ///   appearing in `idx_job_executions_queue_active`'s PREDICATE -- key
+    ///   columns are the indexed columns themselves, not predicate
+    ///   references -- so retry, reschedule, reclaim and promote all run
+    ///   unimpeded. None of them can orphan a queue anyway: they leave an
+    ///   active row behind (`pending`), or swap one for another atomically.
+    /// - It does **not** conflict with ITSELF, so concurrent spawns into the
+    ///   same queue never serialize against each other. Insert throughput is
+    ///   unaffected by this statement.
+    ///
+    /// `ORDER BY id` inside a `MATERIALIZED` CTE is what makes the lock
+    /// acquisition order deterministic (the plan puts `LockRows` above
+    /// `Sort`, so rows are locked in id order however the scan below reached
+    /// them -- an unordered bitmap scan included). Every other multi-row
+    /// locker of this table locks in the same id order for the same reason;
+    /// see `batch_dispatcher.rs`'s `complete_in_op` and
+    /// [`PromoteHeadsHook::apply`]. Without that agreement, a multi-queue
+    /// spawn and a multi-queue batch completion touching the same two rows in
+    /// opposite orders would deadlock.
+    ///
+    /// The one thing this DOES contend with is the claim: `poll_jobs` and
+    /// `claim_due_heads_in_op` take `FOR UPDATE SKIP LOCKED`, which conflicts
+    /// with `FOR KEY SHARE`, so a poll running inside this transaction's
+    /// commit tail SKIPS a `pending` occupant it would otherwise have
+    /// claimed. Skipping is not free: `poll_jobs`' `min_wait` only considers
+    /// rows with `execute_at > now`, so a skipped DUE head contributes no
+    /// `next_due_at`, and if `may_have_more` is false that type sleeps for up
+    /// to `MAX_WAIT` with claimable work sitting there. A bare parked row
+    /// notifies nothing by itself, so nothing would wake it.
+    ///
+    /// Hence the second return value: the types of the `pending` occupants
+    /// pinned here, which the caller notifies. The notify is emitted
+    /// post-commit, i.e. strictly after these locks release, so the woken
+    /// poll finds the head claimable. `running` occupants need no such
+    /// treatment -- they are not in the claim scan to begin with. Narrowing
+    /// the lock to `running` rows would sidestep this too, but at the cost of
+    /// reopening the race for a `pending` occupant that gets claimed, run and
+    /// completed inside the commit tail -- exactly the short-job regime this
+    /// bug was first observed in -- so the lock stays broad and the wake pays
+    /// for it.
+    async fn lock_queue_occupants(
+        op: &mut impl AtomicOperation,
+        queue_ids: &[String],
+    ) -> Result<(HashSet<String>, HashSet<JobType>), sqlx::Error> {
+        if queue_ids.is_empty() {
+            return Ok((HashSet::new(), HashSet::new()));
+        }
+        let locked = sqlx::query!(
+            r#"
+            WITH locked AS MATERIALIZED (
+                SELECT id, queue_id, job_type, state FROM job_executions
+                WHERE queue_id = ANY($1) AND state IN ('pending', 'running')
+                ORDER BY id
+                FOR KEY SHARE
+            )
+            SELECT queue_id AS "queue_id!", job_type AS "job_type!",
+                   (state = 'pending') AS "claimable!"
+            FROM locked
+            "#,
+            queue_ids,
+        )
+        .fetch_all(op.as_executor())
+        .await?;
+
+        let mut occupied = HashSet::new();
+        let mut wake_types = HashSet::new();
+        for row in locked {
+            occupied.insert(row.queue_id);
+            if row.claimable {
+                wake_types.insert(JobType::from_owned(row.job_type));
+            }
+        }
+        Ok((occupied, wake_types))
+    }
+
+    /// The rare other branch of [`Self::lock_queue_occupants`]: a queue this
+    /// call parked into has NO active row left to pin, because its occupant
+    /// completed between statement 1 and the lock. The parked row would be
+    /// orphaned the moment this transaction commits, so re-arbitrate it here
+    /// instead -- the whole point of locking rather than assuming.
+    ///
+    /// Deletes this call's own parked rows for those queues (they are this
+    /// transaction's own uncommitted inserts, invisible to everyone else) and
+    /// re-submits them through [`Self::insert_many`], whose `ON CONFLICT`
+    /// arbiter is what makes this safe against a CONCURRENT adopter: two
+    /// transactions that both lost their occupant in the same window would
+    /// each promote their own row if this were a plain `UPDATE ... SET state
+    /// = 'pending'`, and the second would fail the unique index outright. The
+    /// arbiter instead lets exactly one land `pending` and parks the other,
+    /// with no error on either side.
+    ///
+    /// The re-inserted row is not necessarily the queue's rightful head -- an
+    /// OLDER parked sibling can have been sitting behind the vanished
+    /// occupant all along -- so the caller feeds whatever lands `pending`
+    /// here into [`PromoteHeadsHook::apply`], exactly like every other "rows
+    /// just moved to pending" call site. That restores Invariant B in the
+    /// same transaction.
+    ///
+    /// Returns the fresh [`InsertedRow`]s (which supersede statement 1's for
+    /// these ids) and the ids that landed `pending`.
+    async fn adopt_orphaned_queues(
+        op: &mut impl AtomicOperation,
+        readopt: &[NewExecutionRow],
+    ) -> Result<(Vec<InsertedRow>, Vec<uuid::Uuid>), sqlx::Error> {
+        let ids: Vec<JobId> = readopt.iter().map(|row| row.id).collect();
+        sqlx::query!(
+            r#"DELETE FROM job_executions WHERE id = ANY($1)"#,
+            &ids as _
+        )
+        .execute(op.as_executor())
+        .await?;
+
+        let reinserted = Self::insert_many(op, readopt).await?;
+        let landed = reinserted
+            .iter()
+            .filter(|row| row.landed_pending)
+            .map(|row| uuid::Uuid::from(row.id))
+            .collect();
+        Ok((reinserted, landed))
+    }
 }
 
 impl ExecutionInsertHook {
+    /// The distinct `queue_id`s this call parked a row into -- the queues
+    /// whose occupant [`Self::lock_queue_occupants`] must pin. A row that
+    /// landed `pending` took its queue's active slot itself and has nothing
+    /// to pin; an unqueued row can never park. Pure, for the same
+    /// no-live-poller-needed testability reason as [`Self::due_now_by_type`].
+    fn parked_queues(inserted: &[InsertedRow], rows: &[NewExecutionRow]) -> Vec<String> {
+        let by_id: HashMap<JobId, &NewExecutionRow> = rows.iter().map(|r| (r.id, r)).collect();
+        inserted
+            .iter()
+            .filter(|row| !row.landed_pending)
+            .filter_map(|row| {
+                by_id
+                    .get(&row.id)
+                    .and_then(|new_row| new_row.queue_id.clone())
+            })
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect()
+    }
+
     /// The due-now-per-type subset of `inserted`'s landed-pending rows,
     /// cross-referenced against `rows` (the id -> job_type/schedule_at map
     /// this hook carries in). Pure -- no DB, no poller -- so this is
@@ -267,14 +435,53 @@ impl CommitHook for ExecutionInsertHook {
         self,
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
-        let inserted = Self::insert_many(&mut op, &self.rows).await?;
+        let mut inserted = Self::insert_many(&mut op, &self.rows).await?;
 
-        let occupant_ids: Vec<uuid::Uuid> =
+        // Statement 2 and, only if a queue lost its occupant in the meantime,
+        // the adopt path -- see `lock_queue_occupants`/`adopt_orphaned_queues`.
+        let parked_queues = Self::parked_queues(&inserted, &self.rows);
+        let (occupied, wake_types) = Self::lock_queue_occupants(&mut op, &parked_queues).await?;
+        let mut adopted_ids: Vec<uuid::Uuid> = Vec::new();
+        if occupied.len() < parked_queues.len() {
+            let parked: HashSet<JobId> = inserted
+                .iter()
+                .filter(|row| !row.landed_pending)
+                .map(|row| row.id)
+                .collect();
+            let readopt: Vec<NewExecutionRow> = self
+                .rows
+                .iter()
+                .filter(|row| parked.contains(&row.id))
+                .filter(|row| {
+                    row.queue_id
+                        .as_ref()
+                        .is_some_and(|queue_id| !occupied.contains(queue_id))
+                })
+                .cloned()
+                .collect();
+            let (reinserted, landed) = Self::adopt_orphaned_queues(&mut op, &readopt).await?;
+            let superseded: HashSet<JobId> = reinserted.iter().map(|row| row.id).collect();
+            inserted.retain(|row| !superseded.contains(&row.id));
+            inserted.extend(reinserted);
+            adopted_ids = landed;
+        }
+
+        let mut promote_ids: Vec<uuid::Uuid> =
             inserted.iter().filter_map(|row| row.occupant_id).collect();
-        let promoted = PromoteHeadsHook::apply(&mut op, &occupant_ids).await?;
+        // An adopted row landed `pending` into a queue that had no active row
+        // -- the one case where a row of THIS batch landing pending can still
+        // have an older parked sibling to yield to.
+        promote_ids.append(&mut adopted_ids);
+        let promoted = PromoteHeadsHook::apply(&mut op, &promote_ids).await?;
 
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-        for job_type in Self::notify_types(&inserted, &self.rows, &promoted) {
+        let mut notify = Self::notify_types(&inserted, &self.rows, &promoted);
+        // Re-wake every `pending` occupant this pass pinned: a poll that ran
+        // inside the commit tail skipped it under SKIP LOCKED and, because a
+        // skipped DUE row contributes no `next_due_at`, may now be asleep on
+        // claimable work. See `lock_queue_occupants`.
+        notify.extend(wake_types);
+        for job_type in notify {
             self.notifier
                 .execution_ready_in_op(&mut op, &job_type)
                 .await?;

@@ -410,6 +410,17 @@ impl BatchDispatcher {
     /// distinct queues in one commit, and each one's next job can be a
     /// different type than this batch's own, so every promoted type gets
     /// its own notify.
+    ///
+    /// The `to_delete` CTE locks the rows in id order BEFORE the `DELETE`
+    /// touches them, for deadlock avoidance rather than for correctness: a
+    /// spawn parking into several queues locks those queues' occupants in id
+    /// order too (`execution_hooks::insert`'s `lock_queue_occupants`), and
+    /// this statement contends with it for exactly those rows. A bare
+    /// `DELETE ... WHERE id = ANY(...)` would acquire in scan order --
+    /// unordered under a bitmap scan -- so a spawn and a batch completion
+    /// touching the same two rows could each hold what the other wants.
+    /// `MATERIALIZED` plus `ORDER BY` puts `LockRows` above `Sort`, which is
+    /// what makes the order actually hold at execution time.
     #[instrument(name = "job.batch_complete", skip_all, fields(n = ids.len()))]
     async fn complete_in_op(
         &mut self,
@@ -422,10 +433,14 @@ impl BatchDispatcher {
         let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
         let rows = sqlx::query!(
             r#"
-            WITH deleted AS (
-                DELETE FROM job_executions
+            WITH to_delete AS MATERIALIZED (
+                SELECT id FROM job_executions
                 WHERE id = ANY($1) AND poller_instance_id = $2
-                RETURNING id, queue_id
+                ORDER BY id
+                FOR UPDATE
+            ), deleted AS (
+                DELETE FROM job_executions je USING to_delete t WHERE je.id = t.id
+                RETURNING je.id, je.queue_id
             ), cleanup AS (
                 DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
             ), heads AS (
@@ -602,13 +617,19 @@ impl BatchDispatcher {
         }
 
         if !terminal_uuids.is_empty() {
-            // Same per-freed-queue promotion as `complete_in_op`.
+            // Same per-freed-queue promotion as `complete_in_op`, including
+            // its id-ordered `to_delete` lock -- see that method's doc
+            // comment for why the ordering is load-bearing.
             let rows = sqlx::query!(
                 r#"
-                WITH deleted AS (
-                    DELETE FROM job_executions
+                WITH to_delete AS MATERIALIZED (
+                    SELECT id FROM job_executions
                     WHERE id = ANY($1) AND poller_instance_id = $2
-                    RETURNING id, queue_id
+                    ORDER BY id
+                    FOR UPDATE
+                ), deleted AS (
+                    DELETE FROM job_executions je USING to_delete t WHERE je.id = t.id
+                    RETURNING je.id, je.queue_id
                 ), cleanup AS (
                     DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
                 ), heads AS (

@@ -763,3 +763,372 @@ async fn short_circuit_spawn_dispatch_survives_a_shutdown_race() -> anyhow::Resu
 
     Ok(())
 }
+
+/// Seed a `running` execution row (plus the `jobs` row its FK needs) holding
+/// `queue`'s active slot — the occupant a racing spawn parks behind.
+async fn seed_running_occupant(
+    pool: &sqlx::PgPool,
+    job_type: &str,
+    queue: &str,
+) -> anyhow::Result<JobId> {
+    let id = JobId::new();
+    let uuid = uuid::Uuid::from(id);
+    sqlx::query("INSERT INTO jobs (id, job_type, queue_id, created_at) VALUES ($1, $2, $3, NOW())")
+        .bind(uuid)
+        .bind(job_type)
+        .bind(queue)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO job_executions \
+         (id, job_type, queue_id, state, attempt_index, execute_at, alive_at, \
+          poller_instance_id, created_at) \
+         VALUES ($1, $2, $3, 'running', 1, NULL, NOW(), gen_random_uuid(), NOW())",
+    )
+    .bind(uuid)
+    .bind(job_type)
+    .bind(queue)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Pins the lock-strength choice made by `ExecutionInsertHook::
+/// lock_queue_occupants` against the real schema, since the whole cost
+/// argument for taking a spawn-side lock at all rests on it: `FOR KEY SHARE`
+/// must block a completion's `DELETE` and nothing else.
+///
+/// The `state` probe is the interesting one. `state` appears in
+/// `idx_job_executions_queue_active`'s PREDICATE, so it would be reasonable
+/// to guess Postgres treats it as a key column and blocks retry / reschedule
+/// / reclaim / promote too. It does not — key columns are the indexed
+/// columns themselves — and if that ever changed, the spawn lock would start
+/// blocking far more than intended. Hence a test rather than a comment.
+#[tokio::test]
+async fn key_share_blocks_only_the_delete() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let queue = unique("keyshare-matrix");
+    let id = seed_running_occupant(&pool, &unique("keyshare"), &queue).await?;
+    let uuid = uuid::Uuid::from(id);
+
+    // Probe `sql` from a second connection while a `FOR KEY SHARE` holder is
+    // open, and report whether it had to wait for that holder.
+    async fn blocked_by_key_share(
+        pool: &sqlx::PgPool,
+        queue: &str,
+        sql: &str,
+        uuid: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        let mut holder = pool.begin().await?;
+        sqlx::query(
+            "SELECT id FROM job_executions WHERE queue_id = $1 \
+             AND state IN ('pending','running') ORDER BY id FOR KEY SHARE",
+        )
+        .bind(queue)
+        .fetch_all(&mut *holder)
+        .await?;
+
+        let mut probe = pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '750ms'")
+            .execute(&mut *probe)
+            .await?;
+        let outcome = sqlx::query(sql).bind(uuid).execute(&mut *probe).await;
+        let blocked = match outcome {
+            Ok(_) => false,
+            Err(e) => {
+                let db_err = e
+                    .as_database_error()
+                    .expect("probe must fail only on a lock timeout");
+                assert_eq!(
+                    db_err.code().as_deref(),
+                    Some("55P03"),
+                    "unexpected probe failure: {e}"
+                );
+                true
+            }
+        };
+        probe.rollback().await?;
+        holder.rollback().await?;
+        Ok(blocked)
+    }
+
+    assert!(
+        !blocked_by_key_share(
+            &pool,
+            &queue,
+            "UPDATE job_executions SET alive_at = NOW() WHERE id = $1",
+            uuid
+        )
+        .await?,
+        "the keep-alive heartbeat is one bulk statement across every live job on \
+         the instance; a spawn must never stall it"
+    );
+    assert!(
+        !blocked_by_key_share(
+            &pool,
+            &queue,
+            "UPDATE job_executions SET state = 'pending' WHERE id = $1",
+            uuid
+        )
+        .await?,
+        "`state` sits in idx_job_executions_queue_active's predicate, not its key, \
+         so retry/reschedule/reclaim/promote stay unblocked"
+    );
+    assert!(
+        !blocked_by_key_share(
+            &pool,
+            &queue,
+            "SELECT id FROM job_executions WHERE id = $1 FOR KEY SHARE",
+            uuid
+        )
+        .await?,
+        "concurrent spawns into one queue must not serialize against each other"
+    );
+    assert!(
+        blocked_by_key_share(
+            &pool,
+            &queue,
+            "DELETE FROM job_executions WHERE id = $1",
+            uuid
+        )
+        .await?,
+        "a completion's DELETE is the one operation that can orphan a parked row, \
+         and the one this lock exists to make wait"
+    );
+
+    Ok(())
+}
+
+/// The orphan race, driven for real rather than hand-constructed: a spawn
+/// parks behind an occupant that a concurrent completion is deleting right
+/// now. The spawn's insert sees the occupant live (the delete is
+/// uncommitted), so the row parks; the completion's own promote pass cannot
+/// see that parked row, so it promotes nothing. Before the spawn-side lock,
+/// this left the queue with a parked backlog and no active row — invisible
+/// to the claim scan until the sweep ran, up to `job_lost_interval / 2`
+/// later.
+///
+/// The spawn must now come out the other side `pending`: `lock_queue_occupants`
+/// blocks on the uncommitted `DELETE`, and once it commits, EPQ reports the
+/// occupant gone and `adopt_orphaned_queues` re-arbitrates the queue in the
+/// same transaction.
+#[tokio::test]
+async fn spawn_racing_a_completion_adopts_the_freed_queue() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("adopt-queue");
+    let occupant_type = unique("adopt-occupant");
+    let occupant = seed_running_occupant(&pool, &occupant_type, &queue).await?;
+
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("adopt-spawn"),
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+
+    // The completion, held open mid-transaction: the occupant row is deleted
+    // but not yet committed, exactly the window the race needs.
+    let mut completion = pool.begin().await?;
+    sqlx::query("DELETE FROM job_executions WHERE id = $1")
+        .bind(uuid::Uuid::from(occupant))
+        .execute(&mut *completion)
+        .await?;
+
+    let id = JobId::new();
+    let spawn = tokio::spawn(async move { spawner.spawn_with_queue_id(id, Cfg, queue).await });
+
+    // Let the spawn reach its lock statement and block there, then release
+    // the completion.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!spawn.is_finished(), "the spawn must wait on the occupant");
+    completion.commit().await?;
+
+    spawn
+        .await?
+        .expect("the spawn must succeed, not fail on the vanished occupant");
+
+    assert_eq!(
+        row_state(&pool, id).await?,
+        "pending",
+        "a spawn whose occupant completed underneath it must adopt the freed \
+         queue, never commit an orphaned parked row"
+    );
+
+    Ok(())
+}
+
+/// Two spawns that both lose their occupant in the same window both reach
+/// the adopt path. Each can only see its OWN uncommitted parked row, so a
+/// naive "promote my own head" would have both of them promote a different
+/// row into one queue's active slot — a bare unique-index violation, which
+/// would surface as a failed business transaction rather than a delayed job.
+///
+/// Routing the adopt back through `insert_many`'s `ON CONFLICT` arbiter is
+/// what makes this safe: exactly one lands `pending`, the other parks, and
+/// neither errors.
+#[tokio::test]
+async fn concurrent_adopts_of_one_freed_queue_do_not_conflict() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("adopt-race-queue");
+    let occupant = seed_running_occupant(&pool, &unique("adopt-race-occ"), &queue).await?;
+
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("adopt-race"),
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+
+    let mut completion = pool.begin().await?;
+    sqlx::query("DELETE FROM job_executions WHERE id = $1")
+        .bind(uuid::Uuid::from(occupant))
+        .execute(&mut *completion)
+        .await?;
+
+    let a = JobId::new();
+    let b = JobId::new();
+    let spawns: Vec<_> = [a, b]
+        .into_iter()
+        .map(|id| {
+            let spawner = spawner.clone();
+            let queue = queue.clone();
+            tokio::spawn(async move { spawner.spawn_with_queue_id(id, Cfg, queue).await })
+        })
+        .collect();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    completion.commit().await?;
+
+    for spawn in spawns {
+        spawn
+            .await?
+            .expect("neither adopt may fail on a unique-index violation");
+    }
+
+    let states = [row_state(&pool, a).await?, row_state(&pool, b).await?];
+    assert_eq!(
+        states.iter().filter(|s| *s == "pending").count(),
+        1,
+        "exactly one adopter takes the freed slot: {states:?}"
+    );
+    assert_eq!(
+        states.iter().filter(|s| *s == "parked").count(),
+        1,
+        "the loser parks behind it rather than erroring: {states:?}"
+    );
+
+    Ok(())
+}
+
+/// Await the first `job_events` payload satisfying `pred`, ignoring unrelated
+/// traffic from concurrently-running tests. Returns `None` on timeout.
+async fn next_matching(
+    listener: &mut sqlx::postgres::PgListener,
+    within: std::time::Duration,
+    mut pred: impl FnMut(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let notification = match tokio::time::timeout(remaining, listener.recv()).await {
+            Ok(Ok(notification)) => notification,
+            _ => return None,
+        };
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(notification.payload())
+            && pred(&payload)
+        {
+            return Some(payload);
+        }
+    }
+}
+
+/// Pinning a queue's occupant costs something the other lock probes don't
+/// cover: the claim takes `FOR UPDATE SKIP LOCKED`, which DOES conflict with
+/// `FOR KEY SHARE`, so a poll running inside a parking spawn's commit tail
+/// skips a `pending` occupant it would otherwise have claimed.
+///
+/// That skip is not self-healing. `poll_jobs`' `min_wait` only considers rows
+/// with `execute_at > now`, so a skipped DUE head contributes no
+/// `next_due_at`; with `may_have_more` false the type can sleep up to
+/// `MAX_WAIT` on work that is sitting right there, and a bare parked row
+/// notifies nothing that would wake it.
+///
+/// So a spawn that parks behind a `pending` occupant must notify that
+/// OCCUPANT's type — which is generally not the spawning type, and gets no
+/// notify from any other rule in `notify_types`.
+#[tokio::test]
+async fn parking_behind_a_pending_occupant_wakes_the_occupants_type() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("wake-queue");
+    let occupant_type = unique("wake-occupant");
+
+    // A due `pending` occupant, left unclaimed (no poller is started here).
+    let occupant = JobId::new();
+    sqlx::query("INSERT INTO jobs (id, job_type, queue_id, created_at) VALUES ($1, $2, $3, NOW())")
+        .bind(uuid::Uuid::from(occupant))
+        .bind(&occupant_type)
+        .bind(&queue)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO job_executions \
+         (id, job_type, queue_id, state, attempt_index, execute_at, alive_at, created_at) \
+         VALUES ($1, $2, $3, 'pending', 1, NOW(), NOW(), NOW())",
+    )
+    .bind(uuid::Uuid::from(occupant))
+    .bind(&occupant_type)
+    .bind(&queue)
+    .execute(&pool)
+    .await?;
+
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("wake-spawn"),
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+    listener.listen("job_events").await?;
+
+    let id = JobId::new();
+    spawner.spawn_with_queue_id(id, Cfg, queue.clone()).await?;
+    assert_eq!(
+        row_state(&pool, id).await?,
+        "parked",
+        "the spawn must park behind the pending occupant"
+    );
+
+    // One global channel, concurrent tests: only this occupant is evidence.
+    let woken = next_matching(
+        &mut listener,
+        std::time::Duration::from_secs(5),
+        |payload| payload["job_type"] == occupant_type.as_str(),
+    )
+    .await;
+    assert!(
+        woken.is_some(),
+        "parking behind a pending occupant must wake that occupant's type, or a \
+         poll that skipped it under SKIP LOCKED sleeps on claimable work"
+    );
+
+    Ok(())
+}
