@@ -1533,6 +1533,148 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
         static DEPS: std::sync::OnceLock<[std::any::TypeId; 1]> = std::sync::OnceLock::new();
         DEPS.get_or_init(|| [std::any::TypeId::of::<PromoteHeadsHook>()])
     }
+
+    /// Fires when this hook's `pre_commit` succeeded but the commit pass
+    /// still failed -- either a LATER hook's `pre_commit` errored (the
+    /// transaction is already rolled back; every row this claimed reverted
+    /// with it) or the `COMMIT` itself errored (the transaction "may have
+    /// landed despite the client error" per the trait's own docs -- this
+    /// claim's rows possibly committed `running`, with no `post_commit`
+    /// pass ever going to run to dispatch them). `on_rollback` cannot tell
+    /// these two cases apart; [`ClaimReconciler`] resolves the ambiguity by
+    /// checking, rather than assuming either. Signal-only and sync per the
+    /// trait's contract, so the actual DB work is handed to a detached task
+    /// (the sanctioned pattern the trait docs name) instead of run here.
+    ///
+    /// Every `UnitReservation` in `self.claimed`/`self.recycled` still
+    /// releases normally via `Drop` when `self` goes out of scope at the
+    /// end of this call -- capacity accounting stays on `Drop`
+    /// unconditionally (see `ClaimHook`'s own doc comment); this method
+    /// only extracts the (id, execute_at, job_type) triples it needs BEFORE
+    /// that drop, it never touches the reservations themselves.
+    fn on_rollback(self) {
+        let Some(poller) = self.poller.upgrade() else {
+            return;
+        };
+        let rows: Vec<(JobId, DateTime<Utc>, JobType)> = self
+            .claimed
+            .iter()
+            .flat_map(|(_, target, _)| match target {
+                DispatchTarget::Single(row) => {
+                    vec![(row.id, row.execute_at, row.job_type.clone())]
+                }
+                DispatchTarget::Batch(_, rows) => rows
+                    .iter()
+                    .map(|row| (row.id, row.execute_at, row.job_type.clone()))
+                    .collect(),
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        tokio::spawn(ClaimReconciler::run(poller, rows));
+    }
+}
+
+/// Detached best-effort recovery for [`ClaimHook::on_rollback`] (handoff
+/// addendum §8.4): resolves the ambiguity `on_rollback` can't -- restores
+/// working state instead of merely documenting the degradation with a warn.
+/// Cost is zero on every successful commit (nothing spawns) and, on the rare
+/// rollback of a claiming transaction, one indexed statement in the common
+/// case (nothing landed) or one reset statement plus a notify in the rare
+/// landed-but-errored case.
+struct ClaimReconciler;
+
+impl ClaimReconciler {
+    /// 250ms / 1s / 4s -- a pool that just failed a `COMMIT` may be
+    /// transiently unreachable; this is generous enough to ride out a blip
+    /// without holding the reconciler open indefinitely.
+    const BACKOFF: [Duration; 3] = [
+        Duration::from_millis(250),
+        Duration::from_secs(1),
+        Duration::from_secs(4),
+    ];
+
+    /// Spawned from `on_rollback`. Retries [`Self::reconcile_unclaimed`] a
+    /// bounded number of times against a pool that just failed a commit,
+    /// notifies every type it actually reset, then gives up loudly --
+    /// `reclaim_lost_jobs`' slower, guaranteed-eventual sweep is the
+    /// backstop either way, so abandoning here is a latency regression for
+    /// these specific rows, never a correctness one.
+    async fn run(poller: Arc<JobPoller>, rows: Vec<(JobId, DateTime<Utc>, JobType)>) {
+        for (attempt, backoff) in Self::BACKOFF.into_iter().enumerate() {
+            match Self::reconcile_unclaimed(poller.repo.pool(), poller.instance_id, &rows).await {
+                Ok(0) => return, // the common case: a real rollback, nothing landed
+                Ok(_) => {
+                    let reset_types: HashSet<JobType> =
+                        rows.iter().map(|(_, _, t)| t.clone()).collect();
+                    for job_type in reset_types {
+                        poller.notifier.execution_ready(&job_type);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        exception.message = %error,
+                        "claim reconciler retrying after a transient error"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+        tracing::error!(
+            n_rows = rows.len(),
+            "claim reconciler exhausted its retries; abandoning to reclaim_lost_jobs' slower backstop"
+        );
+    }
+
+    /// The actual DB work: un-claims whichever of `rows` genuinely landed
+    /// `running` under `instance_id` (the COMMIT-errored case), restoring
+    /// each to `pending` at its ORIGINAL `execute_at` -- no `attempt_index`
+    /// bump. Unlike `reclaim_lost_jobs`, which must assume a reclaimed job
+    /// MAY have executed (a dead poller, unknown progress), this claim
+    /// provably never dispatched: dispatch only ever happens from
+    /// `ClaimHook::post_commit`, and the hook system fired `on_rollback`
+    /// INSTEAD of `post_commit` for this very reason. A pure un-claim, not
+    /// a retry.
+    ///
+    /// The `state = 'running' AND poller_instance_id = $3` guard makes this
+    /// a no-op against anything that beat it here -- another instance's
+    /// `reclaim_lost_jobs` already reset it, or (the common case) this was
+    /// a genuine rollback and these rows were never committed `running` at
+    /// all. Nothing else can be legitimately EXECUTING these rows: only
+    /// this never-run `post_commit` could have dispatched them. Returns how
+    /// many rows were actually reset, so `run` knows whether to notify.
+    async fn reconcile_unclaimed(
+        pool: &PgPool,
+        instance_id: uuid::Uuid,
+        rows: &[(JobId, DateTime<Utc>, JobType)],
+    ) -> Result<usize, sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<uuid::Uuid> = rows
+            .iter()
+            .map(|(id, _, _)| uuid::Uuid::from(*id))
+            .collect();
+        let execute_ats: Vec<DateTime<Utc>> = rows.iter().map(|(_, at, _)| *at).collect();
+        let reset = sqlx::query_scalar!(
+            r#"
+            UPDATE job_executions je
+            SET state = 'pending', poller_instance_id = NULL, execute_at = u.execute_at
+            FROM UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
+            WHERE je.id = u.id AND je.state = 'running' AND je.poller_instance_id = $3
+            RETURNING je.id AS "id!: JobId"
+            "#,
+            &ids,
+            &execute_ats,
+            instance_id,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(reset.len())
+    }
 }
 
 async fn reclaim_lost_jobs(
@@ -2871,6 +3013,143 @@ mod tests {
         );
         assert_eq!(row_state(&pool, sibling).await?, "pending");
         assert_eq!(row_state(&pool, lost).await?, "parked");
+
+        Ok(())
+    }
+
+    /// Seed a `job_executions` row already `running` under `instance_id`,
+    /// `execute_at` NULL exactly like a real claim leaves it -- what a claim
+    /// that landed but whose commit then errored looks like to
+    /// [`ClaimReconciler`]. The row's ORIGINAL `execute_at` (what
+    /// `reconcile_unclaimed` should restore) is tracked only in the caller's
+    /// test, mirroring how `ClaimedRow::execute_at` carries it in the real
+    /// path -- the DB row itself no longer has it once claimed.
+    async fn seed_landed_running_row(
+        pool: &PgPool,
+        repo: &JobRepo,
+        job_type: &str,
+        instance_id: uuid::Uuid,
+    ) -> anyhow::Result<JobId> {
+        let id = JobId::new();
+        let new_job = crate::entity::NewJob::builder()
+            .id(id)
+            .job_type(JobType::from_owned(job_type.to_string()))
+            .config(serde_json::json!({}))?
+            .build()
+            .expect("build NewJob");
+        repo.create(new_job).await?;
+
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, state, attempt_index, execute_at, alive_at, poller_instance_id, created_at) \
+             VALUES ($1, $2, 'running', 1, NULL, $3, $4, $3)",
+        )
+        .bind(uuid::Uuid::from(id))
+        .bind(job_type)
+        .bind(now)
+        .bind(instance_id)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// The landed case: a row genuinely committed `running` under this
+    /// instance (mirrors a claim that landed but whose `COMMIT` then
+    /// errored). `reconcile_unclaimed` must reset it to `pending`, restore
+    /// its ORIGINAL `execute_at`, clear `poller_instance_id`, and leave
+    /// `attempt_index` untouched -- it never ran, so this is an un-claim,
+    /// not a retry.
+    #[tokio::test]
+    async fn reconciler_resets_a_row_that_actually_landed_running() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = JobRepo::new(&pool);
+        let job_type = format!("reconciler-landed-{}", uuid::Uuid::now_v7());
+        let instance_id = uuid::Uuid::now_v7();
+        let original_execute_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+
+        let id = seed_landed_running_row(&pool, &repo, &job_type, instance_id).await?;
+
+        let n = ClaimReconciler::reconcile_unclaimed(
+            &pool,
+            instance_id,
+            &[(id, original_execute_at, JobType::from_owned(job_type))],
+        )
+        .await?;
+        assert_eq!(n, 1);
+
+        let row = sqlx::query!(
+            r#"SELECT state::text AS "state!", poller_instance_id, attempt_index, execute_at
+               FROM job_executions WHERE id = $1"#,
+            uuid::Uuid::from(id),
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.state, "pending");
+        assert!(row.poller_instance_id.is_none());
+        assert_eq!(
+            row.attempt_index, 1,
+            "no attempt bump -- this row never ran"
+        );
+        assert_eq!(
+            row.execute_at.map(|at| at.timestamp_millis()),
+            Some(original_execute_at.timestamp_millis()),
+            "must restore the row's original execute_at, not re-timestamp it to now"
+        );
+
+        Ok(())
+    }
+
+    /// The common case: the transaction genuinely rolled back, so the row
+    /// this claim would have carried never landed at all.
+    /// `reconcile_unclaimed` must report zero resets and touch nothing.
+    #[tokio::test]
+    async fn reconciler_is_a_noop_for_a_row_that_never_landed() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("reconciler-never-landed-{}", uuid::Uuid::now_v7());
+        let instance_id = uuid::Uuid::now_v7();
+        // No row inserted at all -- the transaction that would have claimed
+        // it rolled back before ever committing anything.
+        let phantom_id = JobId::new();
+
+        let n = ClaimReconciler::reconcile_unclaimed(
+            &pool,
+            instance_id,
+            &[(
+                phantom_id,
+                chrono::Utc::now(),
+                JobType::from_owned(job_type),
+            )],
+        )
+        .await?;
+        assert_eq!(n, 0);
+
+        Ok(())
+    }
+
+    /// The guard case: a row `running` under a DIFFERENT instance (already
+    /// reclaimed by a peer, or simply never ours) must be left alone --
+    /// `reconcile_unclaimed` only touches rows still `running` under ITS
+    /// OWN `instance_id`.
+    #[tokio::test]
+    async fn reconciler_does_not_touch_a_different_instances_row() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = JobRepo::new(&pool);
+        let job_type = format!("reconciler-guard-{}", uuid::Uuid::now_v7());
+        let owner_instance = uuid::Uuid::now_v7();
+        let our_instance = uuid::Uuid::now_v7();
+        let original_execute_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+
+        let id = seed_landed_running_row(&pool, &repo, &job_type, owner_instance).await?;
+
+        let n = ClaimReconciler::reconcile_unclaimed(
+            &pool,
+            our_instance,
+            &[(id, original_execute_at, JobType::from_owned(job_type))],
+        )
+        .await?;
+        assert_eq!(n, 0, "must not reset a row owned by a different instance");
+        assert_eq!(row_state(&pool, id).await?, "running");
 
         Ok(())
     }

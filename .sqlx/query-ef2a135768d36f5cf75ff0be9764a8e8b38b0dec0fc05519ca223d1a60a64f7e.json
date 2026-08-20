@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT state::text AS \"state!\", poller_instance_id, attempt_index, execute_at\n               FROM job_executions WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "poller_instance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "execute_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "ef2a135768d36f5cf75ff0be9764a8e8b38b0dec0fc05519ca223d1a60a64f7e"
+}

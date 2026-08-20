@@ -418,6 +418,15 @@ pub(crate) struct ClaimedRow {
     pub attempt: i32,
     pub queue_id: Option<String>,
     pub data_json: Option<JsonValue>,
+    /// This row's `execute_at` immediately BEFORE the claim nulled it, and
+    /// its `job_type` (constant across one [`claim_due_heads_in_op`] call,
+    /// carried per-row so a flattened `Vec<ClaimedRow>` is self-contained).
+    /// Both unused by the ordinary dispatch path; carried for
+    /// [`crate::poller::ClaimReconciler`], which needs them to restore a
+    /// row's true oldest-first position if the claiming transaction's
+    /// `COMMIT` fails after landing (see [`crate::poller::ClaimHook::on_rollback`]).
+    pub execute_at: DateTime<Utc>,
+    pub job_type: JobType,
 }
 
 /// Claim up to `limit` of the oldest due `pending` rows of `job_type`,
@@ -463,7 +472,7 @@ pub(crate) async fn claim_due_heads_in_op(
         ClaimedRow,
         r#"
         WITH heads AS (
-            SELECT id FROM job_executions
+            SELECT id, execute_at FROM job_executions
             WHERE job_type = $1 AND state = 'pending' AND execute_at <= $2
               AND (NOT $6 OR attempt_index = 1)
             ORDER BY execute_at, id
@@ -474,10 +483,11 @@ pub(crate) async fn claim_due_heads_in_op(
             UPDATE job_executions je
             SET state = 'running', poller_instance_id = $4, alive_at = $5, execute_at = NULL
             FROM heads WHERE je.id = heads.id
-            RETURNING je.id, je.queue_id, je.attempt_index
+            RETURNING je.id, je.queue_id, je.attempt_index, heads.execute_at AS original_execute_at
         )
         SELECT u.id AS "id!: JobId", u.attempt_index AS "attempt!", u.queue_id AS "queue_id?",
-               s.execution_state_json AS "data_json?"
+               s.execution_state_json AS "data_json?", u.original_execute_at AS "execute_at!",
+               $1 AS "job_type!: JobType"
         FROM updated u
         LEFT JOIN job_execution_states s ON s.id = u.id
         "#,
