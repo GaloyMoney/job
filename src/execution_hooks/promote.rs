@@ -8,11 +8,32 @@ use es_entity::operation::hooks::{CommitHook, HookOperation, PreCommitRet};
 use crate::entity::JobType;
 use crate::notifier::JobEventNotifier;
 
-/// Restores Invariant B (a queue's active row is its min-`(execute_at, id)`
-/// live-or-parked row) for a set of rows a caller just moved to `pending`
-/// (retry backoff, voluntary reschedule, or a bulk reclaim sweep), promoting
-/// an older parked sibling ahead of them wherever one exists and is older:
-/// swap them (the newly-pending row → `parked`, the sibling → `pending`).
+/// THE Invariant-B repair point (a queue's active row is its
+/// min-`(execute_at, id)` live-or-parked row), covering the two ways a write
+/// can leave that invariant broken:
+///
+/// - **`ids`** -- rows a caller just moved to `pending` (retry backoff,
+///   voluntary reschedule, or a bulk reclaim sweep): promote an older parked
+///   sibling ahead of them wherever one exists and is older -- swap them
+///   (the newly-pending row → `parked`, the sibling → `pending`).
+/// - **`freed_queues`** -- queues whose active row a completer just deleted
+///   ([`crate::dispatcher::JobDispatcher::delete_execution_in_op`] and
+///   `batch_dispatcher.rs`'s two completers): promote each one's oldest
+///   parked sibling outright. This runs here, as a commit-hook statement
+///   strictly AFTER the deleting statement, and never as a CTE of the
+///   `DELETE` itself, for a snapshot-visibility reason: the `DELETE` blocks
+///   on any in-flight spawn's `FOR KEY SHARE` occupant pin (`super::insert`'s
+///   `lock_queue_occupants`), so by the time it returns, every spawn that
+///   parked a row behind the occupant has committed -- but under READ
+///   COMMITTED a statement that blocks on a row lock resumes with its
+///   ORIGINAL snapshot, re-checking nothing beyond the conflicting row
+///   itself (EvalPlanQual). A parked-sibling scan inside the SAME statement
+///   therefore runs with a snapshot from before the pinning spawn committed,
+///   sees no parked row, and orphans the queue until
+///   `sweep_orphaned_parked_rows`, up to `job_lost_interval / 2` later. Only
+///   a NEW statement -- this hook's -- gets a snapshot that sees the freshly
+///   committed parked row. Pinned end-to-end by
+///   `tests/parked_rows.rs::completion_blocked_on_a_spawn_pin_promotes_the_parked_row`.
 ///
 /// Called either directly via [`Self::apply`] (when the caller has no
 /// commit-hook buffer to register into, or needs the promoted rows back
@@ -20,10 +41,15 @@ use crate::notifier::JobEventNotifier;
 /// `PromoteHeadsHook` (when promotion is the entire unit of work for a
 /// call).
 ///
-/// Multiple registrations on one `op` merge (`own_types` unions, `ids`
-/// concatenates) via [`Self::merge`], so e.g. a retry and a reschedule
-/// sharing a hand-composed transaction promote in ONE statement and notify
-/// their combined set of types once each.
+/// Multiple registrations on one `op` merge (`own_types` unions, `ids` and
+/// `freed_queues` concatenate) via [`Self::merge`], so e.g. a batch's retry
+/// backoffs and its terminal deletes sharing one transaction promote in one
+/// hook execution and notify their combined set of types once each. The
+/// `ids` swap and the `freed_queues` promote stay two statements (each
+/// skipped when its input is empty -- in practice an op carries one kind,
+/// so it is one statement): fusing them would weave a second promotion
+/// source into the swap CTE's delicate lock-order/demote-before-promote
+/// reasoning to save a round trip only for ops that carry both.
 ///
 /// **Notify policy**: always notifies every registered `own_types` entry,
 /// plus every DISTINCT promoted type not already in it. This is
@@ -32,11 +58,14 @@ use crate::notifier::JobEventNotifier;
 /// the only sound policy across merged registrations is "notify everything
 /// that could plausibly have new work" -- a redundant notify is harmless
 /// (the emitter coalesces, and an empty poll costs one query), a missed one
-/// is not.
+/// is not. Completers register with EMPTY `own_types`, preserving their
+/// long-standing behavior of waking only the PROMOTED row's type, never
+/// their own type on every completion.
 pub(crate) struct PromoteHeadsHook {
     pub(crate) notifier: Arc<JobEventNotifier>,
     pub(crate) own_types: HashSet<JobType>,
     pub(crate) ids: Vec<uuid::Uuid>,
+    pub(crate) freed_queues: Vec<String>,
 }
 
 /// One sibling promoted by [`PromoteHeadsHook::apply`]: its type (for
@@ -49,6 +78,62 @@ pub(crate) struct PromotedRow {
 }
 
 impl PromoteHeadsHook {
+    /// The freed-queue promote statement: each freed queue's oldest parked
+    /// sibling goes to `pending`, by the same (execute_at, id) tiebreak the
+    /// claim query and [`Self::apply`] use -- ordering by execute_at alone
+    /// would let this promote a different row, and so a different TYPE, than
+    /// every peer would independently agree is the head. See the type-level
+    /// docs for why this is its own statement, never a CTE of the completer's
+    /// `DELETE`.
+    ///
+    /// The `NOT EXISTS` active-row guard makes the promote self-verifying
+    /// rather than trusting the registrant's "I just deleted the queue's
+    /// only active row" (Invariant A): if an active row exists after all,
+    /// promoting a sibling would fail `idx_job_executions_queue_active`
+    /// outright, so the guard skips a queue that needs no promotion instead
+    /// of erroring.
+    async fn apply_freed(
+        op: &mut impl AtomicOperation,
+        queue_ids: &[String],
+    ) -> Result<Vec<PromotedRow>, sqlx::Error> {
+        let deduped: Vec<String> = queue_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect();
+        if deduped.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as!(
+            PromotedRow,
+            r#"
+            WITH heads AS (
+                -- At most one row per input queue (the LATERAL's LIMIT 1
+                -- against deduped input), so no DISTINCT is needed.
+                SELECT p.id
+                FROM UNNEST($1::text[]) AS q(queue_id)
+                CROSS JOIN LATERAL (
+                    SELECT id FROM job_executions
+                    WHERE state = 'parked' AND queue_id = q.queue_id
+                    ORDER BY execute_at, id
+                    LIMIT 1
+                ) p
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM job_executions a
+                    WHERE a.queue_id = q.queue_id AND a.state IN ('pending', 'running')
+                )
+            )
+            UPDATE job_executions je SET state = 'pending'
+            FROM heads h WHERE je.id = h.id
+            RETURNING je.job_type, je.execute_at AS "execute_at!"
+            "#,
+            &deduped,
+        )
+        .fetch_all(op.as_executor())
+        .await
+    }
+
     /// The swap statement itself. Set-based so one statement covers
     /// everything from a single-row retry to a bulk batch reschedule or
     /// reclaim sweep. Callers pass only the ids they just moved to
@@ -151,11 +236,46 @@ impl PromoteHeadsHook {
         own_types: impl IntoIterator<Item = JobType>,
         ids: Vec<uuid::Uuid>,
     ) -> Result<(), sqlx::Error> {
-        let hook = PromoteHeadsHook {
-            notifier: Arc::clone(notifier),
-            own_types: own_types.into_iter().collect(),
-            ids,
-        };
+        Self::register_hook(
+            op,
+            PromoteHeadsHook {
+                notifier: Arc::clone(notifier),
+                own_types: own_types.into_iter().collect(),
+                ids,
+                freed_queues: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    /// Builds and registers a `PromoteHeadsHook` for queues whose active row
+    /// the caller just deleted, with the same no-hook-buffer fallback as
+    /// [`Self::register`]. `own_types` is empty on purpose: a completer only
+    /// ever wakes the PROMOTED row's type (see the type-level notify policy).
+    pub(crate) async fn register_freed_queues(
+        op: &mut impl AtomicOperation,
+        notifier: &Arc<JobEventNotifier>,
+        freed_queues: Vec<String>,
+    ) -> Result<(), sqlx::Error> {
+        if freed_queues.is_empty() {
+            return Ok(());
+        }
+        Self::register_hook(
+            op,
+            PromoteHeadsHook {
+                notifier: Arc::clone(notifier),
+                own_types: HashSet::new(),
+                ids: Vec::new(),
+                freed_queues,
+            },
+        )
+        .await
+    }
+
+    async fn register_hook(
+        op: &mut impl AtomicOperation,
+        hook: PromoteHeadsHook,
+    ) -> Result<(), sqlx::Error> {
         if let Err(hook) = op.add_commit_hook(hook) {
             hook.force_execute_pre_commit(op).await?;
         }
@@ -168,7 +288,8 @@ impl CommitHook for PromoteHeadsHook {
         self,
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
-        let promoted = Self::apply(&mut op, &self.ids).await?;
+        let mut promoted = Self::apply(&mut op, &self.ids).await?;
+        promoted.extend(Self::apply_freed(&mut op, &self.freed_queues).await?);
 
         let mut notified: HashSet<String> = self.own_types.iter().map(|t| t.to_string()).collect();
         for job_type in &self.own_types {
@@ -189,6 +310,7 @@ impl CommitHook for PromoteHeadsHook {
 
     fn merge(&mut self, other: &mut Self) -> bool {
         self.ids.append(&mut other.ids);
+        self.freed_queues.append(&mut other.freed_queues);
         self.own_types.extend(other.own_types.drain());
         true
     }

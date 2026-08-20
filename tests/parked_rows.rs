@@ -1132,3 +1132,97 @@ async fn parking_behind_a_pending_occupant_wakes_the_occupants_type() -> anyhow:
 
     Ok(())
 }
+
+/// The REVERSE ordering of `spawn_racing_a_completion_adopts_the_freed_queue`:
+/// the spawn parks its row and pins the occupant FIRST, and the completion's
+/// `DELETE` starts while that pin is held. The `DELETE` blocks and, once the
+/// spawn commits, proceeds — but under READ COMMITTED a blocked statement
+/// resumes with its ORIGINAL snapshot (EvalPlanQual re-checks nothing beyond
+/// the conflicting row itself), in which the freshly committed parked row
+/// does not yet exist. A parked-sibling promote folded into that SAME
+/// statement as a CTE therefore promotes nothing and orphans the queue until
+/// `sweep_orphaned_parked_rows`, up to `job_lost_interval / 2` later. The
+/// promote must instead run as its own later statement (the completer's
+/// `PromoteHeadsHook` freed-queue registration), whose fresh snapshot sees
+/// the row.
+///
+/// Driven through the real completion path: a holdable occupant job runs on
+/// the poller; the spawn side is hand-rolled SQL replicating exactly what
+/// `ExecutionInsertHook` emits (parked insert + `FOR KEY SHARE` occupant
+/// pin), held open across the occupant's completion.
+#[tokio::test]
+async fn completion_blocked_on_a_spawn_pin_promotes_the_parked_row() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let queue = unique("pin-first-queue");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawner = jobs.add_initializer(HoldableInitializer {
+        job_type: job_type("pin-first-occupant"),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        fail_first_n: 0,
+        attempts_so_far: Arc::new(AtomicUsize::new(0)),
+        retry_settings: RetrySettings::default(),
+    });
+    jobs.start_poll().await?;
+
+    let occupant = JobId::new();
+    spawner
+        .spawn_with_queue_id(occupant, Cfg, queue.clone())
+        .await?;
+    started.notified().await;
+
+    // The spawn side, held open: a parked row plus the occupant pin, the
+    // statements `ExecutionInsertHook` runs in a spawning transaction's
+    // commit tail. `execute_at` is an hour out so the row, once promoted,
+    // stays `pending` (nothing claims it) and the assertion below is not
+    // racing the runner.
+    let parked = JobId::new();
+    let parked_uuid = uuid::Uuid::from(parked);
+    let parked_type = unique("pin-first-parked");
+    let mut spawn_tx = pool.begin().await?;
+    sqlx::query("INSERT INTO jobs (id, job_type, queue_id, created_at) VALUES ($1, $2, $3, NOW())")
+        .bind(parked_uuid)
+        .bind(&parked_type)
+        .bind(&queue)
+        .execute(&mut *spawn_tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO job_executions \
+         (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at) \
+         VALUES ($1, $2, $3, NULL, 'parked', 1, NOW() + INTERVAL '1 hour', NOW(), NOW())",
+    )
+    .bind(parked_uuid)
+    .bind(&parked_type)
+    .bind(&queue)
+    .execute(&mut *spawn_tx)
+    .await?;
+    sqlx::query(
+        "SELECT id FROM job_executions WHERE queue_id = $1 \
+         AND state IN ('pending','running') ORDER BY id FOR KEY SHARE",
+    )
+    .bind(&queue)
+    .fetch_all(&mut *spawn_tx)
+    .await?;
+
+    // Release the occupant: the dispatcher's completion DELETE now blocks on
+    // the pin. Give it time to actually reach and block on it, then commit
+    // the spawn.
+    release.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    spawn_tx.commit().await?;
+
+    // The completion itself must promote the parked row — within the
+    // completion transaction, not minutes later via the orphan sweep (the
+    // default `job_lost_interval` keeps the sweep far beyond this budget).
+    wait_until(
+        async || Ok(row_state(&pool, parked).await? == "pending"),
+        "the parked row must be promoted by the blocked completion itself",
+    )
+    .await?;
+
+    Ok(())
+}

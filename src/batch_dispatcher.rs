@@ -405,11 +405,13 @@ impl BatchDispatcher {
 
     /// Deletes every completed row's execution (batched jobs are never
     /// keyed, so no retained-state guard is needed) and promotes each freed
-    /// queue's oldest parked sibling in the same statement, mirroring
-    /// `dispatcher.rs`'s `delete_execution_in_op`. A batch can free several
-    /// distinct queues in one commit, and each one's next job can be a
-    /// different type than this batch's own, so every promoted type gets
-    /// its own notify.
+    /// queue's oldest parked sibling via a [`PromoteHeadsHook`] freed-queue
+    /// registration on this same transaction — deliberately NOT a CTE of the
+    /// `DELETE`; see that hook for the snapshot-visibility reason —
+    /// mirroring `dispatcher.rs`'s `delete_execution_in_op`. A batch can
+    /// free several distinct queues in one commit, and each one's next job
+    /// can be a different type than this batch's own; the hook wakes every
+    /// promoted type itself.
     ///
     /// The `to_delete` CTE locks the rows in id order BEFORE the `DELETE`
     /// touches them, for deadlock avoidance rather than for correctness: a
@@ -443,23 +445,8 @@ impl BatchDispatcher {
                 RETURNING je.id, je.queue_id
             ), cleanup AS (
                 DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
-            ), heads AS (
-                SELECT DISTINCT ON (d.queue_id) p.id
-                FROM deleted d
-                CROSS JOIN LATERAL (
-                    SELECT id FROM job_executions
-                    WHERE state = 'parked' AND queue_id = d.queue_id
-                    ORDER BY execute_at, id
-                    LIMIT 1
-                ) p
-                WHERE d.queue_id IS NOT NULL
-            ), promoted AS (
-                UPDATE job_executions je SET state = 'pending'
-                FROM heads h WHERE je.id = h.id
-                RETURNING je.job_type
             )
-            SELECT id AS "id!: JobId", queue_id AS "queue_id?",
-                   (SELECT array_agg(job_type) FROM promoted) AS "promoted_types?"
+            SELECT id AS "id!: JobId", queue_id AS "queue_id?"
             FROM deleted
             "#,
             &uuids,
@@ -472,10 +459,9 @@ impl BatchDispatcher {
             return Ok(());
         }
         let deleted: Vec<JobId> = rows.iter().map(|row| row.id).collect();
-        let promoted_types: Vec<String> = rows
-            .first()
-            .and_then(|row| row.promoted_types.clone())
-            .unwrap_or_default();
+        let freed_queues: Vec<String> =
+            rows.iter().filter_map(|row| row.queue_id.clone()).collect();
+        PromoteHeadsHook::register_freed_queues(op, &self.notifier, freed_queues).await?;
 
         let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &deleted).await?;
         let mut jobs = Vec::with_capacity(deleted.len());
@@ -489,11 +475,6 @@ impl BatchDispatcher {
 
         for id in &deleted {
             self.notifier.job_terminal_in_op(op, *id).await?;
-        }
-        for promoted_type in promoted_types {
-            self.notifier
-                .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
-                .await?;
         }
         Ok(())
     }
@@ -617,9 +598,13 @@ impl BatchDispatcher {
         }
 
         if !terminal_uuids.is_empty() {
-            // Same per-freed-queue promotion as `complete_in_op`, including
-            // its id-ordered `to_delete` lock -- see that method's doc
-            // comment for why the ordering is load-bearing.
+            // Same per-freed-queue promotion as `complete_in_op` -- a
+            // `PromoteHeadsHook` freed-queue registration, never a CTE of
+            // the DELETE (see that hook for the snapshot-visibility
+            // reason; here it also merges with the retry registration
+            // above into one hook execution) -- including its id-ordered
+            // `to_delete` lock; see `complete_in_op`'s doc comment for why
+            // the ordering is load-bearing.
             let rows = sqlx::query!(
                 r#"
                 WITH to_delete AS MATERIALIZED (
@@ -632,23 +617,8 @@ impl BatchDispatcher {
                     RETURNING je.id, je.queue_id
                 ), cleanup AS (
                     DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
-                ), heads AS (
-                    SELECT DISTINCT ON (d.queue_id) p.id
-                    FROM deleted d
-                    CROSS JOIN LATERAL (
-                        SELECT id FROM job_executions
-                        WHERE state = 'parked' AND queue_id = d.queue_id
-                        ORDER BY execute_at, id
-                        LIMIT 1
-                    ) p
-                    WHERE d.queue_id IS NOT NULL
-                ), promoted AS (
-                    UPDATE job_executions je SET state = 'pending'
-                    FROM heads h WHERE je.id = h.id
-                    RETURNING je.job_type
                 )
-                SELECT id AS "id!: JobId", queue_id AS "queue_id?",
-                       (SELECT array_agg(job_type) FROM promoted) AS "promoted_types?"
+                SELECT id AS "id!: JobId", queue_id AS "queue_id?"
                 FROM deleted
                 "#,
                 &terminal_uuids,
@@ -657,17 +627,11 @@ impl BatchDispatcher {
             .fetch_all(op.as_executor())
             .await?;
 
-            let promoted_types: Vec<String> = rows
-                .first()
-                .and_then(|row| row.promoted_types.clone())
-                .unwrap_or_default();
+            let freed_queues: Vec<String> =
+                rows.iter().filter_map(|row| row.queue_id.clone()).collect();
+            PromoteHeadsHook::register_freed_queues(op, &self.notifier, freed_queues).await?;
             for row in &rows {
                 self.notifier.job_terminal_in_op(op, row.id).await?;
-            }
-            for promoted_type in promoted_types {
-                self.notifier
-                    .execution_ready_in_op(op, &JobType::from_owned(promoted_type))
-                    .await?;
             }
         }
 
