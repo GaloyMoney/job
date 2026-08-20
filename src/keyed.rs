@@ -13,6 +13,7 @@
 //! singleton per shard) or any other per-entity singleton that should be
 //! recreated after it finishes.
 
+use chrono::{DateTime, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 
@@ -29,7 +30,6 @@ use super::{
     poller::PollerHandle,
     repo::JobRepo,
     runner::{JobRunner, RetrySettings},
-    spawner::{KeyedInsert, insert_keyed_execution},
 };
 
 /// Describes how to construct a [`crate::JobRunner`] for a keyed job type.
@@ -100,7 +100,7 @@ pub struct KeyedJobSpawner<Config> {
     notifier: Arc<JobEventNotifier>,
     inherits_state: bool,
     /// Reaches this process's poller for the head-swap short-circuit fast
-    /// path (handoff addendum §7.3 site 5). See [`PollerHandle`].
+    /// path. See [`PollerHandle`].
     poller_ref: PollerHandle,
     _phantom: PhantomData<Config>,
 }
@@ -178,39 +178,26 @@ where
         let config = serde_json::to_value(config).map_err(JobError::CouldNotSerializeConfig)?;
 
         for _attempt in 0..3 {
+            let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+            let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
             let new_job = NewJob::builder()
                 .id(JobId::new())
                 .unique_key(key.clone())
                 .job_type(self.job_type.clone())
                 .config(config.clone())?
                 .tracing_context(es_entity::context::TracingContext::current())
+                .schedule_at(schedule_at)
                 .build()
                 .expect("Could not build new job");
-            let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
             // The id is an internally generated v7 uuid, `resident` defaults
             // to false here (this path never sets it), and `jobs` carries no
             // unique-key-string constraint (liveness enforcement is on
             // `job_executions`, see below) — this can no longer conflict.
-            let mut job = self.repo.create_in_op(&mut op, new_job).await?;
-            let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
-            match insert_keyed_execution(
-                &self.repo,
-                &self.notifier,
-                &mut op,
-                &mut job,
-                schedule_at,
-                &key,
-            )
-            .await?
-            {
+            let job = self.repo.create_in_op(&mut op, new_job).await?;
+            match insert_keyed_execution(&self.notifier, &mut op, &job, schedule_at, &key).await? {
                 KeyedInsert::Inserted => {
                     self.carry_state_in_op(&mut op, job.id, &key).await?;
 
-                    // Head-swap short-circuit (handoff addendum §7.3 site 5):
-                    // a due-now keyed spawn tries to claim capacity for this
-                    // type's oldest due backlog, same as the plain spawn
-                    // path. A later statement in this same `op`, so it sees
-                    // the insert above with guaranteed ordering.
                     if schedule_at <= self.clock.now()
                         && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
                     {
@@ -293,4 +280,65 @@ where
             self.clock.clone(),
         )
     }
+}
+
+/// Outcome of a keyed execution insert.
+pub(crate) enum KeyedInsert {
+    /// The key was free; this job now holds it.
+    Inserted,
+    /// The key is already held by this LIVE job.
+    Live(JobId),
+    /// The key was taken, but its holder is no longer visible — it went
+    /// terminal between the conflict and the read. The caller should retry.
+    Contended,
+}
+
+/// Insert a keyed execution row, resolving a live-key conflict in the SAME
+/// round trip rather than following up with a separate lookup.
+///
+/// `ON CONFLICT DO NOTHING` (inferring the partial live-key index) turns the
+/// conflict into data instead of an error, so the holder's id comes back
+/// alongside it and there is no constraint-name string matching to keep in
+/// sync with the schema. The holder is read at this statement's snapshot, so a
+/// key claimed by a transaction that committed after it reports
+/// [`KeyedInsert::Contended`] rather than a stale id.
+#[instrument(name = "job.insert_keyed_execution", skip_all)]
+async fn insert_keyed_execution(
+    notifier: &Arc<JobEventNotifier>,
+    op: &mut impl es_entity::AtomicOperation,
+    job: &Job,
+    schedule_at: DateTime<Utc>,
+    unique_key: &str,
+) -> Result<KeyedInsert, JobError> {
+    let row = sqlx::query!(
+        r#"
+        WITH ins AS (
+            INSERT INTO job_executions
+                (id, job_type, queue_id, unique_key, execute_at, alive_at, created_at)
+            VALUES ($1, $2, NULL, $3, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
+            ON CONFLICT (job_type, unique_key) WHERE unique_key IS NOT NULL
+            DO NOTHING
+            RETURNING id
+        )
+        SELECT (SELECT id FROM ins) AS "inserted?: JobId",
+               (SELECT id FROM job_executions
+                WHERE job_type = $2 AND unique_key = $3) AS "live?: JobId"
+        "#,
+        job.id as JobId,
+        &job.job_type as &JobType,
+        unique_key,
+        schedule_at,
+        op.maybe_now(),
+    )
+    .fetch_one(op.as_executor())
+    .await?;
+
+    if row.inserted.is_some() {
+        notifier.execution_ready_in_op(op, &job.job_type).await?;
+        return Ok(KeyedInsert::Inserted);
+    }
+    Ok(match row.live {
+        Some(id) => KeyedInsert::Live(id),
+        None => KeyedInsert::Contended,
+    })
 }

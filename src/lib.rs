@@ -726,10 +726,9 @@ impl Jobs {
                 .expect("Registry has been consumed by executor")
                 .add_batched_initializer(initializer)
         };
-        // Batched types take the head-swap short-circuit path too (see the
-        // handoff addendum, §7.1) -- sharing the real handle here is what
-        // lets a due-now batched spawn claim its type's batch slot the same
-        // way a plain spawn claims a row slot.
+        // Sharing the real handle here is what lets a due-now batched spawn
+        // claim its type's batch slot the same way a plain spawn claims a
+        // row slot.
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,

@@ -1,14 +1,8 @@
-//! Tests for the parked-row queue-exclusion redesign and the short-circuit
-//! spawn fast path (job-dev handoff: "parked-rows claim redesign +
-//! short-circuit dispatch").
-//!
-//! Per the #169 testing standard, the highest-risk pieces here -- moving
-//! queue exclusion from an emergent claim-time convention to a DB
-//! constraint, and the bulk-insert / backdated-spawn / retry-backoff swap
-//! paths -- were written first and verified failing against the
-//! pre-parked-row design before the fix landed (temporarily reverting
-//! `insert_or_park_in_op`'s swap branch / the bulk-insert's two-step
-//! INSERT reproduces the failure).
+//! Tests for parked-row queue exclusion and the short-circuit spawn fast
+//! path: queue exclusion (at most one live row per `queue_id`) is enforced
+//! as a database constraint, and a due-now spawn or a completion that frees
+//! capacity can claim and dispatch immediately instead of waiting for the
+//! next poll.
 
 mod helpers;
 
@@ -116,24 +110,15 @@ async fn row_execute_at(pool: &sqlx::PgPool, id: JobId) -> anyhow::Result<Option
 }
 
 /// Poll `f` until it returns `true` or the attempt budget is exhausted --
-/// state polling, not a blind sleep (the #169 standard).
+/// state polling, not a blind sleep.
 async fn wait_until(
     mut f: impl AsyncFnMut() -> anyhow::Result<bool>,
     what: &str,
 ) -> anyhow::Result<()> {
-    // 800 x 25ms = 20s. Bumped twice now, both times from
-    // `retry_backoff_yields_to_an_older_parked_sibling` alone: several tests
-    // in this file race a spawn's insert-time swap against a retry's
-    // fail_job-time swap, and every spawn on the head-swap path costs at
-    // least one extra DB round trip for its own claim attempt -- on a
-    // slower/more contended CI runner that was enough to occasionally miss
-    // the previous 5s, then 10s, budget even though the invariant itself
-    // was never violated (5s -> 10s: PR #173 CI run 32309538035; 10s ->
-    // 20s: CI run 32353146219, finished in 10.951s against the 10s budget,
-    // i.e. still just barely too slow rather than genuinely hung -- the
-    // commit-hook decomposition (handoff addendum §8) added no new round
-    // trips to this path, just more indirection per trip, which is exactly
-    // the kind of cost a loaded CI runner feels harder than a local one).
+    // 800 x 25ms = 20s: several tests in this file race a spawn's
+    // insert-time swap against a retry's own swap, and a contended CI
+    // runner can push those races close to a tighter budget even though
+    // the invariant itself holds.
     for _ in 0..800 {
         if f().await? {
             return Ok(());
@@ -143,14 +128,9 @@ async fn wait_until(
     anyhow::bail!("timed out waiting for: {what}");
 }
 
-/// HIGHEST RISK (invariant 6): the bulk-spawn insert with two specs sharing
-/// one `queue_id` in a single `spawn_all` call. Verified failing pre-fix by
-/// temporarily reverting the two-step `ON CONFLICT DO NOTHING` + leftover
-/// insert in `spawn_all_in_op` back to a single unconditional INSERT (as it
-/// was before this PR): that shape raises a unique-constraint error at the
-/// SQL level instead of landing one row `pending` and the other `parked`,
-/// since `idx_job_executions_queue_active` now rejects a second active row
-/// for one queue within the same statement.
+/// A bulk `spawn_all` call with two specs sharing one `queue_id` must
+/// resolve the conflict between them: exactly one lands `pending`, the
+/// other `parked` -- never a raw unique-constraint violation.
 #[tokio::test]
 async fn bulk_spawn_shared_queue_id_lands_one_pending_one_parked() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -203,11 +183,9 @@ async fn bulk_spawn_shared_queue_id_lands_one_pending_one_parked() -> anyhow::Re
     Ok(())
 }
 
-/// HIGHEST RISK (invariant 6): the backdated-spawn ordering edge (handoff
-/// §2.3). Verified failing pre-fix by temporarily removing the `should_swap`
-/// branch from `insert_or_park_in_op` (conflicted spawns always park,
-/// never swap): the older backdated row then sits parked behind a YOUNGER
-/// pending head until that head completes, instead of running first.
+/// A spawn backdated well before a queue's current `pending` head must
+/// swap ahead of it -- take the active slot itself, parking the younger
+/// head instead of queuing behind it.
 #[tokio::test]
 async fn backdated_spawn_swaps_ahead_of_a_younger_pending_head() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -224,12 +202,10 @@ async fn backdated_spawn_swaps_ahead_of_a_younger_pending_head() -> anyhow::Resu
         retry_settings: RetrySettings::default(),
     });
 
-    // A lands pending "now" -- the queue's active slot.
     let a = JobId::new();
     spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
     assert_eq!(row_state(&pool, a).await?, "pending");
 
-    // B is backdated well before A -- must swap: A -> parked, B -> pending.
     let b = JobId::new();
     let backdated_at = chrono::Utc::now() - chrono::Duration::hours(1);
     spawner
@@ -258,11 +234,9 @@ async fn backdated_spawn_swaps_ahead_of_a_younger_pending_head() -> anyhow::Resu
     Ok(())
 }
 
-/// HIGH RISK: the retry-backoff swap (handoff §2.5). Verified failing
-/// pre-fix by temporarily removing the `swap_older_parked_siblings_in_op`
-/// call from `fail_job`'s retry branch: the retrying row then keeps running
-/// ahead of an older parked sibling through its whole backoff window instead
-/// of yielding to it.
+/// A row scheduled for retry backoff must yield its queue's active slot to
+/// an older parked sibling, rather than keep it through the whole backoff
+/// window.
 #[tokio::test]
 async fn retry_backoff_yields_to_an_older_parked_sibling() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -289,38 +263,27 @@ async fn retry_backoff_yields_to_an_older_parked_sibling() -> anyhow::Result<()>
     });
     jobs.start_poll().await?;
 
-    // A: takes the active slot, will fail its first attempt (backoff pushes
-    // its retry execute_at ~30s into the future).
     let a = JobId::new();
     spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
 
-    started.notified().await; // A's first attempt is running.
+    started.notified().await;
 
-    // B: spawned into the same (still-occupied-by-A) queue with an execute_at
-    // in the past -- older than A's post-failure retry time either way.
     let b = JobId::new();
     let older = chrono::Utc::now() - chrono::Duration::seconds(5);
-    let b_op_result = {
-        // Use spawn_at to control B's execute_at precisely.
-        spawner
-            .spawn_at_with_queue_id(b, Cfg, older, queue.clone())
-            .await
-    };
+    let b_op_result = spawner
+        .spawn_at_with_queue_id(b, Cfg, older, queue.clone())
+        .await;
     b_op_result?;
-    // Racy by nature (this test's whole point is exercising the ordering
-    // guarantee across a race): if B's spawn lands while A is still
-    // `running`, B parks and waits for `fail_job`'s own swap; if A has
-    // already failed and rescheduled to a future `execute_at` by then, B's
-    // own occupant-swap check (`ExecutionInsertHook::insert_many`'s
-    // occupant lookup + `PromoteHeadsHook::apply`) takes the slot
-    // immediately. Both are correct outcomes of the same guarantee.
+    // Racy by construction: if B's spawn lands while A is still running, B
+    // parks and waits for the retry's own swap; if A has already failed and
+    // rescheduled by then, B's insert-time swap takes the slot immediately.
+    // Both are correct.
     let b_after_spawn = row_state(&pool, b).await?;
     assert!(
         b_after_spawn == "parked" || b_after_spawn == "running",
         "B must be waiting behind A or have already swapped in: got {b_after_spawn}"
     );
 
-    // Either way, A must end up yielding to B.
     wait_until(
         async || Ok(row_state(&pool, a).await? == "parked"),
         "A to be parked, having yielded to the older B",
@@ -342,12 +305,11 @@ async fn retry_backoff_yields_to_an_older_parked_sibling() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Structural test per the handoff (§2.9 test 4): `idx_job_executions_job_type_unique_key`
-/// has no `state` predicate, so a parked row with a `unique_key` still blocks
-/// a keyed re-spawn exactly like a pending or running one would. Keyed rows
-/// never carry a `queue_id` in practice (see the PR body / handoff §8.12),
-/// so this hand-constructs the combination directly at the SQL level rather
-/// than through the public keyed-spawn API.
+/// `idx_job_executions_job_type_unique_key` has no `state` predicate, so a
+/// `parked` row with a `unique_key` still blocks a keyed re-spawn exactly
+/// like a `pending` or `running` one would. Keyed rows never carry a
+/// `queue_id` in practice, so this hand-constructs the combination directly
+/// at the SQL level rather than through the public keyed-spawn API.
 #[tokio::test]
 async fn keyed_spawn_is_blocked_by_a_parked_row_with_the_same_key() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -377,8 +339,6 @@ async fn keyed_spawn_is_blocked_by_a_parked_row_with_the_same_key() -> anyhow::R
         job_type: jt.clone(),
     });
 
-    // Hand-construct a parked row holding the key -- an id-only `jobs` row
-    // plus a `job_executions` row in state='parked' with unique_key set.
     let existing_id = JobId::new();
     sqlx::query(
         "INSERT INTO jobs (id, unique_key, job_type, created_at) VALUES ($1, $2, $3, NOW())",
@@ -478,9 +438,6 @@ async fn short_circuit_spawn_lands_running_immediately_on_commit() -> anyhow::Re
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
 
-    // Read immediately after the spawning transaction committed -- no sleep,
-    // no poll wait. A born-claimed row is already `running` with an owner at
-    // this exact point.
     let (state, owner): (String, Option<uuid::Uuid>) =
         sqlx::query_as("SELECT state::text, poller_instance_id FROM job_executions WHERE id = $1")
             .bind(uuid::Uuid::from(id))
@@ -495,15 +452,13 @@ async fn short_circuit_spawn_lands_running_immediately_on_commit() -> anyhow::Re
         "a running row must be owned by an instance"
     );
 
-    // Drive it to terminal, and confirm the runner actually executed.
     let outcome = jobs
         .handle(id)
         .await_completion(std::time::Duration::from_secs(10))
         .await?;
     assert_eq!(outcome.state(), job::JobTerminalState::Completed);
-    // `notify_one` already fired inside the runner before it returned, so
-    // this resolves immediately -- a direct confirmation the runner body
-    // actually ran, not just that the entity reached terminal.
+    // Resolves immediately: `completed` was notified before the runner
+    // returned, confirming the runner body actually executed.
     tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
         .await
         .expect("the runner must have actually executed");
@@ -512,8 +467,8 @@ async fn short_circuit_spawn_lands_running_immediately_on_commit() -> anyhow::Re
 }
 
 /// `JobInitializer::short_circuit() == false` opts a type out: a due-now
-/// spawn lands ordinary `pending`, exactly as it did before this PR, and
-/// waits for the poll loop like every other type.
+/// spawn lands ordinary `pending` and waits for the poll loop like every
+/// other type.
 #[tokio::test]
 async fn short_circuit_disabled_lands_pending() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -531,10 +486,6 @@ async fn short_circuit_disabled_lands_pending() -> anyhow::Result<()> {
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
 
-    // Immediately after commit: an opted-out type must never be born-claimed,
-    // even though the poll loop may race to claim it right after (that race
-    // is fine and expected -- what must NOT happen is landing `running`
-    // directly from the spawn's own transaction).
     let state: String = sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
         .bind(uuid::Uuid::from(id))
         .fetch_one(&pool)
@@ -543,24 +494,16 @@ async fn short_circuit_disabled_lands_pending() -> anyhow::Result<()> {
         state == "pending" || state == "running",
         "opted-out type must not skip the ordinary insert path: got {state}"
     );
-    // The reliable signal that it went through the ORDINARY path rather than
-    // short-circuit is that if it's already running, it was the poll loop
-    // that claimed it (there is no other claimant this fast) -- accept both
-    // as correct, since the poll loop can win the race, but never assert the
-    // short-circuit-specific synchronous guarantee for an opted-out type.
+    // The poll loop may independently win a race to claim it right after
+    // commit; what matters is that it never lands `running` directly from
+    // the spawn's own transaction, the way a short-circuited type would.
 
     Ok(())
 }
 
-/// FAIRNESS (handoff addendum §7.1, revert-to-red per §7.5 test 1): the
-/// head-swap claim must serve an OLDER due row of the same type before the
-/// row a fresh spawn just inserted -- a spawn is never guaranteed to
-/// dispatch itself. Verified failing under the born-claimed design this
-/// addendum replaces: that design claimed the SPAWNED row unconditionally
-/// (landed `running` directly on insert), so an older unqueued backlog row
-/// -- which can never conflict with anything at insert time, the only way to
-/// build backlog for an uncapped type -- would sit `pending` behind a
-/// strictly younger row that jumped straight to `running`.
+/// The short-circuit claim must serve an OLDER due row of the same type
+/// before the row a fresh spawn just inserted -- a spawn is never
+/// guaranteed to dispatch itself.
 #[tokio::test]
 async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -575,10 +518,10 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
     });
     jobs.start_poll().await?;
 
-    // Hand-construct an OLDER due `pending` row directly, unqueued so it can
-    // never conflict with anything at insert time -- an ordinary spawn of an
-    // uncapped type always short-circuits itself immediately when nothing
-    // else is due, so this is the only way to put backlog in front of it.
+    // Hand-construct an older due `pending` row directly (unqueued, so it
+    // can never conflict at insert time) -- an ordinary spawn of an
+    // uncapped type always claims itself immediately when nothing else is
+    // due, so this is the only way to put backlog in front of it.
     let old_id = JobId::new();
     let old_at = chrono::Utc::now() - chrono::Duration::seconds(30);
     sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, $2, NOW())")
@@ -599,17 +542,10 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
     let new_id = JobId::new();
     spawner.spawn(new_id, Cfg).await?;
 
-    // Read both rows in ONE query, immediately after the spawning
-    // transaction committed and with no sleep: the background poll loop
-    // (also running, `start_poll` above) cannot see either row until that
-    // commit lands, so a single combined read right after `spawn` returns
-    // captures the state the head-swap claim itself produced, before the
-    // background loop gets an independent chance to also claim the now
-    // uncontested `new_id` (which -- once `old_id` is already `running` --
-    // would be a legitimate, separate claim, not a fairness violation;
-    // splitting this into two sequential awaited reads was observed to
-    // occasionally let exactly that happen, making the assertion below
-    // flaky rather than wrong).
+    // Read both rows in ONE query so the background poll loop gets no
+    // window to independently claim `new_id` between two separate reads,
+    // which would be a legitimate claim (once `old_id` is running) rather
+    // than a fairness violation, but would still make this assertion racy.
     let (old_state, new_state): (String, String) = sqlx::query_as(
         "SELECT \
            (SELECT state::text FROM job_executions WHERE id = $1), \
@@ -631,13 +567,9 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
     Ok(())
 }
 
-/// CHAIN HOP (handoff addendum §7.3 site 2, revert-to-red per §7.5 test 4):
-/// completing A must not just promote its queue's parked sibling B to
+/// Completing A must not just promote its queue's parked sibling B to
 /// `pending` -- the completion-time recycle claim must dispatch it
 /// synchronously, in the same transaction, with no poll needed in between.
-/// Verified failing by temporarily removing the recycle block from
-/// `delete_execution_in_op`: B then sits `pending`, picked up only by the
-/// ordinary (much slower, and here entirely absent -- see below) poll path.
 #[tokio::test]
 async fn completion_recycles_into_a_promoted_sibling_with_no_poll_needed() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -659,7 +591,7 @@ async fn completion_recycles_into_a_promoted_sibling_with_no_poll_needed() -> an
 
     let a = JobId::new();
     spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
-    started.notified().await; // A's run() is live, blocked on `release`.
+    started.notified().await;
     assert_eq!(row_state(&pool, a).await?, "running");
 
     let b = JobId::new();
@@ -670,9 +602,6 @@ async fn completion_recycles_into_a_promoted_sibling_with_no_poll_needed() -> an
         "B must park behind A's active slot"
     );
 
-    // Release A: it completes, `delete_execution_in_op` promotes B, and (the
-    // point of this test) recycles A's freed unit straight into dispatching
-    // B -- no NOTIFY-triggered poll cycle needed to pick B up.
     release.notify_one();
 
     wait_until(
@@ -696,9 +625,9 @@ async fn completion_recycles_into_a_promoted_sibling_with_no_poll_needed() -> an
         "a recycled claim must be owned by an instance, byte-identical to a poll claim"
     );
 
-    // Drive B to completion too, confirming the recycled dispatch is a real,
-    // working dispatcher and not just a state flip.
-    started.notified().await; // B's own run() call.
+    // Drive B to completion too, to confirm the recycled dispatch is a
+    // real dispatcher, not just a state flip.
+    started.notified().await;
     release.notify_one();
     wait_until(
         async || {
@@ -716,15 +645,11 @@ async fn completion_recycles_into_a_promoted_sibling_with_no_poll_needed() -> an
     Ok(())
 }
 
-/// SHUTDOWN GUARD (handoff addendum §7.4, revert-to-red per §7.5 test 6): a
-/// completion during an in-flight shutdown drain must NOT recycle into new
-/// work -- doing so would re-admit a dispatch after the drain has started
-/// collecting acks, exactly the #169 hazard this addendum must not reopen (a
-/// late-spawned task never subscribes to the shutdown broadcast in time and
-/// gets force-aborted instead of drained). Verified failing by temporarily
-/// removing the `is_shutting_down()` check from `try_claim_for_recycle`: B
-/// then races straight to `running` while `jobs.shutdown()` is still
-/// collecting acks.
+/// A completion during an in-flight shutdown drain must NOT recycle into
+/// new work -- doing so would re-admit a dispatch after the drain has
+/// started collecting acks, and a task spawned that late never subscribes
+/// to the shutdown broadcast in time, so it gets force-aborted instead of
+/// drained.
 #[tokio::test]
 async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -753,14 +678,10 @@ async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::
     spawner.spawn_with_queue_id(b, Cfg, queue.clone()).await?;
     assert_eq!(row_state(&pool, b).await?, "parked");
 
-    // Start the drain while A is still blocked -- `perform()` flips
-    // `shutdown_started` as its very first step, then blocks waiting on A.
     let shutdown_task = tokio::spawn(async move { jobs.shutdown().await });
-    // Calibration only (mirrors `shutdown_drains_self_rescheduling_jobs`'s
-    // own steady-state sleep): give the shutdown task a moment to actually
-    // run and flip the flag before A is released. Every correctness
-    // assertion below is state-based, taken only once `shutdown_task` has
-    // been fully awaited -- not timed.
+    // Calibration only: give the shutdown task a moment to actually flip
+    // its "started" flag before A is released. Every assertion below is
+    // state-based, taken only after `shutdown_task` is fully awaited.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     release.notify_one();
@@ -769,10 +690,8 @@ async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::
         .await?
         .expect("shutdown must drain A and return cleanly");
 
-    // The drain is fully finished -- nothing in this process can claim
-    // anything anymore. If the recycle had not been gated on shutdown, B
-    // would already be `running`; it must instead sit exactly where the
-    // ordinary (non-recycling) promote leaves it.
+    // If the recycle were not gated on shutdown, B would already be
+    // `running`; it must instead sit where the ordinary promote leaves it.
     assert_eq!(
         row_state(&pool, b).await?,
         "pending",
@@ -792,19 +711,13 @@ async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::
     Ok(())
 }
 
-/// SHUTDOWN SUBSCRIBE TIMING (found by automated review on this PR;
-/// revert-to-red verified below): a head-swap-dispatched execution's
-/// shutdown-coordination `broadcast::Receiver`s must be subscribed BEFORE
-/// the claiming transaction commits, not inside the task
-/// `ClaimHook::post_commit` spawns to run it. A late subscribe races
-/// `ShutdownCoordinator::perform`'s broadcast -- `tokio::sync::broadcast`
+/// A short-circuit-dispatched execution's shutdown-coordination
+/// `broadcast::Receiver`s must be subscribed BEFORE the claiming
+/// transaction commits, not inside the task spawned to run it afterward. A
+/// late subscribe races the shutdown broadcast -- `tokio::sync::broadcast`
 /// never delivers to a subscriber that arrives after `send` -- and a
 /// dispatch that loses that race is never acked, never waited for, and gets
-/// force-aborted by `kill_remaining_jobs` mid-flight instead of drained:
-/// exactly the #169 hazard the ordinary poll path was already hardened
-/// against, reopened here for the short-circuit spawn path specifically.
-/// Verified failing by temporarily reverting `register_dispatch_hook`/
-/// `spawn_dispatch_task` to subscribe inside the post-commit task again.
+/// force-aborted mid-flight instead of drained.
 #[tokio::test]
 async fn short_circuit_spawn_dispatch_survives_a_shutdown_race() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -824,11 +737,10 @@ async fn short_circuit_spawn_dispatch_survives_a_shutdown_race() -> anyhow::Resu
     jobs.start_poll().await?;
 
     let id = JobId::new();
-    // No gap between spawn (which short-circuit-dispatches this due-now job)
-    // and racing a shutdown right after -- deliberately stressing the exact
-    // commit-to-subscribe window this test targets.
+    // No gap between spawn and the shutdown race -- deliberately stressing
+    // the commit-to-subscribe window.
     spawner.spawn(id, Cfg).await?;
-    started.notified().await; // the short-circuited dispatch is live.
+    started.notified().await;
 
     let shutdown_task = tokio::spawn(async move { jobs.shutdown().await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -851,16 +763,3 @@ async fn short_circuit_spawn_dispatch_survives_a_shutdown_race() -> anyhow::Resu
 
     Ok(())
 }
-
-// The bulk short-circuit due-now gate (a spawn_all of entirely
-// future-scheduled work must not claim unrelated due backlog) is covered by
-// pure unit tests on `count_due_now` in `src/spawner.rs`, not here.
-// An earlier version of this test asserted on row state after a REAL
-// `spawn_all` call with a real background poll loop running (`start_poll`)
-// -- but `spawn_all_in_op` always fires `execution_ready_in_op` when
-// anything lands pending, which wakes that live poller regardless of
-// whether the due-now count is right, so it could independently claim the
-// same unrelated backlog row via its own, unrelated claim cycle: a false
-// failure with nothing to do with what was being tested (flagged by
-// automated review on this PR). `count_due_now` is a pure function --
-// extracted specifically so this logic is testable without that race.

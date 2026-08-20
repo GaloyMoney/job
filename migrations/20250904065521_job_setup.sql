@@ -47,14 +47,12 @@ CREATE TABLE job_events (
 -- live row. Unqueued rows are never parked -- nothing to block them.
 --
 -- Invariant A (exclusion): per `queue_id`, at most one row in state
--- `pending` or `running` -- enforced below by `idx_job_executions_queue_active`,
--- now the ONLY enforcement of queue exclusion (previously an emergent
--- property of the claim query's `FOR UPDATE SKIP LOCKED`).
+-- `pending` or `running` -- enforced below by `idx_job_executions_queue_active`.
 -- Invariant B (order): the active (`pending`/`running`) row of a queue is
 -- its min-`(execute_at, id)` live-or-parked row. Maintained by the write
--- paths (insert-swap in `spawner.rs`, retry/reschedule/reclaim-swap in
--- `dispatcher.rs`/`batch_dispatcher.rs`/`poller.rs`); claim correctness does
--- not depend on it (exclusion is Invariant A alone), but scheduling
+-- paths (insert-swap in `execution_hooks.rs`, retry/reschedule/reclaim-swap
+-- in `dispatcher.rs`/`batch_dispatcher.rs`/`poller.rs`); claim correctness
+-- does not depend on it (exclusion is Invariant A alone), but scheduling
 -- semantics do -- a queue's backlog must still drain oldest-first.
 CREATE TYPE JobExecutionState AS ENUM ('pending', 'parked', 'running');
 
@@ -86,15 +84,14 @@ CREATE UNIQUE INDEX idx_job_executions_job_type_unique_key
   ON job_executions (job_type, unique_key)
   WHERE unique_key IS NOT NULL;
 
--- CLAIM PATH, the only index it needs. `state = 'pending'` now contains
--- ONLY already-claimable rows -- every queue's blocked backlog sits in
--- `parked` instead -- so a single ordered prefix scan serves queued and
--- unqueued rows together, bounded by what the poll can admit. `id` trails
+-- CLAIM PATH, the only index it needs. `state = 'pending'` contains ONLY
+-- already-claimable rows -- every queue's blocked backlog sits in `parked`
+-- instead -- so a single ordered prefix scan serves queued and unqueued
+-- rows together, bounded by what the poll can admit. `id` trails
 -- `execute_at` to make the order total, so that prefix is well defined
 -- instead of an arbitrary cut through a group of rows sharing a timestamp
 -- (bulk spawns give a whole batch one). See PERFORMANCE.md ("Claim
--- admission") for the measurements behind this shape and why the previous
--- anti-join/per-queue-LATERAL design was replaced.
+-- admission") for the measurements behind this shape.
 --
 -- Also serves `min_wait` and the stale-pending reporter on its leading column.
 CREATE INDEX idx_job_executions_pending_execute_at

@@ -562,8 +562,7 @@ impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
         notifier: Arc<crate::notifier::JobEventNotifier>,
     ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error>> {
         // Always-empty handle: fan-out spawns from within a batch runner
-        // take the ordinary insert path (see the identical comment on
-        // `registry.rs`'s `impl<T: JobInitializer> AnyJobInitializer`).
+        // take the ordinary insert path.
         let spawner = JobSpawner::<T::Config>::new(
             repo,
             self.job_type(),

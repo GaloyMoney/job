@@ -1,10 +1,3 @@
-//! Commit hooks that do real DB work in `pre_commit` (handoff addendum §8):
-//! [`PromoteHeadsHook`] and [`ExecutionInsertHook`]. Both centralize SQL that
-//! used to run inline at several call sites into one place per concern, and
-//! both stage further hooks re-entrantly (`JobEventHook` for notify,
-//! [`crate::poller::JobPoller::register_claim_demand`] for the head-swap
-//! claim) rather than doing dispatch/claim work inline.
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,174 +12,7 @@ use crate::entity::JobType;
 use crate::notifier::JobEventNotifier;
 use crate::poller::PollerHandle;
 
-/// Restores Invariant B (a queue's active row is its min-`(execute_at, id)`
-/// live-or-parked row) for a set of rows a caller just moved to `pending`
-/// (retry backoff, voluntary reschedule, or a bulk reclaim sweep), promoting
-/// an older parked sibling ahead of them wherever one exists and is older:
-/// swap them (the newly-pending row → `parked`, the sibling → `pending`).
-///
-/// Replaces the free-standing `swap_older_parked_siblings_in_op` fn from an
-/// earlier revision of this design -- identical SQL, now [`Self::apply`],
-/// called either directly (by `reclaim_lost_jobs`'s raw pool transaction,
-/// which has no commit-hook buffer to register into, and by
-/// `ExecutionInsertHook::pre_commit` once it lands, as a same-pass
-/// sequential step rather than a competing hook) or via a *registered*
-/// `PromoteHeadsHook` (the retry/reschedule call sites, where promotion is
-/// the entire unit of work for that `_in_op` call).
-///
-/// Multiple registrations on one `op` merge (`own_types` unions, `ids`
-/// concatenates) via [`Self::merge`], so e.g. a retry and a reschedule
-/// sharing a hand-composed transaction promote in ONE statement and notify
-/// their combined set of types once each -- centralizing the notify-dedup
-/// that used to be hand-rolled (inconsistently -- see below) at each call
-/// site.
-///
-/// **Notify policy**: always notifies every registered `own_types` entry,
-/// plus every DISTINCT promoted type not already in it. The two single-row
-/// call sites in `dispatcher.rs` (`fail_job`'s retry branch, `reschedule_job`)
-/// used to notify their own type ONLY when nothing promoted (reasoning: if
-/// their one row got swapped back to `parked`, their own type has nothing
-/// newly claimable). Centralizing drops that precision in favor of the
-/// batch call sites' existing, safe over-notification: after a merge there
-/// is no way to attribute "this promoted type corresponds to THAT specific
-/// registration's own row", so the only sound policy across merged
-/// registrations is "notify everything that could plausibly have new work" --
-/// a redundant notify is harmless (the emitter coalesces, and an empty poll
-/// costs one query), a missed one is not.
-pub(crate) struct PromoteHeadsHook {
-    pub(crate) notifier: Arc<JobEventNotifier>,
-    pub(crate) own_types: HashSet<JobType>,
-    pub(crate) ids: Vec<uuid::Uuid>,
-}
-
-/// One sibling promoted by [`PromoteHeadsHook::apply`]: its type (for
-/// notify) and its own `execute_at`, unchanged by the promote (for callers
-/// that need to know whether it is ACTUALLY due, not merely promoted --
-/// see [`ExecutionInsertHook::due_now_by_type`]).
-pub(crate) struct PromotedRow {
-    pub job_type: String,
-    pub execute_at: DateTime<Utc>,
-}
-
-impl PromoteHeadsHook {
-    /// The swap statement itself. Set-based so one statement covers
-    /// everything from a single-row retry to a bulk batch reschedule or
-    /// reclaim sweep. Callers pass only the ids they just moved to
-    /// `pending` -- a row this didn't touch is left alone even if it
-    /// happens to belong to a queue with parked siblings (nothing changed
-    /// for it, so there is nothing to fix).
-    ///
-    /// Returns the job type AND `execute_at` of every promoted sibling, so
-    /// callers can wake the pollers that actually cover it -- a sibling can
-    /// be a different type than the row it displaced (one `queue_id` can be
-    /// shared across types), so notifying only the caller's own type would
-    /// miss it, exactly the failure mode `delete_execution_in_op`'s
-    /// `next_in_queue` resolution exists to prevent on the completion path.
-    /// `execute_at` is unchanged by this statement (only `state` is set) --
-    /// it lets [`ExecutionInsertHook::due_now_by_type`] gate claim demand on
-    /// whether a promoted row is ACTUALLY due, not merely promoted (see its
-    /// doc comment: a promoted row's own `execute_at` can be in the future).
-    pub(crate) async fn apply(
-        op: &mut impl AtomicOperation,
-        ids: &[uuid::Uuid],
-    ) -> Result<Vec<PromotedRow>, sqlx::Error> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        sqlx::query_as!(
-            PromotedRow,
-            r#"
-            WITH candidates AS (
-                SELECT je.id, je.queue_id, je.execute_at
-                FROM job_executions je
-                WHERE je.id = ANY($1) AND je.state = 'pending' AND je.queue_id IS NOT NULL
-            ), swaps AS (
-                SELECT c.id AS pending_id, sib.id AS parked_id
-                FROM candidates c
-                CROSS JOIN LATERAL (
-                    SELECT id, execute_at FROM job_executions
-                    WHERE state = 'parked' AND queue_id = c.queue_id
-                    ORDER BY execute_at, id
-                    LIMIT 1
-                ) sib
-                WHERE (sib.execute_at, sib.id) < (c.execute_at, c.id)
-            ), demote AS (
-                UPDATE job_executions SET state = 'parked'
-                WHERE id IN (SELECT pending_id FROM swaps)
-                RETURNING id
-            )
-            -- The promote UPDATE reads FROM `demote` (not `swaps`) so Postgres
-            -- has a real data dependency forcing `demote` to run to completion
-            -- first. Without it, this is two independent writes to the same
-            -- table within one statement with no ordering guarantee between
-            -- them -- observed as a live, reproducible unique-violation on
-            -- `idx_job_executions_queue_active` when the promote half committed
-            -- before the demote half, transiently making two rows active for
-            -- one queue within the statement's own execution.
-            UPDATE job_executions je SET state = 'pending'
-            FROM swaps s
-            JOIN demote d ON d.id = s.pending_id
-            WHERE je.id = s.parked_id
-            RETURNING je.job_type, je.execute_at AS "execute_at!"
-            "#,
-            ids,
-        )
-        .fetch_all(op.as_executor())
-        .await
-    }
-
-    /// Builds and registers a `PromoteHeadsHook` for `ids`, falling back to
-    /// immediate execution if `op` carries no commit-hook buffer -- the
-    /// promote (and its notify) must not be silently dropped either way, so
-    /// callers never need their own fallback branch.
-    pub(crate) async fn register(
-        op: &mut impl AtomicOperation,
-        notifier: &Arc<JobEventNotifier>,
-        own_types: impl IntoIterator<Item = JobType>,
-        ids: Vec<uuid::Uuid>,
-    ) -> Result<(), sqlx::Error> {
-        let hook = PromoteHeadsHook {
-            notifier: Arc::clone(notifier),
-            own_types: own_types.into_iter().collect(),
-            ids,
-        };
-        if let Err(hook) = op.add_commit_hook(hook) {
-            hook.force_execute_pre_commit(op).await?;
-        }
-        Ok(())
-    }
-}
-
-impl CommitHook for PromoteHeadsHook {
-    async fn pre_commit(
-        self,
-        mut op: HookOperation<'_>,
-    ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
-        let promoted = Self::apply(&mut op, &self.ids).await?;
-
-        let mut notified: HashSet<String> = self.own_types.iter().map(|t| t.to_string()).collect();
-        for job_type in &self.own_types {
-            self.notifier
-                .execution_ready_in_op(&mut op, job_type)
-                .await?;
-        }
-        for row in promoted {
-            if notified.insert(row.job_type.clone()) {
-                self.notifier
-                    .execution_ready_in_op(&mut op, &JobType::from_owned(row.job_type))
-                    .await?;
-            }
-        }
-
-        PreCommitRet::ok(self, op)
-    }
-
-    fn merge(&mut self, other: &mut Self) -> bool {
-        self.ids.append(&mut other.ids);
-        self.own_types.extend(other.own_types.drain());
-        true
-    }
-}
+use super::promote::{PromoteHeadsHook, PromotedRow};
 
 /// One `job_executions` row to insert, as gathered by [`ExecutionInsertHook`].
 /// `unique_key` is deliberately absent -- keyed and bulk/single spawning are
@@ -211,23 +37,19 @@ struct InsertedRow {
     occupant_id: Option<uuid::Uuid>,
 }
 
-/// The insert half of the head-swap kernel (handoff addendum §8.2a): batches
-/// every `spawn_in_op`/`spawn_all_in_op`/resident-spawn insert registered on
-/// one `op` into ONE statement at commit time, instead of each call running
-/// its own (for the pre-existing single-row path, up to four-round-trip)
-/// insert inline. [`Self::merge`] is what makes this the "batch merge
-/// semantics" win: N `spawn_in_op` calls sharing one transaction get one
-/// multi-row insert, without the caller ever calling `spawn_all`.
+/// Batches every `spawn_in_op`/`spawn_all_in_op`/resident-spawn insert
+/// registered on one `op` into ONE statement at commit time. [`Self::merge`]
+/// is what makes this a genuine batching win: N `spawn_in_op` calls sharing
+/// one transaction get one multi-row insert, without the caller ever calling
+/// `spawn_all`.
 ///
 /// `pre_commit` does three things, in order:
 /// 1. One combined `INSERT ... ON CONFLICT DO NOTHING` / fallback-`INSERT
 ///    'parked'` statement for every row (queued and unqueued alike) --
 ///    [`Self::insert_many`].
 /// 2. If anything parked behind an occupant, [`PromoteHeadsHook::apply`] on
-///    those occupant ids, as a same-pass sequential step (not a competing
-///    hook -- this ordering is already guaranteed by being sequential code
-///    inside one `pre_commit`, independent of `PromoteHeadsHook`'s own
-///    `runs_after`-based ordering guarantee for OTHER callers).
+///    those occupant ids, as a sequential step within this same
+///    `pre_commit`.
 /// 3. Re-entrant registration (`op.add_commit_hook`, which this
 ///    `HookOperation` always supports -- see the [module docs on re-entrant
 ///    registration](es_entity::operation::hooks#re-entrant-registration)) of
@@ -285,9 +107,9 @@ impl ExecutionInsertHook {
     /// against the queue's active slot (Postgres evaluates the arbiter per
     /// row within one statement, so at most one row of a batch sharing a
     /// `queue_id` lands `pending` and the rest see the first as already
-    /// occupying the slot -- same as the pre-existing bulk path); whichever
-    /// didn't land lands `parked`. An unqueued row (`queue_id.is_none()`)
-    /// can never conflict -- it always lands `pending`.
+    /// occupying the slot); whichever didn't land lands `parked`. An
+    /// unqueued row (`queue_id.is_none()`) can never conflict -- it always
+    /// lands `pending`.
     ///
     /// For every parked row, also resolves `occupant_id`: the id CURRENTLY
     /// holding its queue's active slot, checked in this priority order --
@@ -295,13 +117,12 @@ impl ExecutionInsertHook {
     /// from `ins`'s own `RETURNING`, so it reflects this statement's own
     /// writes), or (b) a pre-existing occupant (read via a plain scan of
     /// `job_executions`, which -- since none of this statement's own insert
-    /// commands touch an EXISTING row -- sees exactly the statement-start snapshot,
-    /// i.e. whoever held the slot before this call ran). At most one of (a)/
-    /// (b) can ever match per queue (Invariant A), so the `COALESCE` of two
-    /// scalar subqueries is safe. This is what lets a batch's own losing
-    /// rows -- not just pre-existing backlog -- get swap-checked by
-    /// [`PromoteHeadsHook`] next, which the pre-refactor bulk path could
-    /// never do (it had no swap logic for the bulk path at all).
+    /// commands touch an EXISTING row -- sees exactly the statement-start
+    /// snapshot, i.e. whoever held the slot before this call ran). At most
+    /// one of (a)/(b) can ever match per queue (Invariant A), so the
+    /// `COALESCE` of two scalar subqueries is safe. This is what lets a
+    /// batch's own losing rows -- not just pre-existing backlog -- get
+    /// swap-checked by [`PromoteHeadsHook`] next.
     async fn insert_many(
         op: &mut impl AtomicOperation,
         rows: &[NewExecutionRow],
@@ -360,12 +181,10 @@ impl ExecutionInsertHook {
 impl ExecutionInsertHook {
     /// The due-now-per-type subset of `inserted`'s landed-pending rows,
     /// cross-referenced against `rows` (the id -> job_type/schedule_at map
-    /// this hook carries in). Pure -- no DB, no poller -- same reasoning as
-    /// `spawner.rs`'s old `count_due_now` this folds in: a live background
-    /// poller can independently claim a row the instant it lands pending, so
-    /// asserting on post-insert row state in an integration test races it; a
-    /// pure function taking the insert's own return value sidesteps that
-    /// entirely.
+    /// this hook carries in). Pure -- no DB, no poller -- so this is
+    /// testable without a live background poller independently claiming a
+    /// row the instant it lands pending, which would otherwise race an
+    /// integration test asserting on post-insert row state.
     ///
     /// A row's `schedule_at` may be in the future (an explicit per-spec
     /// `JobSpec::schedule_at`, or a backdated/forward `spawn_at`); those must
@@ -377,21 +196,16 @@ impl ExecutionInsertHook {
     /// [`PromoteHeadsHook::apply`] just swapped into this call's queue's
     /// active `pending` slot (which may be an EXISTING parked sibling this
     /// call never touched, not one of `rows`; its own `execute_at`, carried
-    /// on [`crate::execution_hooks::PromotedRow`], is unchanged by the
-    /// promote and is what this checks). A promoted-but-not-yet-due row
-    /// still gets a plain `execution_ready` notify (see [`Self::notify_types`],
-    /// which does NOT due-gate -- the ordinary poll will pick it up once it
-    /// actually comes due) but must NOT count as claim demand here: gating
-    /// on `landed_pending`'s own rows without also gating promoted rows was
-    /// exactly the bug automated review caught -- `claim_due_heads_in_op`
+    /// on [`PromotedRow`], is unchanged by the promote and is what this
+    /// checks). A promoted-but-not-yet-due row still gets a plain
+    /// `execution_ready` notify (see [`Self::notify_types`], which does NOT
+    /// due-gate -- the ordinary poll will pick it up once it actually comes
+    /// due) but must NOT count as claim demand here: `claim_due_heads_in_op`
     /// claims the type's OLDEST due row, not specifically the promoted one,
-    /// so an ungated reservation for a future promotion could still reserve
-    /// and drain a completely UNRELATED due backlog row of the same type,
+    /// so an ungated reservation for a future promotion could reserve and
+    /// drain a completely UNRELATED due backlog row of the same type,
     /// bypassing `next_batch_size`'s `min_jobs` throttle for a promotion
-    /// that has nothing to do with due-now admission -- the identical
-    /// failure mode `count_due_now`'s own `landed_pending` gate exists to
-    /// prevent for future-scheduled inserts, just missed for this second
-    /// source of demand.
+    /// that has nothing to do with due-now admission.
     fn due_now_by_type(
         inserted: &[InsertedRow],
         rows: &[NewExecutionRow],
@@ -520,9 +334,8 @@ mod tests {
         }
     }
 
-    /// The exact bug an earlier version of the bulk spawn path had (flagged
-    /// by automated review on PR #173): counting every row that landed
-    /// pending, including future-scheduled ones, as if it were due now.
+    /// A future-scheduled row that happens to land pending must not count
+    /// as due-now demand -- only the genuinely due row should.
     #[test]
     fn due_now_excludes_future_scheduled_rows() {
         let now = chrono::Utc::now();
@@ -542,9 +355,7 @@ mod tests {
         );
     }
 
-    /// A batch of entirely future work must count zero -- the case that let
-    /// a bulk short-circuit reserve and drain unrelated due backlog before
-    /// this was fixed.
+    /// A batch of entirely future work must count zero due-now demand.
     #[test]
     fn due_now_is_zero_for_all_future_work() {
         let now = chrono::Utc::now();
@@ -615,22 +426,17 @@ mod tests {
         assert_eq!(due_counts.get(&TYPE_B).copied(), Some(1));
     }
 
-    /// Caught live by `retry_backoff_yields_to_an_older_parked_sibling`: a
-    /// row that lands `parked` behind a `pending` occupant, then displaces
+    /// A row that lands `parked` behind a `pending` occupant, then displaces
     /// that occupant via `PromoteHeadsHook::apply`, must contribute claim
     /// demand for ITS type even though `inserted` never reports it
-    /// `landed_pending` (statement 1 saw it park; the promotion is a LATER
-    /// statement). Without this, the promoted row sits `pending` -- notified
-    /// but never claimed within this commit pass -- instead of dispatching
-    /// immediately.
+    /// `landed_pending` (statement 1 saw it park; the promotion is a later
+    /// statement). Without this, the promoted row would be notified but
+    /// never claimed within the same commit pass.
     #[test]
     fn due_now_counts_promoted_rows_even_though_insert_saw_them_park() {
         let now = chrono::Utc::now();
         let backdated = JobId::new();
         let rows = vec![row(backdated, TYPE_A.clone(), now)];
-        // Statement 1: our row conflicted and parked; statement 2 then
-        // promoted it (it's now the queue's `pending` occupant), which
-        // `PromoteHeadsHook::apply` reports back as `TYPE_A.to_string()`.
         let inserted = vec![parked(backdated, Some(uuid::Uuid::from(JobId::new())))];
         let promoted = vec![promoted_row(TYPE_A.clone(), now)];
 
@@ -642,13 +448,11 @@ mod tests {
         );
     }
 
-    /// The bug automated review caught: a promotion whose OWN `execute_at`
-    /// is still in the future must NOT contribute claim demand, or the
-    /// resulting over-eager reservation would claim `claim_due_heads_in_op`'s
-    /// oldest due row of that type -- an UNRELATED backlog row, not the
-    /// not-yet-due promotion itself -- bypassing `next_batch_size`'s
-    /// `min_jobs` throttle for a promotion that has nothing to do with
-    /// due-now admission.
+    /// A promotion whose OWN `execute_at` is still in the future must NOT
+    /// contribute claim demand, or an over-eager reservation would let
+    /// `claim_due_heads_in_op` claim an UNRELATED due backlog row of that
+    /// type instead, bypassing `next_batch_size`'s `min_jobs` throttle for a
+    /// promotion that has nothing to do with due-now admission.
     #[test]
     fn due_now_excludes_a_promoted_row_that_is_not_itself_due() {
         let now = chrono::Utc::now();
@@ -686,8 +490,7 @@ mod tests {
     fn notify_types_includes_promoted_types_even_with_nothing_pending() {
         let inserted: Vec<InsertedRow> = vec![];
         let rows: Vec<NewExecutionRow> = vec![];
-        // Deliberately not-yet-due -- notify never due-gates, unlike claim
-        // demand (see `due_now_excludes_a_promoted_row_that_is_not_itself_due`).
+        // notify never due-gates, unlike claim demand.
         let promoted = vec![promoted_row(
             TYPE_B.clone(),
             chrono::Utc::now() + chrono::Duration::hours(1),

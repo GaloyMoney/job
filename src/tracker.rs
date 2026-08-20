@@ -220,37 +220,34 @@ impl JobTracker {
     }
 
     /// Reserve one execution unit of `job_type` BEFORE the DB write that
-    /// would consume it (the short-circuit spawn fast path's born-claimed
-    /// insert). Mirrors `dispatch_job`'s accounting exactly -- a reservation
-    /// IS a unit in flight, the same way `dispatch_job`'s claim is -- so
-    /// `next_batch_size`/`plan_claim` see it immediately, for the same
-    /// reason `JobDispatcher::new` claims its slot synchronously rather than
-    /// inside the execution task (see its doc comment).
+    /// would consume it. Mirrors `dispatch_job`'s accounting exactly -- a
+    /// reservation IS a unit in flight, the same way `dispatch_job`'s claim
+    /// is -- so `next_batch_size`/`plan_claim` see it immediately, for the
+    /// same reason `JobDispatcher::new` claims its slot synchronously rather
+    /// than inside the execution task (see its doc comment).
     ///
     /// `None` if the process is already at `max_jobs`, or `per_type_cap` is
     /// `Some` and `job_type` is already at it. Reserving does not require
     /// knowing the job's id yet -- see [`UnitReservation::into_live`].
     ///
-    /// **Known bounded race** (flagged by automated review on PR #173, not
-    /// fixed there): a reservation taken here between `JobRegistry::plan_claim`
-    /// reading `units_in_flight` and the poll's claim query actually running
-    /// against Postgres is invisible to that poll -- its `row_limit` was
-    /// already baked in as a query parameter from the stale snapshot, so it
-    /// can claim up to that many rows even though this reservation just took
-    /// some of the capacity it assumed was free. The overshoot is bounded (at
-    /// most however many concurrent short-circuit reservations land inside
-    /// one poll's snapshot-to-claim window) and self-corrects on the very
-    /// next poll cycle, since `units_in_flight` is authoritative again by
-    /// then -- this is the same class of soft, self-correcting accounting
-    /// imperfection the original handoff explicitly filed rather than fixed
-    /// for `max_jobs`' own unit-vs-row mismatch. A real fix needs either a
+    /// **Known bounded race**: a reservation taken here between
+    /// `JobRegistry::plan_claim` reading `units_in_flight` and the poll's
+    /// claim query actually running against Postgres is invisible to that
+    /// poll -- its `row_limit` was already baked in as a query parameter
+    /// from the stale snapshot, so it can claim up to that many rows even
+    /// though this reservation just took some of the capacity it assumed
+    /// was free. The overshoot is bounded (at most however many concurrent
+    /// short-circuit reservations land inside one poll's snapshot-to-claim
+    /// window) and self-corrects on the very next poll cycle, since
+    /// `units_in_flight` is authoritative again by then -- the same class of
+    /// soft, self-correcting accounting imperfection `max_jobs`' own
+    /// unit-vs-row mismatch already carries. A tighter fix needs either a
     /// lock spanning the whole plan-to-claim window (serializing every
     /// short-circuit reservation behind poll latency -- a real regression
     /// for exactly the paths this design exists to speed up) or a
     /// post-claim backstop that re-validates and releases any row a poll
-    /// over-claimed before dispatching it. Neither was judged worth bundling
-    /// into this PR; a per-type cap that must never be exceeded even
-    /// transiently should not rely on this path alone.
+    /// over-claimed before dispatching it. A per-type cap that must never be
+    /// exceeded even transiently should not rely on this path alone.
     pub(crate) fn try_reserve(
         self: &Arc<Self>,
         job_type: &JobType,
@@ -283,8 +280,7 @@ impl JobTracker {
     /// Transfer an already-accounted-for unit of `job_type`'s capacity from a
     /// job/batch that is completing to whatever this reservation goes on to
     /// dispatch next, instead of releasing it outright -- the completion-time
-    /// counterpart of [`Self::try_reserve`] (head-swap claiming's recycle
-    /// path; see the handoff addendum this implements, §7.2).
+    /// counterpart of [`Self::try_reserve`].
     ///
     /// Unlike `try_reserve`, this can never fail and never touches
     /// `running_jobs`/`units_in_flight`: the unit is already counted (the
@@ -335,7 +331,7 @@ pub(crate) struct UnitReservation {
 }
 
 impl UnitReservation {
-    /// The born-claimed write landed and `id` is about to be dispatched.
+    /// The reserved write landed and `id` is about to be dispatched.
     /// Registers `id` in the same live-job bookkeeping [`JobTracker::dispatch_job`]
     /// uses, WITHOUT re-incrementing the counters `try_reserve` already
     /// incremented -- the caller must build its `JobDispatcher` from this
@@ -440,7 +436,7 @@ mod tests {
         );
     }
 
-    /// D7: without the capped-type notify rule this would time out — a
+    /// Without the capped-type notify rule this would time out — a
     /// single completion never crosses `min_jobs` (set high here) or carries
     /// `rescheduled`, so the capped-type check is the only thing that can
     /// wake the poll loop.

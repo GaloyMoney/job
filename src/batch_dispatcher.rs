@@ -152,8 +152,7 @@ impl BatchDispatcher {
         self.tracker.mark_finished_without_releasing_unit(&self.ids);
     }
 
-    /// Head-swap completion recycle (handoff addendum §7.3 site 3 / §8.2c):
-    /// this batch's unit of `job_type`'s capacity is about to free (`Drop`
+    /// This batch's unit of `job_type`'s capacity is about to free (`Drop`
     /// fires `batch_completed` below unless this recycles it first). Hands
     /// it, unconditionally, to a `ClaimHook` that will try to spend it on
     /// this SAME type's own oldest due backlog at commit time -- if nothing
@@ -404,6 +403,13 @@ impl BatchDispatcher {
         Ok(())
     }
 
+    /// Deletes every completed row's execution (batched jobs are never
+    /// keyed, so no retained-state guard is needed) and promotes each freed
+    /// queue's oldest parked sibling in the same statement, mirroring
+    /// `dispatcher.rs`'s `delete_execution_in_op`. A batch can free several
+    /// distinct queues in one commit, and each one's next job can be a
+    /// different type than this batch's own, so every promoted type gets
+    /// its own notify.
     #[instrument(name = "job.batch_complete", skip_all, fields(n = ids.len()))]
     async fn complete_in_op(
         &mut self,
@@ -414,19 +420,6 @@ impl BatchDispatcher {
             return Ok(());
         }
         let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
-        // Unlike `dispatcher.rs`'s per-job `delete_execution_in_op`, no
-        // `unique_key IS NULL` guard is needed here: batched jobs are never
-        // keyed (`KeyedJobInitializer` registers through `add_initializer`'s
-        // ordinary per-job dispatch path, not `add_batched_initializer`), so
-        // every execution row a batch ever deletes already has a NULL
-        // `unique_key` and this cleanup always applies.
-        //
-        // Promotes each freed queue's oldest parked sibling in the same
-        // statement — mirrors `dispatcher.rs`'s `delete_execution_in_op`
-        // exactly (same head tiebreak), rather than the coarser
-        // "notify my own type if any queue freed" this used to do: a batch
-        // can free several distinct queues in one commit, and each one's
-        // next job can be a different type than this batch's own.
         let rows = sqlx::query!(
             r#"
             WITH deleted AS (
@@ -531,12 +524,9 @@ impl BatchDispatcher {
             }
         }
         self.repo.update_all_in_op(op, &mut jobs).await?;
-        // Invariant B: mirrors `dispatcher.rs::reschedule_job`, set-based --
-        // `uuids` can name several rows at once, and a swap only demotes the
-        // ONE row whose queue actually had an older parked sibling, so any
-        // row in `uuids` that didn't swap is still `pending` and still needs
-        // its own type's wake. See `PromoteHeadsHook`'s doc comment for the
-        // notify policy (own type always, plus every promoted type).
+        // Invariant B: a swap only demotes the ONE row whose queue actually
+        // had an older parked sibling, so any other row in `uuids` is still
+        // `pending` and still needs its own type's wake.
         PromoteHeadsHook::register(op, &self.notifier, [self.job_type.clone()], uuids).await?;
         Ok(())
     }
@@ -612,11 +602,7 @@ impl BatchDispatcher {
         }
 
         if !terminal_uuids.is_empty() {
-            // See the comment in `complete_in_op` above: batched jobs are
-            // never keyed, so no `unique_key IS NULL` guard is needed here.
-            // Same per-freed-queue promotion as `complete_in_op` — mirrors
-            // `dispatcher.rs::delete_execution_in_op`'s precision rather
-            // than notifying this batch's own type.
+            // Same per-freed-queue promotion as `complete_in_op`.
             let rows = sqlx::query!(
                 r#"
                 WITH deleted AS (

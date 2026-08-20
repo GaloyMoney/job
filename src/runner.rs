@@ -47,21 +47,18 @@ pub trait JobInitializer: Send + Sync + 'static {
         None
     }
 
-    /// Whether a due-now spawn of this type may skip the pending queue
-    /// entirely: land the row already `running`-by-this-instance and hand it
-    /// to the dispatcher the moment the spawning transaction commits, with no
-    /// NOTIFY and no poll in between.
+    /// Whether a due-now spawn or completion of this type may take the
+    /// head-swap short-circuit path: capacity for this type is reserved and
+    /// its oldest due `pending` row is claimed and handed to the dispatcher
+    /// the moment the transaction commits, with no NOTIFY and no poll in
+    /// between. The row claimed is always the type's oldest due row —
+    /// possibly a different one than whatever triggered the short-circuit —
+    /// so admission stays `(execute_at, id)`-ordered exactly like the
+    /// ordinary poll path; there is no fairness trade-off to opt out of.
     ///
-    /// Defaults to `true`. Trade-off to know before relying on it: a
-    /// born-claimed spawn is dispatched as soon as capacity allows,
-    /// independent of how much OLDER due backlog of this (or any) type is
-    /// still sitting `pending` — the ordinary claim path's oldest-first
-    /// admission (see PERFORMANCE.md, "Queue fairness: oldest-first") does
-    /// not apply to it. For a type whose callers rely on roughly FIFO
-    /// service against its own backlog (rather than per-queue ordering,
-    /// which is unaffected — a queue can have only one live row either way),
-    /// override this to `false` and it always lands `pending`/`parked` like
-    /// today.
+    /// Defaults to `true`. Override to `false` for a type that would rather
+    /// never pay the extra claim statement and always go through the
+    /// ordinary poll instead.
     fn short_circuit(&self) -> bool {
         true
     }

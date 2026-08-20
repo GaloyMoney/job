@@ -135,10 +135,8 @@ impl JobDispatcher {
     }
 
     /// Detach this dispatcher's unit from the ordinary Drop-triggered
-    /// release: `delete_execution_in_op` found due work of the same type to
-    /// [`JobTracker::recycle`] the about-to-be-freed unit into instead of
-    /// releasing it plainly. Must only be called once a recycled claim has
-    /// actually landed a row -- see `JobPoller::try_claim_for_recycle`.
+    /// release: `delete_execution_in_op` is handing the about-to-be-freed
+    /// unit to [`JobTracker::recycle`] instead of releasing it plainly.
     fn recycle_unit(&mut self) {
         self.dispatched = false;
         self.tracker
@@ -383,9 +381,7 @@ impl JobDispatcher {
             .await?;
             // Invariant B: the retrying row keeps its queue's active slot,
             // but an older parked sibling should run first during the
-            // backoff. See `PromoteHeadsHook`'s doc comment for the notify
-            // policy (always own type + promoted types, superseding this
-            // site's old if-promoted-else-own_type precision).
+            // backoff.
             PromoteHeadsHook::register(
                 &mut op,
                 &self.notifier,
@@ -414,11 +410,14 @@ impl JobDispatcher {
     /// Promoting is worth reporting because the queue's backlog was, until
     /// this moment, entirely unclaimable — `parked` rows never appear in the
     /// claim scan — and it is also the only wake for that backlog: the poll
-    /// loop sleeps on `next_due_at`, and a promoted row is already due.
-    /// The reschedule paths (`reschedule_job`, the retry branch of
-    /// `fail_job`) don't need this: they always report unconditionally,
-    /// since a job going back to `pending` is exactly the ordinary case every
-    /// instance already polls for. Reports nothing when no row was deleted.
+    /// loop sleeps on `next_due_at`, and a promoted row is already due. The
+    /// notify targets the PROMOTED job's type, not this job's own type — a
+    /// poller only wakes for types it polls, and the two are frequently
+    /// different. Reports nothing when no row was deleted.
+    ///
+    /// Also hands this job's about-to-free unit of capacity to a `ClaimHook`
+    /// so it can be spent immediately on this SAME type's own oldest due
+    /// backlog, independent of whichever type got promoted above.
     ///
     /// The `job_execution_states` row is deleted with the execution unless
     /// this type sets [`KeyedJobInitializer::inherits_state`], which is the
@@ -481,12 +480,6 @@ impl JobDispatcher {
 
         self.notifier.job_terminal_in_op(op, id).await?;
 
-        // Report the type of the job the freed queue just made claimable, not
-        // the type of the job that vacated it: a poller only wakes for types
-        // it polls, and the two are frequently different. Reporting the
-        // completing type instead leaves the queue's next job to wait for an
-        // unrelated poll — invisible while `may_have_more` was permanently
-        // true, load-bearing now that it isn't.
         if row.queue_id.is_some()
             && let Some(next) = row.next_in_queue
         {
@@ -495,23 +488,6 @@ impl JobDispatcher {
                 .await?;
         }
 
-        // Head-swap completion recycle (handoff addendum §7.3 site 2 / §8.2c):
-        // this job's unit of `job_type`'s capacity is about to free (Drop
-        // fires `job_completed` below unless this recycles it first). Hand
-        // it, unconditionally, to a `ClaimHook` that will try to spend it on
-        // this SAME type's own oldest due backlog at commit time --
-        // independent of the freed-queue promote above (a different queue
-        // can promote a DIFFERENT type's sibling; that case is served by the
-        // ordinary notify, unchanged). The promote CTE above already ran as
-        // an earlier statement in this same still-open transaction, so
-        // whenever the hook's claim runs it sees that promote with
-        // guaranteed ordering. If nothing turns out to be due (or shutdown
-        // is underway, or the type opted out), the reservation the hook
-        // holds simply releases -- identical to not recycling at all.
-        // Scoped to this deletion path only -- the retry/reschedule branches
-        // (`fail_job`'s retry branch, `reschedule_job`) keep their row
-        // `pending` rather than freeing a unit, so there is nothing to
-        // recycle there.
         if let Some(poller) = self.poller.upgrade() {
             self.recycle_unit();
             let reservation = self.tracker.recycle(&self.job_type);
@@ -557,8 +533,7 @@ impl JobDispatcher {
         .await?;
         // Invariant B: same ordering fixup as the retry branch of
         // `fail_job` — the rescheduled row keeps its queue's active slot,
-        // but an older parked sibling should run first. See
-        // `PromoteHeadsHook`'s doc comment for the notify policy.
+        // but an older parked sibling should run first.
         PromoteHeadsHook::register(
             op,
             &self.notifier,

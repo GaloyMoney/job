@@ -72,7 +72,7 @@ pub(crate) struct JobPoller {
     /// completion-time recycle claim (`ClaimHook::pre_commit`) so a
     /// completing job/batch never re-admits new work once the drain is
     /// underway: recycling during shutdown would let a self-rescheduling job
-    /// keep the process alive past the drain, defeating #169.
+    /// keep the process alive past the drain.
     shutdown_started: Arc<AtomicBool>,
 }
 
@@ -166,15 +166,12 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 /// instance holds locks on the rows this poll would target. Sized for
 /// contention, not for filtering.
 ///
-/// Fixed, not adaptive: under the parked-row design `state = 'pending'`
-/// contains only already-claimable rows (one per queue at most), so the
-/// window is no longer bounded by ROWS while the budget counts QUEUES --
+/// Fixed, not adaptive: `state = 'pending'`
+/// contains only already-claimable rows (one per queue at most), so
 /// every window row is a candidate, and a queue's blocked backlog never
-/// enters the window at all (it is `parked`). The old adaptive-widening
-/// ladder existed solely to compensate for that row/queue mismatch and is
-/// gone with it; this constant now only needs to survive `SKIP LOCKED`
-/// fall-through, which a small fixed overscan does. See PERFORMANCE.md,
-/// "Contention headroom".
+/// enters the window at all (it is `parked`). This constant only needs to
+/// survive `SKIP LOCKED` fall-through, which a small fixed overscan does.
+/// See PERFORMANCE.md, "Contention headroom".
 const CONTENTION_HEADROOM: i32 = 4;
 
 impl JobPoller {
@@ -320,7 +317,6 @@ impl JobPoller {
             }
         }
 
-        // Reported after the loop is provably done claiming rows.
         let _ = poll_exited_tx.send(true);
     }
 
@@ -340,7 +336,6 @@ impl JobPoller {
         };
         let plan = self.registry.plan_claim(n_jobs_to_poll);
         if plan.types.is_empty() {
-            // Every type is saturated or capped and nothing else is registered.
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
@@ -359,7 +354,6 @@ impl JobPoller {
 
         let (rows, window) = match result {
             JobPollResult::WaitTillNextJob(window) => {
-                // Fresh clock read: a duration captured earlier can go stale under a manual clock.
                 let duration = window.sleep_for(self.clock.now());
                 span.record("next_poll_in", tracing::field::debug(duration));
                 span.record("n_jobs_to_start", 0);
@@ -379,28 +373,23 @@ impl JobPoller {
         };
         span.record("next_poll_in", tracing::field::debug(next_poll_in));
 
-        // NOT detached from the poll loop, despite the handoff this
-        // implements suggesting it (§2.8's "move find_all + dispatch off the
-        // poll loop"). Tried it; reverted. `dispatch_job`/`dispatch_batches`
-        // do two things synchronously that a detached continuation makes
-        // late instead: (a) `tracker.dispatch_job`/`dispatch_batch`, which
-        // `plan_claim` reads on the NEXT poll -- late, a poll immediately
-        // following a full claim (`next_poll_in` is `Duration::ZERO`, the
-        // common case under load) can race ahead of the continuation and
-        // claim a second full batch against a slot budget the tracker hasn't
-        // heard is spoken for yet, observed unbounded under sustained load in
-        // `claims_are_capped_by_free_batch_slots`; (b) the dispatch task's
-        // `shutdown_tx.subscribe()`, which `tokio::sync::broadcast` only
-        // delivers to if it happened before `ShutdownCoordinator::perform`'s
-        // broadcast -- late, a shutdown landing between this poll returning
-        // and the continuation actually running broadcasts to no one,
-        // reproduced as force-aborted (not drained) executions in
-        // `shutdown_drains_self_rescheduling_jobs`. Both are call-site
-        // proofs that this optimization needs the slot claim AND the
-        // shutdown subscription to stay synchronous with the poll loop;
-        // deferring only `find_all` would still need threading a
-        // pre-reservation through, which is a larger, riskier change than
-        // this PR's budget covers cleanly. Left for a follow-up.
+        // Deliberately not detached from the poll loop: `dispatch_job`/
+        // `dispatch_batches` do two things synchronously that a detached
+        // continuation would make late. (a) `tracker.dispatch_job`/
+        // `dispatch_batch`, which `plan_claim` reads on the NEXT poll --
+        // late, a poll immediately following a full claim (`next_poll_in`
+        // is `Duration::ZERO`, the common case under load) can race ahead
+        // of the continuation and claim a second full batch against a slot
+        // budget the tracker hasn't heard is spoken for yet (see
+        // `claims_are_capped_by_free_batch_slots`). (b) the dispatch
+        // task's `shutdown_tx.subscribe()`, which `tokio::sync::broadcast`
+        // only delivers to if it happened before the shutdown broadcast --
+        // late, a shutdown landing between this poll returning and the
+        // continuation actually running broadcasts to no one, force-
+        // aborting rather than draining the execution (see
+        // `shutdown_drains_self_rescheduling_jobs`). Both require the slot
+        // claim and the shutdown subscription to stay synchronous with the
+        // poll loop.
         if !rows.is_empty() {
             self.load_and_dispatch_claimed(rows).await?;
         }
@@ -459,9 +448,8 @@ impl JobPoller {
         let notifier = Arc::clone(&self.notifier);
         OwnedTaskHandle::new(spawn_named_task!("job-poller-lost-handler", async move {
             loop {
-                // Liveness is a wall-clock question — a manual application clock
-                // can be frozen between operator-driven advances while the OS
-                // process holding a job either is or isn't actually alive.
+                // Liveness is a wall-clock question, independent of any
+                // manual application clock.
                 tokio::time::sleep(job_lost_interval / 2).await;
                 let alive_threshold = chrono::Utc::now() - job_lost_interval;
                 let reschedule_at = clock.now();
@@ -499,12 +487,6 @@ impl JobPoller {
                                     notifier.execution_ready(job_type);
                                 }
                             }
-                            // The reclaim's own swap can promote an OLDER
-                            // parked sibling of a DIFFERENT type than any
-                            // reclaimed row's own type (see
-                            // `reclaim_lost_jobs`'s doc comment) -- notify
-                            // those too, deduplicated against what the loop
-                            // above already reported.
                             for promoted_type in promoted {
                                 if reported.insert(promoted_type.clone()) {
                                     notifier.execution_ready(&JobType::from_owned(promoted_type));
@@ -523,9 +505,7 @@ impl JobPoller {
 
                     // Piggybacked on this same cadence: recover any queue
                     // whose parked backlog has no active (pending/running)
-                    // row. In steady state this is the orphan race documented
-                    // on `insert_or_park_in_op` firing at ~0 -- a nonzero rate
-                    // here is a signal something upstream of it is wrong.
+                    // row.
                     match sweep_orphaned_parked_rows(&pool).await {
                         Ok(promoted) => {
                             Span::current().record("n_orphaned_parked", promoted.len());
@@ -635,9 +615,6 @@ impl JobPoller {
             "job-poller-stale-jobs-handler",
             async move {
                 loop {
-                    // Staleness reporting is a wall-clock concern — a manual clock
-                    // advance should not immediately fire the stale checker before
-                    // the poller has had a chance to pick up newly-eligible jobs.
                     tokio::time::sleep(pending_jobs_check_interval).await;
                     let now = clock.now();
 
@@ -810,7 +787,7 @@ impl JobPoller {
     /// Spawn the batch execution task and its shutdown-coordination monitor
     /// for an already-built [`BatchDispatcher`]. Shared by [`Self::dispatch_batch`]
     /// and [`Self::dispatch_batch_from_reservation`] so the shutdown
-    /// handshake (`job.shutdown_coordination`, `#169`) has exactly one
+    /// handshake (`job.shutdown_coordination`) has exactly one
     /// implementation, mirroring [`Self::spawn_dispatch_task`]. Takes
     /// already-subscribed receivers for the same reason that one does.
     fn spawn_batch_dispatch_task(
@@ -978,10 +955,7 @@ impl JobPoller {
         }
     }
 
-    /// The head-swap kernel's claim step, generalized to `n_units`
-    /// reservations in ONE statement (handoff addendum §8.2c -- this
-    /// replaces the earlier one-reservation-at-a-time `claim_after`, which
-    /// cost the bulk spawn path a claim statement PER reservation): claims
+    /// The head-swap kernel's claim step: claims, in ONE statement,
     /// up to `n_units * claim_shape(job_type).0` of `job_type`'s due backlog
     /// and splits the result into that many [`DispatchTarget`]s -- one row
     /// per reservation for a plain type, up to `max_batch_size` rows per
@@ -1024,8 +998,8 @@ impl JobPoller {
         }
     }
 
-    /// Registers spawn-side claim demand for `job_type` (handoff addendum
-    /// §8.2c): `n_due` is a count of due ROWS, not reservations -- at commit
+    /// Registers spawn-side claim demand for `job_type`. `n_due` is a count
+    /// of due ROWS, not reservations -- at commit
     /// time [`ClaimHook::pre_commit`] translates it into
     /// `n_due.div_ceil(per_reservation)` fresh reservations (one row per
     /// reservation for a plain type, up to `max_batch_size` rows per
@@ -1053,8 +1027,8 @@ impl JobPoller {
         Self::register_claim_hook(op, hook);
     }
 
-    /// Registers a completion-side recycled unit of `job_type`'s capacity
-    /// (handoff addendum §8.2c): the caller already owns this unit (it just
+    /// Registers a completion-side recycled unit of `job_type`'s capacity:
+    /// the caller already owns this unit (it just
     /// called [`JobTracker::recycle`], having first detached its own
     /// Drop-triggered release) and is about to lose it. At commit time,
     /// [`ClaimHook::pre_commit`] tries to spend it on this type's own oldest
@@ -1213,7 +1187,7 @@ impl JobPoller {
     /// Spawn the execution task and its shutdown-coordination monitor for an
     /// already-built [`JobDispatcher`]. Shared by [`Self::dispatch_job`] and
     /// [`Self::dispatch_job_from_reservation`] so the shutdown handshake
-    /// (`job.shutdown_coordination`, `#169`) has exactly one implementation.
+    /// (`job.shutdown_coordination`) has exactly one implementation.
     /// Takes already-subscribed receivers rather than subscribing itself:
     /// the head-swap caller must subscribe before its claiming `op` commits
     /// (see [`ClaimHook::pre_commit`]'s doc comment) -- subscribing
@@ -1336,9 +1310,9 @@ pub(crate) struct ClaimedRow {
 /// claim would produce (same `state`/`poller_instance_id`/`alive_at`/
 /// `execute_at` columns, same tiebreak). The head-swap kernel: a
 /// short-circuit event (spawn or completion) never dispatches a specific
-/// row, it claims whichever oldest due row(s) of `job_type` exist right now
-/// -- see the handoff addendum this implements (§7.1) for why that is the
-/// fairness fix over the born-claimed design it replaces.
+/// row, it claims whichever oldest due row(s) of `job_type` exist right
+/// now, so admission within one type stays oldest-first even on the fast
+/// path.
 ///
 /// Always a LATER statement in the SAME transaction as the caller's write
 /// (insert, promote, reclaim) -- sees that write's uncommitted rows with
@@ -1405,7 +1379,7 @@ async fn claim_due_heads_in_op(
 }
 
 /// One unit of head-swap claimed work, ready to dispatch once its claiming
-/// transaction commits (handoff addendum §7.2). Carries everything
+/// transaction commits. Carries everything
 /// [`JobPoller::dispatch_job_from_reservation`]/
 /// [`JobPoller::dispatch_batch_from_reservation`] need besides the poller
 /// itself -- see [`ClaimHook`].
@@ -1424,14 +1398,11 @@ struct ShutdownSubs {
     monitor: ShutdownRx,
 }
 
-/// The head-swap short-circuit's commit hook (handoff addendum §8.2c): does
+/// The head-swap short-circuit's commit hook: does
 /// its DB work -- reserving capacity and claiming due heads -- in
 /// `pre_commit`, so the `FOR UPDATE SKIP LOCKED` head lock is held only from
 /// the claim to commit, not for the remainder of whatever transaction the
-/// caller's own write runs in. Replaces the earlier `DispatchHook` (which
-/// only dispatched an already-claimed target in `post_commit`, with the
-/// claim itself run mid-transaction by `try_claim_after_spawn`/
-/// `try_claim_after_bulk_spawn`/`try_claim_for_recycle` at the call site).
+/// caller's own write runs in.
 ///
 /// Two kinds of demand merge into one instance per `op` (via [`Self::merge`],
 /// which is why registration order across call sites never matters):
@@ -1450,6 +1421,14 @@ struct ClaimHook {
     claimed: Vec<(UnitReservation, DispatchTarget, ShutdownSubs)>,
 }
 
+impl ClaimHook {
+    /// [`Self::runs_after`]'s dependency list -- an associated const rather
+    /// than a value built inline: `TypeId::of` is a `const fn`, so this is
+    /// fully compile-time-determined, and `&Self::RUNS_AFTER` promotes to a
+    /// `'static` reference for free (no `OnceLock`, no runtime init check).
+    const RUNS_AFTER: [std::any::TypeId; 1] = [std::any::TypeId::of::<PromoteHeadsHook>()];
+}
+
 impl es_entity::operation::hooks::CommitHook for ClaimHook {
     /// Subscribes to `shutdown_tx` HERE -- synchronously, inside this
     /// pre-commit pass, before `op` even commits -- rather than inside the
@@ -1457,12 +1436,10 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
     /// and that task actually running would never be seen by a receiver
     /// that only subscribes inside it (`tokio::sync::broadcast` never
     /// delivers to a late subscriber), and the execution would be
-    /// force-aborted instead of drained -- the exact #169 hazard
-    /// `poll_and_dispatch`'s own reverted detach experiment hit for the
-    /// ordinary poll path. Subscribing here is the earliest point
-    /// architecturally available for a head-swap dispatch, mirroring how
-    /// `dispatch_job`/`dispatch_batch` subscribe synchronously before ever
-    /// spawning their task.
+    /// force-aborted instead of drained. Subscribing here is the earliest
+    /// point architecturally available for a head-swap dispatch, mirroring
+    /// how `dispatch_job`/`dispatch_batch` subscribe synchronously before
+    /// ever spawning their task.
     async fn pre_commit(
         mut self,
         mut op: es_entity::operation::hooks::HookOperation<'_>,
@@ -1476,11 +1453,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
         };
 
         if poller.is_shutting_down() {
-            // #169: a completion recycling into new work during drain would
-            // keep a self-rescheduling job alive past the drain. Every
-            // recycled reservation drops with `self` below and releases
-            // plainly -- identical to what the caller's own Drop would have
-            // done had it not recycled.
             return es_entity::operation::hooks::PreCommitRet::ok(self, op);
         }
 
@@ -1492,12 +1464,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             if !poller.registry.short_circuit(&job_type) {
                 continue;
             }
-            // `n_due` is a row count; a batched type's single reservation
-            // can claim up to `per_reservation` of them, so attempting one
-            // reservation per due row would over-reserve by up to
-            // `max_batch_size`x -- mirrors the old `try_claim_after_bulk_spawn`'s
-            // identical `div_ceil` (moved here now that spawn-site demand and
-            // completion-side recycling share one hook).
             let per_reservation = poller.claim_shape(&job_type).0.max(1) as usize;
             let n_reservations = n_due.div_ceil(per_reservation);
             let entry = units_by_type.entry(job_type.clone()).or_default();
@@ -1515,11 +1481,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
                 continue;
             }
             if !poller.registry.short_circuit(&job_type) {
-                // Opted out after all -- a recycled unit reaches
-                // `units_by_type` regardless of the gate (see
-                // `register_claim_recycle`). Every reservation gathered for
-                // this type drops at the end of this iteration and releases
-                // plainly.
                 continue;
             }
             let targets = poller
@@ -1532,12 +1493,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
                 };
                 self.claimed.push((reservation, target, subs));
             }
-            // Any reservation past `targets.len()` drops here: the `for`
-            // loop's `zip` stops pulling from `reservations.into_iter()`
-            // once `targets` is exhausted, and the un-yielded tail drops
-            // with the iterator at the end of the loop, releasing plainly --
-            // exactly the "nothing due" case the old `try_claim_for_recycle`
-            // used to return `None` for.
         }
 
         es_entity::operation::hooks::PreCommitRet::ok(self, op)
@@ -1611,19 +1566,16 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
         true
     }
 
-    /// Deferred behind every still-pending [`PromoteHeadsHook`] instance
-    /// (handoff addendum §8.5's `runs_after` note): a caller that hand-
-    /// composes a promote AND a claim into one transaction (not any single
-    /// `_in_op` method today, but a realistic saga across several) must see
-    /// the promote's effect before this claim runs, or a row it just moved
+    /// Deferred behind every still-pending [`PromoteHeadsHook`] instance: a
+    /// caller that hand-composes a promote AND a claim into one transaction
+    /// must see the promote's effect before this claim runs, or a row it just moved
     /// to `pending` could be missed. Registration order across the two
     /// hooks never needs to match call order for this to hold -- that is
     /// the entire point of declaring the dependency instead of relying on
     /// it. A type that never registers `PromoteHeadsHook` on this `op`, or
     /// whose instance already executed, imposes no delay.
     fn runs_after(&self) -> &[std::any::TypeId] {
-        static DEPS: std::sync::OnceLock<[std::any::TypeId; 1]> = std::sync::OnceLock::new();
-        DEPS.get_or_init(|| [std::any::TypeId::of::<PromoteHeadsHook>()])
+        &Self::RUNS_AFTER
     }
 
     /// Fires when this hook's `pre_commit` succeeded but the commit pass
@@ -1668,10 +1620,11 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
     }
 }
 
-/// Detached best-effort recovery for [`ClaimHook::on_rollback`] (handoff
-/// addendum §8.4): resolves the ambiguity `on_rollback` can't -- restores
-/// working state instead of merely documenting the degradation with a warn.
-/// Cost is zero on every successful commit (nothing spawns) and, on the rare
+/// Detached best-effort recovery for [`ClaimHook::on_rollback`]: resolves an
+/// ambiguity `on_rollback` can't itself distinguish -- a rollback where
+/// nothing landed versus a `COMMIT` that errored after actually landing --
+/// by checking, and restores working state rather than merely logging the
+/// degradation. Cost is zero on every successful commit (nothing spawns) and, on the rare
 /// rollback of a claiming transaction, one indexed statement in the common
 /// case (nothing landed) or one reset statement plus a notify in the rare
 /// landed-but-errored case.
@@ -1803,6 +1756,13 @@ impl ClaimReconciler {
     }
 }
 
+/// Resets every `running` row of `supported_job_types` whose `alive_at` is
+/// older than `alive_threshold` (and isn't one of `self_live_ids`, this
+/// instance's own currently-live jobs) back to `pending` for a retry, then
+/// restores Invariant B for every queue those rows occupy: an older parked
+/// sibling should run first during the reclaimed row's backoff, and that
+/// sibling can be a different type than the row it displaced -- reported
+/// separately, so callers can wake the right pollers.
 async fn reclaim_lost_jobs(
     pool: &PgPool,
     instance_id: uuid::Uuid,
@@ -1831,19 +1791,6 @@ async fn reclaim_lost_jobs(
     .fetch_all(&mut *tx)
     .await?;
 
-    // Invariant B: same ordering fixup as the dispatcher's retry/reschedule
-    // paths. A reclaimed row keeps its queue's active slot (it was already
-    // the sole `running` occupant), but an older parked sibling should run
-    // first during the reclaimed row's backoff. Applied to every queue this
-    // reclaim touched, in one statement. The promoted sibling's type is
-    // reported separately -- it can differ from every reclaimed row's own
-    // type (one `queue_id` can be shared across types), so notifying only
-    // the reclaimed types would miss it, the same failure mode
-    // `delete_execution_in_op`'s `next_in_queue` resolution and
-    // `PromoteHeadsHook::apply`'s own doc comment exist to prevent
-    // everywhere else this helper is called. Calls `apply` directly rather
-    // than registering a hook: `tx` is a raw `sqlx::Transaction`, not an
-    // `es_entity` op, so it carries no commit-hook buffer to register into.
     let reclaimed_uuids: Vec<uuid::Uuid> = rows.iter().map(|r| uuid::Uuid::from(r.id)).collect();
     let promoted = PromoteHeadsHook::apply(&mut tx, &reclaimed_uuids).await?;
 
@@ -2038,8 +1985,7 @@ async fn poll_jobs(
             -- every type means every claimable due row was examined, so
             -- `next_due_at` is the honest next deadline -- exact now, not
             -- merely a heuristic: every window row is by construction
-            -- already a candidate (no anti-join can discard one after the
-            -- fact the way the old design required). Blocked queues are
+            -- already a candidate. Blocked queues are
             -- covered by a wake rather than a spin: `delete_execution_in_op`/
             -- the orphan sweeper report `execution_ready` when a queue's
             -- head is promoted.
@@ -2445,6 +2391,7 @@ mod tests {
             .id(id)
             .job_type(JobType::from_owned(job_type.to_string()))
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("build NewJob");
         repo.create(new_job).await?;
@@ -2486,8 +2433,8 @@ mod tests {
     }
 
     /// `kill_remaining_jobs` must survive losing a version race on a `Job` it is
-    /// force-rescheduling — the failure lana PR #8282 saw escape
-    /// `Jobs::shutdown()` as `JobModifyError - ConcurrentModification`.
+    /// force-rescheduling, rather than letting it escape `Jobs::shutdown()`
+    /// as `JobModifyError - ConcurrentModification`.
     ///
     /// The concurrent writer here has `set_result`'s shape: it appends to the
     /// `Job` without touching the execution row, so the row locks
@@ -2602,15 +2549,10 @@ mod tests {
     }
 
     /// A backlogged capped type must NOT be able to consume another type's
-    /// admission budget.
-    ///
-    /// This is the regression that the per-type budget replaced the old
-    /// `n_claim * 4` overscan window to fix: previously every pollable type
-    /// competed for one shared, globally-ordered candidate window, so type A's
-    /// 10 older rows filled it completely and type B's due row was never even
-    /// seen — the poll returned only A's single capped row and left B starved
-    /// behind it. Each type now scans under its own budget, so both are
-    /// claimed in the same poll.
+    /// admission budget: each type scans under its own budget, so a type
+    /// with 10 older due rows and a second type with one younger due row
+    /// both get claimed in the same poll -- the first type's backlog never
+    /// crowds the second type's row out of a shared candidate window.
     #[tokio::test]
     async fn capped_type_backlog_does_not_starve_another_type() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -2771,14 +2713,10 @@ mod tests {
         Ok(id)
     }
 
-    /// A blocked queue's backlog must not consume the admission budget.
-    ///
-    /// This is the zero-claim cliff. Under the parked-row design a blocked
-    /// queue's backlog is `parked`, not `pending` — it never enters
+    /// A blocked queue's backlog must not consume the admission budget: a
+    /// blocked queue's backlog is `parked`, not `pending` -- it never enters
     /// `state = 'pending'` at all, so it structurally cannot appear in the
-    /// claim window no matter how deep it is (the old design instead relied
-    /// on an anti-join running INSIDE the window; this pins the same
-    /// user-visible guarantee under the new mechanism). See PERFORMANCE.md,
+    /// claim window no matter how deep it is. See PERFORMANCE.md,
     /// "Claim admission".
     #[tokio::test]
     async fn blocked_queue_backlog_does_not_consume_the_budget() -> anyhow::Result<()> {
@@ -2852,19 +2790,16 @@ mod tests {
 
     /// Invariant A, at the schema level: `idx_job_executions_queue_active`
     /// (`UNIQUE (queue_id) WHERE state IN ('pending','running') AND queue_id
-    /// IS NOT NULL`) is now the ONLY enforcement of queue exclusion — this
-    /// replaces the claim-time head-resolution guarantee the two deleted
-    /// tests (`queue_head_is_resolved_independently_of_saturated_types`,
-    /// `tied_execute_at_resolves_one_stable_queue_head`) used to pin: with at
+    /// IS NOT NULL`) is the ONLY enforcement of queue exclusion. With at
     /// most one pending/running row per queue possible in the first place,
     /// there is no "which row is the head" question left for differently
     /// saturated instances to disagree about.
     ///
-    /// Exercises the constraint directly at the SQL level (not through
-    /// `insert_or_park_in_op`, which is covered by `spawner`'s own tests):
-    /// two concurrent raw inserts racing for one queue's active slot must
-    /// leave exactly one `pending` row, with the loser's insert failing on
-    /// this exact index.
+    /// Exercises the constraint directly at the SQL level (not through the
+    /// application's own insert path, which is covered by `spawner`'s own
+    /// tests): two concurrent raw inserts racing for one queue's active slot
+    /// must leave exactly one `pending` row, with the loser's insert failing
+    /// on this exact index.
     #[tokio::test]
     async fn queue_active_unique_index_enforces_exclusion() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -2954,17 +2889,11 @@ mod tests {
         // Parked, no active sibling for this queue -- an orphan.
         let orphan = seed_queued_job(&pool, &job_type, &queue, base, "parked").await?;
 
-        // The sweep is a table-wide scan and this suite shares one dev DB
-        // across tests/runs, so it may also recover unrelated orphans left
-        // by other tests -- assert only on what THIS test seeded. It also
-        // races the SAME query run by every live `Jobs` instance's
-        // lost-handler background loop elsewhere in the suite (any test that
-        // calls `start_poll`): if one of those wins and promotes `orphan`
+        // This call races every live `Jobs` instance's own lost-handler
+        // background sweep elsewhere in the suite -- if one of those wins
         // first, this call's own return value can legitimately come back
-        // without it -- the row still ends up correctly `pending` either
-        // way, just not necessarily reported by this specific call. Assert
-        // only on `row_state`, the one thing guaranteed regardless of which
-        // caller actually won the race.
+        // without `orphan`, even though the row still ends up correctly
+        // `pending`. Assert only on `row_state`.
         sweep_orphaned_parked_rows(&pool).await?;
         assert_eq!(row_state(&pool, orphan).await?, "pending");
 
@@ -3017,7 +2946,7 @@ mod tests {
         Ok(())
     }
 
-    /// Invariant B on the reclaim path (handoff §2.5): a lost job's row keeps
+    /// Invariant B on the reclaim path: a lost job's row keeps
     /// its queue's active slot on reclaim (it was already the sole `running`
     /// occupant), but an older parked sibling must run first during the
     /// reclaimed row's backoff.
@@ -3087,14 +3016,12 @@ mod tests {
         Ok(())
     }
 
-    /// Found by automated review on this PR: a reclaim's own swap can
+    /// A reclaim's own swap can
     /// promote an OLDER parked sibling of a DIFFERENT type than the
     /// reclaimed row's own type (one `queue_id` can be shared across
     /// types) -- `reclaim_lost_jobs` must report that type too, not just
     /// the reclaimed types, or the promoted sibling's poller is never
-    /// woken. Revert-to-red verified by temporarily discarding
-    /// `swap_older_parked_siblings_in_op`'s return value again (mirroring
-    /// how the pre-fix code called it for its side effect only).
+    /// woken.
     #[tokio::test]
     async fn reclaim_reports_a_promoted_sibling_of_a_different_type() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -3161,6 +3088,7 @@ mod tests {
             .id(id)
             .job_type(JobType::from_owned(job_type.to_string()))
             .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
             .build()
             .expect("build NewJob");
         repo.create(new_job).await?;
@@ -3286,7 +3214,7 @@ mod tests {
         Ok(())
     }
 
-    /// The bug automated review caught: a reset row is not automatically
+    /// A reset row is not automatically
     /// its queue's rightful head again. While it sat `running`, a backdated
     /// sibling could have landed `parked` in the same queue (a `running`
     /// occupant blocks a swap at insert time exactly like a `pending` one

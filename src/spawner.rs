@@ -84,8 +84,7 @@ pub struct JobSpawner<Config> {
     clock: ClockHandle,
     notifier: Arc<JobEventNotifier>,
     /// Reaches this process's poller for the short-circuit spawn fast path
-    /// (§3.2 of the handoff this implements) once it exists. See
-    /// [`PollerHandle`].
+    /// once it exists. See [`PollerHandle`].
     poller_ref: PollerHandle,
     _phantom: PhantomData<Config>,
 }
@@ -314,7 +313,8 @@ where
         let mut queue_ids: Vec<Option<String>> = Vec::with_capacity(specs.len());
 
         for spec in specs {
-            schedule_times.push(spec.schedule_at.unwrap_or(default_schedule_at));
+            let schedule_at = spec.schedule_at.unwrap_or(default_schedule_at);
+            schedule_times.push(schedule_at);
 
             let mut builder = NewJob::builder();
             builder
@@ -322,23 +322,18 @@ where
                 .job_type(self.job_type.clone())
                 .config(spec.config)?
                 .tracing_context(es_entity::context::TracingContext::current())
-                .queue_id(spec.queue_id.clone());
+                .queue_id(spec.queue_id.clone())
+                .schedule_at(schedule_at);
             let new_job = builder.build().expect("Could not build new job");
             new_jobs.push(new_job);
             queue_ids.push(spec.queue_id);
         }
 
-        let mut jobs = self.repo.create_all_in_op(op, new_jobs).await?;
+        let jobs = self.repo.create_all_in_op(op, new_jobs).await?;
 
         // `unique_key` is always NULL here: keyed and bulk spawning are
         // disjoint APIs (`JobSpec` deliberately carries no unique_key — see
         // `KeyedJobSpawner::spawn` for the keyed path).
-        //
-        // Head-swap kernel, insert half (handoff addendum §8.2a): one
-        // `ExecutionInsertHook` registration for the whole batch, merged
-        // into a single multi-row insert statement at commit time -- this
-        // ALSO gains the bulk path Invariant-B swap semantics it never had
-        // before (see `ExecutionInsertHook::insert_many`'s doc comment).
         let rows: Vec<NewExecutionRow> = jobs
             .iter()
             .zip(&schedule_times)
@@ -352,11 +347,6 @@ where
             .collect();
         ExecutionInsertHook::register(op, &self.notifier, &self.poller_ref, &self.clock, rows)
             .await?;
-
-        for (job, schedule_at) in jobs.iter_mut().zip(&schedule_times) {
-            job.schedule_execution(*schedule_at);
-        }
-        self.repo.update_all_in_op(op, &mut jobs).await?;
 
         Ok(jobs)
     }
@@ -376,17 +366,12 @@ where
             .config(config)?
             .tracing_context(es_entity::context::TracingContext::current())
             .queue_id(queue_id.clone())
+            .schedule_at(schedule_at)
             .build()
             .expect("Could not build new job");
 
-        let mut job = self.repo.create_in_op(op, new_job).await?;
+        let job = self.repo.create_in_op(op, new_job).await?;
 
-        // Head-swap kernel, insert half (handoff addendum §8.2a): registers
-        // an `ExecutionInsertHook` that does the actual `job_executions`
-        // insert, any Invariant-B swap, notify, and due-now claim demand --
-        // all in `pre_commit`, at commit time. Several `spawn_in_op` calls
-        // sharing one `op` merge into ONE multi-row insert statement (see
-        // `ExecutionInsertHook::merge`).
         ExecutionInsertHook::register_one(
             op,
             &self.notifier,
@@ -401,73 +386,6 @@ where
         )
         .await?;
 
-        job.schedule_execution(schedule_at);
-        self.repo.update_in_op(op, &mut job).await?;
-
         Ok(job)
     }
-}
-
-/// Outcome of a keyed execution insert.
-pub(crate) enum KeyedInsert {
-    /// The key was free; this job now holds it.
-    Inserted,
-    /// The key is already held by this LIVE job.
-    Live(JobId),
-    /// The key was taken, but its holder is no longer visible — it went
-    /// terminal between the conflict and the read. The caller should retry.
-    Contended,
-}
-
-/// Insert a keyed execution row, resolving a live-key conflict in the SAME
-/// round trip rather than following up with a separate lookup.
-///
-/// `ON CONFLICT DO NOTHING` (inferring the partial live-key index) turns the
-/// conflict into data instead of an error, so the holder's id comes back
-/// alongside it and there is no constraint-name string matching to keep in
-/// sync with the schema. The holder is read at this statement's snapshot, so a
-/// key claimed by a transaction that committed after it reports
-/// [`KeyedInsert::Contended`] rather than a stale id.
-#[instrument(name = "job.insert_keyed_execution", skip_all)]
-pub(crate) async fn insert_keyed_execution(
-    repo: &JobRepo,
-    notifier: &Arc<JobEventNotifier>,
-    op: &mut impl es_entity::AtomicOperation,
-    job: &mut Job,
-    schedule_at: DateTime<Utc>,
-    unique_key: &str,
-) -> Result<KeyedInsert, JobError> {
-    let row = sqlx::query!(
-        r#"
-        WITH ins AS (
-            INSERT INTO job_executions
-                (id, job_type, queue_id, unique_key, execute_at, alive_at, created_at)
-            VALUES ($1, $2, NULL, $3, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
-            ON CONFLICT (job_type, unique_key) WHERE unique_key IS NOT NULL
-            DO NOTHING
-            RETURNING id
-        )
-        SELECT (SELECT id FROM ins) AS "inserted?: JobId",
-               (SELECT id FROM job_executions
-                WHERE job_type = $2 AND unique_key = $3) AS "live?: JobId"
-        "#,
-        job.id as JobId,
-        &job.job_type as &JobType,
-        unique_key,
-        schedule_at,
-        op.maybe_now(),
-    )
-    .fetch_one(op.as_executor())
-    .await?;
-
-    if row.inserted.is_some() {
-        notifier.execution_ready_in_op(op, &job.job_type).await?;
-        job.schedule_execution(schedule_at);
-        repo.update_in_op(op, job).await?;
-        return Ok(KeyedInsert::Inserted);
-    }
-    Ok(match row.live {
-        Some(id) => KeyedInsert::Live(id),
-        None => KeyedInsert::Contended,
-    })
 }

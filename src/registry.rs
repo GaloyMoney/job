@@ -41,12 +41,9 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        // Fan-out spawns made from WITHIN a running job's own runner don't
-        // get the short-circuit fast path in this pass -- an always-empty
-        // handle means they take the ordinary insert path unconditionally,
-        // same as before. Deferred: reaching the live poller from here needs
-        // an `Arc<JobPoller>` at the dispatch call site, which `dispatch_job`
-        // doesn't carry today. See the handoff's PR2 §3.2 scope note.
+        // Fan-out spawns made from WITHIN a running job's own runner take
+        // the ordinary insert path: this handle is never populated, since
+        // `dispatch_job` has no `Arc<JobPoller>` to hand it here.
         let spawner = JobSpawner::<T::Config>::new(
             repo,
             self.job_type(),
@@ -90,10 +87,8 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
         notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         // Always-empty handle: fan-out spawns of further generations made
-        // from WITHIN a running keyed job's own runner don't get the
-        // head-swap fast path in this pass -- same deferral as the plain and
-        // batched fan-out cases (see the identical comment on
-        // `impl<T: JobInitializer> AnyJobInitializer` above).
+        // from WITHIN a running keyed job's own runner take the ordinary
+        // insert path, same as the plain and batched fan-out cases above.
         let spawner = KeyedJobSpawner::<I::Config>::new(
             repo,
             self.inner.job_type(),
@@ -336,7 +331,7 @@ impl JobRegistry {
     /// `BatchedJobInitializer::short_circuit`, default `true` on all three).
     /// Meaningful for plain, keyed, and batched types alike -- resident types
     /// never reach this check (`ResidentJobSpawner` holds no poller
-    /// reference; see the handoff addendum this implements, §7.1).
+    /// reference).
     pub(super) fn short_circuit(&self, job_type: &JobType) -> bool {
         !self.short_circuit_disabled.contains(job_type)
     }
@@ -407,7 +402,7 @@ mod tests {
         }
     }
 
-    /// D18: `Some(0)` caps are clamped to 1 rather than silently and
+    /// `Some(0)` caps are clamped to 1 rather than silently and
     /// permanently starving a type.
     #[test]
     fn zero_cap_is_clamped_to_one() {
