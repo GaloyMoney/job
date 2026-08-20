@@ -121,14 +121,20 @@ async fn wait_until(
     mut f: impl AsyncFnMut() -> anyhow::Result<bool>,
     what: &str,
 ) -> anyhow::Result<()> {
-    // 400 x 25ms = 10s. Bumped from a 5s budget: several tests in this file
-    // race a spawn's insert-time swap against a retry's fail_job-time swap,
-    // and every spawn on the head-swap path now costs one extra DB round
-    // trip for its own claim attempt -- on a slower/more contended CI
-    // runner that was enough to occasionally miss the tighter budget even
-    // though the invariant itself was never violated (see PR #173 CI run
-    // 32309538035, `retry_backoff_yields_to_an_older_parked_sibling`).
-    for _ in 0..400 {
+    // 800 x 25ms = 20s. Bumped twice now, both times from
+    // `retry_backoff_yields_to_an_older_parked_sibling` alone: several tests
+    // in this file race a spawn's insert-time swap against a retry's
+    // fail_job-time swap, and every spawn on the head-swap path costs at
+    // least one extra DB round trip for its own claim attempt -- on a
+    // slower/more contended CI runner that was enough to occasionally miss
+    // the previous 5s, then 10s, budget even though the invariant itself
+    // was never violated (5s -> 10s: PR #173 CI run 32309538035; 10s ->
+    // 20s: CI run 32353146219, finished in 10.951s against the 10s budget,
+    // i.e. still just barely too slow rather than genuinely hung -- the
+    // commit-hook decomposition (handoff addendum §8) added no new round
+    // trips to this path, just more indirection per trip, which is exactly
+    // the kind of cost a loaded CI runner feels harder than a local one).
+    for _ in 0..800 {
         if f().await? {
             return Ok(());
         }
@@ -305,8 +311,8 @@ async fn retry_backoff_yields_to_an_older_parked_sibling() -> anyhow::Result<()>
     // guarantee across a race): if B's spawn lands while A is still
     // `running`, B parks and waits for `fail_job`'s own swap; if A has
     // already failed and rescheduled to a future `execute_at` by then, B's
-    // insert-time swap (mirrors `insert_or_park_in_op`'s ordering edge, now
-    // also in the short-circuit path's conflict fallback) takes the slot
+    // own occupant-swap check (`ExecutionInsertHook::insert_many`'s
+    // occupant lookup + `PromoteHeadsHook::apply`) takes the slot
     // immediately. Both are correct outcomes of the same guarantee.
     let b_after_spawn = row_state(&pool, b).await?;
     assert!(
@@ -790,7 +796,7 @@ async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::
 /// revert-to-red verified below): a head-swap-dispatched execution's
 /// shutdown-coordination `broadcast::Receiver`s must be subscribed BEFORE
 /// the claiming transaction commits, not inside the task
-/// `DispatchHook::post_commit` spawns to run it. A late subscribe races
+/// `ClaimHook::post_commit` spawns to run it. A late subscribe races
 /// `ShutdownCoordinator::perform`'s broadcast -- `tokio::sync::broadcast`
 /// never delivers to a subscriber that arrives after `send` -- and a
 /// dispatch that loses that race is never acked, never waited for, and gets
