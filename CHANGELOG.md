@@ -1,3 +1,11 @@
+# [job release v0.13.0](https://github.com/GaloyMoney/job/releases/tag/0.13.0)
+
+
+
+### Features
+
+- [**breaking**] Parked-row queue exclusion + short-circuit spawn dispatch (#173)
+
 # [job release v0.12.1](https://github.com/GaloyMoney/job/releases/tag/0.12.1)
 
 
