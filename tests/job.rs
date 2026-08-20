@@ -3912,7 +3912,20 @@ async fn spawn_keyed_duplicate_returns_persisted_handle() -> anyhow::Result<()> 
     let spawner = jobs.add_keyed_initializer(TestKeyedInitializer {
         job_type: JobType::new(job_type),
     });
-    jobs.start_poll().await?;
+    // Deliberately NOT polling. A key is held by its execution row, and
+    // `idx_job_executions_job_type_unique_key` stops applying the moment that
+    // row is deleted -- so once the first job COMPLETES, the key is free and a
+    // second spawn is entitled to open a new generation with a new id (that is
+    // what `KeyedJobInitializer::inherits_state` exists for). With a poller
+    // running, short-circuit dispatch claims this 10ms job on the spawn's own
+    // commit, so the key can be released within milliseconds and the assertion
+    // below becomes a race against the runner -- one a loaded CI worker loses.
+    // The dedup under test is a spawn-time property of a LIVE key and needs no
+    // execution at all, so leaving the job pending pins it deterministically.
+    //
+    // `resident_spawn_returns_existing_handle_on_duplicate` looks identical but
+    // is immune: resident dedup rides `idx_jobs_job_type_resident` on `jobs`,
+    // which has no state predicate and outlives the execution row.
 
     let first_handle = spawner
         .spawn("shard-1", TestJobConfig { delay_ms: 10 })
