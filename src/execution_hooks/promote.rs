@@ -141,13 +141,14 @@ impl PromoteHeadsHook {
     /// happens to belong to a queue with parked siblings (nothing changed
     /// for it, so there is nothing to fix).
     ///
-    /// Every row this touches is locked up front by the `locked` CTE, in id
-    /// order, matching every other multi-row locker of this table
-    /// (`execution_hooks::insert`'s `lock_queue_occupants`,
-    /// `batch_dispatcher.rs`'s two completers). Without it the `demote` and
-    /// promote `UPDATE`s acquire in planner-determined scan order, so two
-    /// concurrent multi-row callers -- two overlapping `reclaim_lost_jobs`
-    /// sweeps, or a batch reschedule racing a reclaim -- could each hold a row
+    /// Every row this touches is locked up front by the `locked` CTE, in
+    /// `(queue_id, id)` order -- the same global order
+    /// `execution_hooks::insert`'s `lock_queue_occupants` (the spawn-side
+    /// pin) and `ExecutionInsertHook::pre_commit`'s row pre-sort agree on.
+    /// Without it the `demote` and promote `UPDATE`s acquire in
+    /// planner-determined scan order, so two concurrent multi-row callers --
+    /// two overlapping `reclaim_lost_jobs` sweeps, a batch reschedule racing
+    /// a reclaim, or a spawn's pin racing this swap -- could each hold a row
     /// the other wants. `FOR NO KEY UPDATE` rather than `FOR UPDATE` because
     /// it is what these `state`-only `UPDATE`s already take, and because it
     /// leaves a spawn's `FOR KEY SHARE` on the same row unblocked; `FOR
@@ -187,18 +188,21 @@ impl PromoteHeadsHook {
                 ) sib
                 WHERE (sib.execute_at, sib.id) < (c.execute_at, c.id)
             ), locked AS MATERIALIZED (
-                -- Take BOTH sides of every swap in id order, in one pass,
-                -- before either UPDATE below runs. `demote` reads from this
-                -- (not from `swaps`) purely to force that dependency. See the
-                -- doc comment for why the order is load-bearing; the strength
-                -- is exactly what the two writes below would take anyway --
-                -- `state` is no index's key column -- so this changes lock
-                -- ORDER only, never what conflicts with what.
+                -- Take BOTH sides of every swap in (queue_id, id) order, in
+                -- one pass, before either UPDATE below runs. `demote` reads
+                -- from this (not from `swaps`) purely to force that
+                -- dependency. See the doc comment for why the order is
+                -- load-bearing; the strength is exactly what the two writes
+                -- below would take anyway -- `state` is no index's key
+                -- column -- so this changes lock ORDER only, never what
+                -- conflicts with what. A swap's two rows always share one
+                -- `queue_id` (the sibling lookup is `queue_id = c.queue_id`),
+                -- so ordering by it groups each swap's pair together.
                 SELECT je.id FROM job_executions je
                 WHERE je.id IN (
                     SELECT pending_id FROM swaps UNION SELECT parked_id FROM swaps
                 )
-                ORDER BY je.id
+                ORDER BY je.queue_id, je.id
                 FOR NO KEY UPDATE
             ), demote AS (
                 UPDATE job_executions SET state = 'parked'

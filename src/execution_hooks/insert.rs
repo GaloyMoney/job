@@ -217,15 +217,21 @@ impl ExecutionInsertHook {
     ///   same queue never serialize against each other. Insert throughput is
     ///   unaffected by this statement.
     ///
-    /// `ORDER BY id` inside a `MATERIALIZED` CTE is what makes the lock
-    /// acquisition order deterministic (the plan puts `LockRows` above
-    /// `Sort`, so rows are locked in id order however the scan below reached
-    /// them -- an unordered bitmap scan included). Every other multi-row
-    /// locker of this table locks in the same id order for the same reason;
-    /// see `batch_dispatcher.rs`'s `complete_in_op` and
-    /// [`PromoteHeadsHook::apply`]. Without that agreement, a multi-queue
-    /// spawn and a multi-queue batch completion touching the same two rows in
-    /// opposite orders would deadlock.
+    /// `ORDER BY queue_id, id` inside a `MATERIALIZED` CTE is what makes the
+    /// lock acquisition order deterministic (the plan puts `LockRows` above
+    /// `Sort`, so rows are locked in that order however the scan below
+    /// reached them -- an unordered bitmap scan included). This is the same
+    /// global order as [`PromoteHeadsHook::apply`]'s swap lock and
+    /// `ExecutionInsertHook::pre_commit`'s pre-sort of `rows` before the
+    /// arbiter insert. Without agreement here, a multi-queue spawn and a
+    /// multi-queue batch completion touching the same two rows in opposite
+    /// orders would deadlock.
+    ///
+    /// `batch_dispatcher.rs`'s `complete_in_op` still locks its own
+    /// (disjoint, id-addressed) row set by plain `id`, not `(queue_id, id)`
+    /// -- deliberately out of scope here, see the lock-ordering fix's PR
+    /// description for why sorting removes same-shape cycles but cannot
+    /// exclude every heterogeneous one.
     ///
     /// The one thing this DOES contend with is the claim: `poll_jobs` and
     /// `claim_due_heads_in_op` take `FOR UPDATE SKIP LOCKED`, which conflicts
@@ -259,7 +265,7 @@ impl ExecutionInsertHook {
             WITH locked AS MATERIALIZED (
                 SELECT id, queue_id, job_type, state FROM job_executions
                 WHERE queue_id = ANY($1) AND state IN ('pending', 'running')
-                ORDER BY id
+                ORDER BY queue_id, id
                 FOR KEY SHARE
             )
             SELECT queue_id AS "queue_id!", job_type AS "job_type!",
@@ -435,9 +441,21 @@ impl ExecutionInsertHook {
 
 impl CommitHook for ExecutionInsertHook {
     async fn pre_commit(
-        self,
+        mut self,
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
+        // Deterministic lock ordering: `insert_many`'s arbiter (`ON CONFLICT
+        // (queue_id) ... DO NOTHING`) WAITS on a concurrent uncommitted row
+        // holding the same queue slot, and until now that wait had no
+        // defined order -- it followed whatever order the caller/merge
+        // accumulated `rows` in. Sorting by `(queue_id, id)` here, once, up
+        // front, puts it on the SAME order as every other waiting locker of
+        // this table (`lock_queue_occupants` below, `PromoteHeadsHook::apply`).
+        // Unqueued rows (`queue_id.is_none()`) sort first -- they never
+        // conflict, so their relative order doesn't matter.
+        self.rows
+            .sort_by(|a, b| (a.queue_id.as_deref(), a.id).cmp(&(b.queue_id.as_deref(), b.id)));
+
         let mut inserted = Self::insert_many(&mut op, &self.rows).await?;
 
         // Statement 2 and, only if a queue lost its occupant in the meantime,
