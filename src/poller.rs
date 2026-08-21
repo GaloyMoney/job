@@ -1414,7 +1414,7 @@ struct ShutdownSubs {
 /// - `recycled`: a completion-side call already owns a unit of `job_type`'s
 ///   capacity (its own dispatcher is about to release it) and hands it over
 ///   instead of releasing outright -- see [`JobTracker::recycle`].
-struct ClaimHook {
+pub(crate) struct ClaimHook {
     poller: std::sync::Weak<JobPoller>,
     fresh_demand: HashMap<JobType, usize>,
     recycled: Vec<(JobType, UnitReservation)>,
@@ -1426,7 +1426,20 @@ impl ClaimHook {
     /// than a value built inline: `TypeId::of` is a `const fn`, so this is
     /// fully compile-time-determined, and `&Self::RUNS_AFTER` promotes to a
     /// `'static` reference for free (no `OnceLock`, no runtime init check).
-    const RUNS_AFTER: [std::any::TypeId; 1] = [std::any::TypeId::of::<PromoteHeadsHook>()];
+    ///
+    /// Extended from `[PromoteHeadsHook]` to also name `ExecutionInsertHook`:
+    /// a claim must never run before the inserts that create the rows it
+    /// would claim. In practice `ClaimHook` is always registered
+    /// re-entrantly FROM `ExecutionInsertHook::pre_commit`, which already
+    /// guarantees the insert ran first -- but declaring the dependency makes
+    /// that hold for every call site (present or future) that hand-composes
+    /// both hooks on one `op`, not just the ones where registration happens
+    /// to occur in the right order today. See the crate-level hook-DAG note
+    /// on [`crate::execution_hooks`] for the full picture.
+    pub(crate) const RUNS_AFTER: [std::any::TypeId; 2] = [
+        std::any::TypeId::of::<crate::execution_hooks::ExecutionInsertHook>(),
+        std::any::TypeId::of::<PromoteHeadsHook>(),
+    ];
 }
 
 impl es_entity::operation::hooks::CommitHook for ClaimHook {
@@ -1495,6 +1508,40 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             }
         }
 
+        // Fix 3 (sb-max8): report exactly WHICH rows this pass claimed, per
+        // type, so the `NotifierHook` instance `ExecutionInsertHook` staged
+        // (deferred behind this hook -- see `RUNS_AFTER`) can check per-id
+        // coverage against its `added` and skip the notify only when this
+        // claim actually carried THOSE SAME freshly landed rows off -- not
+        // merely as many rows of the type. `claim_due_heads_in_op` claims a
+        // type's OLDEST due row, which can be pre-existing backlog rather
+        // than one of `added`'s ids, so a count match here would be unsound
+        // (see `ExecutionInsertHook::due_now_landed_ids_by_type`'s doc
+        // comment). Ids come from `self.claimed` (what was actually
+        // claimed), not `fresh_demand`/`recycled` (what was asked for) -- a
+        // claim can come back short of its reservations.
+        let mut claimed_ids: HashMap<JobType, HashSet<JobId>> = HashMap::new();
+        for (_, target, _) in &self.claimed {
+            match target {
+                DispatchTarget::Single(row) => {
+                    claimed_ids
+                        .entry(row.job_type.clone())
+                        .or_default()
+                        .insert(row.id);
+                }
+                DispatchTarget::Batch(job_type, rows) => {
+                    let entry = claimed_ids.entry(job_type.clone()).or_default();
+                    entry.extend(rows.iter().map(|row| row.id));
+                }
+            }
+        }
+        poller.notifier.register_execution_ready_in_op(
+            &mut op,
+            HashMap::new(),
+            claimed_ids,
+            HashSet::new(),
+        );
+
         es_entity::operation::hooks::PreCommitRet::ok(self, op)
     }
 
@@ -1502,7 +1549,7 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
     /// of work off to [`JobPoller::dispatch_job_from_reservation`]/
     /// [`JobPoller::dispatch_batch_from_reservation`]. Dispatching from here
     /// rather than inline in `pre_commit` because `post_commit` runs
-    /// synchronously (mirrors `notifier.rs`'s `JobEventHook`) — the actual
+    /// synchronously (mirrors `notifier.rs`'s `NotifierHook`) — the actual
     /// dispatch needs `.await`, so this spawns a detached task per entry,
     /// same as the ordinary poll-claim path already does off the poll loop.
     fn post_commit(self) {
@@ -1905,11 +1952,16 @@ async fn poll_jobs(
         window_rows AS (
             -- One LATERAL probe per type, each bounded by ITS OWN budget
             -- ($1 x $7 rows capped at that type's own row_limit), never by
-            -- how much is pending: cost is O(budget), flat in backlog.
-            -- Ordering is `(execute_at, id)` and the tiebreak is load-bearing
-            -- for the same reason it always was -- a total order, so each
-            -- type's window is a well-defined prefix rather than an
-            -- arbitrary cut through a group of rows sharing a timestamp.
+            -- how much is pending: cost is O(budget), flat in backlog --
+            -- true only because `idx_job_executions_pending_execute_at`
+            -- leads with `job_type`, so this probe is an index descent into
+            -- that type's own slice rather than a filter-scan of every
+            -- other type's pending rows too (see PERFORMANCE.md, "Claim
+            -- admission"). Ordering is `(execute_at, id)` within that slice
+            -- and the tiebreak is load-bearing for the same reason it
+            -- always was -- a total order, so each type's window is a
+            -- well-defined prefix rather than an arbitrary cut through a
+            -- group of rows sharing a timestamp.
             SELECT d.id, d.execute_at, d.job_type
             FROM limits t
             CROSS JOIN LATERAL (

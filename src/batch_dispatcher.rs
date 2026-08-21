@@ -413,16 +413,24 @@ impl BatchDispatcher {
     /// can be a different type than this batch's own; the hook wakes every
     /// promoted type itself.
     ///
-    /// The `to_delete` CTE locks the rows in id order BEFORE the `DELETE`
-    /// touches them, for deadlock avoidance rather than for correctness: a
-    /// spawn parking into several queues locks those queues' occupants in id
-    /// order too (`execution_hooks::insert`'s `lock_queue_occupants`), and
-    /// this statement contends with it for exactly those rows. A bare
-    /// `DELETE ... WHERE id = ANY(...)` would acquire in scan order --
-    /// unordered under a bitmap scan -- so a spawn and a batch completion
-    /// touching the same two rows could each hold what the other wants.
-    /// `MATERIALIZED` plus `ORDER BY` puts `LockRows` above `Sort`, which is
-    /// what makes the order actually hold at execution time.
+    /// The `to_delete` CTE locks the rows in `(queue_id, id)` order BEFORE
+    /// the `DELETE` touches them, for deadlock avoidance rather than for
+    /// correctness: a spawn parking into several queues locks those queues'
+    /// occupants in that same order (`execution_hooks::insert`'s
+    /// `lock_queue_occupants`), as does the promote swap
+    /// (`PromoteHeadsHook::apply`/`apply_freed`) and
+    /// `ExecutionInsertHook::insert_many`'s `input` CTE, and this statement
+    /// contends with them for exactly those rows. A bare `DELETE ... WHERE
+    /// id = ANY(...)` would acquire in scan order -- unordered under a
+    /// bitmap scan -- so a spawn and a batch completion touching the same
+    /// two rows could each hold what the other wants. `MATERIALIZED` plus
+    /// `ORDER BY` puts `LockRows` above `Sort`, which is what makes the
+    /// order actually hold at execution time. Ordering by `queue_id` here
+    /// even though this CTE is id-addressed (not queue-addressed, unlike
+    /// the other lockers) is what makes the agreement crate-wide rather
+    /// than local: a bare `id` order was internally consistent with itself
+    /// but not with a `queue_id`-leading locker touching an overlapping row
+    /// set.
     #[instrument(name = "job.batch_complete", skip_all, fields(n = ids.len()))]
     async fn complete_in_op(
         &mut self,
@@ -438,7 +446,7 @@ impl BatchDispatcher {
             WITH to_delete AS MATERIALIZED (
                 SELECT id FROM job_executions
                 WHERE id = ANY($1) AND poller_instance_id = $2
-                ORDER BY id
+                ORDER BY queue_id, id
                 FOR UPDATE
             ), deleted AS (
                 DELETE FROM job_executions je USING to_delete t WHERE je.id = t.id
@@ -602,15 +610,16 @@ impl BatchDispatcher {
             // `PromoteHeadsHook` freed-queue registration, never a CTE of
             // the DELETE (see that hook for the snapshot-visibility
             // reason; here it also merges with the retry registration
-            // above into one hook execution) -- including its id-ordered
-            // `to_delete` lock; see `complete_in_op`'s doc comment for why
-            // the ordering is load-bearing.
+            // above into one hook execution) -- including its
+            // `(queue_id, id)`-ordered `to_delete` lock; see
+            // `complete_in_op`'s doc comment for why the ordering (and
+            // leading with `queue_id`) is load-bearing.
             let rows = sqlx::query!(
                 r#"
                 WITH to_delete AS MATERIALIZED (
                     SELECT id FROM job_executions
                     WHERE id = ANY($1) AND poller_instance_id = $2
-                    ORDER BY id
+                    ORDER BY queue_id, id
                     FOR UPDATE
                 ), deleted AS (
                     DELETE FROM job_executions je USING to_delete t WHERE je.id = t.id

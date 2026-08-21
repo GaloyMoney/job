@@ -68,6 +68,19 @@ pub(crate) struct PromoteHeadsHook {
     pub(crate) freed_queues: Vec<String>,
 }
 
+impl PromoteHeadsHook {
+    /// [`CommitHook::runs_after`]'s dependency list -- see the hook-DAG note
+    /// on [`crate::execution_hooks`] for the full picture. A hand-composed
+    /// op that both spawns (registers `ExecutionInsertHook`) and promotes
+    /// (registers this hook standalone -- e.g. a retry backoff sharing a
+    /// transaction with an unrelated spawn) must see the spawn's rows before
+    /// this hook looks for a parked sibling to swap; a freshly `parked` row
+    /// from that spawn can be an older sibling this hook should have
+    /// promoted instead.
+    const RUNS_AFTER: [std::any::TypeId; 1] =
+        [std::any::TypeId::of::<super::insert::ExecutionInsertHook>()];
+}
+
 /// One sibling promoted by [`PromoteHeadsHook::apply`]: its type (for
 /// notify) and its own `execute_at`, unchanged by the promote (for callers
 /// that need to know whether it is ACTUALLY due, not merely promoted --
@@ -92,6 +105,15 @@ impl PromoteHeadsHook {
     /// promoting a sibling would fail `idx_job_executions_queue_active`
     /// outright, so the guard skips a queue that needs no promotion instead
     /// of erroring.
+    ///
+    /// Locks every head in `(queue_id, id)` order before updating any of
+    /// them -- the same global order every other multi-row locker of this
+    /// table agrees on (`lock_queue_occupants`, `Self::apply`'s own swap
+    /// lock, `ExecutionInsertHook::insert_many`'s `input` CTE). A batch
+    /// completion can free several queues in one call; without an ordered
+    /// lock here, it would acquire in whatever order the `UNNEST` input
+    /// happens to iterate, which can deadlock against a concurrent spawn's
+    /// pin or swap touching the same rows in the opposite order.
     async fn apply_freed(
         op: &mut impl AtomicOperation,
         queue_ids: &[String],
@@ -123,9 +145,23 @@ impl PromoteHeadsHook {
                     SELECT 1 FROM job_executions a
                     WHERE a.queue_id = q.queue_id AND a.state IN ('pending', 'running')
                 )
+            ), locked AS MATERIALIZED (
+                -- Lock every head in (queue_id, id) order before the UPDATE
+                -- below touches any of them -- the same global order
+                -- `lock_queue_occupants` and `Self::apply`'s own `locked` CTE
+                -- use. A bare `UPDATE ... FROM heads` has no ordering
+                -- guarantee of its own (`heads`'s row order is not a lock
+                -- order), so a multi-queue batch completion freeing several
+                -- queues here could otherwise acquire in planner/`UNNEST`
+                -- order and deadlock against a concurrent spawn's pin or
+                -- swap touching the same rows in the opposite order.
+                SELECT je.id FROM job_executions je
+                WHERE je.id IN (SELECT id FROM heads)
+                ORDER BY je.queue_id, je.id
+                FOR NO KEY UPDATE
             )
             UPDATE job_executions je SET state = 'pending'
-            FROM heads h WHERE je.id = h.id
+            FROM locked l WHERE je.id = l.id
             RETURNING je.job_type, je.execute_at AS "execute_at!"
             "#,
             &deduped,
@@ -141,13 +177,14 @@ impl PromoteHeadsHook {
     /// happens to belong to a queue with parked siblings (nothing changed
     /// for it, so there is nothing to fix).
     ///
-    /// Every row this touches is locked up front by the `locked` CTE, in id
-    /// order, matching every other multi-row locker of this table
-    /// (`execution_hooks::insert`'s `lock_queue_occupants`,
-    /// `batch_dispatcher.rs`'s two completers). Without it the `demote` and
-    /// promote `UPDATE`s acquire in planner-determined scan order, so two
-    /// concurrent multi-row callers -- two overlapping `reclaim_lost_jobs`
-    /// sweeps, or a batch reschedule racing a reclaim -- could each hold a row
+    /// Every row this touches is locked up front by the `locked` CTE, in
+    /// `(queue_id, id)` order -- the same global order
+    /// `execution_hooks::insert`'s `lock_queue_occupants` (the spawn-side
+    /// pin) and `ExecutionInsertHook::insert_many`'s `input` CTE agree on.
+    /// Without it the `demote` and promote `UPDATE`s acquire in
+    /// planner-determined scan order, so two concurrent multi-row callers --
+    /// two overlapping `reclaim_lost_jobs` sweeps, a batch reschedule racing
+    /// a reclaim, or a spawn's pin racing this swap -- could each hold a row
     /// the other wants. `FOR NO KEY UPDATE` rather than `FOR UPDATE` because
     /// it is what these `state`-only `UPDATE`s already take, and because it
     /// leaves a spawn's `FOR KEY SHARE` on the same row unblocked; `FOR
@@ -187,18 +224,21 @@ impl PromoteHeadsHook {
                 ) sib
                 WHERE (sib.execute_at, sib.id) < (c.execute_at, c.id)
             ), locked AS MATERIALIZED (
-                -- Take BOTH sides of every swap in id order, in one pass,
-                -- before either UPDATE below runs. `demote` reads from this
-                -- (not from `swaps`) purely to force that dependency. See the
-                -- doc comment for why the order is load-bearing; the strength
-                -- is exactly what the two writes below would take anyway --
-                -- `state` is no index's key column -- so this changes lock
-                -- ORDER only, never what conflicts with what.
+                -- Take BOTH sides of every swap in (queue_id, id) order, in
+                -- one pass, before either UPDATE below runs. `demote` reads
+                -- from this (not from `swaps`) purely to force that
+                -- dependency. See the doc comment for why the order is
+                -- load-bearing; the strength is exactly what the two writes
+                -- below would take anyway -- `state` is no index's key
+                -- column -- so this changes lock ORDER only, never what
+                -- conflicts with what. A swap's two rows always share one
+                -- `queue_id` (the sibling lookup is `queue_id = c.queue_id`),
+                -- so ordering by it groups each swap's pair together.
                 SELECT je.id FROM job_executions je
                 WHERE je.id IN (
                     SELECT pending_id FROM swaps UNION SELECT parked_id FROM swaps
                 )
-                ORDER BY je.id
+                ORDER BY je.queue_id, je.id
                 FOR NO KEY UPDATE
             ), demote AS (
                 UPDATE job_executions SET state = 'parked'
@@ -313,5 +353,9 @@ impl CommitHook for PromoteHeadsHook {
         self.freed_queues.append(&mut other.freed_queues);
         self.own_types.extend(other.own_types.drain());
         true
+    }
+
+    fn runs_after(&self) -> &[std::any::TypeId] {
+        &Self::RUNS_AFTER
     }
 }

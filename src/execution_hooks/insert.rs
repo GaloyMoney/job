@@ -58,7 +58,7 @@ struct InsertedRow {
 /// 3. Re-entrant registration (`op.add_commit_hook`, which this
 ///    `HookOperation` always supports -- see the [module docs on re-entrant
 ///    registration](es_entity::operation::hooks#re-entrant-registration)) of
-///    a `JobEventHook` per type that landed pending or got promoted, and a
+///    a `NotifierHook` per type that landed pending or got promoted, and a
 ///    `ClaimHook` with `n_due` = this pass's own due-now landed-pending count
 ///    per type.
 pub(crate) struct ExecutionInsertHook {
@@ -128,6 +128,20 @@ impl ExecutionInsertHook {
     /// `COALESCE` of two scalar subqueries is safe. This is what lets a
     /// batch's own losing rows -- not just pre-existing backlog -- get
     /// swap-checked by [`PromoteHeadsHook`] next.
+    ///
+    /// `input` is `MATERIALIZED` and `ORDER BY (queue_id, id)`, deliberately:
+    /// the `ins` arbiter insert's `ON CONFLICT` WAITS on a concurrent
+    /// uncommitted row holding the same queue slot, and per-row arbiter
+    /// processing follows a materialized CTE's stored (i.e. sorted) row
+    /// order -- the same mechanism `PromoteHeadsHook::apply`'s `locked` CTE
+    /// uses to fix lock ACQUISITION order via `ORDER BY` + `FOR NO KEY
+    /// UPDATE`. This puts the arbiter wait on the SAME global order as every
+    /// other waiting locker of this table (`lock_queue_occupants` below,
+    /// `PromoteHeadsHook::apply`/`apply_freed`), regardless of what order
+    /// `rows` arrived in -- the row order is enforced in SQL, not by the
+    /// caller/accumulator having sorted `rows` beforehand. Unqueued rows
+    /// (`queue_id IS NULL`) sort last under plain `ORDER BY` and never
+    /// conflict, so their position doesn't matter.
     async fn insert_many(
         op: &mut impl AtomicOperation,
         rows: &[NewExecutionRow],
@@ -140,9 +154,10 @@ impl ExecutionInsertHook {
         sqlx::query_as!(
             InsertedRow,
             r#"
-            WITH input AS (
+            WITH input AS MATERIALIZED (
                 SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[])
                     AS t(id, job_type, queue_id, execute_at)
+                ORDER BY queue_id, id
             ), ins AS (
                 INSERT INTO job_executions
                     (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
@@ -217,15 +232,22 @@ impl ExecutionInsertHook {
     ///   same queue never serialize against each other. Insert throughput is
     ///   unaffected by this statement.
     ///
-    /// `ORDER BY id` inside a `MATERIALIZED` CTE is what makes the lock
-    /// acquisition order deterministic (the plan puts `LockRows` above
-    /// `Sort`, so rows are locked in id order however the scan below reached
-    /// them -- an unordered bitmap scan included). Every other multi-row
-    /// locker of this table locks in the same id order for the same reason;
-    /// see `batch_dispatcher.rs`'s `complete_in_op` and
-    /// [`PromoteHeadsHook::apply`]. Without that agreement, a multi-queue
-    /// spawn and a multi-queue batch completion touching the same two rows in
-    /// opposite orders would deadlock.
+    /// `ORDER BY queue_id, id` inside a `MATERIALIZED` CTE is what makes the
+    /// lock acquisition order deterministic (the plan puts `LockRows` above
+    /// `Sort`, so rows are locked in that order however the scan below
+    /// reached them -- an unordered bitmap scan included). This is the same
+    /// global order as [`PromoteHeadsHook::apply`]'s swap lock and
+    /// [`Self::insert_many`]'s `input` CTE, which orders the arbiter insert
+    /// the same way, in SQL, rather than relying on `rows` having arrived
+    /// pre-sorted. Without agreement here, a multi-queue spawn and a
+    /// multi-queue batch completion touching the same two rows in opposite
+    /// orders would deadlock.
+    ///
+    /// `batch_dispatcher.rs`'s `complete_in_op` still locks its own
+    /// (disjoint, id-addressed) row set by plain `id`, not `(queue_id, id)`
+    /// -- deliberately out of scope here, see the lock-ordering fix's PR
+    /// description for why sorting removes same-shape cycles but cannot
+    /// exclude every heterogeneous one.
     ///
     /// The one thing this DOES contend with is the claim: `poll_jobs` and
     /// `claim_due_heads_in_op` take `FOR UPDATE SKIP LOCKED`, which conflicts
@@ -259,7 +281,7 @@ impl ExecutionInsertHook {
             WITH locked AS MATERIALIZED (
                 SELECT id, queue_id, job_type, state FROM job_executions
                 WHERE queue_id = ANY($1) AND state IN ('pending', 'running')
-                ORDER BY id
+                ORDER BY queue_id, id
                 FOR KEY SHARE
             )
             SELECT queue_id AS "queue_id!", job_type AS "job_type!",
@@ -369,7 +391,7 @@ impl ExecutionInsertHook {
     /// call never touched, not one of `rows`; its own `execute_at`, carried
     /// on [`PromotedRow`], is unchanged by the promote and is what this
     /// checks). A promoted-but-not-yet-due row still gets a plain
-    /// `execution_ready` notify (see [`Self::notify_types`], which does NOT
+    /// `execution_ready` notify (see [`Self::promoted_types`], which does NOT
     /// due-gate -- the ordinary poll will pick it up once it actually comes
     /// due) but must NOT count as claim demand here: `claim_due_heads_in_op`
     /// claims the type's OLDEST due row, not specifically the promoted one,
@@ -405,31 +427,80 @@ impl ExecutionInsertHook {
         due
     }
 
-    /// Every type worth an `execution_ready` notify: one landed pending (so
-    /// its own backlog gained a claimable row), or one got promoted by
-    /// [`PromoteHeadsHook`] (so ITS backlog did) -- regardless of the
-    /// promoted row's own due-ness, unlike [`Self::due_now_by_type`]: a
-    /// plain notify only ever wakes the ordinary poll (which re-checks
-    /// `execute_at <= now` itself), so over-notifying a not-yet-due
-    /// promotion is harmless, while over-COUNTING it as claim demand is not
-    /// (see that method's doc comment).
-    fn notify_types(
+    /// The specific ids behind [`Self::due_now_by_type`]'s LANDED-row half
+    /// only (never promoted rows -- [`PromotedRow`] carries no id to
+    /// attribute against, and promoted types are already unconditionally
+    /// forced via [`Self::promoted_types`], so they never need this).
+    ///
+    /// [`NotifierHook`] needs the exact ids, not just a count:
+    /// `ClaimHook` always claims a type's OLDEST due row via
+    /// `claim_due_heads_in_op`, which can be a pre-existing backlog row
+    /// rather than one of THESE newly-landed ones. A count comparison would
+    /// wrongly call a type "covered" whenever a claim happened to match the
+    /// count, even if it claimed different rows entirely and left these
+    /// stuck. Comparing ids as sets closes that gap.
+    ///
+    /// [`NotifierHook`]: crate::notifier::NotifierHook
+    fn due_now_landed_ids_by_type(
         inserted: &[InsertedRow],
         rows: &[NewExecutionRow],
-        promoted: &[PromotedRow],
+        now: DateTime<Utc>,
+    ) -> HashMap<JobType, HashSet<JobId>> {
+        let by_id: HashMap<JobId, &NewExecutionRow> = rows.iter().map(|r| (r.id, r)).collect();
+        let mut due: HashMap<JobType, HashSet<JobId>> = HashMap::new();
+        for row in inserted {
+            if !row.landed_pending {
+                continue;
+            }
+            let Some(new_row) = by_id.get(&row.id) else {
+                continue;
+            };
+            if new_row.schedule_at <= now {
+                due.entry(new_row.job_type.clone())
+                    .or_default()
+                    .insert(row.id);
+            }
+        }
+        due
+    }
+
+    /// Landed-pending rows whose `schedule_at` is still in the future -- the
+    /// complement of [`Self::due_now_by_type`]'s landed-row half. These can
+    /// never be reached by THIS SAME op's `ClaimHook` (which only claims
+    /// rows already due), so [`NotifierHook`] must always
+    /// notify their type rather than netting it against a claim count that
+    /// was never going to cover it.
+    ///
+    /// [`NotifierHook`]: crate::notifier::NotifierHook
+    fn not_yet_due_landed_types(
+        inserted: &[InsertedRow],
+        rows: &[NewExecutionRow],
+        now: DateTime<Utc>,
     ) -> HashSet<JobType> {
         let by_id: HashMap<JobId, &NewExecutionRow> = rows.iter().map(|r| (r.id, r)).collect();
-        let mut types: HashSet<JobType> = inserted
+        inserted
             .iter()
             .filter(|row| row.landed_pending)
-            .filter_map(|row| by_id.get(&row.id).map(|new_row| new_row.job_type.clone()))
-            .collect();
-        types.extend(
-            promoted
-                .iter()
-                .map(|row| JobType::from_owned(row.job_type.clone())),
-        );
-        types
+            .filter_map(|row| by_id.get(&row.id).copied())
+            .filter(|new_row| new_row.schedule_at > now)
+            .map(|new_row| new_row.job_type.clone())
+            .collect()
+    }
+
+    /// Every type [`PromoteHeadsHook::apply`] promoted a sibling into,
+    /// regardless of that sibling's own due-ness, unlike
+    /// [`Self::due_now_by_type`]'s promoted-row half: a head-swap claim
+    /// targets a type's OLDEST due row, not specifically the one promoted
+    /// here, so a promotion may or may not be what gets claimed --
+    /// [`NotifierHook`] always forces its type rather than
+    /// netting it against this pass's claim count.
+    ///
+    /// [`NotifierHook`]: crate::notifier::NotifierHook
+    fn promoted_types(promoted: &[PromotedRow]) -> HashSet<JobType> {
+        promoted
+            .iter()
+            .map(|row| JobType::from_owned(row.job_type.clone()))
+            .collect()
     }
 }
 
@@ -478,20 +549,26 @@ impl CommitHook for ExecutionInsertHook {
         let promoted = PromoteHeadsHook::apply(&mut op, &promote_ids).await?;
 
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-        let mut notify = Self::notify_types(&inserted, &self.rows, &promoted);
-        // Re-wake every `pending` occupant this pass pinned: a poll that ran
-        // inside the commit tail skipped it under SKIP LOCKED and, because a
-        // skipped DUE row contributes no `next_due_at`, may now be asleep on
-        // claimable work. See `lock_queue_occupants`.
-        notify.extend(wake_types);
-        for job_type in notify {
-            self.notifier
-                .execution_ready_in_op(&mut op, &job_type)
-                .await?;
-        }
+        let due_now = Self::due_now_by_type(&inserted, &self.rows, &promoted, now);
+
+        // `forces`: notify-worthy regardless of what this pass's ClaimHook
+        // claims below -- a not-yet-due landed row and a promoted sibling
+        // can never be reached by a head-swap claim (which targets the
+        // type's oldest DUE row), and a pinned pending occupant a concurrent
+        // poll had to SKIP LOCKED past (see `lock_queue_occupants`) needs a
+        // wake regardless of self-claim. Due-now LANDED rows are handled
+        // separately below, by exact id, netted against `ClaimHook`'s
+        // `claimed` ids by `NotifierHook` -- see `due_now_landed_ids_by_type`
+        // for why ids and not counts.
+        let mut forces = Self::not_yet_due_landed_types(&inserted, &self.rows, now);
+        forces.extend(Self::promoted_types(&promoted));
+        forces.extend(wake_types);
+        let added = Self::due_now_landed_ids_by_type(&inserted, &self.rows, now);
+        self.notifier
+            .register_execution_ready_in_op(&mut op, added, HashMap::new(), forces);
 
         if let Some(poller) = self.poller.get().and_then(|w| w.upgrade()) {
-            for (job_type, n_due) in Self::due_now_by_type(&inserted, &self.rows, &promoted, now) {
+            for (job_type, n_due) in due_now {
                 poller.register_claim_demand(&mut op, &job_type, n_due);
             }
         }
@@ -678,35 +755,76 @@ mod tests {
         );
     }
 
-    /// A landed-pending row's type is always notify-worthy; a parked row's
-    /// is not, unless its queue's occupant got promoted.
+    /// A due landed-pending row must NOT force a notify -- it belongs in
+    /// `due_now_landed_ids_by_type`'s `added` instead, netted by
+    /// `NotifierHook` against whatever this same pass's `ClaimHook` actually
+    /// claims. Forcing it here would defeat the whole point of Fix 3: a
+    /// self-claimed row would notify unconditionally again.
     #[test]
-    fn notify_types_covers_pending_and_promoted_not_bare_parked() {
+    fn not_yet_due_landed_types_excludes_rows_already_due() {
         let now = chrono::Utc::now();
-        let landed = JobId::new();
-        let was_parked = JobId::new();
-        let rows = vec![
-            row(landed, TYPE_A.clone(), now),
-            row(was_parked, TYPE_B.clone(), now),
-        ];
-        let inserted = vec![pending(landed), parked(was_parked, None)];
+        let due = JobId::new();
+        let rows = vec![row(due, TYPE_A.clone(), now)];
+        let inserted = vec![pending(due)];
 
-        let types = ExecutionInsertHook::notify_types(&inserted, &rows, &[]);
+        let types = ExecutionInsertHook::not_yet_due_landed_types(&inserted, &rows, now);
+        assert!(
+            !types.contains(&TYPE_A),
+            "a due row must be handled via adds/suppress, not forced"
+        );
+    }
+
+    /// A future-scheduled landed-pending row can never be reached by this
+    /// same pass's head-swap claim (which only claims already-due rows), so
+    /// it must always force a notify regardless of what got claimed.
+    #[test]
+    fn not_yet_due_landed_types_includes_future_scheduled_rows() {
+        let now = chrono::Utc::now();
+        let future = JobId::new();
+        let rows = vec![row(
+            future,
+            TYPE_A.clone(),
+            now + chrono::Duration::hours(1),
+        )];
+        let inserted = vec![pending(future)];
+
+        let types = ExecutionInsertHook::not_yet_due_landed_types(&inserted, &rows, now);
         assert!(types.contains(&TYPE_A));
+    }
+
+    /// A row that landed `parked` (never claimable) contributes nothing,
+    /// even with a future `schedule_at` -- nothing about it becoming
+    /// claimable happens in this call.
+    #[test]
+    fn not_yet_due_landed_types_ignores_parked_rows() {
+        let now = chrono::Utc::now();
+        let was_parked = JobId::new();
+        let rows = vec![row(
+            was_parked,
+            TYPE_B.clone(),
+            now + chrono::Duration::hours(1),
+        )];
+        let inserted = vec![parked(was_parked, None)];
+
+        let types = ExecutionInsertHook::not_yet_due_landed_types(&inserted, &rows, now);
         assert!(!types.contains(&TYPE_B));
     }
 
+    /// Every promoted type forces a notify regardless of the promoted row's
+    /// own due-ness -- a head-swap claim targets a type's oldest due row,
+    /// not specifically the one promoted here, so it may or may not be
+    /// what gets claimed.
     #[test]
-    fn notify_types_includes_promoted_types_even_with_nothing_pending() {
-        let inserted: Vec<InsertedRow> = vec![];
-        let rows: Vec<NewExecutionRow> = vec![];
-        // notify never due-gates, unlike claim demand.
-        let promoted = vec![promoted_row(
-            TYPE_B.clone(),
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        )];
+    fn promoted_types_includes_every_promoted_type_regardless_of_due_ness() {
+        let promoted = vec![
+            promoted_row(TYPE_A.clone(), chrono::Utc::now()),
+            promoted_row(
+                TYPE_B.clone(),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            ),
+        ];
 
-        let types = ExecutionInsertHook::notify_types(&inserted, &rows, &promoted);
-        assert_eq!(types, HashSet::from([TYPE_B]));
+        let types = ExecutionInsertHook::promoted_types(&promoted);
+        assert_eq!(types, HashSet::from([TYPE_A, TYPE_B]));
     }
 }
