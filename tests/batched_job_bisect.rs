@@ -911,3 +911,181 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+/// The conflict allowance must not be spendable by the probe budget.
+///
+/// A conflicted probe re-runs the same range, which is not search progress, so
+/// it refunds what it drew from [`BisectBudget`]. Without that refund the cap
+/// can fall in the gap between a conflict and its retry, and the re-queued
+/// range is then budget-`Fail`ed -- a per-item verdict pinned on jobs for a
+/// deadlock none of them caused, burning their retry attempts. That is exactly
+/// what the conflict path exists to prevent.
+///
+/// `MaxProbes(1)` is the sharpest case: the first conflict spends the only
+/// probe, so before the refund the allowance could never run at all.
+#[tokio::test]
+async fn a_conflict_retry_is_not_charged_to_the_probe_budget() -> anyhow::Result<()> {
+    let table = "bisect_conflict_budget";
+    let pool = helpers::init_pool().await?;
+    reset_scratch_table(&pool, table).await?;
+    for v in [1, 2] {
+        sqlx::query(&format!("INSERT INTO {table} (v) VALUES ($1)"))
+            .bind(v)
+            .execute(&pool)
+            .await?;
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct CbConfig {
+        table: String,
+    }
+
+    struct CbRunner {
+        table: String,
+        probes: Arc<AtomicUsize>,
+        helper_ready: Arc<tokio::sync::Semaphore>,
+        probe_ready: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl BatchedJobRunner for CbRunner {
+        type Config = CbConfig;
+
+        async fn run_batch(
+            &self,
+            current_batch: CurrentBatchedJob<CbConfig>,
+        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+            let mut op = current_batch.begin_op().await?;
+            let probes = Arc::clone(&self.probes);
+            let helper_ready = Arc::clone(&self.helper_ready);
+            let probe_ready = Arc::clone(&self.probe_ready);
+            let table = self.table.clone();
+            let outcomes = current_batch
+                .run_bisected_with(
+                    &mut op,
+                    BisectBudget::MaxProbes(1),
+                    async move |sp, _slice| {
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        let _ = helper_ready.acquire().await;
+                        sqlx::query(&format!("SELECT v FROM {table} WHERE v = 1 FOR UPDATE"))
+                            .fetch_one(sp.as_executor())
+                            .await?;
+                        probe_ready.add_permits(4096);
+                        sqlx::query(&format!("SELECT v FROM {table} WHERE v = 2 FOR UPDATE"))
+                            .fetch_one(sp.as_executor())
+                            .await?;
+                        Ok::<_, sqlx::Error>(())
+                    },
+                )
+                .await?;
+            Ok(JobBatchCompletion::WithOutcomesWithOp(op, outcomes))
+        }
+    }
+
+    struct CbInitializer {
+        job_type: JobType,
+        table: String,
+        probes: Arc<AtomicUsize>,
+        helper_ready: Arc<tokio::sync::Semaphore>,
+        probe_ready: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl BatchedJobInitializer for CbInitializer {
+        type Config = CbConfig;
+        fn job_type(&self) -> JobType {
+            self.job_type.clone()
+        }
+        fn retry_on_error_settings(&self) -> RetrySettings {
+            RetrySettings {
+                // Terminal on first failure: a budget-`Fail` therefore shows up
+                // as `Errored` rather than being hidden by a later retry.
+                n_attempts: Some(1),
+                ..Default::default()
+            }
+        }
+        fn init(
+            &self,
+            _: job::JobSpawner<Self::Config>,
+        ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>>
+        {
+            Ok(Box::new(CbRunner {
+                table: self.table.clone(),
+                probes: Arc::clone(&self.probes),
+                helper_ready: Arc::clone(&self.helper_ready),
+                probe_ready: Arc::clone(&self.probe_ready),
+            }))
+        }
+    }
+
+    let probes = Arc::new(AtomicUsize::new(0));
+    let helper_ready = Arc::new(tokio::sync::Semaphore::new(0));
+    let probe_ready = Arc::new(tokio::sync::Semaphore::new(0));
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_batched_initializer(CbInitializer {
+        job_type: helpers::job_type("bisect-conflict-budget"),
+        table: table.to_string(),
+        probes: Arc::clone(&probes),
+        helper_ready: Arc::clone(&helper_ready),
+        probe_ready: Arc::clone(&probe_ready),
+    });
+
+    let ids: Vec<JobId> = (0..2).map(|_| JobId::new()).collect();
+    spawner
+        .spawn_all(
+            ids.iter()
+                .map(|id| {
+                    JobSpec::new(
+                        *id,
+                        CbConfig {
+                            table: table.to_string(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+    let helper_pool = helpers::init_pool().await?;
+    let helper_table = table.to_string();
+    let helper = tokio::spawn(async move {
+        let mut tx = helper_pool.begin().await?;
+        sqlx::query(&format!(
+            "SELECT v FROM {helper_table} WHERE v = 2 FOR UPDATE"
+        ))
+        .fetch_one(&mut *tx)
+        .await?;
+        helper_ready.add_permits(4096);
+        let _ = probe_ready.acquire().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let _ = sqlx::query(&format!(
+            "SELECT v FROM {helper_table} WHERE v = 1 FOR UPDATE"
+        ))
+        .fetch_one(&mut *tx)
+        .await;
+        let _ = tx.rollback().await;
+        Ok::<_, sqlx::Error>(())
+    });
+
+    jobs.start_poll().await?;
+    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    let _ = helper.await;
+
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed),
+        "a conflict retry must survive a budget of one probe, not be \
+         budget-failed; saw {:?}",
+        outcomes.iter().map(|o| o.state()).collect::<Vec<_>>()
+    );
+    // Two closure invocations against a one-probe budget: the conflicted probe
+    // refunded what it drew, so the retry had a budget to run on.
+    let used = probes.load(Ordering::SeqCst);
+    assert_eq!(
+        used, 2,
+        "expected the conflicted probe plus its refunded retry, saw {used}"
+    );
+
+    Ok(())
+}

@@ -199,6 +199,12 @@ pub type BatchOutcomes = Vec<(JobId, BatchItemOutcome)>;
 /// This is the one knob the helper exposes, and it is per-call, not a
 /// property of the job type: the right budget depends on how expensive the
 /// caller's probe closure is, which only the call site knows.
+///
+/// It bounds the *search*. A probe Postgres aborted as a deadlock victim or
+/// serialization failure is re-run against the same range without drawing on
+/// this budget, under its own small allowance — so a batch that hits conflicts
+/// can invoke the closure a few times beyond the cap. That is deliberate: the
+/// alternative is budget-failing jobs for a conflict none of them caused.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BisectBudget {
     /// `2 * ceil(log2(N)) + 1` probes, computed per call from the batch
@@ -246,6 +252,14 @@ impl BisectBudget {
 /// these conflicts resolve as soon as the surviving partner commits, so a
 /// re-probe normally succeeds at once; a batch that keeps losing is contending
 /// with something persistent and belongs in a whole-batch retry, not here.
+///
+/// Separate from [`BisectBudget`] on purpose. A conflict retry is not search
+/// progress -- it re-runs a range the search has already chosen -- so it
+/// refunds what it drew from the search budget and draws on this instead.
+/// Sharing one counter would let the cap fall between a conflict and its
+/// retry, and the re-queued range would then be budget-`Fail`ed: a per-item
+/// verdict pinned on jobs for a conflict none of them caused, which is the
+/// whole thing this path exists to prevent.
 const BISECT_MAX_CONFLICT_RETRIES: usize = 2;
 
 /// `ceil(log2(n))`, defined as `0` for `n <= 1`.
@@ -733,9 +747,19 @@ impl<C> CurrentBatchedJob<C> {
                     // is the total `deadlock_timeout` this batch can pay,
                     // since Postgres makes every conflicting probe wait one
                     // (a second, by default) before reporting.
+                    //
+                    // It is also a budget of its own, refunding what this
+                    // probe drew from [`BisectBudget`]. A conflict is not
+                    // search progress -- the same range is about to be run
+                    // again -- so charging the search for it would let the cap
+                    // fall in between and budget-`Fail` the very items this
+                    // path exists to protect. `MaxProbes(1)` made that certain:
+                    // the first conflict spent the only probe, and the re-queued
+                    // range was failed instead of retried.
                     if let Some(code) = crate::error::retryable_conflict_code(&e) {
                         if conflict_retries < BISECT_MAX_CONFLICT_RETRIES {
                             conflict_retries += 1;
+                            probes_used -= 1;
                             tracing::warn!(
                                 target: "job.batch_bisect",
                                 n_items = n,
