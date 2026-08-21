@@ -32,6 +32,86 @@ use super::{
     tracker::{JobTracker, UnitReservation},
 };
 
+/// How many times a crate-owned seal transaction is re-attempted after
+/// Postgres aborts it as a deadlock victim or serialization failure.
+///
+/// Small on purpose: these conflicts are resolved by whichever partner
+/// survives, so a re-attempt normally succeeds immediately. If three in a row
+/// lose, something is wrong beyond ordinary contention and the batch is
+/// better off going through the rescue path than spinning here.
+const SEAL_MAX_ATTEMPTS: u32 = 3;
+
+/// Whether Postgres aborted this transaction for a conflict that is, by
+/// definition, resolved by retrying: `40P01` deadlock detected, `40001`
+/// serialization failure. The victim did nothing wrong -- the server picked
+/// it to break a cycle.
+///
+/// Walks the source chain rather than matching one [`JobError`] variant: the
+/// same abort surfaces as `Sqlx` from raw statements and wrapped in a repo
+/// error (`Modify`/`Find`/`Query`/`Create`) from es-entity's own writes,
+/// and a seal touches both.
+fn is_retryable_conflict(err: &JobError) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if let Some(db) = e
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+            && matches!(db.code().as_deref(), Some("40P01") | Some("40001"))
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// What happened to a batch's claimed rows after the dispatcher failed
+/// terminally. Reported on the `batch dispatcher error` log so an operator
+/// can tell a self-healing blip from a genuine stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimDisposition {
+    /// Rows were handed back as `pending` with `execute_at = now`; the next
+    /// poll re-dispatches them.
+    Rescheduled,
+    /// The batch had already dispositioned its rows (they are terminal or
+    /// pending by the seal's own doing) -- nothing was left claimed.
+    AlreadyDisposed,
+    /// The rescue itself failed. Rows stay `running` under this instance and
+    /// only the lost-handler will recover them, one `job_lost_interval`
+    /// later. This is the case that used to be silent.
+    Leaked,
+}
+
+impl std::fmt::Display for ClaimDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ClaimDisposition::Rescheduled => "rescheduled",
+            ClaimDisposition::AlreadyDisposed => "already-disposed",
+            ClaimDisposition::Leaked => "leaked",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Renders a batch's ids as a comma-separated list for one log field.
+///
+/// The `batch dispatcher error` log used to carry only the error, which is
+/// why two production runs of lost-job bursts went undiagnosed: there was no
+/// way to tie an error line to the jobs it stranded.
+struct DisplayIds<'a>(&'a [JobId]);
+
+impl std::fmt::Display for DisplayIds<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, id) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{id}")?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct BatchDispatcher {
     /// Reaches this process's poller for the head-swap completion-recycle
     /// claim (`try_recycle_own_type`). `Weak` so a dispatcher never keeps the
@@ -47,6 +127,10 @@ pub(crate) struct BatchDispatcher {
     attempts: HashMap<JobId, u32>,
     rescheduled: bool,
     dispatched: bool,
+    /// Whether this batch's unit has already been handed to a recycle
+    /// reservation. See [`Self::try_recycle_own_type`] -- it must happen at
+    /// most once, including across a retried seal.
+    recycled: bool,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
 }
@@ -91,6 +175,7 @@ impl BatchDispatcher {
             attempts,
             rescheduled: false,
             dispatched: true,
+            recycled: false,
             instance_id,
             clock,
         }
@@ -133,6 +218,7 @@ impl BatchDispatcher {
             attempts,
             rescheduled: false,
             dispatched: true,
+            recycled: false,
             instance_id,
             clock,
         }
@@ -166,16 +252,30 @@ impl BatchDispatcher {
     /// `fail_in_op` would try to spend the SAME freed unit twice whenever
     /// one batch disposes items through both branches.
     fn try_recycle_own_type(&mut self, op: &mut impl AtomicOperation) {
+        // "Exactly once" has to hold across the conflict retries in
+        // `seal_in_own_op`/`fail_batch` too, not just across sub-outcome
+        // branches. A rolled-back attempt drops its `UnitReservation`, and
+        // dropping one *releases* the unit -- so handing out a second
+        // reservation for the same unit would release it twice and hand the
+        // tracker capacity it does not have. A retried seal therefore
+        // forfeits the recycle optimisation, which costs at most one
+        // extra poll: `recycle_unit` has already cleared `dispatched`, so
+        // `Drop` correctly declines to release the unit a second time.
+        if self.recycled {
+            return;
+        }
         let Some(poller) = self.poller.upgrade() else {
             return;
         };
+        self.recycled = true;
         self.recycle_unit();
         let reservation = self.tracker.recycle(&self.job_type);
         poller.register_claim_recycle(op, &self.job_type, reservation);
     }
 
     #[instrument(name = "job.execute_batch", skip_all,
-        fields(job_type, n_items, poller_id, error, error.level, error.message, conclusion, now)
+        fields(job_type, n_items, poller_id, error, error.level, error.message, conclusion, now,
+               claim_disposition)
     )]
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_batch(
@@ -218,11 +318,92 @@ impl BatchDispatcher {
         };
 
         let runner = self.runner.take().expect("runner");
-        match Self::run_batch(runner, items, ctx).await {
+        let outcome = match Self::run_batch(runner, items, ctx).await {
             Ok(completion) => self.apply(completion).await,
             Err(e) => {
                 span.record("conclusion", "Error");
                 self.fail_batch(e).await
+            }
+        };
+
+        // Every failure funnels here, and every one of them leaves this
+        // batch's rows still `running` under this instance -- the seal is
+        // atomic, so an error means nothing was dispositioned. Before
+        // sb-max10 the error was logged and that was the end of it: `Drop`
+        // had already dropped the ids from the live tracker, so the
+        // keep-alive stopped refreshing their `alive_at`, and the rows sat
+        // frozen until the lost-handler noticed them a full
+        // `job_lost_interval` later. In production that stalled five loan
+        // approvals for 7m40s behind a single deadlock.
+        //
+        // Hand the rows back instead, so the lost-handler is a true backstop
+        // rather than the primary recovery path.
+        if let Err(e) = outcome {
+            let disposition = self.rescue_claimed_rows().await;
+            span.record("claim_disposition", tracing::field::display(disposition));
+            // Emitted here rather than in the poller's spawn wrapper, which
+            // is where it used to live: only this scope knows WHICH jobs were
+            // affected and what became of them. The old log carried the error
+            // alone, which is why two production runs of lost-job bursts went
+            // undiagnosed -- nothing tied an error line to the jobs it
+            // stranded.
+            tracing::error!(
+                job_type = %self.job_type,
+                job_ids = %DisplayIds(&self.ids),
+                n_items = self.ids.len(),
+                claim_disposition = %disposition,
+                exception.message = %e,
+                exception.type = std::any::type_name_of_val(&e),
+                "batch dispatcher error"
+            );
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Last-resort release of rows this batch still holds, in a fresh
+    /// transaction (the failed one is poisoned).
+    ///
+    /// Deliberately `reschedule_in_op` rather than `fail_in_op`: a deadlock
+    /// victim or a dead connection says nothing about the job's own
+    /// correctness, so it must not burn a retry attempt or push the job
+    /// terminal. The rows go back to `pending` with `execute_at = now` and
+    /// `attempt_index = 1`, which is what the next poll re-dispatches.
+    ///
+    /// Best-effort by construction: if this fails too there is nothing left
+    /// to try, and the lost-handler remains as the final backstop -- but the
+    /// return value makes that outcome visible instead of silent.
+    async fn rescue_claimed_rows(&mut self) -> ClaimDisposition {
+        if self.ids.is_empty() {
+            return ClaimDisposition::AlreadyDisposed;
+        }
+        let now = self.clock.now();
+        let reschedules: Vec<(JobId, DateTime<Utc>)> =
+            self.ids.iter().map(|id| (*id, now)).collect();
+
+        let attempt = async {
+            let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+            self.reschedule_in_op(&mut op, reschedules).await?;
+            op.commit().await?;
+            Ok::<_, JobError>(())
+        }
+        .await;
+
+        match attempt {
+            // `reschedule_in_op` filters on `poller_instance_id`, so a batch
+            // whose rows were already dispositioned matches nothing and
+            // still lands here -- harmless either way.
+            Ok(()) => ClaimDisposition::Rescheduled,
+            Err(e) => {
+                tracing::error!(
+                    job_type = %self.job_type,
+                    job_ids = %DisplayIds(&self.ids),
+                    exception.message = %e,
+                    exception.type = std::any::type_name_of_val(&e),
+                    "could not release claimed rows; they stay running until \
+                     the lost-handler reclaims them"
+                );
+                ClaimDisposition::Leaked
             }
         }
     }
@@ -285,18 +466,14 @@ impl BatchDispatcher {
             JobBatchCompletion::CompleteAll => {
                 span.record("conclusion", "CompleteAll");
                 let outcomes = self.all_complete();
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                self.seal(&mut op, outcomes).await?;
-                op.commit().await?;
+                self.seal_in_own_op(outcomes).await?;
             }
             JobBatchCompletion::WithOutcomes(outcomes) => {
                 span.record("conclusion", "WithOutcomes");
                 if let Err(e) = self.validate(&outcomes) {
                     return self.fail_batch(e).await;
                 }
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                self.seal(&mut op, outcomes).await?;
-                op.commit().await?;
+                self.seal_in_own_op(outcomes).await?;
             }
             #[cfg(feature = "es-entity")]
             JobBatchCompletion::CompleteAllWithOp(mut op) => {
@@ -375,6 +552,45 @@ impl BatchDispatcher {
             )));
         }
         Ok(())
+    }
+
+    /// Seal into a transaction this dispatcher owns, re-attempting the whole
+    /// transaction when Postgres aborts it as a deadlock victim or
+    /// serialization failure.
+    ///
+    /// Retrying is only sound *because* the transaction is the crate's own:
+    /// it holds nothing but this batch's bookkeeping, the abort rolled all of
+    /// it back, and `outcomes` is plain data that re-applies identically. The
+    /// `*WithOp`/`*WithTx` completions cannot use this -- the runner's own
+    /// writes live in that same transaction, so an abort destroys work this
+    /// dispatcher cannot recreate. Those fall through to the rescue in
+    /// `execute_batch`, which hands the rows back so the runner runs again.
+    async fn seal_in_own_op(&mut self, outcomes: BatchOutcomes) -> Result<(), JobError> {
+        let mut attempt = 1;
+        loop {
+            let result = async {
+                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                self.seal(&mut op, outcomes.clone()).await?;
+                op.commit().await?;
+                Ok::<_, JobError>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < SEAL_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                    tracing::warn!(
+                        job_type = %self.job_type,
+                        job_ids = %DisplayIds(&self.ids),
+                        attempt,
+                        exception.message = %e,
+                        "batch seal lost a lock conflict; retrying"
+                    );
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     async fn seal(
@@ -679,14 +895,40 @@ impl BatchDispatcher {
     )]
     async fn fail_batch(&mut self, error: JobError) -> Result<(), JobError> {
         let message = error.to_string();
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-        let fails: Vec<(JobId, String)> =
-            self.ids.iter().map(|id| (*id, message.clone())).collect();
-        self.fail_in_op(&mut op, fails, now).await?;
-        self.try_recycle_own_type(&mut op);
-        op.commit().await?;
-        Ok(())
+        // Same bounded conflict retry as `seal_in_own_op`, and sound for the
+        // same reason: this transaction is the crate's own. Losing the
+        // failure-recording transaction to a deadlock is the worst time to
+        // give up -- it would strand rows whose disposition was already
+        // decided.
+        let mut attempt = 1;
+        loop {
+            let result = async {
+                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+                let fails: Vec<(JobId, String)> =
+                    self.ids.iter().map(|id| (*id, message.clone())).collect();
+                self.fail_in_op(&mut op, fails, now).await?;
+                self.try_recycle_own_type(&mut op);
+                op.commit().await?;
+                Ok::<_, JobError>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < SEAL_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                    tracing::warn!(
+                        job_type = %self.job_type,
+                        job_ids = %DisplayIds(&self.ids),
+                        attempt,
+                        exception.message = %e,
+                        "batch fail-record lost a lock conflict; retrying"
+                    );
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
