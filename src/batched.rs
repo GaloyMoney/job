@@ -34,9 +34,19 @@
 //!   against the batch's `op` aborts the whole transaction. To isolate it —
 //!   so batch-mates still commit — run that item's work through
 //!   [`CurrentBatchedJob::run_isolated`], which wraps each item in its own
-//!   `SAVEPOINT` via [`es_entity::DbOp::with_savepoint`]. Savepoints isolate
-//!   *failures*, not *contention*: they do not release Postgres locks, so
-//!   they are not a lever for raising batch size under lock pressure.
+//!   `SAVEPOINT` via [`es_entity::DbOp::with_savepoint`]. Rolling back to a
+//!   savepoint DOES release the locks taken since it (row and table alike --
+//!   verified against Postgres), so a failed item leaves nothing pinned. What
+//!   savepoints do not shorten is how long a *successful* item's locks are
+//!   held: those live until the shared transaction commits, exactly as they
+//!   would without one. Savepoints are therefore a lever for isolating
+//!   failures, not for raising batch size under lock pressure.
+//! - A **true batch** (batch-load, mutate, batch-persist as one statement)
+//!   has no per-item loop for `run_isolated` to wrap. For that shape, use
+//!   [`CurrentBatchedJob::run_bisected`] instead: it probes the whole batch
+//!   in one savepoint and, only on failure, auto-bisects into smaller
+//!   sub-ranges until each culprit is isolated — clean items still commit
+//!   in this dispatch instead of every item failing through to solo retry.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -45,6 +55,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use super::{
@@ -180,6 +191,117 @@ pub enum BatchItemOutcome {
 
 /// Per-job dispositions returned by a batched runner.
 pub type BatchOutcomes = Vec<(JobId, BatchItemOutcome)>;
+
+/// How many probes [`CurrentBatchedJob::run_bisected_with`] may spend on one
+/// batch. A probe is one invocation of the caller's closure — successful or
+/// not — including the initial whole-batch attempt.
+///
+/// This is the one knob the helper exposes, and it is per-call, not a
+/// property of the job type: the right budget depends on how expensive the
+/// caller's probe closure is, which only the call site knows.
+///
+/// It bounds the *search*. A probe Postgres aborted as a deadlock victim or
+/// serialization failure is re-run against the same range without drawing on
+/// this budget, under its own small allowance — so a batch that hits conflicts
+/// can invoke the closure a few times beyond the cap. That is deliberate: the
+/// alternative is budget-failing jobs for a conflict none of them caused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BisectBudget {
+    /// `2 * ceil(log2(N)) + 1` probes, computed per call from the batch
+    /// size — exactly enough to fully isolate **one** culprit and complete
+    /// everything else, at any batch size (9 probes at N=10, 11 at N=25, 15
+    /// at N=100). A flat constant can't do this: at N=25 a cap of, say, 4
+    /// would exhaust after salvaging only ~12 of 25 items on a single
+    /// culprit, sending the other 12 *innocent* items through solo retry
+    /// for no reason. More than one culprit degrades gracefully:
+    /// largest-first probing still salvages the big clean ranges, and the
+    /// (smaller) remainder budget-fails into the ordinary solo-retry path.
+    #[default]
+    Auto,
+    /// An explicit hard cap, clamped to at least 1 (the first probe is
+    /// mandatory — nothing can be dispositioned without it).
+    /// `MaxProbes(1)` is the degenerate case: it probes once, and on
+    /// failure every item budget-fails — equivalent to returning `Err`
+    /// from `run_batch` directly, just routed through this helper.
+    MaxProbes(usize),
+    /// Run the search to completion instead of capping it: `2k * log2(N/k)`
+    /// probes for `k` culprits, degrading to `2N - 1` when every item is
+    /// bad. This is bounded by the batch size, not actually unbounded — but
+    /// it is the variant most likely to spend a probe budget you didn't
+    /// intend, so pick it explicitly rather than by default.
+    FullResolution,
+}
+
+impl BisectBudget {
+    /// Resolve to a concrete probe cap for a batch of `n` items.
+    fn effective_cap(self, n: usize) -> usize {
+        match self {
+            BisectBudget::Auto => 2 * ceil_log2(n) + 1,
+            BisectBudget::MaxProbes(max) => max.max(1),
+            BisectBudget::FullResolution => usize::MAX,
+        }
+    }
+}
+
+/// How many probes across one bisect may be re-attempted after Postgres
+/// aborted them as a deadlock victim or serialization failure.
+///
+/// Global rather than per range, because what needs bounding is the total
+/// `deadlock_timeout` a single batch can pay: Postgres makes every conflicting
+/// probe wait one out (a second, by default) before it reports. Small because
+/// these conflicts resolve as soon as the surviving partner commits, so a
+/// re-probe normally succeeds at once; a batch that keeps losing is contending
+/// with something persistent and belongs in a whole-batch retry, not here.
+///
+/// Separate from [`BisectBudget`] on purpose. A conflict retry is not search
+/// progress -- it re-runs a range the search has already chosen -- so it
+/// refunds what it drew from the search budget and draws on this instead.
+/// Sharing one counter would let the cap fall between a conflict and its
+/// retry, and the re-queued range would then be budget-`Fail`ed: a per-item
+/// verdict pinned on jobs for a conflict none of them caused, which is the
+/// whole thing this path exists to prevent.
+const BISECT_MAX_CONFLICT_RETRIES: usize = 2;
+
+/// `ceil(log2(n))`, defined as `0` for `n <= 1`.
+fn ceil_log2(n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    (usize::BITS - (n - 1).leading_zeros()) as usize
+}
+
+/// A contiguous, half-open range of item indices still awaiting a probe in
+/// [`CurrentBatchedJob::run_bisected_with`]'s search.
+///
+/// `Ord` makes this a max-heap key of `(length DESC, start ASC)`: the
+/// longest pending range is probed next, and among equal lengths the
+/// earliest one wins — both purely for determinism, so probe order (and
+/// therefore probe *count*) is reproducible given the same input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingRange {
+    start: usize,
+    end: usize,
+}
+
+impl PendingRange {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+}
+
+impl Ord for PendingRange {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.len()
+            .cmp(&other.len())
+            .then_with(|| other.start.cmp(&self.start))
+    }
+}
+
+impl PartialOrd for PendingRange {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Result returned by [`BatchedJobRunner::run_batch`].
 ///
@@ -419,6 +541,12 @@ impl<C> CurrentBatchedJob<C> {
     /// domain logic. That failure isn't attributable to a single item —
     /// propagate it with `?` and let the whole batch retry, exactly like a
     /// whole-batch `Err` returned from `run_batch` today.
+    ///
+    /// Use only `*_in_op` methods against the savepoint inside `f`. The
+    /// pool-backed [`BatchedJobItem::update_execution_state`] /
+    /// [`BatchedJobItem::set_result`] commit in their own transaction
+    /// outside `op` entirely, so they do **not** unwind if this item's
+    /// savepoint rolls back.
     #[cfg(feature = "es-entity")]
     pub async fn run_isolated<E>(
         &self,
@@ -439,6 +567,258 @@ impl<C> CurrentBatchedJob<C> {
             };
             outcomes.push((item.id, outcome));
         }
+        Ok(outcomes)
+    }
+
+    /// Run the whole batch as one unit inside a single `SAVEPOINT`; on
+    /// failure, auto-bisect: roll back and probe smaller contiguous
+    /// sub-ranges — largest pending range first — until each culprit is
+    /// isolated (or [`BisectBudget`] runs out). Clean items resolve to
+    /// [`BatchItemOutcome::Complete`] in this very dispatch; each culprit to
+    /// [`BatchItemOutcome::Fail`] (via `E`'s `Display`, from its own
+    /// singleton probe — so the message is attributable).
+    ///
+    /// The counterpart of [`run_isolated`](Self::run_isolated) for **true
+    /// batch** implementations: a batch-load/mutate/batch-persist runner has
+    /// no per-item loop for `run_isolated` to wrap, so its only failure
+    /// shape was previously "every item fails, all N retry solo". `f` here
+    /// takes a *slice* of items — probe them with one statement, the same
+    /// shape a true batch already uses.
+    ///
+    /// Equivalent to [`run_bisected_with`](Self::run_bisected_with) with
+    /// [`BisectBudget::default()`] (`Auto`).
+    ///
+    /// # Cost
+    ///
+    /// Happy path: one extra `SAVEPOINT`/`RELEASE` pair for the whole batch.
+    /// With `k` culprits in `N` items: roughly `2k·log₂(N/k)` probes. If a
+    /// type's dominant failure mode is "everything fails together" (a
+    /// shared upstream precondition), returning `Err` from `run_batch`
+    /// directly is still cheaper — this helper targets `k ≪ N`.
+    ///
+    /// # Contract on `f`
+    ///
+    /// - **Must tolerate re-execution over arbitrary contiguous sub-slices,
+    ///   in non-positional order.** Each probe's DB writes unwind with its
+    ///   savepoint on failure, but *host-side* state (counters, caches) does
+    ///   not — derive everything `f` needs from `(sp, slice)`. In the worst
+    ///   case `f` runs `2N-1` times; any single item is re-probed at most
+    ///   `⌈log₂ N⌉+1` times.
+    /// - **No external calls** (HTTP, mail, RPC) — already the rule for
+    ///   shared batch transactions; bisection would repeat them per probe.
+    /// - **Only `*_in_op` methods against `sp`.** The pool-backed
+    ///   [`BatchedJobItem::update_execution_state`] /
+    ///   [`BatchedJobItem::set_result`] commit outside this transaction and
+    ///   will NOT unwind with a rolled-back probe.
+    /// - **Set semantics, not sequence semantics.** A bisected batch gives
+    ///   up the positional "equivalent to running in order" guarantee the
+    ///   module documents for `run_isolated`/plain loops: probes run
+    ///   largest-range-first, so two items with a real dependency between
+    ///   them (a shared unique key, a read-your-write coupling) resolve
+    ///   deterministically by probe order, not item order. Only use this
+    ///   for batches whose items are safe to probe in any grouping —
+    ///   i.e. the module's existing entity-disjointness guidance
+    ///   (`queue_id` is the serialization unit).
+    /// - **The search does not run against a frozen snapshot.** A failed
+    ///   probe's rollback releases the locks it took, so rows it touched are
+    ///   free for other transactions to change before the next probe reaches
+    ///   them. A probe's result is a fact about the moment it ran, not a
+    ///   standing one.
+    /// - Locks a *successful* probe takes are held until the shared
+    ///   transaction commits, so bisecting extends how long they are held —
+    ///   by the probes still to run — without widening the set. The set is
+    ///   the rows that were going to be committed anyway.
+    ///
+    /// # Errors
+    ///
+    /// An outer `Err` means the batch could not be dispositioned here at all:
+    /// either the savepoint machinery itself failed (a dead connection), or
+    /// probes kept losing lock conflicts. Propagate it with `?` and let the
+    /// whole batch retry, exactly like [`run_isolated`](Self::run_isolated).
+    ///
+    /// A `40P01` deadlock or `40001` serialization failure never drives the
+    /// search. It is not attributable to any item, so splitting on one cannot
+    /// isolate anything — and splitting can *provoke* it, since there are lock
+    /// sets that succeed taken at once and deadlock taken in halves. Such a
+    /// probe is re-run against the same range instead: its rollback released
+    /// its locks, and the partner that won the cycle has moved on, so a retry
+    /// usually succeeds and settles the batch in this dispatch. Only after
+    /// they keep recurring does the bisect give up — which bounds the total
+    /// `deadlock_timeout` one batch can pay, since Postgres makes every
+    /// conflicting probe wait one out before reporting it.
+    ///
+    /// ```rust,ignore
+    /// let mut op = current_batch.begin_op().await?;
+    /// let outcomes = current_batch
+    ///     .run_bisected(&mut op, |sp, slice| async move {
+    ///         self.execute_many_in_op(sp, slice).await
+    ///     })
+    ///     .await?;
+    /// Ok(JobBatchCompletion::WithOutcomesWithOp(op, outcomes))
+    /// ```
+    #[cfg(feature = "es-entity")]
+    pub async fn run_bisected<E>(
+        &self,
+        op: &mut es_entity::DbOp<'static>,
+        f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>,
+    ) -> Result<BatchOutcomes, sqlx::Error>
+    where
+        E: std::error::Error + 'static,
+    {
+        self.run_bisected_with(op, BisectBudget::default(), f).await
+    }
+
+    /// [`run_bisected`](Self::run_bisected) with an explicit [`BisectBudget`]
+    /// instead of the default `Auto`. See `run_bisected`'s doc comment for
+    /// the full contract; this is the same helper, just with the probe
+    /// budget spelled out at the call site.
+    #[cfg(feature = "es-entity")]
+    pub async fn run_bisected_with<E>(
+        &self,
+        op: &mut es_entity::DbOp<'static>,
+        budget: BisectBudget,
+        f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>,
+    ) -> Result<BatchOutcomes, sqlx::Error>
+    where
+        E: std::error::Error + 'static,
+    {
+        let n = self.items.len();
+        let mut outcomes = Vec::with_capacity(n);
+        if n == 0 {
+            return Ok(outcomes);
+        }
+
+        let cap = budget.effective_cap(n);
+
+        let mut heap = BinaryHeap::new();
+        heap.push(PendingRange { start: 0, end: n });
+
+        let mut probes_used = 0usize;
+        let mut conflict_retries = 0usize;
+        let mut last_error: Option<String> = None;
+        let mut logged_bisecting = false;
+
+        while let Some(range) = heap.pop() {
+            if probes_used >= cap {
+                let message = match &last_error {
+                    Some(e) => format!(
+                        "bisect probe budget exhausted after {probes_used} probes; \
+                         last error: {e}"
+                    ),
+                    None => {
+                        format!("bisect probe budget exhausted after {probes_used} probes")
+                    }
+                };
+                outcomes.extend(
+                    self.items[range.start..range.end]
+                        .iter()
+                        .map(|item| (item.id, BatchItemOutcome::Fail(message.clone()))),
+                );
+                continue;
+            }
+
+            let slice = &self.items[range.start..range.end];
+            probes_used += 1;
+            match op.with_savepoint(async |sp| f(sp, slice).await).await? {
+                Ok(()) => {
+                    outcomes.extend(
+                        slice
+                            .iter()
+                            .map(|item| (item.id, BatchItemOutcome::Complete)),
+                    );
+                }
+                Err(e) => {
+                    // A deadlock or serialization failure is NOT evidence of a
+                    // culprit item, so it must never drive the search. It
+                    // cannot isolate anything, because no item caused it, and
+                    // splitting on one can make it *likelier*: there are lock
+                    // sets that succeed taken all at once and deadlock taken
+                    // in two halves. Left to drive the search it would mark
+                    // items `Fail` and burn their retry attempts for a
+                    // conflict the server invented to break a cycle.
+                    //
+                    // Re-probe the SAME range instead. The rollback released
+                    // this probe's locks, so the retry starts clean, and the
+                    // partner that won the cycle has moved on -- which is why
+                    // one of these normally succeeds immediately, settling the
+                    // batch in this dispatch rather than deferring it.
+                    //
+                    // The allowance is global, not per range: what it bounds
+                    // is the total `deadlock_timeout` this batch can pay,
+                    // since Postgres makes every conflicting probe wait one
+                    // (a second, by default) before reporting.
+                    //
+                    // It is also a budget of its own, refunding what this
+                    // probe drew from [`BisectBudget`]. A conflict is not
+                    // search progress -- the same range is about to be run
+                    // again -- so charging the search for it would let the cap
+                    // fall in between and budget-`Fail` the very items this
+                    // path exists to protect. `MaxProbes(1)` made that certain:
+                    // the first conflict spent the only probe, and the re-queued
+                    // range was failed instead of retried.
+                    if let Some(code) = crate::error::retryable_conflict_code(&e) {
+                        if conflict_retries < BISECT_MAX_CONFLICT_RETRIES {
+                            conflict_retries += 1;
+                            probes_used -= 1;
+                            tracing::warn!(
+                                target: "job.batch_bisect",
+                                n_items = n,
+                                probes_used,
+                                conflict_retries,
+                                sqlstate = code,
+                                "probe hit a retryable conflict; re-probing the \
+                                 same range"
+                            );
+                            heap.push(range);
+                            continue;
+                        }
+                        tracing::warn!(
+                            target: "job.batch_bisect",
+                            n_items = n,
+                            probes_used,
+                            sqlstate = code,
+                            "probe kept hitting retryable conflicts; abandoning \
+                             the bisect for a whole-batch retry"
+                        );
+                        return Err(sqlx::Error::Protocol(format!(
+                            "bisect abandoned after {probes_used} probes and \
+                             {conflict_retries} conflict retries; last conflict \
+                             {code}: {e}"
+                        )));
+                    }
+
+                    if !logged_bisecting {
+                        logged_bisecting = true;
+                        tracing::warn!(
+                            target: "job.batch_bisect",
+                            n_items = n,
+                            "batch failed; bisecting"
+                        );
+                    }
+                    let message = e.to_string();
+
+                    if range.len() == 1 {
+                        outcomes.push((
+                            self.items[range.start].id,
+                            BatchItemOutcome::Fail(message.clone()),
+                        ));
+                        last_error = Some(message);
+                    } else {
+                        last_error = Some(message);
+                        let mid = range.start + range.len() / 2;
+                        heap.push(PendingRange {
+                            start: mid,
+                            end: range.end,
+                        });
+                        heap.push(PendingRange {
+                            start: range.start,
+                            end: mid,
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(outcomes)
     }
 

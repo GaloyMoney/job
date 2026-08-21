@@ -65,7 +65,7 @@ impl JobRunner for CountingRunner {
 #[tokio::test]
 async fn poller_falls_through_locked_head_rows_to_later_due_jobs() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
-    let job_type = JobType::new("poll-contention-fallthrough");
+    let job_type = helpers::job_type("poll-contention-fallthrough");
 
     // Small poll budget so `n_jobs_to_poll` (and thus a non-batched type's
     // row_limit) is 5, while far more due work exists.
@@ -143,7 +143,7 @@ async fn poller_falls_through_locked_head_rows_to_later_due_jobs() -> anyhow::Re
 #[tokio::test]
 async fn partial_claim_sleeps_until_next_due() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
-    let job_type = JobType::new("partial-claim-next-due");
+    let job_type = helpers::job_type("partial-claim-next-due");
 
     let config = JobSvcConfig::builder().pool(pool).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
@@ -182,7 +182,7 @@ async fn partial_claim_sleeps_until_next_due() -> anyhow::Result<()> {
 #[tokio::test]
 async fn full_claim_drains_immediately() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
-    let job_type = JobType::new("full-claim-drains-immediately");
+    let job_type = helpers::job_type("full-claim-drains-immediately");
 
     let poller_config = JobPollerConfig {
         max_jobs_per_process: 3,

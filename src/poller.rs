@@ -495,10 +495,21 @@ impl JobPoller {
                         Ok((reclaimed, promoted)) => {
                             Span::current().record("n_lost_jobs", reclaimed.len());
                             let mut reported: HashSet<String> = HashSet::new();
-                            for (id, job_type) in &reclaimed {
-                                tracing::error!(job_id = %id, "lost job");
-                                if reported.insert(job_type.to_string()) {
-                                    notifier.execution_ready(job_type);
+                            let reclaimed_at = chrono::Utc::now();
+                            for job in &reclaimed {
+                                // `job_type` and the stall age turn this from
+                                // "something was lost" into an attributable
+                                // event: the age says how long the job sat
+                                // unheartbeaten, which is what identifies the
+                                // dispatcher failure that stranded it.
+                                tracing::error!(
+                                    job_id = %job.id,
+                                    job_type = %job.job_type,
+                                    stall_secs = (reclaimed_at - job.alive_at).num_seconds(),
+                                    "lost job"
+                                );
+                                if reported.insert(job.job_type.to_string()) {
+                                    notifier.execution_ready(&job.job_type);
                                 }
                             }
                             for promoted_type in promoted {
@@ -580,13 +591,46 @@ impl JobPoller {
                             failures = 0;
                             return job_lost_interval / 4;
                         }
+                        // Ordered and non-blocking, for deadlock avoidance.
+                        //
+                        // This fires every `job_lost_interval / 4` over every
+                        // running row of the instance, which made it the
+                        // busiest multi-row `job_executions` writer in the
+                        // crate -- and, as a bare `id = ANY(...)` UPDATE, the
+                        // last big one still taking row locks in scan order.
+                        // It was caught as a deadlock victim in production
+                        // (stress run sb-max10) and is the prime suspect for
+                        // the surviving partner of the batch-seal deadlocks
+                        // there and in sb-max9. One unordered writer
+                        // re-poisons every ordered one it overlaps, so this
+                        // adopts the same `MATERIALIZED` + `ORDER BY
+                        // queue_id, id` lock pattern `complete_in_op` uses --
+                        // see its doc comment for why the ordering (and
+                        // leading with `queue_id`) is load-bearing.
+                        //
+                        // `SKIP LOCKED` on top: a heartbeat has nothing to
+                        // gain by waiting for a contended row. Whoever holds
+                        // it is either deleting the row (terminal) or about to
+                        // release it, in which case the next beat refreshes
+                        // it. Worst-case gap is 2 * (interval / 4) = half the
+                        // liveness threshold, so a skipped row can never be
+                        // mistaken for lost. `FOR NO KEY UPDATE` rather than
+                        // `FOR UPDATE` so the heartbeat never blocks a
+                        // key-level locker.
                         match sqlx::query!(
                             r#"
-                        UPDATE job_executions
+                        WITH to_touch AS MATERIALIZED (
+                            SELECT id FROM job_executions
+                            WHERE poller_instance_id = $2
+                              AND state = 'running'
+                              AND id = ANY($3)
+                            ORDER BY queue_id, id
+                            FOR NO KEY UPDATE SKIP LOCKED
+                        )
+                        UPDATE job_executions je
                         SET alive_at = $1
-                        WHERE poller_instance_id = $2
-                          AND state = 'running'
-                          AND id = ANY($3)
+                        FROM to_touch t
+                        WHERE je.id = t.id
                         "#,
                             now,
                             instance_id,
@@ -831,16 +875,11 @@ impl JobPoller {
             tokio::pin!(batch_fut);
 
             tokio::select! {
+                // `execute_batch` emits `batch dispatcher error` itself --
+                // it is the only scope that knows which job ids were
+                // affected and how their claimed rows were disposed of.
                 res = &mut batch_fut => {
-                    if let Err(e) = res {
-                        tracing::error!(
-                            job_type = %dispatched_type,
-                            n_items,
-                            exception.message = %e,
-                            exception.type = std::any::type_name_of_val(&e),
-                            "batch dispatcher error"
-                        );
-                    }
+                    let _ = res;
                 }
                 Ok(shutdown_notifier) = shutdown_rx_monitor.recv() => {
                     let (send, recv) = tokio::sync::oneshot::channel();
@@ -856,14 +895,9 @@ impl JobPoller {
                                     Ok(res) => {
                                         tracing::Span::current().record("job_completed", true);
                                         tracing::info!("Batch completed gracefully");
-                                        if let Err(e) = res {
-                                            tracing::error!(
-                                                n_items,
-                                                exception.message = %e,
-                                                exception.type = std::any::type_name_of_val(&e),
-                                                "batch dispatcher error"
-                                            );
-                                        }
+                                        // See the note above: the error log
+                                        // is `execute_batch`'s to emit.
+                                        let _ = res;
                                     }
                                     Err(_) => {
                                         tracing::Span::current().record("job_completed", false);
@@ -1843,6 +1877,19 @@ impl ClaimReconciler {
 /// transaction acquire two overlapping sets of locks in two different orders.
 /// A queue whose row this reclaims is very often the same queue `apply` then
 /// swaps.
+/// A row the lost-handler took back from a poller that stopped heartbeating.
+///
+/// Carries `alive_at` -- the heartbeat that froze -- so the `lost job` log can
+/// report how long the job actually stalled. Two production runs of lost-job
+/// bursts went undiagnosed because that log was id-only: with neither the
+/// type nor the stall age, there was no way to tie a burst back to the
+/// batch-seal failures that caused it.
+struct ReclaimedJob {
+    id: JobId,
+    job_type: JobType,
+    alive_at: DateTime<Utc>,
+}
+
 async fn reclaim_lost_jobs(
     pool: &PgPool,
     instance_id: uuid::Uuid,
@@ -1850,7 +1897,7 @@ async fn reclaim_lost_jobs(
     alive_threshold: DateTime<Utc>,
     reschedule_at: DateTime<Utc>,
     self_live_ids: &[uuid::Uuid],
-) -> Result<(Vec<(JobId, JobType)>, Vec<String>), sqlx::Error> {
+) -> Result<(Vec<ReclaimedJob>, Vec<String>), sqlx::Error> {
     let mut tx = pool.begin().await?;
     let rows = sqlx::query!(
         r#"
@@ -1866,7 +1913,8 @@ async fn reclaim_lost_jobs(
         UPDATE job_executions je
         SET state = 'pending', execute_at = $3, attempt_index = attempt_index + 1, poller_instance_id = NULL
         FROM locked l WHERE je.id = l.id
-        RETURNING je.id AS "id!: JobId", je.job_type AS "job_type!: JobType"
+        RETURNING je.id AS "id!: JobId", je.job_type AS "job_type!: JobType",
+                  je.alive_at AS "alive_at!"
         "#,
         alive_threshold,
         supported_job_types as _,
@@ -1882,7 +1930,13 @@ async fn reclaim_lost_jobs(
 
     tx.commit().await?;
     Ok((
-        rows.into_iter().map(|r| (r.id, r.job_type)).collect(),
+        rows.into_iter()
+            .map(|r| ReclaimedJob {
+                id: r.id,
+                job_type: r.job_type,
+                alive_at: r.alive_at,
+            })
+            .collect(),
         promoted.into_iter().map(|row| row.job_type).collect(),
     ))
 }
@@ -2773,7 +2827,7 @@ mod tests {
         .await?
         .0
         .into_iter()
-        .map(|(id, _)| id)
+        .map(|job| job.id)
         .collect();
 
         assert!(
@@ -3229,7 +3283,7 @@ mod tests {
         )
         .await?;
         assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].0, lost);
+        assert_eq!(reclaimed[0].id, lost);
         assert_eq!(
             promoted,
             vec![job_type],
@@ -3301,7 +3355,7 @@ mod tests {
         )
         .await?;
         assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].0, lost);
+        assert_eq!(reclaimed[0].id, lost);
         assert_eq!(
             promoted,
             vec![sibling_type],

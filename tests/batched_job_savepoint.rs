@@ -128,7 +128,7 @@ async fn run_isolated_keeps_batch_mates_committing_after_a_per_item_db_error() -
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_batched_initializer(SavepointInitializer {
-        job_type: JobType::new("batched-savepoint-conflict"),
+        job_type: helpers::job_type("batched-savepoint-conflict"),
         // Terminal on the first failure: keeps this test's assertions about
         // the *first pass* unambiguous (no retry churn to account for).
         n_attempts: Some(1),
@@ -224,7 +224,7 @@ async fn run_isolated_failed_item_retries_solo_and_recovers() -> anyhow::Result<
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_batched_initializer(SavepointInitializer {
-        job_type: JobType::new("batched-savepoint-retry"),
+        job_type: helpers::job_type("batched-savepoint-retry"),
         n_attempts: Some(5),
     });
 

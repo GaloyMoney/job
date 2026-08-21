@@ -67,6 +67,40 @@ pub enum JobError {
     KeyedSpawnRace(JobType, String),
 }
 
+/// The SQLSTATE, if this error (or anything it wraps) is a Postgres abort that
+/// is retryable by definition: `40P01` deadlock detected, `40001` serialization
+/// failure. The victim did nothing wrong -- the server picked it to break a
+/// cycle -- so the work is worth re-attempting rather than blaming on the job.
+///
+/// Walks the source chain rather than matching one variant: the same abort
+/// surfaces as a bare [`sqlx::Error`] from raw statements, wrapped in a repo
+/// error from es-entity's own writes, and wrapped again in whatever error type
+/// a caller's closure returns.
+pub(crate) fn retryable_conflict_code(
+    err: &(dyn std::error::Error + 'static),
+) -> Option<&'static str> {
+    let mut source = Some(err);
+    while let Some(e) = source {
+        if let Some(db) = e
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+        {
+            match db.code().as_deref() {
+                Some("40P01") => return Some("40P01"),
+                Some("40001") => return Some("40001"),
+                _ => {}
+            }
+        }
+        source = e.source();
+    }
+    None
+}
+
+/// [`retryable_conflict_code`] as a predicate.
+pub(crate) fn is_retryable_conflict(err: &(dyn std::error::Error + 'static)) -> bool {
+    retryable_conflict_code(err).is_some()
+}
+
 impl From<Box<dyn std::error::Error>> for JobError {
     fn from(error: Box<dyn std::error::Error>) -> Self {
         JobError::JobExecutionError(error.to_string())

@@ -110,17 +110,6 @@ impl JobInitializer for HoldableInitializer {
     }
 }
 
-/// A fresh, process-unique `JobType`/queue-id-ish string for `prefix`, so
-/// re-running the suite against the same persistent dev DB never collides
-/// with a previous run's leftover rows.
-fn unique(prefix: &str) -> String {
-    format!("{prefix}-{}", uuid::Uuid::now_v7())
-}
-
-fn job_type(prefix: &str) -> JobType {
-    JobType::new(Box::leak(unique(prefix).into_boxed_str()))
-}
-
 async fn row_state(pool: &sqlx::PgPool, id: JobId) -> anyhow::Result<String> {
     let state: String = sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
         .bind(uuid::Uuid::from(id))
@@ -166,9 +155,9 @@ async fn bulk_spawn_shared_queue_id_lands_one_pending_one_parked() -> anyhow::Re
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("bulk-shared");
+    let queue = helpers::unique("bulk-shared");
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("bulk-shared-queue"),
+        job_type: helpers::job_type("bulk-shared-queue"),
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
         fail_first_n: 0,
@@ -221,9 +210,9 @@ async fn backdated_spawn_swaps_ahead_of_a_younger_pending_head() -> anyhow::Resu
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("backdate-queue");
+    let queue = helpers::unique("backdate-queue");
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("backdated-swap"),
+        job_type: helpers::job_type("backdated-swap"),
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
         fail_first_n: 0,
@@ -272,12 +261,12 @@ async fn retry_backoff_yields_to_an_older_parked_sibling() -> anyhow::Result<()>
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("retry-queue");
+    let queue = helpers::unique("retry-queue");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let attempts = Arc::new(AtomicUsize::new(0));
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("retry-swap"),
+        job_type: helpers::job_type("retry-swap"),
         started: Arc::clone(&started),
         release: Arc::clone(&release),
         fail_first_n: 1,
@@ -362,8 +351,8 @@ async fn keyed_spawn_is_blocked_by_a_parked_row_with_the_same_key() -> anyhow::R
         }
     }
 
-    let jt = job_type("keyed-blocked-by-parked");
-    let key = unique("held-key");
+    let jt = helpers::job_type("keyed-blocked-by-parked");
+    let key = helpers::unique("held-key");
     let spawner = jobs.add_keyed_initializer(KeyedInit {
         job_type: jt.clone(),
     });
@@ -469,7 +458,7 @@ async fn short_circuit_spawn_lands_running_immediately_on_commit() -> anyhow::Re
     let completed = Arc::new(Notify::new());
     let gate = closed_gate();
     let spawner = jobs.add_initializer(ImmediateInitializer {
-        job_type: job_type("short-circuit-immediate"),
+        job_type: helpers::job_type("short-circuit-immediate"),
         completed: Arc::clone(&completed),
         short_circuit: true,
         gate: Some(Arc::clone(&gate)),
@@ -521,7 +510,7 @@ async fn short_circuit_disabled_lands_pending() -> anyhow::Result<()> {
     let completed = Arc::new(Notify::new());
     let gate = closed_gate();
     let spawner = jobs.add_initializer(ImmediateInitializer {
-        job_type: job_type("short-circuit-disabled"),
+        job_type: helpers::job_type("short-circuit-disabled"),
         completed,
         short_circuit: false,
         gate: Some(Arc::clone(&gate)),
@@ -559,7 +548,7 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let jt = job_type("fairness");
+    let jt = helpers::job_type("fairness");
     let gate = closed_gate();
     let spawner = jobs.add_initializer(ImmediateInitializer {
         job_type: jt.clone(),
@@ -643,11 +632,11 @@ async fn completion_recycles_into_a_promoted_sibling_with_no_poll_needed() -> an
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("chain-hop-queue");
+    let queue = helpers::unique("chain-hop-queue");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("chain-hop"),
+        job_type: helpers::job_type("chain-hop"),
         started: Arc::clone(&started),
         release: Arc::clone(&release),
         fail_first_n: 0,
@@ -723,11 +712,11 @@ async fn completion_during_shutdown_does_not_recycle_into_new_work() -> anyhow::
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("shutdown-recycle-queue");
+    let queue = helpers::unique("shutdown-recycle-queue");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("shutdown-recycle"),
+        job_type: helpers::job_type("shutdown-recycle"),
         started: Arc::clone(&started),
         release: Arc::clone(&release),
         fail_first_n: 0,
@@ -794,7 +783,7 @@ async fn short_circuit_spawn_dispatch_survives_a_shutdown_race() -> anyhow::Resu
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("shutdown-race"),
+        job_type: helpers::job_type("shutdown-race"),
         started: Arc::clone(&started),
         release: Arc::clone(&release),
         fail_first_n: 0,
@@ -874,8 +863,8 @@ async fn seed_running_occupant(
 #[tokio::test]
 async fn key_share_blocks_only_the_delete() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
-    let queue = unique("keyshare-matrix");
-    let id = seed_running_occupant(&pool, &unique("keyshare"), &queue).await?;
+    let queue = helpers::unique("keyshare-matrix");
+    let id = seed_running_occupant(&pool, &helpers::unique("keyshare"), &queue).await?;
     let uuid = uuid::Uuid::from(id);
 
     // Probe `sql` from a second connection while a `FOR KEY SHARE` holder is
@@ -985,12 +974,12 @@ async fn spawn_racing_a_completion_adopts_the_freed_queue() -> anyhow::Result<()
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("adopt-queue");
-    let occupant_type = unique("adopt-occupant");
+    let queue = helpers::unique("adopt-queue");
+    let occupant_type = helpers::unique("adopt-occupant");
     let occupant = seed_running_occupant(&pool, &occupant_type, &queue).await?;
 
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("adopt-spawn"),
+        job_type: helpers::job_type("adopt-spawn"),
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
         fail_first_n: 0,
@@ -1044,11 +1033,11 @@ async fn concurrent_adopts_of_one_freed_queue_do_not_conflict() -> anyhow::Resul
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("adopt-race-queue");
-    let occupant = seed_running_occupant(&pool, &unique("adopt-race-occ"), &queue).await?;
+    let queue = helpers::unique("adopt-race-queue");
+    let occupant = seed_running_occupant(&pool, &helpers::unique("adopt-race-occ"), &queue).await?;
 
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("adopt-race"),
+        job_type: helpers::job_type("adopt-race"),
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
         fail_first_n: 0,
@@ -1142,8 +1131,8 @@ async fn parking_behind_a_pending_occupant_wakes_the_occupants_type() -> anyhow:
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("wake-queue");
-    let occupant_type = unique("wake-occupant");
+    let queue = helpers::unique("wake-queue");
+    let occupant_type = helpers::unique("wake-occupant");
 
     // A due `pending` occupant, left unclaimed (no poller is started here).
     let occupant = JobId::new();
@@ -1165,7 +1154,7 @@ async fn parking_behind_a_pending_occupant_wakes_the_occupants_type() -> anyhow:
     .await?;
 
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("wake-spawn"),
+        job_type: helpers::job_type("wake-spawn"),
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
         fail_first_n: 0,
@@ -1223,11 +1212,11 @@ async fn completion_blocked_on_a_spawn_pin_promotes_the_parked_row() -> anyhow::
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let queue = unique("pin-first-queue");
+    let queue = helpers::unique("pin-first-queue");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("pin-first-occupant"),
+        job_type: helpers::job_type("pin-first-occupant"),
         started: Arc::clone(&started),
         release: Arc::clone(&release),
         fail_first_n: 0,
@@ -1249,7 +1238,7 @@ async fn completion_blocked_on_a_spawn_pin_promotes_the_parked_row() -> anyhow::
     // racing the runner.
     let parked = JobId::new();
     let parked_uuid = uuid::Uuid::from(parked);
-    let parked_type = unique("pin-first-parked");
+    let parked_type = helpers::unique("pin-first-parked");
     let mut spawn_tx = pool.begin().await?;
     sqlx::query("INSERT INTO jobs (id, job_type, queue_id, created_at) VALUES ($1, $2, $3, NOW())")
         .bind(parked_uuid)

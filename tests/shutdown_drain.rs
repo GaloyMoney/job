@@ -16,6 +16,8 @@
 //! Self-rescheduling jobs make that window easy to hit: they hand a row back to
 //! `pending` and notify, so the loop is polling essentially continuously.
 
+mod helpers;
+
 use async_trait::async_trait;
 use job::{
     CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobPollerConfig, JobRunner, JobSpawner,
@@ -118,9 +120,7 @@ async fn shutdown_drains_self_rescheduling_jobs() -> anyhow::Result<()> {
         let mut jobs = Jobs::init(config).await?;
         // Unique per iteration: rows left pending by an earlier iteration (or
         // an earlier run) must not be re-claimed here.
-        let job_type = JobType::new(Box::leak(
-            format!("shutdown-drain-{}", uuid::Uuid::now_v7()).into_boxed_str(),
-        ));
+        let job_type = helpers::job_type("shutdown-drain");
         let spawner = jobs.add_initializer(ChurnInitializer {
             job_type,
             watch: Arc::clone(&watch),

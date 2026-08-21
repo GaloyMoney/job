@@ -11,10 +11,13 @@ mod helpers;
 
 use async_trait::async_trait;
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec,
-    JobSvcConfig, JobType, Jobs,
+    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobPollerConfig, JobRunner, JobSpawner,
+    JobSpec, JobSvcConfig, JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Cfg;
@@ -54,14 +57,6 @@ impl JobInitializer for NoopInitializer {
     }
 }
 
-fn unique(prefix: &str) -> String {
-    format!("{prefix}-{}", uuid::Uuid::now_v7())
-}
-
-fn job_type(prefix: &str) -> JobType {
-    JobType::new(Box::leak(unique(prefix).into_boxed_str()))
-}
-
 /// sb-max8 traced its 21 deadlocks/25min to the park-or-take arbiter insert
 /// (`ExecutionInsertHook::insert_many`, statement 1) having no defined
 /// lock-acquisition order -- unlike every OTHER multi-row locker of
@@ -88,7 +83,7 @@ async fn concurrent_multi_queue_spawns_do_not_deadlock() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let jt = job_type("lock-order");
+    let jt = helpers::job_type("lock-order");
     let spawner = jobs.add_initializer(NoopInitializer { job_type: jt });
 
     for _ in 0..25 {
@@ -96,8 +91,8 @@ async fn concurrent_multi_queue_spawns_do_not_deadlock() -> anyhow::Result<()> {
         // differs before either's UUID suffix begins, so string ordering
         // (what `ExecutionInsertHook`'s sort uses) is deterministic
         // regardless of the UUIDs' own values.
-        let q1 = unique("lockorder-q1");
-        let q2 = unique("lockorder-q2");
+        let q1 = helpers::unique("lockorder-q1");
+        let q2 = helpers::unique("lockorder-q2");
 
         let a_specs = vec![
             JobSpec::new(JobId::new(), Cfg).queue_id(q1.clone()),
@@ -116,6 +111,177 @@ async fn concurrent_multi_queue_spawns_do_not_deadlock() -> anyhow::Result<()> {
         rb.expect("batch B must not deadlock");
     }
 
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Parks inside `run` until the test opens the gate, so its execution row
+/// stays `running` -- and therefore inside the keep-alive's live set -- for
+/// as long as the test needs to observe heartbeats.
+struct GatedRunner {
+    gate: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl JobRunner for GatedRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let _permit = self.gate.acquire().await?;
+        Ok(JobCompletion::Complete)
+    }
+}
+
+struct GatedInitializer {
+    job_type: JobType,
+    gate: Arc<Semaphore>,
+}
+
+impl JobInitializer for GatedInitializer {
+    type Config = Cfg;
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        Ok(Box::new(GatedRunner {
+            gate: Arc::clone(&self.gate),
+        }))
+    }
+}
+
+async fn alive_at(pool: &sqlx::PgPool, id: JobId) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+        "SELECT alive_at FROM job_executions WHERE id = $1",
+    )
+    .bind(uuid::Uuid::from(id))
+    .fetch_one(pool)
+    .await?;
+    Ok(at)
+}
+
+/// The keep-alive heartbeat must not block on a row another transaction
+/// holds, and must still refresh every row it CAN take.
+///
+/// sb-max10 caught the heartbeat as a deadlock victim in production
+/// (`keep alive error ... deadlock detected`). It fires every
+/// `job_lost_interval / 4` over every running row of the instance, which
+/// makes it the busiest multi-row `job_executions` writer in the crate, and
+/// as a bare `UPDATE ... WHERE id = ANY(...)` it took row locks in scan
+/// order -- an order no other writer agrees with. It is the prime suspect
+/// for the surviving partner of the batch-seal deadlocks that stalled five
+/// loan approvals for 7m40s.
+///
+/// The fix orders its locks `(queue_id, id)` like every other multi-row
+/// locker and adds `FOR NO KEY UPDATE SKIP LOCKED`, which is what this
+/// asserts: with one of two running rows pinned by a competing
+/// `FOR UPDATE`, the heartbeat skips that row and refreshes the other.
+///
+/// Before the fix this fails on the *other* row: a bare UPDATE blocks on the
+/// pinned row mid-statement, and because the statement is its own
+/// transaction nothing it already wrote is visible until it completes -- so
+/// the unpinned row's `alive_at` stays frozen too. That is the property
+/// that matters. A heartbeat that stalls behind one contended row stops
+/// refreshing every OTHER job it is responsible for, and those jobs age
+/// toward the lost-handler's threshold through no fault of their own.
+#[tokio::test]
+async fn keep_alive_skips_a_contended_row_and_still_refreshes_the_rest() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    // The keep-alive beats at `job_lost_interval / 4`, so this gives ~4
+    // beats per second -- fast enough to observe without making the test
+    // slow, and far above the liveness threshold this test never reaches.
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .poller_config(JobPollerConfig {
+            job_lost_interval: Duration::from_secs(1),
+            ..Default::default()
+        })
+        .build()
+        .unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let gate = Arc::new(Semaphore::new(0));
+    let spawner = jobs.add_initializer(GatedInitializer {
+        job_type: helpers::job_type("keepalive-skip-locked"),
+        gate: Arc::clone(&gate),
+    });
+
+    // Two unqueued jobs so both run concurrently and both land in the same
+    // heartbeat's live set.
+    let pinned = JobId::new();
+    let free = JobId::new();
+    spawner
+        .spawn_all(vec![JobSpec::new(pinned, Cfg), JobSpec::new(free, Cfg)])
+        .await?;
+    jobs.start_poll().await?;
+
+    // Both must be `running` before pinning anything, or the heartbeat has
+    // nothing to skip and nothing to refresh.
+    let mut waited = 0;
+    loop {
+        let running: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_executions WHERE id = ANY($1) AND state = 'running'",
+        )
+        .bind(vec![uuid::Uuid::from(pinned), uuid::Uuid::from(free)])
+        .fetch_one(&pool)
+        .await?;
+        if running == 2 {
+            break;
+        }
+        waited += 1;
+        assert!(waited < 100, "both jobs should reach running");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let pinned_before = alive_at(&pool, pinned).await?;
+    let free_before = alive_at(&pool, free).await?;
+
+    // A competing lock on ONE row, held across several heartbeats. Its own
+    // connection, so the pool the poller uses cannot be starved by it.
+    let holder_pool = helpers::init_pool().await?;
+    let mut holder = holder_pool.begin().await?;
+    sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR UPDATE")
+        .bind(uuid::Uuid::from(pinned))
+        .fetch_one(&mut *holder)
+        .await?;
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let pinned_during = alive_at(&pool, pinned).await?;
+    let free_during = alive_at(&pool, free).await?;
+
+    assert_eq!(
+        pinned_during, pinned_before,
+        "the pinned row must be skipped, not waited on"
+    );
+    assert!(
+        free_during > free_before,
+        "a contended row must not stop the heartbeat refreshing the rest: \
+         {free_before} -> {free_during}"
+    );
+
+    // Releasing the pin lets the next beat pick the skipped row back up --
+    // the reason skipping is safe: the gap is bounded by one beat, far
+    // inside the liveness threshold.
+    holder.rollback().await?;
+    let mut waited = 0;
+    loop {
+        if alive_at(&pool, pinned).await? > pinned_before {
+            break;
+        }
+        waited += 1;
+        assert!(
+            waited < 100,
+            "a skipped row must be refreshed again once the pin is released"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    gate.add_permits(1024);
     jobs.shutdown().await?;
     Ok(())
 }
