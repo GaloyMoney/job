@@ -37,6 +37,12 @@
 //!   `SAVEPOINT` via [`es_entity::DbOp::with_savepoint`]. Savepoints isolate
 //!   *failures*, not *contention*: they do not release Postgres locks, so
 //!   they are not a lever for raising batch size under lock pressure.
+//! - A **true batch** (batch-load, mutate, batch-persist as one statement)
+//!   has no per-item loop for `run_isolated` to wrap. For that shape, use
+//!   [`CurrentBatchedJob::run_bisected`] instead: it probes the whole batch
+//!   in one savepoint and, only on failure, auto-bisects into smaller
+//!   sub-ranges until each culprit is isolated — clean items still commit
+//!   in this dispatch instead of every item failing through to solo retry.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -45,6 +51,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use super::{
@@ -180,6 +187,93 @@ pub enum BatchItemOutcome {
 
 /// Per-job dispositions returned by a batched runner.
 pub type BatchOutcomes = Vec<(JobId, BatchItemOutcome)>;
+
+/// How many probes [`CurrentBatchedJob::run_bisected_with`] may spend on one
+/// batch. A probe is one invocation of the caller's closure — successful or
+/// not — including the initial whole-batch attempt.
+///
+/// This is the one knob the helper exposes, and it is per-call, not a
+/// property of the job type: the right budget depends on how expensive the
+/// caller's probe closure is, which only the call site knows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BisectBudget {
+    /// `2 * ceil(log2(N)) + 1` probes, computed per call from the batch
+    /// size — exactly enough to fully isolate **one** culprit and complete
+    /// everything else, at any batch size (9 probes at N=10, 11 at N=25, 15
+    /// at N=100). A flat constant can't do this: at N=25 a cap of, say, 4
+    /// would exhaust after salvaging only ~12 of 25 items on a single
+    /// culprit, sending the other 12 *innocent* items through solo retry
+    /// for no reason. More than one culprit degrades gracefully:
+    /// largest-first probing still salvages the big clean ranges, and the
+    /// (smaller) remainder budget-fails into the ordinary solo-retry path.
+    #[default]
+    Auto,
+    /// An explicit hard cap, clamped to at least 1 (the first probe is
+    /// mandatory — nothing can be dispositioned without it).
+    /// `MaxProbes(1)` is the degenerate case: it probes once, and on
+    /// failure every item budget-fails — equivalent to returning `Err`
+    /// from `run_batch` directly, just routed through this helper.
+    MaxProbes(usize),
+    /// Run the search to completion instead of capping it: at most
+    /// `2N - 1` probes, typically `~N + O(log N)` once escalation kicks in
+    /// on a mostly-bad batch. This is bounded by the batch size, not
+    /// actually unbounded — but it is the variant most likely to spend a
+    /// probe budget you didn't intend, so pick it explicitly rather than by
+    /// default.
+    FullResolution,
+}
+
+impl BisectBudget {
+    /// Resolve to a concrete probe cap for a batch of `n` items.
+    fn effective_cap(self, n: usize) -> usize {
+        match self {
+            BisectBudget::Auto => 2 * ceil_log2(n) + 1,
+            BisectBudget::MaxProbes(max) => max.max(1),
+            BisectBudget::FullResolution => usize::MAX,
+        }
+    }
+}
+
+/// `ceil(log2(n))`, defined as `0` for `n <= 1`.
+fn ceil_log2(n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    (usize::BITS - (n - 1).leading_zeros()) as usize
+}
+
+/// A contiguous, half-open range of item indices still awaiting a probe in
+/// [`CurrentBatchedJob::run_bisected_with`]'s search.
+///
+/// `Ord` makes this a max-heap key of `(length DESC, start ASC)`: the
+/// longest pending range is probed next, and among equal lengths the
+/// earliest one wins — both purely for determinism, so probe order (and
+/// therefore probe *count*) is reproducible given the same input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingRange {
+    start: usize,
+    end: usize,
+}
+
+impl PendingRange {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+}
+
+impl Ord for PendingRange {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.len()
+            .cmp(&other.len())
+            .then_with(|| other.start.cmp(&self.start))
+    }
+}
+
+impl PartialOrd for PendingRange {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Result returned by [`BatchedJobRunner::run_batch`].
 ///
@@ -419,6 +513,12 @@ impl<C> CurrentBatchedJob<C> {
     /// domain logic. That failure isn't attributable to a single item —
     /// propagate it with `?` and let the whole batch retry, exactly like a
     /// whole-batch `Err` returned from `run_batch` today.
+    ///
+    /// Use only `*_in_op` methods against the savepoint inside `f`. The
+    /// pool-backed [`BatchedJobItem::update_execution_state`] /
+    /// [`BatchedJobItem::set_result`] commit in their own transaction
+    /// outside `op` entirely, so they do **not** unwind if this item's
+    /// savepoint rolls back.
     #[cfg(feature = "es-entity")]
     pub async fn run_isolated<E>(
         &self,
@@ -439,6 +539,218 @@ impl<C> CurrentBatchedJob<C> {
             };
             outcomes.push((item.id, outcome));
         }
+        Ok(outcomes)
+    }
+
+    /// Run the whole batch as one unit inside a single `SAVEPOINT`; on
+    /// failure, auto-bisect: roll back and probe smaller contiguous
+    /// sub-ranges — largest pending range first — until each culprit is
+    /// isolated (or [`BisectBudget`] runs out). Clean items resolve to
+    /// [`BatchItemOutcome::Complete`] in this very dispatch; each culprit to
+    /// [`BatchItemOutcome::Fail`] (via `E`'s `Display`, from its own
+    /// singleton probe — so the message is attributable).
+    ///
+    /// The counterpart of [`run_isolated`](Self::run_isolated) for **true
+    /// batch** implementations: a batch-load/mutate/batch-persist runner has
+    /// no per-item loop for `run_isolated` to wrap, so its only failure
+    /// shape was previously "every item fails, all N retry solo". `f` here
+    /// takes a *slice* of items — probe them with one statement, the same
+    /// shape a true batch already uses.
+    ///
+    /// Equivalent to [`run_bisected_with`](Self::run_bisected_with) with
+    /// [`BisectBudget::default()`] (`Auto`).
+    ///
+    /// # Cost
+    ///
+    /// Happy path: one extra `SAVEPOINT`/`RELEASE` pair for the whole batch.
+    /// With `k` culprits in `N` items: roughly `2k·log₂(N/k)` probes. If a
+    /// type's dominant failure mode is "everything fails together" (a
+    /// shared upstream precondition), returning `Err` from `run_batch`
+    /// directly is still cheaper — this helper targets `k ≪ N`.
+    ///
+    /// # Contract on `f`
+    ///
+    /// - **Must tolerate re-execution over arbitrary contiguous sub-slices,
+    ///   in non-positional order.** Each probe's DB writes unwind with its
+    ///   savepoint on failure, but *host-side* state (counters, caches) does
+    ///   not — derive everything `f` needs from `(sp, slice)`. In the worst
+    ///   case `f` runs `2N-1` times; any single item is re-probed at most
+    ///   `⌈log₂ N⌉+1` times.
+    /// - **No external calls** (HTTP, mail, RPC) — already the rule for
+    ///   shared batch transactions; bisection would repeat them per probe.
+    /// - **Only `*_in_op` methods against `sp`.** The pool-backed
+    ///   [`BatchedJobItem::update_execution_state`] /
+    ///   [`BatchedJobItem::set_result`] commit outside this transaction and
+    ///   will NOT unwind with a rolled-back probe.
+    /// - **Set semantics, not sequence semantics.** A bisected batch gives
+    ///   up the positional "equivalent to running in order" guarantee the
+    ///   module documents for `run_isolated`/plain loops: probes run
+    ///   largest-range-first, so two items with a real dependency between
+    ///   them (a shared unique key, a read-your-write coupling) resolve
+    ///   deterministically by probe order, not item order. Only use this
+    ///   for batches whose items are safe to probe in any grouping —
+    ///   i.e. the module's existing entity-disjointness guidance
+    ///   (`queue_id` is the serialization unit). A deadlock from probing out
+    ///   of the usual `(queue_id, id)` lock order is detected by Postgres
+    ///   and surfaces as an ordinary failing probe.
+    /// - Locks acquired inside a probe are **not released** by its
+    ///   rollback (`ROLLBACK TO` keeps them) — same caveat as
+    ///   `run_isolated`: this is not a lever for raising batch size under
+    ///   lock pressure.
+    ///
+    /// # Errors
+    ///
+    /// The returned `Err` is the *outer* layer of
+    /// [`with_savepoint`](es_entity::DbOp::with_savepoint): the savepoint
+    /// machinery itself failed (e.g. a dead connection), not any probe's
+    /// domain logic. Propagate it with `?` and let the whole batch retry,
+    /// exactly like [`run_isolated`](Self::run_isolated).
+    ///
+    /// ```rust,ignore
+    /// let mut op = current_batch.begin_op().await?;
+    /// let outcomes = current_batch
+    ///     .run_bisected(&mut op, |sp, slice| async move {
+    ///         self.execute_many_in_op(sp, slice).await
+    ///     })
+    ///     .await?;
+    /// Ok(JobBatchCompletion::WithOutcomesWithOp(op, outcomes))
+    /// ```
+    #[cfg(feature = "es-entity")]
+    pub async fn run_bisected<E>(
+        &self,
+        op: &mut es_entity::DbOp<'static>,
+        f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>,
+    ) -> Result<BatchOutcomes, sqlx::Error>
+    where
+        E: std::fmt::Display,
+    {
+        self.run_bisected_with(op, BisectBudget::default(), f).await
+    }
+
+    /// [`run_bisected`](Self::run_bisected) with an explicit [`BisectBudget`]
+    /// instead of the default `Auto`. See `run_bisected`'s doc comment for
+    /// the full contract; this is the same helper, just with the probe
+    /// budget spelled out at the call site.
+    #[cfg(feature = "es-entity")]
+    pub async fn run_bisected_with<E>(
+        &self,
+        op: &mut es_entity::DbOp<'static>,
+        budget: BisectBudget,
+        f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>,
+    ) -> Result<BatchOutcomes, sqlx::Error>
+    where
+        E: std::fmt::Display,
+    {
+        let n = self.items.len();
+        let mut outcomes = Vec::with_capacity(n);
+        if n == 0 {
+            return Ok(outcomes);
+        }
+
+        let cap = budget.effective_cap(n);
+        // Escalation threshold: once a run of this many consecutive probe
+        // failures is observed, singleton-scan the rest rather than keep
+        // halving. See `BisectBudget`'s module docs for why this is
+        // streak-based (not resolved-item density) under largest-first
+        // ordering.
+        let streak_threshold = usize::max(4, ceil_log2(n));
+
+        let mut heap = BinaryHeap::new();
+        heap.push(PendingRange { start: 0, end: n });
+
+        let mut probes_used = 0usize;
+        let mut streak = 0usize;
+        let mut escalated = false;
+        let mut last_error: Option<String> = None;
+        let mut logged_bisecting = false;
+
+        while let Some(range) = heap.pop() {
+            if probes_used >= cap {
+                let message = match &last_error {
+                    Some(e) => format!(
+                        "bisect probe budget exhausted after {probes_used} probes; \
+                         last error: {e}"
+                    ),
+                    None => {
+                        format!("bisect probe budget exhausted after {probes_used} probes")
+                    }
+                };
+                outcomes.extend(
+                    self.items[range.start..range.end]
+                        .iter()
+                        .map(|item| (item.id, BatchItemOutcome::Fail(message.clone()))),
+                );
+                continue;
+            }
+
+            let slice = &self.items[range.start..range.end];
+            probes_used += 1;
+            match op.with_savepoint(async |sp| f(sp, slice).await).await? {
+                Ok(()) => {
+                    streak = 0;
+                    outcomes.extend(
+                        slice
+                            .iter()
+                            .map(|item| (item.id, BatchItemOutcome::Complete)),
+                    );
+                }
+                Err(e) => {
+                    if !logged_bisecting {
+                        logged_bisecting = true;
+                        tracing::warn!(
+                            target: "job.batch_bisect",
+                            n_items = n,
+                            "batch failed; bisecting"
+                        );
+                    }
+                    let message = e.to_string();
+                    streak += 1;
+
+                    if range.len() == 1 {
+                        outcomes.push((
+                            self.items[range.start].id,
+                            BatchItemOutcome::Fail(message.clone()),
+                        ));
+                        last_error = Some(message);
+                    } else if !escalated && streak >= streak_threshold {
+                        escalated = true;
+                        last_error = Some(message);
+                        tracing::warn!(
+                            target: "job.batch_bisect",
+                            streak,
+                            probes_used,
+                            "bisect escalating to singleton scan"
+                        );
+                        // Drain this range plus everything still pending
+                        // into singletons — see the module docs: under
+                        // largest-first ordering a streak of big-range
+                        // failures is strong all-bad evidence.
+                        let mut remaining: Vec<usize> = (range.start..range.end).collect();
+                        while let Some(pending) = heap.pop() {
+                            remaining.extend(pending.start..pending.end);
+                        }
+                        for idx in remaining {
+                            heap.push(PendingRange {
+                                start: idx,
+                                end: idx + 1,
+                            });
+                        }
+                    } else {
+                        last_error = Some(message);
+                        let mid = range.start + range.len() / 2;
+                        heap.push(PendingRange {
+                            start: mid,
+                            end: range.end,
+                        });
+                        heap.push(PendingRange {
+                            start: range.start,
+                            end: mid,
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(outcomes)
     }
 

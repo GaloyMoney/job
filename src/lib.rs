@@ -390,7 +390,8 @@ use std::sync::{Arc, Mutex};
 
 pub use batched::{
     BatchItemOutcome, BatchOutcomes, BatchedJobInitializer, BatchedJobItem, BatchedJobRunner,
-    CurrentBatchedJob, DEFAULT_MAX_BATCH_SIZE, DEFAULT_MAX_CONCURRENT_BATCHES, JobBatchCompletion,
+    BisectBudget, CurrentBatchedJob, DEFAULT_MAX_BATCH_SIZE, DEFAULT_MAX_CONCURRENT_BATCHES,
+    JobBatchCompletion,
 };
 pub use config::*;
 pub use current::*;
