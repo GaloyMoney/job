@@ -542,10 +542,7 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
     let new_id = JobId::new();
     spawner.spawn(new_id, Cfg).await?;
 
-    // Read both rows in ONE query so the background poll loop gets no
-    // window to independently claim `new_id` between two separate reads,
-    // which would be a legitimate claim (once `old_id` is running) rather
-    // than a fairness violation, but would still make this assertion racy.
+    // Read both rows in ONE query so the two states come from one snapshot.
     let (old_state, new_state): (String, String) = sqlx::query_as(
         "SELECT \
            (SELECT state::text FROM job_executions WHERE id = $1), \
@@ -555,13 +552,27 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
     .bind(uuid::Uuid::from(new_id))
     .fetch_one(&pool)
     .await?;
+    // `old_state` carries the whole fairness claim, and carries it on its
+    // own: the spawn's transaction claims exactly one unit for the one row
+    // it added, and this asserts that the unit went to the OLDER row rather
+    // than to `new_id`. The violation this guards against -- the spawn
+    // dispatching itself past older backlog -- necessarily leaves `old_id`
+    // `pending`, so it cannot hide behind a passing assertion here.
+    //
+    // What is deliberately NOT asserted is `new_state == "pending"`. That
+    // used to be here and was the source of this test's flakiness, without
+    // fairness ever having broken: having correctly claimed the older row,
+    // the spawn's commit legitimately emits `execution_ready` for the type
+    // (`new_id` was added and NOT claimed), the poll loop wakes on it, and
+    // claims `new_id` on a later pass. Both rows end up `running` and the
+    // old assertion read red on a system that did exactly the right thing.
+    // Capping the type's concurrency does not close the window either --
+    // units are counted at DISPATCH, after the claiming transaction commits,
+    // so a poll landing in between still sees a free slot.
     assert_eq!(
         old_state, "running",
-        "the OLDER due row must be the one claimed"
-    );
-    assert_eq!(
-        new_state, "pending",
-        "a fresh spawn must not cut ahead of older same-type backlog"
+        "the OLDER due row must be the one the spawn's own claim served \
+         (new_id is {new_state})"
     );
 
     Ok(())
