@@ -77,13 +77,24 @@ pub(crate) struct JobPoller {
 }
 
 /// A tiny dedicated pool for [`poll_jobs`], reusing the main pool's connect
-/// options. The claim query needs `plan_cache_mode = force_generic_plan` and
-/// `enable_bitmapscan = off` (see PERFORMANCE.md, "Ordered index access is
-/// mandatory") on every connection it runs on; setting them once per
-/// connection here — instead of `SET LOCAL` inside a `BEGIN`/`COMMIT` on every
-/// poll — turns the claim into a single autocommit statement (5 round trips
-/// down to 1) without ever touching a connection the application pool might
-/// hand to unrelated queries.
+/// options. The claim query needs `plan_cache_mode = force_generic_plan`,
+/// `enable_bitmapscan = off`, and `enable_seqscan = off` (see
+/// PERFORMANCE.md, "Ordered index access is mandatory") on every connection
+/// it runs on; setting them once per connection here — instead of `SET
+/// LOCAL` inside a `BEGIN`/`COMMIT` on every poll — turns the claim into a
+/// single autocommit statement (5 round trips down to 1) without ever
+/// touching a connection the application pool might hand to unrelated
+/// queries.
+///
+/// `enable_seqscan = off` completes the same contract as `enable_bitmapscan
+/// = off`: under a generic plan built while table stats read near-empty,
+/// the planner otherwise falls back to one heap seq scan per type probe
+/// (~57 per poll on a registry this crate's size) because index bloat
+/// inflates the index path's cost estimate. Forcing ordered index access
+/// keeps the poll's cost O(claimed) + O(registered types), independent of
+/// heap and index bloat. Measured: idle poll 3,192 -> 59 shared
+/// blocks/call; no regression in any claiming regime (sb-max9 evidence,
+/// 2026-08-21).
 async fn build_poll_pool(main_pool: &PgPool) -> Result<PgPool, sqlx::Error> {
     let options: PgConnectOptions = (*main_pool.connect_options()).clone();
     PgPoolOptions::new()
@@ -94,6 +105,9 @@ async fn build_poll_pool(main_pool: &PgPool) -> Result<PgPool, sqlx::Error> {
                     .execute(&mut *conn)
                     .await?;
                 sqlx::query("SET enable_bitmapscan = off")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("SET enable_seqscan = off")
                     .execute(&mut *conn)
                     .await?;
                 Ok(())
