@@ -111,7 +111,7 @@ async fn batched_jobs_complete_and_are_awaitable() -> anyhow::Result<()> {
 
     let log = Arc::new(Mutex::new(BatchLog::default()));
     let spawner = jobs.add_batched_initializer(RecordingInitializer {
-        job_type: JobType::new("batched-complete-all"),
+        job_type: helpers::job_type("batched-complete-all"),
         log: Arc::clone(&log),
         max_batch_size: 25,
     });
@@ -175,7 +175,7 @@ async fn batching_actually_groups_jobs() -> anyhow::Result<()> {
 
     let log = Arc::new(Mutex::new(BatchLog::default()));
     let spawner = jobs.add_batched_initializer(RecordingInitializer {
-        job_type: JobType::new("batched-grouping"),
+        job_type: helpers::job_type("batched-grouping"),
         log: Arc::clone(&log),
         max_batch_size: 25,
     });
@@ -227,7 +227,7 @@ async fn max_batch_size_is_respected() -> anyhow::Result<()> {
 
     let log = Arc::new(Mutex::new(BatchLog::default()));
     let spawner = jobs.add_batched_initializer(RecordingInitializer {
-        job_type: JobType::new("batched-max-size"),
+        job_type: helpers::job_type("batched-max-size"),
         log: Arc::clone(&log),
         max_batch_size: 3,
     });
@@ -319,7 +319,7 @@ async fn per_item_outcomes_are_applied_independently() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_batched_initializer(MixedOutcomeInitializer {
-        job_type: JobType::new("batched-mixed-outcomes"),
+        job_type: helpers::job_type("batched-mixed-outcomes"),
     });
 
     let ok_ids: Vec<JobId> = (0..4).map(|_| JobId::new()).collect();
@@ -444,16 +444,12 @@ async fn batch_error_retries_every_item_and_retries_run_alone() -> anyhow::Resul
 
     let log = Arc::new(Mutex::new(AttemptLog::default()));
     let spawner = jobs.add_batched_initializer(FailFirstInitializer {
-        // Process-unique, unlike most types in this file. This test is the
-        // one that asserts on the shape of EVERY batch its type produces, so
+        // This test asserts on the shape of EVERY batch its type produces, so
         // any row of the type left behind by an earlier run against the same
-        // persistent dev database gets claimed by this run's poller and shows
-        // up as an extra batch (observed as `saw [1, 1, 5, 1, ...]`, the two
-        // leading singletons being ids this test never spawned). Ordinary
-        // tests only assert on their own ids and so tolerate the sharing.
-        job_type: JobType::new(Box::leak(
-            format!("batched-fail-first-{}", uuid::Uuid::now_v7()).into_boxed_str(),
-        )),
+        // persistent dev database would get claimed by this run's poller and
+        // show up as an extra batch (observed as `saw [1, 1, 5, 1, ...]`, the
+        // two leading singletons being ids this test never spawned).
+        job_type: helpers::job_type("batched-fail-first"),
         log: Arc::clone(&log),
     });
 
@@ -567,7 +563,7 @@ async fn checkpoint_rows_deleted_on_batched_terminal() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_batched_initializer(CheckpointBatchInitializer {
-        job_type: JobType::new("batched-checkpoint-cleanup"),
+        job_type: helpers::job_type("batched-checkpoint-cleanup"),
     });
 
     let ok_id = JobId::new();
@@ -665,7 +661,7 @@ async fn undispositioned_items_fail_the_batch_rather_than_being_guessed() -> any
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_batched_initializer(IncompleteOutcomeInitializer {
-        job_type: JobType::new("batched-incomplete-outcomes"),
+        job_type: helpers::job_type("batched-incomplete-outcomes"),
     });
 
     let job_id = JobId::new();
@@ -702,13 +698,17 @@ async fn same_queue_jobs_are_never_in_one_batch() -> anyhow::Result<()> {
 
     let log = Arc::new(Mutex::new(BatchLog::default()));
     let spawner = jobs.add_batched_initializer(RecordingInitializer {
-        job_type: JobType::new("batched-queue-exclusion"),
+        job_type: helpers::job_type("batched-queue-exclusion"),
         log: Arc::clone(&log),
         max_batch_size: 25,
     });
 
     // Ten jobs, all on ONE queue: the poll query may claim at most one of them
-    // at a time, so every batch must have exactly one item.
+    // at a time, so every batch must have exactly one item. The queue id is
+    // process-unique because `idx_job_executions_queue_active` is on
+    // `queue_id` alone — a queued row left by an earlier run would block the
+    // spawn no matter how unique the job type is.
+    let queue_id = helpers::unique("batched-same-queue-one-queue");
     let specs: Vec<JobSpec<BatchConfig>> = (0..10)
         .map(|i| {
             JobSpec::new(
@@ -717,7 +717,7 @@ async fn same_queue_jobs_are_never_in_one_batch() -> anyhow::Result<()> {
                     label: format!("serial-{i}"),
                 },
             )
-            .queue_id("batched-same-queue-one-queue")
+            .queue_id(queue_id.clone())
         })
         .collect();
     let ids: Vec<JobId> = specs.iter().map(|s| s.id).collect();
@@ -802,7 +802,7 @@ async fn results_remain_per_job_across_a_batched_commit() -> anyhow::Result<()> 
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_batched_initializer(ResultPerItemInitializer {
-        job_type: JobType::new("batched-per-item-results"),
+        job_type: helpers::job_type("batched-per-item-results"),
     });
 
     let specs: Vec<JobSpec<BatchConfig>> = (0..6)
@@ -907,7 +907,7 @@ async fn per_item_reschedule_runs_the_job_again() -> anyhow::Result<()> {
 
     let seen = Arc::new(Mutex::new(HashSet::new()));
     let spawner = jobs.add_batched_initializer(RescheduleOnceInitializer {
-        job_type: JobType::new("batched-reschedule-once"),
+        job_type: helpers::job_type("batched-reschedule-once"),
         seen: Arc::clone(&seen),
     });
 
@@ -988,7 +988,7 @@ async fn unknown_outcome_id_is_rejected() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(StrayInitializer {
-        job_type: JobType::new("batched-stray-outcome"),
+        job_type: helpers::job_type("batched-stray-outcome"),
     });
 
     let job_id = JobId::new();
@@ -1106,7 +1106,7 @@ async fn a_running_batch_costs_one_unit_of_poller_capacity() -> anyhow::Result<(
     let seen = Arc::new(Mutex::new(HashSet::new()));
     let release = Arc::new(AtomicBool::new(false));
     let spawner = jobs.add_batched_initializer(BlockingInitializer {
-        job_type: JobType::new("batched-unit-accounting"),
+        job_type: helpers::job_type("batched-unit-accounting"),
         seen: Arc::clone(&seen),
         release: Arc::clone(&release),
         max_batch_size: 3,
@@ -1176,7 +1176,7 @@ async fn claims_are_capped_by_free_batch_slots() -> anyhow::Result<()> {
     let seen = Arc::new(Mutex::new(HashSet::new()));
     let release = Arc::new(AtomicBool::new(false));
     let spawner = jobs.add_batched_initializer(BlockingInitializer {
-        job_type: JobType::new("batched-slot-capped-claims"),
+        job_type: helpers::job_type("batched-slot-capped-claims"),
         seen: Arc::clone(&seen),
         release: Arc::clone(&release),
         max_batch_size: 5,

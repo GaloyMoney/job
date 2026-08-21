@@ -192,7 +192,7 @@ async fn happy_path_probes_once() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-happy-path"),
+        job_type: helpers::job_type("bisect-happy-path"),
         table: table.to_string(),
         budget: BisectBudget::default(),
         probes: Arc::clone(&probes),
@@ -231,7 +231,7 @@ async fn single_culprit_isolates_under_default_auto_budget() -> anyhow::Result<(
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-single-culprit-auto"),
+        job_type: helpers::job_type("bisect-single-culprit-auto"),
         table: table.to_string(),
         budget: BisectBudget::default(),
         probes: Arc::clone(&probes),
@@ -282,7 +282,7 @@ async fn largest_first_salvage_under_tight_budget() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-tight-budget-salvage"),
+        job_type: helpers::job_type("bisect-tight-budget-salvage"),
         table: table.to_string(),
         budget: BisectBudget::MaxProbes(4),
         probes: Arc::clone(&probes),
@@ -327,7 +327,7 @@ async fn all_bad_batch_resolves_every_item_under_full_resolution() -> anyhow::Re
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-all-bad-full-resolution"),
+        job_type: helpers::job_type("bisect-all-bad-full-resolution"),
         table: table.to_string(),
         budget: BisectBudget::FullResolution,
         probes: Arc::clone(&probes),
@@ -395,7 +395,7 @@ async fn scattered_culprits_do_not_poison_their_clean_siblings() -> anyhow::Resu
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-scattered-culprits"),
+        job_type: helpers::job_type("bisect-scattered-culprits"),
         table: table.to_string(),
         budget: BisectBudget::default(),
         probes: Arc::clone(&probes),
@@ -509,7 +509,7 @@ async fn domain_error_isolates_without_touching_the_db() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(FlagInitializer {
-        job_type: JobType::new("bisect-domain-error"),
+        job_type: helpers::job_type("bisect-domain-error"),
         probes: Arc::clone(&probes),
     });
 
@@ -556,33 +556,46 @@ async fn max_probes_one_is_equivalent_to_fail_all() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-max-probes-one"),
+        job_type: helpers::job_type("bisect-max-probes-one"),
         table: table.to_string(),
         budget: BisectBudget::MaxProbes(1),
         probes: Arc::clone(&probes),
-        n_attempts: Some(2),
+        // Terminal on the first failure. Recovery of budget-failed items
+        // through solo retry is covered by
+        // `largest_first_salvage_under_tight_budget`; asserting it here too
+        // would mean five simultaneous backoff+reclaim round trips, and
+        // retry churn of that size is what makes a test load-sensitive
+        // under full-suite concurrency. What this test is responsible for
+        // is the degenerate budget itself, which the first dispatch settles
+        // on its own.
+        n_attempts: Some(1),
     });
 
     let ids = spawn_batch(&spawner, table, 5, &[0]).await?;
     jobs.start_poll().await?;
     let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
 
+    // MaxProbes(1) probes the whole batch exactly once and, since it fails,
+    // budget-fails every item in that same dispatch — no bisection at all.
+    // This is the interpolation endpoint: equivalent to returning `Err` from
+    // `run_batch` directly, just routed through the helper.
     assert!(
         outcomes
             .iter()
-            .all(|o| o.state() == JobTerminalState::Completed),
-        "everything must still recover through solo retry, saw {:?}",
+            .all(|o| o.state() == JobTerminalState::Errored),
+        "a single probe cannot attribute the failure, so every item fails, \
+         saw {:?}",
         outcomes.iter().map(|o| o.state()).collect::<Vec<_>>()
     );
-    // MaxProbes(1) probes the whole batch exactly once, and (since it fails)
-    // budget-fails all 5 items in that same dispatch — the interpolation
-    // endpoint, equivalent to returning `Err` from `run_batch` directly.
-    // Each of the 5 then retries solo, each contributing 1 more probe to
-    // the shared counter: 1 + 5 = 6.
     assert_eq!(
         probes.load(Ordering::SeqCst),
-        6,
-        "expected the 1-probe fail-all dispatch plus 5 solo-retry probes"
+        1,
+        "MaxProbes(1) must probe exactly once and never split"
+    );
+    assert_eq!(
+        scratch_values(&pool, table).await?,
+        vec![SENTINEL_KEY],
+        "the sole probe rolled back, so nothing but the seed is committed"
     );
 
     Ok(())
@@ -598,7 +611,7 @@ async fn max_probes_zero_clamps_to_one() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-max-probes-zero"),
+        job_type: helpers::job_type("bisect-max-probes-zero"),
         table: table.to_string(),
         budget: BisectBudget::MaxProbes(0),
         probes: Arc::clone(&probes),
@@ -635,7 +648,7 @@ async fn coupled_pair_resolves_deterministically_by_probe_order() -> anyhow::Res
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-coupled-pair"),
+        job_type: helpers::job_type("bisect-coupled-pair"),
         table: table.to_string(),
         budget: BisectBudget::default(),
         probes: Arc::clone(&probes),

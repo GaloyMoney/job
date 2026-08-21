@@ -54,14 +54,6 @@ impl JobInitializer for NoopInitializer {
     }
 }
 
-fn unique(prefix: &str) -> String {
-    format!("{prefix}-{}", uuid::Uuid::now_v7())
-}
-
-fn job_type(prefix: &str) -> JobType {
-    JobType::new(Box::leak(unique(prefix).into_boxed_str()))
-}
-
 /// sb-max8 traced its 21 deadlocks/25min to the park-or-take arbiter insert
 /// (`ExecutionInsertHook::insert_many`, statement 1) having no defined
 /// lock-acquisition order -- unlike every OTHER multi-row locker of
@@ -88,7 +80,7 @@ async fn concurrent_multi_queue_spawns_do_not_deadlock() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
 
-    let jt = job_type("lock-order");
+    let jt = helpers::job_type("lock-order");
     let spawner = jobs.add_initializer(NoopInitializer { job_type: jt });
 
     for _ in 0..25 {
@@ -96,8 +88,8 @@ async fn concurrent_multi_queue_spawns_do_not_deadlock() -> anyhow::Result<()> {
         // differs before either's UUID suffix begins, so string ordering
         // (what `ExecutionInsertHook`'s sort uses) is deterministic
         // regardless of the UUIDs' own values.
-        let q1 = unique("lockorder-q1");
-        let q2 = unique("lockorder-q2");
+        let q1 = helpers::unique("lockorder-q1");
+        let q2 = helpers::unique("lockorder-q2");
 
         let a_specs = vec![
             JobSpec::new(JobId::new(), Cfg).queue_id(q1.clone()),

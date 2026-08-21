@@ -122,7 +122,7 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("create-and-run-job"),
+        job_type: helpers::job_type("create-and-run-job"),
     });
 
     jobs.start_poll()
@@ -173,7 +173,10 @@ impl JobInitializer for ScheduledJobInitializer {
     type Config = ScheduledJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("scheduled-job")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("scheduled-job"))
+            .clone()
     }
 
     fn init(
@@ -361,7 +364,7 @@ async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
     let release = Arc::new(Notify::new());
 
     let spawner = jobs.add_initializer(QueueJobInitializer {
-        job_type: JobType::new("queue-serial"),
+        job_type: helpers::job_type("queue-serial"),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
@@ -451,7 +454,7 @@ async fn test_queue_id_serializes_execution_across_two_pollers() -> anyhow::Resu
     let release = Arc::new(Notify::new());
 
     let make_initializer = || QueueJobInitializer {
-        job_type: JobType::new("queue-serial-two-pollers"),
+        job_type: helpers::job_type("queue-serial-two-pollers"),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
@@ -567,7 +570,7 @@ async fn test_different_queue_ids_run_concurrently() -> anyhow::Result<()> {
     let release = Arc::new(Notify::new());
 
     let spawner = jobs.add_initializer(QueueJobInitializer {
-        job_type: JobType::new("queue-concurrent"),
+        job_type: helpers::job_type("queue-concurrent"),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
@@ -640,7 +643,7 @@ async fn test_non_queued_jobs_unaffected() -> anyhow::Result<()> {
     let release = Arc::new(Notify::new());
 
     let spawner = jobs.add_initializer(QueueJobInitializer {
-        job_type: JobType::new("queue-noqueue"),
+        job_type: helpers::job_type("queue-noqueue"),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
@@ -711,7 +714,7 @@ async fn test_bulk_spawn_creates_and_runs_all_jobs() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("bulk-spawn-job"),
+        job_type: helpers::job_type("bulk-spawn-job"),
     });
 
     jobs.start_poll()
@@ -763,7 +766,7 @@ async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("bulk-spawn-dup-job"),
+        job_type: helpers::job_type("bulk-spawn-dup-job"),
     });
 
     jobs.start_poll()
@@ -805,7 +808,7 @@ async fn test_bulk_spawn_empty_batch() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
 
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("bulk-spawn-empty-job"),
+        job_type: helpers::job_type("bulk-spawn-empty-job"),
     });
 
     jobs.start_poll()
@@ -906,7 +909,7 @@ async fn test_await_completion_on_success() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("await-success-job"),
+        job_type: helpers::job_type("await-success-job"),
     });
     jobs.start_poll().await?;
 
@@ -939,7 +942,7 @@ async fn test_await_completion_on_error() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(FailingJobInitializer {
-        job_type: JobType::new("failing-await-completion"),
+        job_type: helpers::job_type("failing-await-completion"),
     });
     jobs.start_poll().await?;
 
@@ -970,7 +973,7 @@ async fn test_await_completion_already_completed() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("await-already-job"),
+        job_type: helpers::job_type("await-already-job"),
     });
     jobs.start_poll().await?;
 
@@ -1057,7 +1060,7 @@ async fn test_await_completion_returns_result() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(ResultJobInitializer {
-        job_type: JobType::new("result-job-await-completion"),
+        job_type: helpers::job_type("result-job-await-completion"),
     });
     jobs.start_poll().await?;
 
@@ -1084,7 +1087,10 @@ impl JobInitializer for PartialResultThenErrorInitializer {
     type Config = ResultJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("partial-result-error-job")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("partial-result-error-job"))
+            .clone()
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
@@ -1153,7 +1159,10 @@ impl JobInitializer for NoResultJobInitializer {
     type Config = ResultJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("no-result-job")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("no-result-job"))
+            .clone()
     }
 
     fn init(
@@ -1221,7 +1230,10 @@ impl JobInitializer for IncrementalResultInitializer {
     type Config = ResultJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("incremental-result-job")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("incremental-result-job"))
+            .clone()
     }
 
     fn init(
@@ -1295,7 +1307,10 @@ impl JobInitializer for IncrementalResultThenErrorInitializer {
     type Config = ResultJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("incremental-error-result-job")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("incremental-error-result-job"))
+            .clone()
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
@@ -1381,7 +1396,7 @@ async fn test_load_state_reflects_pending_and_terminal() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("poll-completion-job"),
+        job_type: helpers::job_type("poll-completion-job"),
     });
     jobs.start_poll().await?;
 
@@ -1439,7 +1454,7 @@ async fn test_await_completion_timeout() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("await-timeout-job"),
+        job_type: helpers::job_type("await-timeout-job"),
     });
     jobs.start_poll().await?;
 
@@ -1480,7 +1495,10 @@ impl JobInitializer for MultiDayJobInitializer {
     type Config = MultiDayJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("multi-day-job")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("multi-day-job"))
+            .clone()
     }
 
     fn init(
@@ -1763,7 +1781,7 @@ async fn test_await_completions_batch() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("await-completions-batch"),
+        job_type: helpers::job_type("await-completions-batch"),
     });
     jobs.start_poll().await?;
 
@@ -1796,7 +1814,7 @@ async fn test_await_all_empty_ids() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let _spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("await-completions-empty"),
+        job_type: helpers::job_type("await-completions-empty"),
     });
     jobs.start_poll().await?;
 
@@ -1819,7 +1837,7 @@ async fn test_await_all_timeout() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("await-completions-timeout"),
+        job_type: helpers::job_type("await-completions-timeout"),
     });
     jobs.start_poll().await?;
 
@@ -1876,7 +1894,7 @@ async fn test_await_all_resolves_when_notifications_dropped() -> anyhow::Result<
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("await-completions-dropped-notifications"),
+        job_type: helpers::job_type("await-completions-dropped-notifications"),
     });
     jobs.start_poll().await?;
 
@@ -1917,10 +1935,10 @@ async fn test_job_completion_results_trait() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
 
     let success_spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("trait-success"),
+        job_type: helpers::job_type("trait-success"),
     });
     let fail_spawner = jobs.add_initializer(FailingJobInitializer {
-        job_type: JobType::new("failing-results-trait"),
+        job_type: helpers::job_type("failing-results-trait"),
     });
 
     jobs.start_poll().await?;
@@ -1984,7 +2002,10 @@ impl JobInitializer for InfiniteListenerInitializer {
     type Config = InfiniteListenerConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("infinite-listener")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("infinite-listener"))
+            .clone()
     }
 
     fn init(
@@ -2047,7 +2068,7 @@ async fn test_keep_alive_protects_live_own_instance_jobs() -> anyhow::Result<()>
     // 1) Register a long-running listener job and a short canary job.
     let listener_spawner = jobs.add_initializer(InfiniteListenerInitializer);
     let canary_spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("lost-handler-canary"),
+        job_type: helpers::job_type("lost-handler-canary"),
     });
 
     jobs.start_poll().await?;
@@ -2130,8 +2151,13 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
 
+    // Bound once and reused: the seeded rows below must carry the SAME type
+    // string the initializer registers, or the lost handler never sees them
+    // (it only scans `registry.registered_job_types()`).
+    let job_type = helpers::job_type("orphan-rescue");
+
     let _spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("orphan-rescue"),
+        job_type: job_type.clone(),
     });
 
     // Insert rows directly as if left behind by a crashed peer. alive_at is
@@ -2143,8 +2169,9 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
     let stale_alive_at = chrono::Utc::now() - chrono::Duration::seconds(60);
 
     // Row in `jobs` (FK target for job_executions).
-    sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, 'orphan-rescue', $2)")
+    sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, $2, $3)")
         .bind(orphan_id)
+        .bind(job_type.as_str())
         .bind(now)
         .execute(&pool)
         .await?;
@@ -2152,10 +2179,11 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, attempt_index, created_at)
-        VALUES ($1, 'orphan-rescue', 'running', $2, $3, 1, $4)
+        VALUES ($1, $2, 'running', $3, $4, 1, $5)
         "#,
     )
     .bind(orphan_id)
+    .bind(job_type.as_str())
     .bind(stale_alive_at)
     .bind(other_instance)
     .bind(now)
@@ -2226,8 +2254,13 @@ async fn test_lost_handler_uses_wall_clock_under_frozen_manual_clock() -> anyhow
 
     let mut jobs = Jobs::init(config).await?;
 
+    // Bound once and reused: the seeded rows below must carry the SAME type
+    // string the initializer registers, or the lost handler never sees them
+    // (it only scans `registry.registered_job_types()`).
+    let job_type = helpers::job_type("frozen-clock-orphan");
+
     let _spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("frozen-clock-orphan"),
+        job_type: job_type.clone(),
     });
 
     let frozen_sim_now = clock.now();
@@ -2240,21 +2273,21 @@ async fn test_lost_handler_uses_wall_clock_under_frozen_manual_clock() -> anyhow
     let other_instance = uuid::Uuid::now_v7();
     let stale_alive_at = chrono::Utc::now() - chrono::Duration::seconds(60);
 
-    sqlx::query(
-        "INSERT INTO jobs (id, job_type, created_at) VALUES ($1, 'frozen-clock-orphan', $2)",
-    )
-    .bind(orphan_id)
-    .bind(frozen_sim_now)
-    .execute(&pool)
-    .await?;
+    sqlx::query("INSERT INTO jobs (id, job_type, created_at) VALUES ($1, $2, $3)")
+        .bind(orphan_id)
+        .bind(job_type.as_str())
+        .bind(frozen_sim_now)
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         r#"
         INSERT INTO job_executions (id, job_type, state, alive_at, poller_instance_id, attempt_index, created_at)
-        VALUES ($1, 'frozen-clock-orphan', 'running', $2, $3, 1, $4)
+        VALUES ($1, $2, 'running', $3, $4, 1, $5)
         "#,
     )
     .bind(orphan_id)
+    .bind(job_type.as_str())
     .bind(stale_alive_at)
     .bind(other_instance)
     .bind(frozen_sim_now)
@@ -2398,7 +2431,7 @@ async fn test_job_terminal_is_delivered_out_of_band() -> anyhow::Result<()> {
         .expect("Failed to build JobsConfig");
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("terminal-out-of-band"),
+        job_type: helpers::job_type("terminal-out-of-band"),
     });
     jobs.start_poll().await?;
 
@@ -2422,7 +2455,7 @@ async fn test_job_terminal_is_delivered_out_of_band() -> anyhow::Result<()> {
 async fn test_execution_ready_reaches_another_process() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
 
-    let job_type = JobType::new("notify-funnel-crosspod");
+    let job_type = helpers::job_type("notify-funnel-crosspod");
     let completed = Arc::new(Mutex::new(Vec::<String>::new()));
 
     let config_b = JobSvcConfig::builder()
@@ -2626,7 +2659,7 @@ async fn execution_state_none_before_first_write_then_roundtrips() -> anyhow::Re
     let wrote = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(StateWritingInitializer {
-        job_type: JobType::new("handle-execution-state"),
+        job_type: helpers::job_type("handle-execution-state"),
         wrote: Arc::clone(&wrote),
         release: Arc::clone(&release),
     });
@@ -2682,7 +2715,7 @@ async fn checkpoint_row_deleted_on_terminal() -> anyhow::Result<()> {
     let wrote = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(StateWritingInitializer {
-        job_type: JobType::new("checkpoint-row-deleted-complete"),
+        job_type: helpers::job_type("checkpoint-row-deleted-complete"),
         wrote: Arc::clone(&wrote),
         release: Arc::clone(&release),
     });
@@ -2788,7 +2821,7 @@ async fn checkpoint_row_deleted_on_errored_terminal() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
     let wrote = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(StateWritingFailingInitializer {
-        job_type: JobType::new("checkpoint-row-deleted-errored"),
+        job_type: helpers::job_type("checkpoint-row-deleted-errored"),
         wrote: Arc::clone(&wrote),
     });
     jobs.start_poll().await?;
@@ -2885,7 +2918,7 @@ async fn checkpoint_survives_retry() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
     let seen_on_retry = Arc::new(Mutex::new(None));
     let spawner = jobs.add_initializer(CheckpointThenFailOnceInitializer {
-        job_type: JobType::new("checkpoint-survives-retry"),
+        job_type: helpers::job_type("checkpoint-survives-retry"),
         seen_on_retry: Arc::clone(&seen_on_retry),
     });
     jobs.start_poll().await?;
@@ -2922,13 +2955,13 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
     let completed = Arc::new(Mutex::new(Vec::<String>::new()));
     let release = Arc::new(Notify::new());
     let queue_spawner = jobs.add_initializer(QueueJobInitializer {
-        job_type: JobType::new("handle-status-lifecycle"),
+        job_type: helpers::job_type("handle-status-lifecycle"),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
     });
     let fail_spawner = jobs.add_initializer(FailingJobInitializer {
-        job_type: JobType::new("failing-status-transitions"),
+        job_type: helpers::job_type("failing-status-transitions"),
     });
     jobs.start_poll().await?;
 
@@ -3055,7 +3088,10 @@ impl JobInitializer for OrderedResultInitializer {
     type Config = OrderedJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("handle-await-all-order")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("handle-await-all-order"))
+            .clone()
     }
 
     fn init(
@@ -3166,7 +3202,7 @@ async fn await_all_times_out_and_reawait_resolves() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("handle-await-all-wedge"),
+        job_type: helpers::job_type("handle-await-all-wedge"),
     });
     jobs.start_poll().await?;
 
@@ -3245,7 +3281,7 @@ async fn handle_await_find_timeout_and_batch() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("handle-await-errors"),
+        job_type: helpers::job_type("handle-await-errors"),
     });
     jobs.start_poll().await?;
 
@@ -3303,10 +3339,10 @@ async fn terminal_status_carries_queue_id() -> anyhow::Result<()> {
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("terminal-queue-id"),
+        job_type: helpers::job_type("terminal-queue-id"),
     });
     let fail_spawner = jobs.add_initializer(FailingJobInitializer {
-        job_type: JobType::new("failing-terminal-queue-id"),
+        job_type: helpers::job_type("failing-terminal-queue-id"),
     });
     jobs.start_poll().await?;
 
@@ -3369,10 +3405,10 @@ async fn snapshot_exposes_config_next_run_and_return_value() -> anyhow::Result<(
     // A dedicated result initializer with a constant return value keeps this
     // test isolated from the order-sensitive `await_all_order_preserved`.
     let result_spawner = jobs.add_initializer(ResultJobInitializer {
-        job_type: JobType::new("result-job-snapshot"),
+        job_type: helpers::job_type("result-job-snapshot"),
     });
     let test_spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("snapshot-getters"),
+        job_type: helpers::job_type("snapshot-getters"),
     });
     jobs.start_poll().await?;
 
@@ -3434,7 +3470,7 @@ async fn load_prefers_terminal_entity_over_stale_execution_row() -> anyhow::Resu
 
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("terminal-vs-stale-row"),
+        job_type: helpers::job_type("terminal-vs-stale-row"),
     });
     jobs.start_poll().await?;
 
@@ -3514,7 +3550,7 @@ async fn resident_handle_resolves_the_resident_job() -> anyhow::Result<()> {
 
     // A type that was never spawned ⇒ None.
     assert!(
-        jobs.resident_handle(JobType::new("resident-handle-never-spawned"))
+        jobs.resident_handle(helpers::job_type("resident-handle-never-spawned"))
             .await?
             .is_none()
     );
@@ -3534,7 +3570,10 @@ impl JobInitializer for FailingWithRetriesInitializer {
     type Config = FailingJobConfig;
 
     fn job_type(&self) -> JobType {
-        JobType::new("failing-with-retries")
+        static JOB_TYPE: std::sync::OnceLock<JobType> = std::sync::OnceLock::new();
+        JOB_TYPE
+            .get_or_init(|| helpers::job_type("failing-with-retries"))
+            .clone()
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
@@ -3571,10 +3610,10 @@ async fn last_error_visible_mid_retry_and_terminal() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
     let retry_spawner = jobs.add_initializer(FailingWithRetriesInitializer);
     let fail_spawner = jobs.add_initializer(FailingJobInitializer {
-        job_type: JobType::new("failing-last-error"),
+        job_type: helpers::job_type("failing-last-error"),
     });
     let ok_spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("last-error-never-failed"),
+        job_type: helpers::job_type("last-error-never-failed"),
     });
     jobs.start_poll().await?;
 
@@ -3650,7 +3689,7 @@ async fn execution_state_point_read() -> anyhow::Result<()> {
     let wrote = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let spawner = jobs.add_initializer(StateWritingInitializer {
-        job_type: JobType::new("execution-state-point-read"),
+        job_type: helpers::job_type("execution-state-point-read"),
         wrote: Arc::clone(&wrote),
         release: Arc::clone(&release),
     });
@@ -3779,7 +3818,7 @@ async fn per_process_cap_bounds_concurrency() -> anyhow::Result<()> {
     let high_water = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(AtomicBool::new(false));
     let spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
-        job_type: JobType::new("per-process-cap-bounds-concurrency"),
+        job_type: helpers::job_type("per-process-cap-bounds-concurrency"),
         max_concurrent_per_process: Some(2),
         running: Arc::clone(&running),
         high_water: Arc::clone(&high_water),
@@ -3843,14 +3882,14 @@ async fn capped_type_does_not_starve_others() -> anyhow::Result<()> {
     let capped_high_water = Arc::new(AtomicUsize::new(0));
     let capped_release = Arc::new(AtomicBool::new(false));
     let capped_spawner = jobs.add_initializer(ConcurrencyProbeInitializer {
-        job_type: JobType::new("capped-does-not-starve-capped"),
+        job_type: helpers::job_type("capped-does-not-starve-capped"),
         max_concurrent_per_process: Some(1),
         running: Arc::clone(&capped_running),
         high_water: Arc::clone(&capped_high_water),
         release: Arc::clone(&capped_release),
     });
     let uncapped_spawner = jobs.add_initializer(TestJobInitializer {
-        job_type: JobType::new("capped-does-not-starve-uncapped"),
+        job_type: helpers::job_type("capped-does-not-starve-uncapped"),
     });
 
     let capped_ids: Vec<JobId> = (0..5).map(|_| JobId::new()).collect();

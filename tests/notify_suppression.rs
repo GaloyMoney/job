@@ -103,14 +103,6 @@ impl JobInitializer for NoopInitializer {
     }
 }
 
-fn unique(prefix: &str) -> String {
-    format!("{prefix}-{}", uuid::Uuid::now_v7())
-}
-
-fn job_type(prefix: &str) -> JobType {
-    JobType::new(Box::leak(unique(prefix).into_boxed_str()))
-}
-
 /// Waits up to `within` for a `job_events` notification matching `pred`,
 /// `None` if nothing matched in time. Modeled on
 /// `tests/job.rs`'s `next_matching` (same channel, same shape) -- an
@@ -154,7 +146,7 @@ async fn self_claimed_spawn_suppresses_its_own_notify() -> anyhow::Result<()> {
 
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
-    let jt = job_type("notify-suppress-claimed");
+    let jt = helpers::job_type("notify-suppress-claimed");
     let gate = closed_gate();
     let spawner = jobs.add_initializer(NoopInitializer {
         job_type: jt.clone(),
@@ -207,7 +199,7 @@ async fn unclaimed_spawn_still_notifies() -> anyhow::Result<()> {
 
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
-    let jt = job_type("notify-unclaimed");
+    let jt = helpers::job_type("notify-unclaimed");
     let spawner = jobs.add_initializer(NoopInitializer {
         job_type: jt.clone(),
         short_circuit: false,
@@ -260,7 +252,7 @@ async fn spawn_not_itself_claimed_still_notifies_even_though_type_was_claimed_fr
 
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
-    let jt = job_type("notify-older-backlog");
+    let jt = helpers::job_type("notify-older-backlog");
     let gate = closed_gate();
     let spawner = jobs.add_initializer(NoopInitializer {
         job_type: jt.clone(),
