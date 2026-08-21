@@ -444,7 +444,16 @@ async fn batch_error_retries_every_item_and_retries_run_alone() -> anyhow::Resul
 
     let log = Arc::new(Mutex::new(AttemptLog::default()));
     let spawner = jobs.add_batched_initializer(FailFirstInitializer {
-        job_type: JobType::new("batched-fail-first"),
+        // Process-unique, unlike most types in this file. This test is the
+        // one that asserts on the shape of EVERY batch its type produces, so
+        // any row of the type left behind by an earlier run against the same
+        // persistent dev database gets claimed by this run's poller and shows
+        // up as an extra batch (observed as `saw [1, 1, 5, 1, ...]`, the two
+        // leading singletons being ids this test never spawned). Ordinary
+        // tests only assert on their own ids and so tolerate the sharing.
+        job_type: JobType::new(Box::leak(
+            format!("batched-fail-first-{}", uuid::Uuid::now_v7()).into_boxed_str(),
+        )),
         log: Arc::clone(&log),
     });
 
