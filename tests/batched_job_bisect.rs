@@ -444,6 +444,21 @@ async fn domain_error_isolates_without_touching_the_db() -> anyhow::Result<()> {
         bad: bool,
     }
 
+    /// A domain error with nothing underneath it. `run_bisected` inspects
+    /// `E`'s source chain to spot retryable conflicts, so this exercises the
+    /// case where the chain bottoms out immediately and the probe is a plain
+    /// attributable failure.
+    #[derive(Debug)]
+    struct FlaggedItem;
+
+    impl std::fmt::Display for FlaggedItem {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("flagged item in slice")
+        }
+    }
+
+    impl std::error::Error for FlaggedItem {}
+
     struct FlagRunner {
         probes: Arc<AtomicUsize>,
     }
@@ -462,7 +477,7 @@ async fn domain_error_isolates_without_touching_the_db() -> anyhow::Result<()> {
                 .run_bisected(&mut op, async move |_sp, slice| {
                     probes.fetch_add(1, Ordering::SeqCst);
                     if slice.iter().any(|item| item.config().bad) {
-                        Err("flagged item in slice".to_string())
+                        Err(FlaggedItem)
                     } else {
                         Ok(())
                     }
@@ -690,6 +705,209 @@ async fn coupled_pair_resolves_deterministically_by_probe_order() -> anyhow::Res
         "the other resolves as an isolated failure, not a batch-wide one"
     );
     assert_eq!(scratch_values(&pool, table).await?, vec![42]);
+
+    Ok(())
+}
+
+/// A `40P01` deadlock inside a probe must re-run that probe, never split on it.
+///
+/// A deadlock is not attributable to any item, so splitting on one cannot
+/// isolate anything. Worse, it can provoke: lock sets exist that succeed taken
+/// at once and deadlock taken in halves. Left to drive the search it would end
+/// up blaming individual jobs -- and burning their retry attempts -- for a
+/// conflict the server invented to break a cycle.
+///
+/// The deadlock is manufactured, and which side loses is made deterministic
+/// rather than left to chance. A helper transaction takes the two scratch rows
+/// in the opposite order to the probe, and the two are stepped through the
+/// interleaving with semaphore gates (permits, so neither can miss a signal it
+/// arrives late for):
+///
+/// 1. helper locks row 2, then opens the probe's gate
+/// 2. probe locks row 1, opens the helper's gate, and reaches for row 2 --
+///    blocking, because the helper holds it
+/// 3. helper waits out a margin, then reaches for row 1 -- closing the cycle
+///
+/// Postgres aborts whichever waiter's `deadlock_timeout` expires first and
+/// finds a cycle. The probe starts waiting a clear margin before the helper
+/// does, so the probe is the victim -- which is the side under test.
+#[tokio::test]
+async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> {
+    let table = "bisect_deadlock_abort";
+    let pool = helpers::init_pool().await?;
+    reset_scratch_table(&pool, table).await?;
+    // Two rows the probe and the helper will contend over, in opposite orders.
+    for v in [1, 2] {
+        sqlx::query(&format!("INSERT INTO {table} (v) VALUES ($1)"))
+            .bind(v)
+            .execute(&pool)
+            .await?;
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct DlConfig {
+        table: String,
+    }
+
+    struct DlRunner {
+        table: String,
+        probes: Arc<AtomicUsize>,
+        /// Opened once the helper holds row 2.
+        helper_ready: Arc<tokio::sync::Semaphore>,
+        /// Opened once the probe holds row 1.
+        probe_ready: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl BatchedJobRunner for DlRunner {
+        type Config = DlConfig;
+
+        async fn run_batch(
+            &self,
+            current_batch: CurrentBatchedJob<DlConfig>,
+        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+            let mut op = current_batch.begin_op().await?;
+            let probes = Arc::clone(&self.probes);
+            let helper_ready = Arc::clone(&self.helper_ready);
+            let probe_ready = Arc::clone(&self.probe_ready);
+            let table = self.table.clone();
+            let outcomes = current_batch
+                .run_bisected(&mut op, async move |sp, _slice| {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    // Wait for the helper to hold row 2, take row 1, then
+                    // reach for row 2 and block. Blocking here first is what
+                    // makes this side the deadlock victim.
+                    let _ = helper_ready.acquire().await;
+                    sqlx::query(&format!("SELECT v FROM {table} WHERE v = 1 FOR UPDATE"))
+                        .fetch_one(sp.as_executor())
+                        .await?;
+                    probe_ready.add_permits(4096);
+                    sqlx::query(&format!("SELECT v FROM {table} WHERE v = 2 FOR UPDATE"))
+                        .fetch_one(sp.as_executor())
+                        .await?;
+                    Ok::<_, sqlx::Error>(())
+                })
+                .await?;
+            Ok(JobBatchCompletion::WithOutcomesWithOp(op, outcomes))
+        }
+    }
+
+    struct DlInitializer {
+        job_type: JobType,
+        table: String,
+        probes: Arc<AtomicUsize>,
+        helper_ready: Arc<tokio::sync::Semaphore>,
+        probe_ready: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl BatchedJobInitializer for DlInitializer {
+        type Config = DlConfig;
+        fn job_type(&self) -> JobType {
+            self.job_type.clone()
+        }
+        fn retry_on_error_settings(&self) -> RetrySettings {
+            RetrySettings {
+                n_attempts: Some(1),
+                ..Default::default()
+            }
+        }
+        fn init(
+            &self,
+            _: job::JobSpawner<Self::Config>,
+        ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>>
+        {
+            Ok(Box::new(DlRunner {
+                table: self.table.clone(),
+                probes: Arc::clone(&self.probes),
+                helper_ready: Arc::clone(&self.helper_ready),
+                probe_ready: Arc::clone(&self.probe_ready),
+            }))
+        }
+    }
+
+    let probes = Arc::new(AtomicUsize::new(0));
+    let helper_ready = Arc::new(tokio::sync::Semaphore::new(0));
+    let probe_ready = Arc::new(tokio::sync::Semaphore::new(0));
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_batched_initializer(DlInitializer {
+        job_type: helpers::job_type("bisect-deadlock-abort"),
+        table: table.to_string(),
+        probes: Arc::clone(&probes),
+        helper_ready: Arc::clone(&helper_ready),
+        probe_ready: Arc::clone(&probe_ready),
+    });
+
+    // Eight items, so a bisect that treated the deadlock as a culprit signal
+    // would be plainly visible: it would split to 15 probes rather than stop.
+    let ids: Vec<JobId> = (0..8).map(|_| JobId::new()).collect();
+    spawner
+        .spawn_all(
+            ids.iter()
+                .map(|id| {
+                    JobSpec::new(
+                        *id,
+                        DlConfig {
+                            table: table.to_string(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+    let helper_pool = helpers::init_pool().await?;
+    let helper_table = table.to_string();
+    let helper = tokio::spawn(async move {
+        let mut tx = helper_pool.begin().await?;
+        sqlx::query(&format!(
+            "SELECT v FROM {helper_table} WHERE v = 2 FOR UPDATE"
+        ))
+        .fetch_one(&mut *tx)
+        .await?;
+        helper_ready.add_permits(4096);
+
+        // Wait for the probe to hold row 1, then give it a clear margin to
+        // start waiting on row 2 before closing the cycle from this side.
+        // Whichever waiter's `deadlock_timeout` expires first is the one
+        // Postgres aborts, and the probe is the side under test.
+        let _ = probe_ready.acquire().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let _ = sqlx::query(&format!(
+            "SELECT v FROM {helper_table} WHERE v = 1 FOR UPDATE"
+        ))
+        .fetch_one(&mut *tx)
+        .await;
+        let _ = tx.rollback().await;
+        Ok::<_, sqlx::Error>(())
+    });
+
+    jobs.start_poll().await?;
+    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    let _ = helper.await;
+
+    // The conflict was transient, so the re-probe wins and the batch settles
+    // in this dispatch -- no item blamed, no retry attempt burnt, even though
+    // `n_attempts` is 1 and there is no second chance.
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed),
+        "a transient conflict must not cost the batch its dispatch, saw {:?}",
+        outcomes.iter().map(|o| o.state()).collect::<Vec<_>>()
+    );
+
+    // The assertion that pins the mechanism. Two probes means the deadlocked
+    // range was re-run whole: [0,8) deadlocks, [0,8) succeeds. Splitting on
+    // the conflict instead -- the behaviour this guards against -- reaches the
+    // same completed outcome by a different route, [0,8) then [0,4) then
+    // [4,8), and is caught here as three.
+    let used = probes.load(Ordering::SeqCst);
+    assert_eq!(
+        used, 2,
+        "a retryable conflict must re-probe the same range, not split it; \
+         saw {used} probes"
+    );
 
     Ok(())
 }

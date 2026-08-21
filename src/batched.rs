@@ -34,9 +34,13 @@
 //!   against the batch's `op` aborts the whole transaction. To isolate it —
 //!   so batch-mates still commit — run that item's work through
 //!   [`CurrentBatchedJob::run_isolated`], which wraps each item in its own
-//!   `SAVEPOINT` via [`es_entity::DbOp::with_savepoint`]. Savepoints isolate
-//!   *failures*, not *contention*: they do not release Postgres locks, so
-//!   they are not a lever for raising batch size under lock pressure.
+//!   `SAVEPOINT` via [`es_entity::DbOp::with_savepoint`]. Rolling back to a
+//!   savepoint DOES release the locks taken since it (row and table alike --
+//!   verified against Postgres), so a failed item leaves nothing pinned. What
+//!   savepoints do not shorten is how long a *successful* item's locks are
+//!   held: those live until the shared transaction commits, exactly as they
+//!   would without one. Savepoints are therefore a lever for isolating
+//!   failures, not for raising batch size under lock pressure.
 //! - A **true batch** (batch-load, mutate, batch-persist as one statement)
 //!   has no per-item loop for `run_isolated` to wrap. For that shape, use
 //!   [`CurrentBatchedJob::run_bisected`] instead: it probes the whole batch
@@ -232,6 +236,17 @@ impl BisectBudget {
         }
     }
 }
+
+/// How many probes across one bisect may be re-attempted after Postgres
+/// aborted them as a deadlock victim or serialization failure.
+///
+/// Global rather than per range, because what needs bounding is the total
+/// `deadlock_timeout` a single batch can pay: Postgres makes every conflicting
+/// probe wait one out (a second, by default) before it reports. Small because
+/// these conflicts resolve as soon as the surviving partner commits, so a
+/// re-probe normally succeeds at once; a batch that keeps losing is contending
+/// with something persistent and belongs in a whole-batch retry, not here.
+const BISECT_MAX_CONFLICT_RETRIES: usize = 2;
 
 /// `ceil(log2(n))`, defined as `0` for `n <= 1`.
 fn ceil_log2(n: usize) -> usize {
@@ -589,21 +604,34 @@ impl<C> CurrentBatchedJob<C> {
     ///   deterministically by probe order, not item order. Only use this
     ///   for batches whose items are safe to probe in any grouping —
     ///   i.e. the module's existing entity-disjointness guidance
-    ///   (`queue_id` is the serialization unit). A deadlock from probing out
-    ///   of the usual `(queue_id, id)` lock order is detected by Postgres
-    ///   and surfaces as an ordinary failing probe.
-    /// - Locks acquired inside a probe are **not released** by its
-    ///   rollback (`ROLLBACK TO` keeps them) — same caveat as
-    ///   `run_isolated`: this is not a lever for raising batch size under
-    ///   lock pressure.
+    ///   (`queue_id` is the serialization unit).
+    /// - **The search does not run against a frozen snapshot.** A failed
+    ///   probe's rollback releases the locks it took, so rows it touched are
+    ///   free for other transactions to change before the next probe reaches
+    ///   them. A probe's result is a fact about the moment it ran, not a
+    ///   standing one.
+    /// - Locks a *successful* probe takes are held until the shared
+    ///   transaction commits, so bisecting extends how long they are held —
+    ///   by the probes still to run — without widening the set. The set is
+    ///   the rows that were going to be committed anyway.
     ///
     /// # Errors
     ///
-    /// The returned `Err` is the *outer* layer of
-    /// [`with_savepoint`](es_entity::DbOp::with_savepoint): the savepoint
-    /// machinery itself failed (e.g. a dead connection), not any probe's
-    /// domain logic. Propagate it with `?` and let the whole batch retry,
-    /// exactly like [`run_isolated`](Self::run_isolated).
+    /// An outer `Err` means the batch could not be dispositioned here at all:
+    /// either the savepoint machinery itself failed (a dead connection), or
+    /// probes kept losing lock conflicts. Propagate it with `?` and let the
+    /// whole batch retry, exactly like [`run_isolated`](Self::run_isolated).
+    ///
+    /// A `40P01` deadlock or `40001` serialization failure never drives the
+    /// search. It is not attributable to any item, so splitting on one cannot
+    /// isolate anything — and splitting can *provoke* it, since there are lock
+    /// sets that succeed taken at once and deadlock taken in halves. Such a
+    /// probe is re-run against the same range instead: its rollback released
+    /// its locks, and the partner that won the cycle has moved on, so a retry
+    /// usually succeeds and settles the batch in this dispatch. Only after
+    /// they keep recurring does the bisect give up — which bounds the total
+    /// `deadlock_timeout` one batch can pay, since Postgres makes every
+    /// conflicting probe wait one out before reporting it.
     ///
     /// ```rust,ignore
     /// let mut op = current_batch.begin_op().await?;
@@ -621,7 +649,7 @@ impl<C> CurrentBatchedJob<C> {
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>,
     ) -> Result<BatchOutcomes, sqlx::Error>
     where
-        E: std::fmt::Display,
+        E: std::error::Error + 'static,
     {
         self.run_bisected_with(op, BisectBudget::default(), f).await
     }
@@ -638,7 +666,7 @@ impl<C> CurrentBatchedJob<C> {
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>,
     ) -> Result<BatchOutcomes, sqlx::Error>
     where
-        E: std::fmt::Display,
+        E: std::error::Error + 'static,
     {
         let n = self.items.len();
         let mut outcomes = Vec::with_capacity(n);
@@ -652,6 +680,7 @@ impl<C> CurrentBatchedJob<C> {
         heap.push(PendingRange { start: 0, end: n });
 
         let mut probes_used = 0usize;
+        let mut conflict_retries = 0usize;
         let mut last_error: Option<String> = None;
         let mut logged_bisecting = false;
 
@@ -685,6 +714,55 @@ impl<C> CurrentBatchedJob<C> {
                     );
                 }
                 Err(e) => {
+                    // A deadlock or serialization failure is NOT evidence of a
+                    // culprit item, so it must never drive the search. It
+                    // cannot isolate anything, because no item caused it, and
+                    // splitting on one can make it *likelier*: there are lock
+                    // sets that succeed taken all at once and deadlock taken
+                    // in two halves. Left to drive the search it would mark
+                    // items `Fail` and burn their retry attempts for a
+                    // conflict the server invented to break a cycle.
+                    //
+                    // Re-probe the SAME range instead. The rollback released
+                    // this probe's locks, so the retry starts clean, and the
+                    // partner that won the cycle has moved on -- which is why
+                    // one of these normally succeeds immediately, settling the
+                    // batch in this dispatch rather than deferring it.
+                    //
+                    // The allowance is global, not per range: what it bounds
+                    // is the total `deadlock_timeout` this batch can pay,
+                    // since Postgres makes every conflicting probe wait one
+                    // (a second, by default) before reporting.
+                    if let Some(code) = crate::error::retryable_conflict_code(&e) {
+                        if conflict_retries < BISECT_MAX_CONFLICT_RETRIES {
+                            conflict_retries += 1;
+                            tracing::warn!(
+                                target: "job.batch_bisect",
+                                n_items = n,
+                                probes_used,
+                                conflict_retries,
+                                sqlstate = code,
+                                "probe hit a retryable conflict; re-probing the \
+                                 same range"
+                            );
+                            heap.push(range);
+                            continue;
+                        }
+                        tracing::warn!(
+                            target: "job.batch_bisect",
+                            n_items = n,
+                            probes_used,
+                            sqlstate = code,
+                            "probe kept hitting retryable conflicts; abandoning \
+                             the bisect for a whole-batch retry"
+                        );
+                        return Err(sqlx::Error::Protocol(format!(
+                            "bisect abandoned after {probes_used} probes and \
+                             {conflict_retries} conflict retries; last conflict \
+                             {code}: {e}"
+                        )));
+                    }
+
                     if !logged_bisecting {
                         logged_bisecting = true;
                         tracing::warn!(

@@ -23,7 +23,7 @@ use super::{
         RawBatchItem, ShutdownRx,
     },
     entity::{Job, JobType, RetryPolicy},
-    error::JobError,
+    error::{JobError, is_retryable_conflict},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -40,30 +40,6 @@ use super::{
 /// lose, something is wrong beyond ordinary contention and the batch is
 /// better off going through the rescue path than spinning here.
 const SEAL_MAX_ATTEMPTS: u32 = 3;
-
-/// Whether Postgres aborted this transaction for a conflict that is, by
-/// definition, resolved by retrying: `40P01` deadlock detected, `40001`
-/// serialization failure. The victim did nothing wrong -- the server picked
-/// it to break a cycle.
-///
-/// Walks the source chain rather than matching one [`JobError`] variant: the
-/// same abort surfaces as `Sqlx` from raw statements and wrapped in a repo
-/// error (`Modify`/`Find`/`Query`/`Create`) from es-entity's own writes,
-/// and a seal touches both.
-fn is_retryable_conflict(err: &JobError) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(e) = source {
-        if let Some(db) = e
-            .downcast_ref::<sqlx::Error>()
-            .and_then(|e| e.as_database_error())
-            && matches!(db.code().as_deref(), Some("40P01") | Some("40001"))
-        {
-            return true;
-        }
-        source = e.source();
-    }
-    false
-}
 
 /// What happened to a batch's claimed rows after the dispatcher failed
 /// terminally. Reported on the `batch dispatcher error` log so an operator
