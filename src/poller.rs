@@ -1414,7 +1414,7 @@ struct ShutdownSubs {
 /// - `recycled`: a completion-side call already owns a unit of `job_type`'s
 ///   capacity (its own dispatcher is about to release it) and hands it over
 ///   instead of releasing outright -- see [`JobTracker::recycle`].
-struct ClaimHook {
+pub(crate) struct ClaimHook {
     poller: std::sync::Weak<JobPoller>,
     fresh_demand: HashMap<JobType, usize>,
     recycled: Vec<(JobType, UnitReservation)>,
@@ -1426,7 +1426,21 @@ impl ClaimHook {
     /// than a value built inline: `TypeId::of` is a `const fn`, so this is
     /// fully compile-time-determined, and `&Self::RUNS_AFTER` promotes to a
     /// `'static` reference for free (no `OnceLock`, no runtime init check).
-    const RUNS_AFTER: [std::any::TypeId; 1] = [std::any::TypeId::of::<PromoteHeadsHook>()];
+    ///
+    /// Extended from `[PromoteHeadsHook]` to also name `ExecutionInsertHook`:
+    /// a claim must never run before the inserts that create the rows it
+    /// would claim. In practice `ClaimHook` is always registered
+    /// re-entrantly FROM `ExecutionInsertHook::pre_commit`, which already
+    /// guarantees the insert ran first -- but declaring the dependency makes
+    /// that hold for every call site (present or future) that hand-composes
+    /// both hooks on one `op`, not just the ones where registration happens
+    /// to occur in the right order today. See the crate-level hook-DAG note
+    /// on [`crate::execution_hooks::ExecutionReadyNotifyHook`] for the full
+    /// picture.
+    pub(crate) const RUNS_AFTER: [std::any::TypeId; 2] = [
+        std::any::TypeId::of::<crate::execution_hooks::ExecutionInsertHook>(),
+        std::any::TypeId::of::<PromoteHeadsHook>(),
+    ];
 }
 
 impl es_entity::operation::hooks::CommitHook for ClaimHook {
@@ -1494,6 +1508,32 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
                 self.claimed.push((reservation, target, subs));
             }
         }
+
+        // Fix 3 (sb-max8): report what THIS pass actually claimed, per type,
+        // so `ExecutionReadyNotifyHook` (deferred behind this hook -- see
+        // `RUNS_AFTER`) can net it against `ExecutionInsertHook`'s `adds`
+        // and skip the notify entirely when this claim already carried the
+        // freshly landed rows off. Counted from `self.claimed` (what was
+        // actually claimed), not `fresh_demand`/`recycled` (what was asked
+        // for) -- a claim can come back short of its reservations.
+        let mut claimed_counts: HashMap<JobType, usize> = HashMap::new();
+        for (_, target, _) in &self.claimed {
+            match target {
+                DispatchTarget::Single(row) => {
+                    *claimed_counts.entry(row.job_type.clone()).or_insert(0) += 1;
+                }
+                DispatchTarget::Batch(job_type, rows) => {
+                    *claimed_counts.entry(job_type.clone()).or_insert(0) += rows.len();
+                }
+            }
+        }
+        crate::execution_hooks::ExecutionReadyNotifyHook::register(
+            &mut op,
+            &poller.notifier,
+            HashMap::new(),
+            claimed_counts,
+            HashSet::new(),
+        );
 
         es_entity::operation::hooks::PreCommitRet::ok(self, op)
     }

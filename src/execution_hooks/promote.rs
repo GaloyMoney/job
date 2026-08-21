@@ -68,6 +68,19 @@ pub(crate) struct PromoteHeadsHook {
     pub(crate) freed_queues: Vec<String>,
 }
 
+impl PromoteHeadsHook {
+    /// [`CommitHook::runs_after`]'s dependency list -- see the hook-DAG note
+    /// on [`crate::execution_hooks`] for the full picture. A hand-composed
+    /// op that both spawns (registers `ExecutionInsertHook`) and promotes
+    /// (registers this hook standalone -- e.g. a retry backoff sharing a
+    /// transaction with an unrelated spawn) must see the spawn's rows before
+    /// this hook looks for a parked sibling to swap; a freshly `parked` row
+    /// from that spawn can be an older sibling this hook should have
+    /// promoted instead.
+    const RUNS_AFTER: [std::any::TypeId; 1] =
+        [std::any::TypeId::of::<super::insert::ExecutionInsertHook>()];
+}
+
 /// One sibling promoted by [`PromoteHeadsHook::apply`]: its type (for
 /// notify) and its own `execute_at`, unchanged by the promote (for callers
 /// that need to know whether it is ACTUALLY due, not merely promoted --
@@ -317,5 +330,9 @@ impl CommitHook for PromoteHeadsHook {
         self.freed_queues.append(&mut other.freed_queues);
         self.own_types.extend(other.own_types.drain());
         true
+    }
+
+    fn runs_after(&self) -> &[std::any::TypeId] {
+        &Self::RUNS_AFTER
     }
 }
