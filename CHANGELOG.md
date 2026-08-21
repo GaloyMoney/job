@@ -1,3 +1,15 @@
+# [job release v0.13.4](https://github.com/GaloyMoney/job/releases/tag/0.13.4)
+
+
+
+### Performance
+
+- Pin enable_seqscan=off on the poll pool — generic plan falls back to per-type heap scans (#180)
+
+### Testing
+
+- Gate instantly-completing runners so a claim-path speedup can't delete the row under an assertion (#181)
+
 # [job release v0.13.3](https://github.com/GaloyMoney/job/releases/tag/0.13.3)
 
 
