@@ -1782,10 +1782,21 @@ impl ClaimReconciler {
         let mut tx = pool.begin().await?;
         let reset = sqlx::query_scalar!(
             r#"
+            -- `(queue_id, id)`-ordered lock first, for the same reason
+            -- `reclaim_lost_jobs` takes one: this transaction goes on to call
+            -- `PromoteHeadsHook::apply`, which locks in that order, over
+            -- queues this reset just touched.
+            WITH locked AS MATERIALIZED (
+                SELECT je.id, u.execute_at FROM job_executions je
+                JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
+                  ON je.id = u.id
+                WHERE je.state = 'running' AND je.poller_instance_id = $3
+                ORDER BY je.queue_id, je.id
+                FOR NO KEY UPDATE OF je
+            )
             UPDATE job_executions je
-            SET state = 'pending', poller_instance_id = NULL, execute_at = u.execute_at
-            FROM UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
-            WHERE je.id = u.id AND je.state = 'running' AND je.poller_instance_id = $3
+            SET state = 'pending', poller_instance_id = NULL, execute_at = l.execute_at
+            FROM locked l WHERE je.id = l.id
             RETURNING je.id AS "id!: JobId"
             "#,
             &ids,
@@ -1810,6 +1821,14 @@ impl ClaimReconciler {
 /// sibling should run first during the reclaimed row's backoff, and that
 /// sibling can be a different type than the row it displaced -- reported
 /// separately, so callers can wake the right pollers.
+///
+/// Takes its locks in `(queue_id, id)` order for the same reason
+/// [`sweep_orphaned_parked_rows`] does, and more urgently: this transaction
+/// goes on to call [`PromoteHeadsHook::apply`], which locks in exactly that
+/// order, so leaving the reclaim `UPDATE` in planner scan order would make one
+/// transaction acquire two overlapping sets of locks in two different orders.
+/// A queue whose row this reclaims is very often the same queue `apply` then
+/// swaps.
 async fn reclaim_lost_jobs(
     pool: &PgPool,
     instance_id: uuid::Uuid,
@@ -1821,13 +1840,19 @@ async fn reclaim_lost_jobs(
     let mut tx = pool.begin().await?;
     let rows = sqlx::query!(
         r#"
-        UPDATE job_executions
+        WITH locked AS MATERIALIZED (
+            SELECT je.id FROM job_executions je
+            WHERE je.state = 'running'
+              AND je.alive_at < $1::timestamptz
+              AND je.job_type = ANY($2)
+              AND (je.poller_instance_id IS DISTINCT FROM $4 OR je.id <> ALL($5))
+            ORDER BY je.queue_id, je.id
+            FOR NO KEY UPDATE
+        )
+        UPDATE job_executions je
         SET state = 'pending', execute_at = $3, attempt_index = attempt_index + 1, poller_instance_id = NULL
-        WHERE state = 'running'
-          AND alive_at < $1::timestamptz
-          AND job_type = ANY($2)
-          AND (poller_instance_id IS DISTINCT FROM $4 OR id <> ALL($5))
-        RETURNING id AS "id!: JobId", job_type AS "job_type!: JobType"
+        FROM locked l WHERE je.id = l.id
+        RETURNING je.id AS "id!: JobId", je.job_type AS "job_type!: JobType"
         "#,
         alive_threshold,
         supported_job_types as _,
@@ -1868,6 +1893,18 @@ async fn reclaim_lost_jobs(
 ///
 /// Returns the job type of every row promoted, so the caller can wake the
 /// pollers that cover it.
+///
+/// Locks every head in `(queue_id, id)` order before promoting any of them --
+/// the one global order every multi-row WAITING locker of this table agrees
+/// on (`ExecutionInsertHook::lock_queue_occupants`, `PromoteHeadsHook::apply`
+/// and `apply_freed`, both `batch_dispatcher` completers' `to_delete`). This
+/// sweep is the widest locker of the lot: unlike those, its row set is
+/// unscoped -- every orphaned queue in the table, across every type and every
+/// process -- so it overlaps whatever any concurrent writer happens to be
+/// touching. Without the ordered `locked` CTE the bare `UPDATE ... FROM heads`
+/// acquires in planner scan order (`heads`'s row order is not a lock order),
+/// which agrees with the rest of the table's writers only by accident, and
+/// stops agreeing whenever a plan changes underneath it.
 async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar!(
         r#"
@@ -1887,9 +1924,14 @@ async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::
                 ORDER BY execute_at, id
                 LIMIT 1
             ) h
+        ), locked AS MATERIALIZED (
+            SELECT je.id FROM job_executions je
+            WHERE je.id IN (SELECT id FROM heads)
+            ORDER BY je.queue_id, je.id
+            FOR NO KEY UPDATE
         )
         UPDATE job_executions je SET state = 'pending'
-        FROM heads h WHERE je.id = h.id
+        FROM locked l WHERE je.id = l.id
         RETURNING je.job_type
         "#,
     )
@@ -2367,12 +2409,22 @@ async fn kill_remaining_jobs(
     let now = clock.now();
     let rows = sqlx::query!(
         r#"
-        UPDATE job_executions
+        -- `(queue_id, id)`-ordered, like every other multi-row waiting locker
+        -- of this table: shutdown releases an unbounded set of rows spread
+        -- across arbitrary queues while peers are still spawning, completing
+        -- and sweeping against the same ones.
+        WITH locked AS MATERIALIZED (
+            SELECT je.id FROM job_executions je
+            WHERE je.poller_instance_id = $2 AND je.state = 'running'
+            ORDER BY je.queue_id, je.id
+            FOR NO KEY UPDATE
+        )
+        UPDATE job_executions je
         SET state = 'pending',
             execute_at = $1,
             poller_instance_id = NULL
-        WHERE poller_instance_id = $2 AND state = 'running'
-        RETURNING id as "id!: JobId", attempt_index
+        FROM locked l WHERE je.id = l.id
+        RETURNING je.id as "id!: JobId", je.attempt_index
         "#,
         now,
         instance_id
@@ -2935,6 +2987,121 @@ mod tests {
                 .fetch_one(pool)
                 .await?;
         Ok(state)
+    }
+
+    /// Seeds one orphaned queue (a `parked` head, no active sibling) with a
+    /// caller-chosen `queue_id` and `id`, so a test can make plain `id` order
+    /// and `(queue_id, id)` order disagree on purpose.
+    async fn seed_orphan_with_id(
+        pool: &PgPool,
+        job_type: &str,
+        queue_id: &str,
+        id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO jobs (id, job_type, queue_id, created_at) VALUES ($1, $2, $3, NOW())",
+        )
+        .bind(id)
+        .bind(job_type)
+        .bind(queue_id)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, queue_id, state, attempt_index, execute_at, alive_at, created_at) \
+             VALUES ($1, $2, $3, 'parked', 1, NOW() - INTERVAL '600 seconds', NOW(), NOW())",
+        )
+        .bind(id)
+        .bind(job_type)
+        .bind(queue_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// `sweep_orphaned_parked_rows` is the widest multi-row WAITING locker of
+    /// `job_executions` in the crate -- its row set is every orphaned queue in
+    /// the table, unscoped by type or process -- so it owes the same
+    /// `(queue_id, id)` lock-acquisition order as every other one
+    /// (`lock_queue_occupants`, `PromoteHeadsHook::apply`/`apply_freed`, both
+    /// completers' `to_delete`). It did not have it: the bare
+    /// `UPDATE ... FROM heads` acquired in planner scan order, which is a
+    /// deadlock (40P01) waiting for a plan change -- observed in CI as
+    /// `orphan_sweeper_recovers_orphaned_parked_row` failing with "deadlock
+    /// detected" once the rest of the table's writers were pinned to
+    /// `(queue_id, id)`.
+    ///
+    /// Deterministic, not a timing race. Two orphaned queues are built so the
+    /// two orderings DISAGREE: `qa` sorts before `qb` by `queue_id`, but `qa`'s
+    /// head has the HIGHER `id`. A holder transaction then takes the row the
+    /// correctly-ordered sweep must lock FIRST (`qa`'s), and only afterwards
+    /// reaches for the one it must lock second (`qb`'s).
+    ///
+    /// Note what this can and cannot pin. Restoring the bare, UNORDERED
+    /// `UPDATE ... FROM heads` does not reliably fail here: on a small local
+    /// database the planner happens to feed `heads` in `queue_id` order
+    /// anyway. That is exactly the defect -- the order was never guaranteed,
+    /// only inherited from a plan -- and it is why this asserts the ORDER
+    /// rather than the absence of a plan. Swapping the `locked` CTE's
+    /// `ORDER BY` to bare `je.id` reproduces CI's 40P01 on every run.
+    ///
+    /// - Ordered (fixed): the sweep blocks on `qa` immediately, holding
+    ///   nothing, so the holder takes `qb` and both finish.
+    /// - Any order that takes `qb` before `qa` (`id` order, and whatever the
+    ///   planner picks): the sweep holds `qb` and waits for `qa` while the
+    ///   holder holds `qa` and waits for `qb` -- a cycle, and Postgres aborts
+    ///   one side.
+    #[tokio::test]
+    async fn orphan_sweep_locks_heads_in_queue_id_order() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("orphan-lockorder-{}", uuid::Uuid::now_v7());
+
+        // Shared prefix differs before either suffix, so `qa < qb` as strings
+        // regardless of the UUIDs' own values.
+        let qa = format!("orphan-lockorder-qa-{}", uuid::Uuid::now_v7());
+        let qb = format!("orphan-lockorder-qb-{}", uuid::Uuid::now_v7());
+
+        // ... but `qa`'s head sorts AFTER `qb`'s by bare `id`: v7 UUIDs are
+        // time-ordered, so minting `qb`'s first is enough.
+        let id_b = uuid::Uuid::now_v7();
+        let id_a = uuid::Uuid::now_v7();
+        assert!(qa < qb && id_b < id_a, "the two orderings must disagree");
+
+        seed_orphan_with_id(&pool, &job_type, &qb, id_b).await?;
+        seed_orphan_with_id(&pool, &job_type, &qa, id_a).await?;
+
+        // Holder: takes `qa`'s head (what the ORDERED sweep locks first), then
+        // reaches for `qb`'s (what it locks second).
+        let holder_pool = pool.clone();
+        let holder = tokio::spawn(async move {
+            let mut tx = holder_pool.begin().await?;
+            sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR NO KEY UPDATE")
+                .bind(id_a)
+                .fetch_one(&mut *tx)
+                .await?;
+            // Long enough that the sweep is reliably already blocked (ordered)
+            // or already holding `qb` (unordered) before this second lock is
+            // requested -- the sweep is a single fast statement either way.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR NO KEY UPDATE")
+                .bind(id_b)
+                .fetch_one(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sweep = sweep_orphaned_parked_rows(&pool).await;
+
+        // Neither side may be a deadlock victim. Assert on both: Postgres
+        // picks whichever it likes.
+        sweep.expect("orphan sweep must not deadlock against an ordered holder");
+        holder
+            .await?
+            .expect("holder must not deadlock against the sweep");
+
+        Ok(())
     }
 
     /// A parked row whose queue has no active row (hand-constructed here,
