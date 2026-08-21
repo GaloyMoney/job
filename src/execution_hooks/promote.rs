@@ -105,6 +105,15 @@ impl PromoteHeadsHook {
     /// promoting a sibling would fail `idx_job_executions_queue_active`
     /// outright, so the guard skips a queue that needs no promotion instead
     /// of erroring.
+    ///
+    /// Locks every head in `(queue_id, id)` order before updating any of
+    /// them -- the same global order every other multi-row locker of this
+    /// table agrees on (`lock_queue_occupants`, `Self::apply`'s own swap
+    /// lock, `ExecutionInsertHook::pre_commit`'s row pre-sort). A batch
+    /// completion can free several queues in one call; without an ordered
+    /// lock here, it would acquire in whatever order the `UNNEST` input
+    /// happens to iterate, which can deadlock against a concurrent spawn's
+    /// pin or swap touching the same rows in the opposite order.
     async fn apply_freed(
         op: &mut impl AtomicOperation,
         queue_ids: &[String],
@@ -136,9 +145,23 @@ impl PromoteHeadsHook {
                     SELECT 1 FROM job_executions a
                     WHERE a.queue_id = q.queue_id AND a.state IN ('pending', 'running')
                 )
+            ), locked AS MATERIALIZED (
+                -- Lock every head in (queue_id, id) order before the UPDATE
+                -- below touches any of them -- the same global order
+                -- `lock_queue_occupants` and `Self::apply`'s own `locked` CTE
+                -- use. A bare `UPDATE ... FROM heads` has no ordering
+                -- guarantee of its own (`heads`'s row order is not a lock
+                -- order), so a multi-queue batch completion freeing several
+                -- queues here could otherwise acquire in planner/`UNNEST`
+                -- order and deadlock against a concurrent spawn's pin or
+                -- swap touching the same rows in the opposite order.
+                SELECT je.id FROM job_executions je
+                WHERE je.id IN (SELECT id FROM heads)
+                ORDER BY je.queue_id, je.id
+                FOR NO KEY UPDATE
             )
             UPDATE job_executions je SET state = 'pending'
-            FROM heads h WHERE je.id = h.id
+            FROM locked l WHERE je.id = l.id
             RETURNING je.job_type, je.execute_at AS "execute_at!"
             "#,
             &deduped,
