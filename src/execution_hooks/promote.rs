@@ -109,7 +109,7 @@ impl PromoteHeadsHook {
     /// Locks every head in `(queue_id, id)` order before updating any of
     /// them -- the same global order every other multi-row locker of this
     /// table agrees on (`lock_queue_occupants`, `Self::apply`'s own swap
-    /// lock, `ExecutionInsertHook::pre_commit`'s row pre-sort). A batch
+    /// lock, `ExecutionInsertHook::insert_many`'s `input` CTE). A batch
     /// completion can free several queues in one call; without an ordered
     /// lock here, it would acquire in whatever order the `UNNEST` input
     /// happens to iterate, which can deadlock against a concurrent spawn's
@@ -180,7 +180,7 @@ impl PromoteHeadsHook {
     /// Every row this touches is locked up front by the `locked` CTE, in
     /// `(queue_id, id)` order -- the same global order
     /// `execution_hooks::insert`'s `lock_queue_occupants` (the spawn-side
-    /// pin) and `ExecutionInsertHook::pre_commit`'s row pre-sort agree on.
+    /// pin) and `ExecutionInsertHook::insert_many`'s `input` CTE agree on.
     /// Without it the `demote` and promote `UPDATE`s acquire in
     /// planner-determined scan order, so two concurrent multi-row callers --
     /// two overlapping `reclaim_lost_jobs` sweeps, a batch reschedule racing

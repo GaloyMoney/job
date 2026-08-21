@@ -128,6 +128,20 @@ impl ExecutionInsertHook {
     /// `COALESCE` of two scalar subqueries is safe. This is what lets a
     /// batch's own losing rows -- not just pre-existing backlog -- get
     /// swap-checked by [`PromoteHeadsHook`] next.
+    ///
+    /// `input` is `MATERIALIZED` and `ORDER BY (queue_id, id)`, deliberately:
+    /// the `ins` arbiter insert's `ON CONFLICT` WAITS on a concurrent
+    /// uncommitted row holding the same queue slot, and per-row arbiter
+    /// processing follows a materialized CTE's stored (i.e. sorted) row
+    /// order -- the same mechanism `PromoteHeadsHook::apply`'s `locked` CTE
+    /// uses to fix lock ACQUISITION order via `ORDER BY` + `FOR NO KEY
+    /// UPDATE`. This puts the arbiter wait on the SAME global order as every
+    /// other waiting locker of this table (`lock_queue_occupants` below,
+    /// `PromoteHeadsHook::apply`/`apply_freed`), regardless of what order
+    /// `rows` arrived in -- the row order is enforced in SQL, not by the
+    /// caller/accumulator having sorted `rows` beforehand. Unqueued rows
+    /// (`queue_id IS NULL`) sort last under plain `ORDER BY` and never
+    /// conflict, so their position doesn't matter.
     async fn insert_many(
         op: &mut impl AtomicOperation,
         rows: &[NewExecutionRow],
@@ -140,9 +154,10 @@ impl ExecutionInsertHook {
         sqlx::query_as!(
             InsertedRow,
             r#"
-            WITH input AS (
+            WITH input AS MATERIALIZED (
                 SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[])
                     AS t(id, job_type, queue_id, execute_at)
+                ORDER BY queue_id, id
             ), ins AS (
                 INSERT INTO job_executions
                     (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
@@ -222,8 +237,9 @@ impl ExecutionInsertHook {
     /// `Sort`, so rows are locked in that order however the scan below
     /// reached them -- an unordered bitmap scan included). This is the same
     /// global order as [`PromoteHeadsHook::apply`]'s swap lock and
-    /// `ExecutionInsertHook::pre_commit`'s pre-sort of `rows` before the
-    /// arbiter insert. Without agreement here, a multi-queue spawn and a
+    /// [`Self::insert_many`]'s `input` CTE, which orders the arbiter insert
+    /// the same way, in SQL, rather than relying on `rows` having arrived
+    /// pre-sorted. Without agreement here, a multi-queue spawn and a
     /// multi-queue batch completion touching the same two rows in opposite
     /// orders would deadlock.
     ///
@@ -453,21 +469,15 @@ impl ExecutionInsertHook {
 
 impl CommitHook for ExecutionInsertHook {
     async fn pre_commit(
-        mut self,
+        self,
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
-        // Deterministic lock ordering: `insert_many`'s arbiter (`ON CONFLICT
-        // (queue_id) ... DO NOTHING`) WAITS on a concurrent uncommitted row
-        // holding the same queue slot, and until now that wait had no
-        // defined order -- it followed whatever order the caller/merge
-        // accumulated `rows` in. Sorting by `(queue_id, id)` here, once, up
-        // front, puts it on the SAME order as every other waiting locker of
-        // this table (`lock_queue_occupants` below, `PromoteHeadsHook::apply`).
-        // Unqueued rows (`queue_id.is_none()`) sort first -- they never
-        // conflict, so their relative order doesn't matter.
-        self.rows
-            .sort_by(|a, b| (a.queue_id.as_deref(), a.id).cmp(&(b.queue_id.as_deref(), b.id)));
-
+        // Deterministic lock ordering for `insert_many`'s arbiter is enforced
+        // in SQL (see that method's doc comment: a `MATERIALIZED` + `ORDER
+        // BY (queue_id, id)` CTE), not here -- `rows` is passed through in
+        // whatever order the caller/merge accumulated it in, on purpose:
+        // the guarantee must not depend on every call site remembering to
+        // sort before calling this.
         let mut inserted = Self::insert_many(&mut op, &self.rows).await?;
 
         // Statement 2 and, only if a queue lost its occupant in the meantime,

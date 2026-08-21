@@ -77,8 +77,11 @@ fn job_type(prefix: &str) -> JobType {
 /// multi-row statement isn't something application code can pause
 /// mid-statement to force. Enough iterations reliably reproduce the
 /// deadlock (40P01, surfaced as a `JobError`) before the fix
-/// (`ExecutionInsertHook::pre_commit`'s `rows.sort_by`) and reliably don't
-/// after it -- verified by temporarily reverting that sort.
+/// (`ExecutionInsertHook::insert_many`'s `input` CTE: `MATERIALIZED` +
+/// `ORDER BY queue_id, id`, enforced in SQL rather than by pre-sorting
+/// `rows` in Rust -- the DB-side order holds regardless of what order any
+/// caller/accumulator happens to pass rows in) and reliably don't after it
+/// -- verified by temporarily reverting that `ORDER BY`.
 #[tokio::test]
 async fn concurrent_multi_queue_spawns_do_not_deadlock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;

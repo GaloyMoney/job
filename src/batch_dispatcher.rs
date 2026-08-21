@@ -419,7 +419,7 @@ impl BatchDispatcher {
     /// occupants in that same order (`execution_hooks::insert`'s
     /// `lock_queue_occupants`), as does the promote swap
     /// (`PromoteHeadsHook::apply`/`apply_freed`) and
-    /// `ExecutionInsertHook::pre_commit`'s row pre-sort, and this statement
+    /// `ExecutionInsertHook::insert_many`'s `input` CTE, and this statement
     /// contends with them for exactly those rows. A bare `DELETE ... WHERE
     /// id = ANY(...)` would acquire in scan order -- unordered under a
     /// bitmap scan -- so a spawn and a batch completion touching the same
