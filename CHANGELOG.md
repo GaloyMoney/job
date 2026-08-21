@@ -1,3 +1,11 @@
+# [job release v0.13.5](https://github.com/GaloyMoney/job/releases/tag/0.13.5)
+
+
+
+### Features
+
+- Add run_bisected auto-bisect failure isolation helper (#183)
+
 # [job release v0.13.4](https://github.com/GaloyMoney/job/releases/tag/0.13.4)
 
 
