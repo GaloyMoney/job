@@ -580,13 +580,46 @@ impl JobPoller {
                             failures = 0;
                             return job_lost_interval / 4;
                         }
+                        // Ordered and non-blocking, for deadlock avoidance.
+                        //
+                        // This fires every `job_lost_interval / 4` over every
+                        // running row of the instance, which made it the
+                        // busiest multi-row `job_executions` writer in the
+                        // crate -- and, as a bare `id = ANY(...)` UPDATE, the
+                        // last big one still taking row locks in scan order.
+                        // It was caught as a deadlock victim in production
+                        // (stress run sb-max10) and is the prime suspect for
+                        // the surviving partner of the batch-seal deadlocks
+                        // there and in sb-max9. One unordered writer
+                        // re-poisons every ordered one it overlaps, so this
+                        // adopts the same `MATERIALIZED` + `ORDER BY
+                        // queue_id, id` lock pattern `complete_in_op` uses --
+                        // see its doc comment for why the ordering (and
+                        // leading with `queue_id`) is load-bearing.
+                        //
+                        // `SKIP LOCKED` on top: a heartbeat has nothing to
+                        // gain by waiting for a contended row. Whoever holds
+                        // it is either deleting the row (terminal) or about to
+                        // release it, in which case the next beat refreshes
+                        // it. Worst-case gap is 2 * (interval / 4) = half the
+                        // liveness threshold, so a skipped row can never be
+                        // mistaken for lost. `FOR NO KEY UPDATE` rather than
+                        // `FOR UPDATE` so the heartbeat never blocks a
+                        // key-level locker.
                         match sqlx::query!(
                             r#"
-                        UPDATE job_executions
+                        WITH to_touch AS MATERIALIZED (
+                            SELECT id FROM job_executions
+                            WHERE poller_instance_id = $2
+                              AND state = 'running'
+                              AND id = ANY($3)
+                            ORDER BY queue_id, id
+                            FOR NO KEY UPDATE SKIP LOCKED
+                        )
+                        UPDATE job_executions je
                         SET alive_at = $1
-                        WHERE poller_instance_id = $2
-                          AND state = 'running'
-                          AND id = ANY($3)
+                        FROM to_touch t
+                        WHERE je.id = t.id
                         "#,
                             now,
                             instance_id,

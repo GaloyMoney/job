@@ -504,13 +504,26 @@ impl BatchDispatcher {
             .collect();
         let times: Vec<DateTime<Utc>> = reschedules.iter().map(|(_, at)| *at).collect();
 
+        // `(queue_id, id)`-ordered lock before the write, same reason and
+        // same `MATERIALIZED` shape as `complete_in_op` -- see its doc
+        // comment. A bare `UPDATE ... FROM UNNEST(...)` acquires in join
+        // order, which is not an order any other writer agrees with.
         sqlx::query!(
             r#"
+            WITH to_reschedule AS MATERIALIZED (
+                SELECT je.id, u.execute_at
+                FROM job_executions je
+                JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
+                  ON je.id = u.id
+                WHERE je.poller_instance_id = $3
+                ORDER BY je.queue_id, je.id
+                FOR UPDATE
+            )
             UPDATE job_executions AS je
-            SET state = 'pending', execute_at = u.execute_at, attempt_index = 1,
+            SET state = 'pending', execute_at = t.execute_at, attempt_index = 1,
                 poller_instance_id = NULL
-            FROM UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
-            WHERE je.id = u.id AND je.poller_instance_id = $3
+            FROM to_reschedule t
+            WHERE je.id = t.id
             "#,
             &uuids,
             &times,
@@ -583,14 +596,25 @@ impl BatchDispatcher {
         span.record("n_errored", terminal_uuids.len());
 
         if !retry_uuids.is_empty() {
+            // Same `(queue_id, id)`-ordered lock as the reschedule path
+            // above, for the same deadlock-avoidance reason.
             sqlx::query!(
                 r#"
+                WITH to_retry AS MATERIALIZED (
+                    SELECT je.id, u.execute_at, u.attempt_index
+                    FROM job_executions je
+                    JOIN UNNEST($1::uuid[], $2::timestamptz[], $3::int4[])
+                        AS u(id, execute_at, attempt_index)
+                      ON je.id = u.id
+                    WHERE je.poller_instance_id = $4
+                    ORDER BY je.queue_id, je.id
+                    FOR UPDATE
+                )
                 UPDATE job_executions AS je
-                SET state = 'pending', execute_at = u.execute_at,
-                    attempt_index = u.attempt_index, poller_instance_id = NULL
-                FROM UNNEST($1::uuid[], $2::timestamptz[], $3::int4[])
-                    AS u(id, execute_at, attempt_index)
-                WHERE je.id = u.id AND je.poller_instance_id = $4
+                SET state = 'pending', execute_at = t.execute_at,
+                    attempt_index = t.attempt_index, poller_instance_id = NULL
+                FROM to_retry t
+                WHERE je.id = t.id
                 "#,
                 &retry_uuids,
                 &retry_times,
