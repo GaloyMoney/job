@@ -375,19 +375,12 @@ async fn test_queue_id_serializes_execution() -> anyhow::Result<()> {
         .expect("Failed to start job polling");
 
     // Spawn two jobs with the same queue_id
+    let queue = helpers::unique("serial-queue");
     spawner
-        .spawn_with_queue_id(
-            JobId::new(),
-            QueueJobConfig { label: "A".into() },
-            "serial-queue",
-        )
+        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "A".into() }, &queue)
         .await?;
     spawner
-        .spawn_with_queue_id(
-            JobId::new(),
-            QueueJobConfig { label: "B".into() },
-            "serial-queue",
-        )
+        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "B".into() }, &queue)
         .await?;
 
     // Wait for job A to start
@@ -453,8 +446,13 @@ async fn test_queue_id_serializes_execution_across_two_pollers() -> anyhow::Resu
     let completed = Arc::new(Mutex::new(Vec::<String>::new()));
     let release = Arc::new(Notify::new());
 
+    // ONE type, cloned into both pollers. Minting it inside the closure would
+    // give A and B different UUID-suffixed names, and since claims filter on
+    // `registered_job_types()` B would never see A's jobs -- the test would
+    // still pass while silently no longer exercising cross-poller contention.
+    let job_type = helpers::job_type("queue-serial-two-pollers");
     let make_initializer = || QueueJobInitializer {
-        job_type: helpers::job_type("queue-serial-two-pollers"),
+        job_type: job_type.clone(),
         started: Arc::clone(&started),
         completed: Arc::clone(&completed),
         release: Arc::clone(&release),
@@ -487,19 +485,12 @@ async fn test_queue_id_serializes_execution_across_two_pollers() -> anyhow::Resu
 
     // Two jobs in the same queue, spawned back-to-back so both pollers'
     // first polls race on the queue head with the same snapshot.
+    let queue = helpers::unique("serial-queue-two-pollers");
     spawner
-        .spawn_with_queue_id(
-            JobId::new(),
-            QueueJobConfig { label: "A".into() },
-            "serial-queue-two-pollers",
-        )
+        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "A".into() }, &queue)
         .await?;
     spawner
-        .spawn_with_queue_id(
-            JobId::new(),
-            QueueJobConfig { label: "B".into() },
-            "serial-queue-two-pollers",
-        )
+        .spawn_with_queue_id(JobId::new(), QueueJobConfig { label: "B".into() }, &queue)
         .await?;
 
     // Wait for A to start
@@ -585,14 +576,14 @@ async fn test_different_queue_ids_run_concurrently() -> anyhow::Result<()> {
         .spawn_with_queue_id(
             JobId::new(),
             QueueJobConfig { label: "Q1".into() },
-            "queue-1",
+            helpers::unique("queue-1"),
         )
         .await?;
     spawner
         .spawn_with_queue_id(
             JobId::new(),
             QueueJobConfig { label: "Q2".into() },
-            "queue-2",
+            helpers::unique("queue-2"),
         )
         .await?;
 
@@ -2371,10 +2362,11 @@ async fn test_write_path_emits_no_in_transaction_execution_ready() -> anyhow::Re
         .await?;
     sqlx::query(
         "INSERT INTO job_executions (id, job_type, queue_id, execute_at, alive_at, created_at) \
-         VALUES ($1, $2, 'notify-funnel-queue', NOW(), NOW(), NOW())",
+         VALUES ($1, $2, $3, NOW(), NOW(), NOW())",
     )
     .bind(job_id)
     .bind(&job_type)
+    .bind(helpers::unique("notify-funnel-queue"))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -2967,13 +2959,14 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
 
     // Pending: scheduled far in the future, in a queue.
     let pending_id = JobId::new();
+    let pending_queue = helpers::unique("status-queue-pending");
     let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
     queue_spawner
         .spawn_at_with_queue_id(
             pending_id,
             QueueJobConfig { label: "P".into() },
             schedule_at,
-            "status-queue-pending",
+            &pending_queue,
         )
         .await?;
     match jobs.handle(pending_id).load().await?.state() {
@@ -2984,18 +2977,19 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
         } => {
             assert!((at - schedule_at).num_seconds().abs() < 1);
             assert_eq!(attempt, 1);
-            assert_eq!(queue_id.as_deref(), Some("status-queue-pending"));
+            assert_eq!(queue_id.as_deref(), Some(pending_queue.as_str()));
         }
         other => panic!("expected Pending, got {other:?}"),
     }
 
     // Running: a parked job in a queue.
     let running_id = JobId::new();
+    let running_queue = helpers::unique("status-queue-running");
     queue_spawner
         .spawn_with_queue_id(
             running_id,
             QueueJobConfig { label: "R".into() },
-            "status-queue-running",
+            &running_queue,
         )
         .await?;
     let mut attempts = 0;
@@ -3013,7 +3007,7 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
             attempt, queue_id, ..
         } => {
             assert_eq!(attempt, 1);
-            assert_eq!(queue_id.as_deref(), Some("status-queue-running"));
+            assert_eq!(queue_id.as_deref(), Some(running_queue.as_str()));
         }
         other => panic!("expected Running, got {other:?}"),
     }
@@ -3028,14 +3022,15 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
     assert_eq!(
         running_handle.load().await?.state(),
         JobStatus::Completed {
-            queue_id: Some("status-queue-running".into())
+            queue_id: Some(running_queue.clone())
         }
     );
 
     // Errored: a failing job in a queue; `error` is the final error string.
     let errored_id = JobId::new();
+    let errored_queue = helpers::unique("status-queue-errored");
     fail_spawner
-        .spawn_with_queue_id(errored_id, FailingJobConfig, "status-queue-errored")
+        .spawn_with_queue_id(errored_id, FailingJobConfig, &errored_queue)
         .await?;
     let errored_handle = jobs.handle(errored_id);
     let outcome = errored_handle
@@ -3048,7 +3043,7 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
                 error.contains("intentional failure"),
                 "unexpected error string: {error}"
             );
-            assert_eq!(queue_id.as_deref(), Some("status-queue-errored"));
+            assert_eq!(queue_id.as_deref(), Some(errored_queue.as_str()));
         }
         other => panic!("expected Errored, got {other:?}"),
     }
@@ -3348,8 +3343,9 @@ async fn terminal_status_carries_queue_id() -> anyhow::Result<()> {
 
     // Completed path.
     let done_id = JobId::new();
+    let done_queue = helpers::unique("terminal-q");
     spawner
-        .spawn_with_queue_id(done_id, TestJobConfig { delay_ms: 10 }, "terminal-q")
+        .spawn_with_queue_id(done_id, TestJobConfig { delay_ms: 10 }, &done_queue)
         .await?;
     let done_handle = jobs.handle(done_id);
     let outcome = done_handle
@@ -3365,14 +3361,15 @@ async fn terminal_status_carries_queue_id() -> anyhow::Result<()> {
     assert_eq!(
         done_handle.load().await?.state(),
         JobStatus::Completed {
-            queue_id: Some("terminal-q".into())
+            queue_id: Some(done_queue.clone())
         }
     );
 
     // Errored path.
     let errored_id = JobId::new();
+    let errored_queue = helpers::unique("terminal-q-err");
     fail_spawner
-        .spawn_with_queue_id(errored_id, FailingJobConfig, "terminal-q-err")
+        .spawn_with_queue_id(errored_id, FailingJobConfig, &errored_queue)
         .await?;
     let errored_handle = jobs.handle(errored_id);
     let outcome = errored_handle
@@ -3381,7 +3378,7 @@ async fn terminal_status_carries_queue_id() -> anyhow::Result<()> {
     assert_eq!(outcome.state(), JobTerminalState::Errored);
     match errored_handle.load().await?.state() {
         JobStatus::Errored { queue_id, .. } => {
-            assert_eq!(queue_id.as_deref(), Some("terminal-q-err"));
+            assert_eq!(queue_id.as_deref(), Some(errored_queue.as_str()));
         }
         other => panic!("expected Errored, got {other:?}"),
     }
