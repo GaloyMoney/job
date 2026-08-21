@@ -58,7 +58,7 @@ struct InsertedRow {
 /// 3. Re-entrant registration (`op.add_commit_hook`, which this
 ///    `HookOperation` always supports -- see the [module docs on re-entrant
 ///    registration](es_entity::operation::hooks#re-entrant-registration)) of
-///    a `JobEventHook` per type that landed pending or got promoted, and a
+///    a `NotifierHook` per type that landed pending or got promoted, and a
 ///    `ClaimHook` with `n_due` = this pass's own due-now landed-pending count
 ///    per type.
 pub(crate) struct ExecutionInsertHook {
@@ -432,7 +432,7 @@ impl ExecutionInsertHook {
     /// attribute against, and promoted types are already unconditionally
     /// forced via [`Self::promoted_types`], so they never need this).
     ///
-    /// [`ExecutionReadyNotifyHook`] needs the exact ids, not just a count:
+    /// [`NotifierHook`] needs the exact ids, not just a count:
     /// `ClaimHook` always claims a type's OLDEST due row via
     /// `claim_due_heads_in_op`, which can be a pre-existing backlog row
     /// rather than one of THESE newly-landed ones. A count comparison would
@@ -440,7 +440,7 @@ impl ExecutionInsertHook {
     /// count, even if it claimed different rows entirely and left these
     /// stuck. Comparing ids as sets closes that gap.
     ///
-    /// [`ExecutionReadyNotifyHook`]: crate::execution_hooks::ExecutionReadyNotifyHook
+    /// [`NotifierHook`]: crate::notifier::NotifierHook
     fn due_now_landed_ids_by_type(
         inserted: &[InsertedRow],
         rows: &[NewExecutionRow],
@@ -467,11 +467,11 @@ impl ExecutionInsertHook {
     /// Landed-pending rows whose `schedule_at` is still in the future -- the
     /// complement of [`Self::due_now_by_type`]'s landed-row half. These can
     /// never be reached by THIS SAME op's `ClaimHook` (which only claims
-    /// rows already due), so [`ExecutionReadyNotifyHook`] must always
+    /// rows already due), so [`NotifierHook`] must always
     /// notify their type rather than netting it against a claim count that
     /// was never going to cover it.
     ///
-    /// [`ExecutionReadyNotifyHook`]: crate::execution_hooks::ExecutionReadyNotifyHook
+    /// [`NotifierHook`]: crate::notifier::NotifierHook
     fn not_yet_due_landed_types(
         inserted: &[InsertedRow],
         rows: &[NewExecutionRow],
@@ -492,10 +492,10 @@ impl ExecutionInsertHook {
     /// [`Self::due_now_by_type`]'s promoted-row half: a head-swap claim
     /// targets a type's OLDEST due row, not specifically the one promoted
     /// here, so a promotion may or may not be what gets claimed --
-    /// [`ExecutionReadyNotifyHook`] always forces its type rather than
+    /// [`NotifierHook`] always forces its type rather than
     /// netting it against this pass's claim count.
     ///
-    /// [`ExecutionReadyNotifyHook`]: crate::execution_hooks::ExecutionReadyNotifyHook
+    /// [`NotifierHook`]: crate::notifier::NotifierHook
     fn promoted_types(promoted: &[PromotedRow]) -> HashSet<JobType> {
         promoted
             .iter()
@@ -509,12 +509,6 @@ impl CommitHook for ExecutionInsertHook {
         self,
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
-        // Deterministic lock ordering for `insert_many`'s arbiter is enforced
-        // in SQL (see that method's doc comment: a `MATERIALIZED` + `ORDER
-        // BY (queue_id, id)` CTE), not here -- `rows` is passed through in
-        // whatever order the caller/merge accumulated it in, on purpose:
-        // the guarantee must not depend on every call site remembering to
-        // sort before calling this.
         let mut inserted = Self::insert_many(&mut op, &self.rows).await?;
 
         // Statement 2 and, only if a queue lost its occupant in the meantime,
@@ -564,19 +558,14 @@ impl CommitHook for ExecutionInsertHook {
         // poll had to SKIP LOCKED past (see `lock_queue_occupants`) needs a
         // wake regardless of self-claim. Due-now LANDED rows are handled
         // separately below, by exact id, netted against `ClaimHook`'s
-        // `claimed` ids by `ExecutionReadyNotifyHook` -- see
-        // `due_now_landed_ids_by_type` for why ids and not counts.
+        // `claimed` ids by `NotifierHook` -- see `due_now_landed_ids_by_type`
+        // for why ids and not counts.
         let mut forces = Self::not_yet_due_landed_types(&inserted, &self.rows, now);
         forces.extend(Self::promoted_types(&promoted));
         forces.extend(wake_types);
         let added = Self::due_now_landed_ids_by_type(&inserted, &self.rows, now);
-        crate::execution_hooks::ExecutionReadyNotifyHook::register(
-            &mut op,
-            &self.notifier,
-            added,
-            HashMap::new(),
-            forces,
-        );
+        self.notifier
+            .register_execution_ready_in_op(&mut op, added, HashMap::new(), forces);
 
         if let Some(poller) = self.poller.get().and_then(|w| w.upgrade()) {
             for (job_type, n_due) in due_now {
@@ -767,11 +756,10 @@ mod tests {
     }
 
     /// A due landed-pending row must NOT force a notify -- it belongs in
-    /// `due_now_by_type`'s `adds` instead, netted by
-    /// `ExecutionReadyNotifyHook` against whatever this same pass's
-    /// `ClaimHook` actually claims. Forcing it here would defeat the whole
-    /// point of Fix 3: a self-claimed row would notify unconditionally
-    /// again.
+    /// `due_now_landed_ids_by_type`'s `added` instead, netted by
+    /// `NotifierHook` against whatever this same pass's `ClaimHook` actually
+    /// claims. Forcing it here would defeat the whole point of Fix 3: a
+    /// self-claimed row would notify unconditionally again.
     #[test]
     fn not_yet_due_landed_types_excludes_rows_already_due() {
         let now = chrono::Utc::now();

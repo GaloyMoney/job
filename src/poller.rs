@@ -1435,8 +1435,7 @@ impl ClaimHook {
     /// that hold for every call site (present or future) that hand-composes
     /// both hooks on one `op`, not just the ones where registration happens
     /// to occur in the right order today. See the crate-level hook-DAG note
-    /// on [`crate::execution_hooks::ExecutionReadyNotifyHook`] for the full
-    /// picture.
+    /// on [`crate::execution_hooks`] for the full picture.
     pub(crate) const RUNS_AFTER: [std::any::TypeId; 2] = [
         std::any::TypeId::of::<crate::execution_hooks::ExecutionInsertHook>(),
         std::any::TypeId::of::<PromoteHeadsHook>(),
@@ -1510,9 +1509,9 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
         }
 
         // Fix 3 (sb-max8): report exactly WHICH rows this pass claimed, per
-        // type, so `ExecutionReadyNotifyHook` (deferred behind this hook --
-        // see `RUNS_AFTER`) can check per-id coverage against
-        // `ExecutionInsertHook`'s `added` and skip the notify only when this
+        // type, so the `NotifierHook` instance `ExecutionInsertHook` staged
+        // (deferred behind this hook -- see `RUNS_AFTER`) can check per-id
+        // coverage against its `added` and skip the notify only when this
         // claim actually carried THOSE SAME freshly landed rows off -- not
         // merely as many rows of the type. `claim_due_heads_in_op` claims a
         // type's OLDEST due row, which can be pre-existing backlog rather
@@ -1536,9 +1535,8 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
                 }
             }
         }
-        crate::execution_hooks::ExecutionReadyNotifyHook::register(
+        poller.notifier.register_execution_ready_in_op(
             &mut op,
-            &poller.notifier,
             HashMap::new(),
             claimed_ids,
             HashSet::new(),
@@ -1551,7 +1549,7 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
     /// of work off to [`JobPoller::dispatch_job_from_reservation`]/
     /// [`JobPoller::dispatch_batch_from_reservation`]. Dispatching from here
     /// rather than inline in `pre_commit` because `post_commit` runs
-    /// synchronously (mirrors `notifier.rs`'s `JobEventHook`) — the actual
+    /// synchronously (mirrors `notifier.rs`'s `NotifierHook`) — the actual
     /// dispatch needs `.await`, so this spawns a detached task per entry,
     /// same as the ordinary poll-claim path already does off the poll loop.
     fn post_commit(self) {

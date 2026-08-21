@@ -1,9 +1,8 @@
-//! Commit hooks that do database work in `pre_commit`: [`PromoteHeadsHook`],
-//! [`ExecutionInsertHook`], and [`ExecutionReadyNotifyHook`]. Each
-//! centralizes the SQL (or, for the notify hook, the arithmetic) for one
-//! concern and stages further hooks re-entrantly (`JobEventHook` for the
-//! actual `pg_notify`, [`crate::poller::JobPoller::register_claim_demand`]
-//! for the head-swap claim) rather than doing that work inline.
+//! Commit hooks that do database work in `pre_commit`: [`PromoteHeadsHook`]
+//! and [`ExecutionInsertHook`]. Each centralizes the SQL for one concern and
+//! stages further hooks re-entrantly (`crate::notifier::NotifierHook` for
+//! notify, [`crate::poller::JobPoller::register_claim_demand`] for the
+//! head-swap claim) rather than doing that work inline.
 //!
 //! # The hook DAG
 //!
@@ -13,29 +12,33 @@
 //! on registration order at a call site:
 //!
 //! ```text
-//! ExecutionInsertHook  (execution_hooks::insert)      runs_after: []
-//! PromoteHeadsHook      (execution_hooks::promote)      runs_after: [ExecutionInsertHook]
-//! ClaimHook             (poller)                        runs_after: [ExecutionInsertHook, PromoteHeadsHook]
-//! ExecutionReadyNotifyHook (execution_hooks::notify)     runs_after: [ExecutionInsertHook, PromoteHeadsHook, ClaimHook]
-//! JobEventHook          (notifier)                       runs_after: []
+//! ExecutionInsertHook  (execution_hooks::insert)  runs_after: []
+//! PromoteHeadsHook      (execution_hooks::promote)  runs_after: [ExecutionInsertHook]
+//! ClaimHook             (poller)                    runs_after: [ExecutionInsertHook, PromoteHeadsHook]
+//! NotifierHook          (notifier)                  runs_after: [ExecutionInsertHook, PromoteHeadsHook, ClaimHook]
 //! ```
 //!
 //! `ExecutionInsertHook` is the producer: it inserts, promotes swapped-in
 //! occupants inline (via [`PromoteHeadsHook::apply`], a plain fn call, not a
 //! registered hook), and re-entrantly stages a `ClaimHook` (spawn-side fresh
-//! demand) and an `ExecutionReadyNotifyHook` (adds + forces). `ClaimHook`
-//! consumes that demand (plus any completion-side recycled capacity) and
-//! stages its own `ExecutionReadyNotifyHook` contribution (suppress) once it
-//! knows what it actually claimed. `ExecutionReadyNotifyHook` -- deferred
-//! behind all three producers -- nets `adds` against `suppress`, unions in
-//! `forces`, and is the only path left that calls `execution_ready_in_op`
-//! for a spawn/claim commit pass. `PromoteHeadsHook`, when registered
-//! standalone (not via `ExecutionInsertHook`'s inline `apply` call --
-//! e.g. retry backoff, freed-queue promotion from a completion), still
-//! notifies directly from its own `pre_commit`, unchanged by this DAG;
-//! its `runs_after` edge exists so a hand-composed op that spawns AND
-//! promotes in one transaction sees the spawn's rows before it looks for a
-//! parked sibling to swap.
+//! demand) and a `NotifierHook` execution-ready-netting contribution (added
+//! ids + forces, via `JobEventNotifier::register_execution_ready_in_op`).
+//! `ClaimHook` consumes that demand (plus any completion-side recycled
+//! capacity) and stages its own netting contribution (claimed ids) once it
+//! knows what it actually claimed. The `NotifierHook` instance those merge
+//! into -- deferred behind all three producers by its own `runs_after`,
+//! declared unconditionally on every instance of the type -- resolves
+//! `added` against `claimed`, unions in `forces`, and is the only path left
+//! that ends up firing an `execution_ready` notification for a spawn/claim
+//! commit pass. `PromoteHeadsHook`, when registered standalone (not via
+//! `ExecutionInsertHook`'s inline `apply` call -- e.g. retry backoff,
+//! freed-queue promotion from a completion), still notifies directly from
+//! its own `pre_commit` via `execution_ready_in_op` (a plain, pre-decided
+//! `NotifierHook` registration -- same hook type, same unconditional
+//! `runs_after`, just no netting data to resolve); its own `runs_after`
+//! edge exists so a hand-composed op that spawns AND promotes in one
+//! transaction sees the spawn's rows before it looks for a parked sibling
+//! to swap.
 //!
 //! Over-declaring is free by the framework's own rules: a listed type that
 //! never registers on a given op, or whose instances have all already
@@ -47,15 +50,13 @@
 //! execution order the DAG above dictates -- exercised with real hook
 //! instances and a live DB, not stand-ins, since `runs_after` dispatches on
 //! the REAL types' `TypeId`s. `tests/notify_suppression.rs` and
-//! `tests/lock_ordering.rs` cover the `ClaimHook`/`ExecutionReadyNotifyHook`
+//! `tests/lock_ordering.rs` cover the `ClaimHook`/`NotifierHook` netting
 //! half of the DAG end-to-end through the public spawn API.
 
 mod insert;
-mod notify;
 mod promote;
 
 pub(crate) use insert::{ExecutionInsertHook, NewExecutionRow};
-pub(crate) use notify::ExecutionReadyNotifyHook;
 pub(crate) use promote::{PromoteHeadsHook, PromotedRow};
 
 #[cfg(test)]

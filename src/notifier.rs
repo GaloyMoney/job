@@ -9,7 +9,7 @@
 use sqlx::postgres::PgPool;
 use tokio::sync::{broadcast, mpsc};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,9 +107,12 @@ impl JobEventNotifier {
         notification: JobNotification,
     ) -> Result<(), sqlx::Error> {
         let serialized = payload(&notification);
-        let hook = JobEventHook {
+        let hook = NotifierHook {
             notifier: Arc::clone(self),
             notifications: HashSet::from([notification]),
+            added: HashMap::new(),
+            claimed: HashMap::new(),
+            forces: HashSet::new(),
         };
 
         if op.add_commit_hook(hook).is_err() {
@@ -121,6 +124,50 @@ impl JobEventNotifier {
         }
 
         Ok(())
+    }
+
+    /// Registers one phase's contribution to the execution-ready netting for
+    /// a spawn/claim commit pass (Fix 3, sb-max8): `added` names due-now
+    /// landed-pending row ids this pass inserted, per type; `claimed` names
+    /// row ids `ClaimHook` actually claimed, per type; `forces` names types
+    /// that always notify regardless of coverage (a not-yet-due landed row,
+    /// a promoted sibling, a pinned pending occupant a concurrent poll had
+    /// to skip). See [`NotifierHook`]'s doc comment for the merge/decision
+    /// semantics -- this is the same hook `execution_ready_in_op`/
+    /// `job_terminal_in_op` register, carrying the netting inputs instead of
+    /// (or alongside) a pre-decided notification.
+    ///
+    /// A no-op if all three are empty. `add_commit_hook` can only fail if
+    /// `op` carries no commit-hook buffer at all, which cannot happen when
+    /// called (as every call site is) from inside another hook's own
+    /// `pre_commit` -- logged rather than force-executed if it ever does:
+    /// forcing this one inline would fire (or skip) a notify with no
+    /// suppression pass ever running to net it against, which is worse than
+    /// simply not registering.
+    pub(crate) fn register_execution_ready_in_op(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        added: HashMap<JobType, HashSet<JobId>>,
+        claimed: HashMap<JobType, HashSet<JobId>>,
+        forces: HashSet<JobType>,
+    ) {
+        if added.is_empty() && claimed.is_empty() && forces.is_empty() {
+            return;
+        }
+        let hook = NotifierHook {
+            notifier: Arc::clone(self),
+            notifications: HashSet::new(),
+            added,
+            claimed,
+            forces,
+        };
+        if op.add_commit_hook(hook).is_err() {
+            tracing::error!(
+                "execution-ready netting could not register its commit hook; \
+                 its contribution is dropped rather than fired unsuppressed or \
+                 silently swallowed -- the ordinary poll still covers the type"
+            );
+        }
     }
 
     /// Fold reports into one set per window and emit; exits when all senders
@@ -191,20 +238,90 @@ fn record_notify_emit_failed(error: &sqlx::Error) {}
 /// Reports once the writer's transaction commits. Registrations on one
 /// operation merge, so a bulk spawn reports one entry per distinct
 /// notification.
-pub(crate) struct JobEventHook {
+///
+/// Two shapes of contribution share this one hook type, deliberately
+/// collapsed rather than kept as separate hooks (a `pre_commit`-only
+/// netting hook staging a `post_commit`-only delivery hook is one layer of
+/// indirection this crate doesn't need):
+/// - **Pre-decided** (`notifications`): `execution_ready_in_op`/
+///   `job_terminal_in_op` already know exactly what to fire -- these go
+///   straight into `notifications`.
+/// - **Netted** (`added`/`claimed`/`forces`, via
+///   [`JobEventNotifier::register_execution_ready_in_op`]): a spawn/claim
+///   commit pass's `ExecutionInsertHook`/`ClaimHook` contribute per-type
+///   due-now row ids re-entrantly; a type is notify-worthy iff it's in
+///   `forces`, or some id in `added` for that type is NOT in `claimed` for
+///   that type (exact per-row coverage, not a count -- `ClaimHook` always
+///   claims a type's OLDEST due row, which can be pre-existing backlog
+///   rather than one of `added`'s ids).
+///
+/// Both shapes resolve into the SAME delivery, and resolving them is pure,
+/// infallible, DB-free computation -- so `pre_commit` is left at its
+/// [`CommitHook`] default (a no-op that only exists to be gated by
+/// [`Self::runs_after`], closing the merge window at the right point in the
+/// pass) and everything, netting included, happens in [`Self::post_commit`].
+///
+/// [`CommitHook`]: es_entity::operation::hooks::CommitHook
+pub(crate) struct NotifierHook {
     notifier: Arc<JobEventNotifier>,
     notifications: HashSet<JobNotification>,
+    added: HashMap<JobType, HashSet<JobId>>,
+    claimed: HashMap<JobType, HashSet<JobId>>,
+    forces: HashSet<JobType>,
 }
 
-impl es_entity::operation::hooks::CommitHook for JobEventHook {
+impl NotifierHook {
+    /// [`CommitHook::runs_after`]'s dependency list. Declared unconditionally
+    /// for every instance -- including a plain pre-decided registration with
+    /// no netting data -- per the `es_entity` convention that all instances
+    /// of one logical hook return the same list; over-declaring costs
+    /// nothing when the named types never register or have already run.
+    ///
+    /// [`CommitHook::runs_after`]: es_entity::operation::hooks::CommitHook::runs_after
+    const RUNS_AFTER: [std::any::TypeId; 3] = [
+        std::any::TypeId::of::<crate::execution_hooks::ExecutionInsertHook>(),
+        std::any::TypeId::of::<crate::execution_hooks::PromoteHeadsHook>(),
+        std::any::TypeId::of::<crate::poller::ClaimHook>(),
+    ];
+}
+
+impl es_entity::operation::hooks::CommitHook for NotifierHook {
     fn post_commit(self) {
-        for notification in self.notifications {
+        let mut notifications = self.notifications;
+        for job_type in self.forces {
+            notifications.insert(JobNotification::ExecutionReady {
+                job_type: job_type.to_string(),
+            });
+        }
+        for (job_type, added_ids) in self.added {
+            let covered = self
+                .claimed
+                .get(&job_type)
+                .is_some_and(|claimed_ids| added_ids.is_subset(claimed_ids));
+            if !covered {
+                notifications.insert(JobNotification::ExecutionReady {
+                    job_type: job_type.to_string(),
+                });
+            }
+        }
+        for notification in notifications {
             self.notifier.notify(notification);
         }
     }
 
     fn merge(&mut self, other: &mut Self) -> bool {
         self.notifications.extend(other.notifications.drain());
+        for (job_type, ids) in other.added.drain() {
+            self.added.entry(job_type).or_default().extend(ids);
+        }
+        for (job_type, ids) in other.claimed.drain() {
+            self.claimed.entry(job_type).or_default().extend(ids);
+        }
+        self.forces.extend(other.forces.drain());
         true
+    }
+
+    fn runs_after(&self) -> &[std::any::TypeId] {
+        &Self::RUNS_AFTER
     }
 }

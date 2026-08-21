@@ -2,10 +2,11 @@
 //! used to notify every type that landed a `pending` row unconditionally,
 //! even when the SAME transaction's head-swap `ClaimHook` immediately
 //! self-claimed it -- a redundant wake for work already stolen, measured at
-//! 19-23% of all DB exec time in production. `ExecutionReadyNotifyHook`
+//! 19-23% of all DB exec time in production. The `NotifierHook` instance
+//! those two stage into (via `JobEventNotifier::register_execution_ready_in_op`)
 //! compares each type's `added` and `claimed` ROW IDS (not counts) and only
-//! calls `execution_ready_in_op` when some `added` id wasn't itself claimed
-//! (or the type is in `forces`).
+//! fires a notification when some `added` id wasn't itself claimed (or the
+//! type is in `forces`).
 
 mod helpers;
 
