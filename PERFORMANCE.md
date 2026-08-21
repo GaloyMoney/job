@@ -245,10 +245,44 @@ promoted normally) waits for the ordinary poll.
   of row count, so a reservation maps onto a batched type unchanged; the
   claim uses `limit = max_batch_size` and excludes `attempt_index > 1` rows
   (retries always run alone, mirroring how `dispatch_batches` splits an
-  ordinary poll claim). Partial batches under light load are already normal
-  behavior — there is no linger and no minimum — and under sustained load a
+  ordinary poll claim).
+
+  **What this costs, concretely: with spare capacity, each separately
+  committed spawn dispatches as its own single-item batch.** The spawn
+  reserves a slot and claims the instant it commits, so the next spawn finds
+  nothing left to batch with — at 2 items with 2 free slots, `run_batch`
+  never sees `N > 1`. Two teams reached this edge independently: it was
+  confirmed with instrumentation on lana PR #8414 while writing a batched
+  test, and it is pinned here by
+  `separately_committed_spawns_each_dispatch_as_their_own_batch`.
+
+  This is the intended trade — latency now, at the cost of batching that only
+  pays off when work is queueing. There is no linger and no minimum. Under
+  sustained load the slots are busy, spawns stop short-circuiting, and a
   completion's recycle claims a full batch in one statement, because the
   backlog is deep at exactly that moment.
+
+  **Batch formation is governed by the transaction boundary, not by
+  `short_circuit()`.** Items that become due in one transaction are claimed by
+  one claim statement and handed to one `run_batch` call — so `spawn_all`, or
+  several `spawn_in_op` calls sharing one `op`, forms a batch on the fast path
+  itself, with the poller running and capacity free. That is also the
+  affordance for *testing* a multi-item `run_batch`: it needs no configuration
+  change, and it is deterministic by construction, since the claim is a later
+  statement in the same transaction as the inserts and no other claimant can
+  observe the rows unclaimed. Pinned by
+  `one_transaction_forms_one_batch_despite_spare_capacity`.
+
+  Setting `short_circuit()` to `false` in a test-only initializer is **not**
+  the lever it looks like. Separate spawns each wake the poller through the
+  ordinary notify path and still arrive one per batch, so it does not even
+  produce `N > 1`; and the flag is read once at registration
+  (`JobRegistry::add_*_initializer`), so flipping it in a test exercises a
+  different configuration than production for no gain. Saturating every batch
+  slot with a blocking runner and spawning behind it does work — the freed
+  slot's recycle claims the queued rows as one batch — but it is strictly more
+  contorted than committing the items together, and it tests the recycle path
+  rather than the spawn path.
 - **Completions recycle into their own type.** `delete_execution_in_op`
   (per job) and `seal`/`fail_batch` (per batch, exactly once per
   `execute_batch` no matter how many sub-outcomes it disposed) hand the

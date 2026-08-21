@@ -219,6 +219,126 @@ async fn batching_actually_groups_jobs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// With the poller running and a batch slot free, each *separately committed*
+/// spawn short-circuits on its own: it reserves a slot and claims immediately,
+/// so the next spawn finds nothing left to batch with. Two spawns in two
+/// transactions therefore produce two batches of one — `run_batch` never sees
+/// `len() > 1`, no matter how close together they arrive.
+///
+/// This is the behaviour a downstream adopter hits first when trying to write
+/// a multi-item `run_batch` test (observed independently on lana PR #8414).
+/// The companion test below shows the affordance that does form a batch.
+#[tokio::test]
+async fn separately_committed_spawns_each_dispatch_as_their_own_batch() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let log = Arc::new(Mutex::new(BatchLog::default()));
+    let spawner = jobs.add_batched_initializer(RecordingInitializer {
+        job_type: JobType::new("batched-separate-commits"),
+        log: Arc::clone(&log),
+        max_batch_size: 25,
+    });
+    jobs.start_poll().await?;
+
+    // Two spawns, two transactions, ample free capacity.
+    let first = JobId::new();
+    let second = JobId::new();
+    spawner
+        .spawn(
+            first,
+            BatchConfig {
+                label: "first".to_string(),
+            },
+        )
+        .await?;
+    spawner
+        .spawn(
+            second,
+            BatchConfig {
+                label: "second".to_string(),
+            },
+        )
+        .await?;
+
+    let outcomes = jobs
+        .handles(vec![first, second])
+        .await_all(Duration::from_secs(30))
+        .await?;
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+
+    let log = log.lock().await;
+    assert_eq!(
+        log.sizes,
+        vec![1, 1],
+        "each separately committed spawn should have short-circuited into its \
+         own single-item batch"
+    );
+    Ok(())
+}
+
+/// Items that become due in **one transaction** are claimed by one claim
+/// statement and handed to one `run_batch` call — the batch forms on the
+/// short-circuit fast path itself, with the production `short_circuit()`
+/// default left alone and the poller running with spare capacity.
+///
+/// This is the affordance for testing a multi-item `run_batch`: batch
+/// formation is governed by the transaction boundary, not by `short_circuit()`.
+/// Deterministic by construction — the claim is a later statement in the same
+/// transaction as the inserts, so no other claimant can see the rows unclaimed
+/// and there is nothing to race.
+#[tokio::test]
+async fn one_transaction_forms_one_batch_despite_spare_capacity() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+
+    let log = Arc::new(Mutex::new(BatchLog::default()));
+    let spawner = jobs.add_batched_initializer(RecordingInitializer {
+        job_type: JobType::new("batched-one-transaction"),
+        log: Arc::clone(&log),
+        max_batch_size: 25,
+    });
+    jobs.start_poll().await?;
+
+    // Same two items as the test above, same free capacity — the only
+    // difference is that they commit together.
+    let specs: Vec<JobSpec<BatchConfig>> = ["first", "second"]
+        .into_iter()
+        .map(|label| {
+            JobSpec::new(
+                JobId::new(),
+                BatchConfig {
+                    label: label.to_string(),
+                },
+            )
+        })
+        .collect();
+    let ids: Vec<JobId> = specs.iter().map(|s| s.id).collect();
+    spawner.spawn_all(specs).await?;
+
+    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.state() == JobTerminalState::Completed)
+    );
+
+    let log = log.lock().await;
+    assert_eq!(
+        log.sizes,
+        vec![2],
+        "two items committed in one transaction should reach run_batch as a \
+         single batch of 2"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn max_batch_size_is_respected() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
