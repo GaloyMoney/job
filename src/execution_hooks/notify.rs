@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use es_entity::operation::hooks::{CommitHook, HookOperation, PreCommitRet};
 
+use crate::JobId;
 use crate::entity::JobType;
 use crate::notifier::JobEventNotifier;
 
@@ -10,7 +11,7 @@ use super::insert::ExecutionInsertHook;
 use super::promote::PromoteHeadsHook;
 
 /// A standalone, always-merging notify hook: every phase of a spawn/claim
-/// commit pass contributes `adds`/`suppress`/`forces` re-entrantly, from its
+/// commit pass contributes `added`/`claimed`/`forces` re-entrantly, from its
 /// own `pre_commit`, with the pass's ACTUAL outcomes -- no registration-time
 /// guessing -- and this hook fires the net result once, last.
 ///
@@ -22,20 +23,24 @@ use super::promote::PromoteHeadsHook;
 /// ~4% of what those notifies woke a poll for, at 19-23% of all DB exec
 /// time -- a redundant wake whose work was already stolen.
 ///
-/// **Arithmetic, not per-row attribution**: after a merge there is no way to
-/// attribute "this add corresponds to THAT claim", so the policy is
-/// aggregate per type: notify iff `forces` names the type, or `adds >
-/// suppress` (residue exists -- local capacity was short, or claims lost a
-/// race to a peer instance). A process with no spare capacity claims 0,
-/// residue is the full `adds`, the notify fires and another instance's
-/// poller picks the work up -- multi-instance correctness falls straight
-/// out of the arithmetic.
+/// **Per-row-id attribution, not counts**: a type's suppression depends on
+/// this exact question -- did this pass's own claim cover EVERY due-now row
+/// `added` this pass, specifically? A count comparison (`added.len() >
+/// claimed.len()`) is unsound: `ClaimHook` always claims a type's OLDEST due
+/// row via `claim_due_heads_in_op`, which can be a PRE-EXISTING backlog row
+/// rather than the one THIS pass just landed. If older backlog already
+/// existed for the type, a claim can satisfy the count while leaving this
+/// pass's own new row un-claimed and un-notified -- silently stuck until the
+/// next poll wake, however far off `next_due_at` is. Comparing `added` and
+/// `claimed` as PER-TYPE SETS OF IDS closes this: a type notifies unless
+/// every id in `added[type]` is also in `claimed[type]`.
 ///
 /// **`forces` exists because not every notify-worthy event is claim-shaped**:
 /// a landed row that isn't due yet, a promoted sibling (which the SAME op's
 /// head-swap claim may or may not reach -- claiming targets the type's
-/// oldest due row, not specifically the promoted one), and a pinned
-/// `pending` occupant a spawn's `FOR KEY SHARE` made a concurrent poll skip
+/// oldest due row, not specifically the promoted one, and `PromotedRow`
+/// carries no id to attribute against anyway), and a pinned `pending`
+/// occupant a spawn's `FOR KEY SHARE` made a concurrent poll skip
 /// (`ExecutionInsertHook::lock_queue_occupants`) all need a notify
 /// regardless of what this pass's `ClaimHook` did.
 ///
@@ -46,12 +51,13 @@ use super::promote::PromoteHeadsHook;
 ///
 /// Ops with no claim coverage (a runner-internal `JobSpawner` handed to
 /// `init()` has no poller handle, or a `short_circuit() = false` type) need
-/// no special casing: no `ClaimHook` registers, so `suppress` stays empty
-/// and every `adds` entry fires -- today's behavior, unchanged.
+/// no special casing: no `ClaimHook` registers, so `claimed` stays empty and
+/// every `added` entry is un-covered, so it fires -- today's behavior,
+/// unchanged.
 pub(crate) struct ExecutionReadyNotifyHook {
     pub(crate) notifier: Arc<JobEventNotifier>,
-    pub(crate) adds: HashMap<JobType, usize>,
-    pub(crate) suppress: HashMap<JobType, usize>,
+    pub(crate) added: HashMap<JobType, HashSet<JobId>>,
+    pub(crate) claimed: HashMap<JobType, HashSet<JobId>>,
     pub(crate) forces: HashSet<JobType>,
 }
 
@@ -83,17 +89,17 @@ impl ExecutionReadyNotifyHook {
     pub(crate) fn register(
         op: &mut impl es_entity::AtomicOperation,
         notifier: &Arc<JobEventNotifier>,
-        adds: HashMap<JobType, usize>,
-        suppress: HashMap<JobType, usize>,
+        added: HashMap<JobType, HashSet<JobId>>,
+        claimed: HashMap<JobType, HashSet<JobId>>,
         forces: HashSet<JobType>,
     ) {
-        if adds.is_empty() && suppress.is_empty() && forces.is_empty() {
+        if added.is_empty() && claimed.is_empty() && forces.is_empty() {
             return;
         }
         let hook = ExecutionReadyNotifyHook {
             notifier: Arc::clone(notifier),
-            adds,
-            suppress,
+            added,
+            claimed,
             forces,
         };
         if op.add_commit_hook(hook).is_err() {
@@ -112,9 +118,11 @@ impl CommitHook for ExecutionReadyNotifyHook {
         mut op: HookOperation<'_>,
     ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
         let mut types: HashSet<JobType> = std::mem::take(&mut self.forces);
-        for (job_type, added) in self.adds.drain() {
-            let suppressed = self.suppress.get(&job_type).copied().unwrap_or(0);
-            if added > suppressed {
+        for (job_type, added_ids) in self.added.drain() {
+            let claimed_ids = self.claimed.get(&job_type);
+            let fully_covered =
+                claimed_ids.is_some_and(|claimed_ids| added_ids.is_subset(claimed_ids));
+            if !fully_covered {
                 types.insert(job_type);
             }
         }
@@ -127,11 +135,11 @@ impl CommitHook for ExecutionReadyNotifyHook {
     }
 
     fn merge(&mut self, other: &mut Self) -> bool {
-        for (job_type, n) in other.adds.drain() {
-            *self.adds.entry(job_type).or_insert(0) += n;
+        for (job_type, ids) in other.added.drain() {
+            self.added.entry(job_type).or_default().extend(ids);
         }
-        for (job_type, n) in other.suppress.drain() {
-            *self.suppress.entry(job_type).or_insert(0) += n;
+        for (job_type, ids) in other.claimed.drain() {
+            self.claimed.entry(job_type).or_default().extend(ids);
         }
         self.forces.extend(other.forces.drain());
         true

@@ -1509,21 +1509,30 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             }
         }
 
-        // Fix 3 (sb-max8): report what THIS pass actually claimed, per type,
-        // so `ExecutionReadyNotifyHook` (deferred behind this hook -- see
-        // `RUNS_AFTER`) can net it against `ExecutionInsertHook`'s `adds`
-        // and skip the notify entirely when this claim already carried the
-        // freshly landed rows off. Counted from `self.claimed` (what was
-        // actually claimed), not `fresh_demand`/`recycled` (what was asked
-        // for) -- a claim can come back short of its reservations.
-        let mut claimed_counts: HashMap<JobType, usize> = HashMap::new();
+        // Fix 3 (sb-max8): report exactly WHICH rows this pass claimed, per
+        // type, so `ExecutionReadyNotifyHook` (deferred behind this hook --
+        // see `RUNS_AFTER`) can check per-id coverage against
+        // `ExecutionInsertHook`'s `added` and skip the notify only when this
+        // claim actually carried THOSE SAME freshly landed rows off -- not
+        // merely as many rows of the type. `claim_due_heads_in_op` claims a
+        // type's OLDEST due row, which can be pre-existing backlog rather
+        // than one of `added`'s ids, so a count match here would be unsound
+        // (see `ExecutionInsertHook::due_now_landed_ids_by_type`'s doc
+        // comment). Ids come from `self.claimed` (what was actually
+        // claimed), not `fresh_demand`/`recycled` (what was asked for) -- a
+        // claim can come back short of its reservations.
+        let mut claimed_ids: HashMap<JobType, HashSet<JobId>> = HashMap::new();
         for (_, target, _) in &self.claimed {
             match target {
                 DispatchTarget::Single(row) => {
-                    *claimed_counts.entry(row.job_type.clone()).or_insert(0) += 1;
+                    claimed_ids
+                        .entry(row.job_type.clone())
+                        .or_default()
+                        .insert(row.id);
                 }
                 DispatchTarget::Batch(job_type, rows) => {
-                    *claimed_counts.entry(job_type.clone()).or_insert(0) += rows.len();
+                    let entry = claimed_ids.entry(job_type.clone()).or_default();
+                    entry.extend(rows.iter().map(|row| row.id));
                 }
             }
         }
@@ -1531,7 +1540,7 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             &mut op,
             &poller.notifier,
             HashMap::new(),
-            claimed_counts,
+            claimed_ids,
             HashSet::new(),
         );
 

@@ -427,6 +427,43 @@ impl ExecutionInsertHook {
         due
     }
 
+    /// The specific ids behind [`Self::due_now_by_type`]'s LANDED-row half
+    /// only (never promoted rows -- [`PromotedRow`] carries no id to
+    /// attribute against, and promoted types are already unconditionally
+    /// forced via [`Self::promoted_types`], so they never need this).
+    ///
+    /// [`ExecutionReadyNotifyHook`] needs the exact ids, not just a count:
+    /// `ClaimHook` always claims a type's OLDEST due row via
+    /// `claim_due_heads_in_op`, which can be a pre-existing backlog row
+    /// rather than one of THESE newly-landed ones. A count comparison would
+    /// wrongly call a type "covered" whenever a claim happened to match the
+    /// count, even if it claimed different rows entirely and left these
+    /// stuck. Comparing ids as sets closes that gap.
+    ///
+    /// [`ExecutionReadyNotifyHook`]: crate::execution_hooks::ExecutionReadyNotifyHook
+    fn due_now_landed_ids_by_type(
+        inserted: &[InsertedRow],
+        rows: &[NewExecutionRow],
+        now: DateTime<Utc>,
+    ) -> HashMap<JobType, HashSet<JobId>> {
+        let by_id: HashMap<JobId, &NewExecutionRow> = rows.iter().map(|r| (r.id, r)).collect();
+        let mut due: HashMap<JobType, HashSet<JobId>> = HashMap::new();
+        for row in inserted {
+            if !row.landed_pending {
+                continue;
+            }
+            let Some(new_row) = by_id.get(&row.id) else {
+                continue;
+            };
+            if new_row.schedule_at <= now {
+                due.entry(new_row.job_type.clone())
+                    .or_default()
+                    .insert(row.id);
+            }
+        }
+        due
+    }
+
     /// Landed-pending rows whose `schedule_at` is still in the future -- the
     /// complement of [`Self::due_now_by_type`]'s landed-row half. These can
     /// never be reached by THIS SAME op's `ClaimHook` (which only claims
@@ -525,16 +562,18 @@ impl CommitHook for ExecutionInsertHook {
         // can never be reached by a head-swap claim (which targets the
         // type's oldest DUE row), and a pinned pending occupant a concurrent
         // poll had to SKIP LOCKED past (see `lock_queue_occupants`) needs a
-        // wake regardless of self-claim. `due_now`'s types are handled
-        // separately below, as `adds` netted against `ClaimHook`'s
-        // `suppress` by `ExecutionReadyNotifyHook`.
+        // wake regardless of self-claim. Due-now LANDED rows are handled
+        // separately below, by exact id, netted against `ClaimHook`'s
+        // `claimed` ids by `ExecutionReadyNotifyHook` -- see
+        // `due_now_landed_ids_by_type` for why ids and not counts.
         let mut forces = Self::not_yet_due_landed_types(&inserted, &self.rows, now);
         forces.extend(Self::promoted_types(&promoted));
         forces.extend(wake_types);
+        let added = Self::due_now_landed_ids_by_type(&inserted, &self.rows, now);
         crate::execution_hooks::ExecutionReadyNotifyHook::register(
             &mut op,
             &self.notifier,
-            due_now.clone(),
+            added,
             HashMap::new(),
             forces,
         );
