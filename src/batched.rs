@@ -214,12 +214,11 @@ pub enum BisectBudget {
     /// failure every item budget-fails — equivalent to returning `Err`
     /// from `run_batch` directly, just routed through this helper.
     MaxProbes(usize),
-    /// Run the search to completion instead of capping it: at most
-    /// `2N - 1` probes, typically `~N + O(log N)` once escalation kicks in
-    /// on a mostly-bad batch. This is bounded by the batch size, not
-    /// actually unbounded — but it is the variant most likely to spend a
-    /// probe budget you didn't intend, so pick it explicitly rather than by
-    /// default.
+    /// Run the search to completion instead of capping it: `2k * log2(N/k)`
+    /// probes for `k` culprits, degrading to `2N - 1` when every item is
+    /// bad. This is bounded by the batch size, not actually unbounded — but
+    /// it is the variant most likely to spend a probe budget you didn't
+    /// intend, so pick it explicitly rather than by default.
     FullResolution,
 }
 
@@ -648,19 +647,11 @@ impl<C> CurrentBatchedJob<C> {
         }
 
         let cap = budget.effective_cap(n);
-        // Escalation threshold: once a run of this many consecutive probe
-        // failures is observed, singleton-scan the rest rather than keep
-        // halving. See `BisectBudget`'s module docs for why this is
-        // streak-based (not resolved-item density) under largest-first
-        // ordering.
-        let streak_threshold = usize::max(4, ceil_log2(n));
 
         let mut heap = BinaryHeap::new();
         heap.push(PendingRange { start: 0, end: n });
 
         let mut probes_used = 0usize;
-        let mut streak = 0usize;
-        let mut escalated = false;
         let mut last_error: Option<String> = None;
         let mut logged_bisecting = false;
 
@@ -687,7 +678,6 @@ impl<C> CurrentBatchedJob<C> {
             probes_used += 1;
             match op.with_savepoint(async |sp| f(sp, slice).await).await? {
                 Ok(()) => {
-                    streak = 0;
                     outcomes.extend(
                         slice
                             .iter()
@@ -704,7 +694,6 @@ impl<C> CurrentBatchedJob<C> {
                         );
                     }
                     let message = e.to_string();
-                    streak += 1;
 
                     if range.len() == 1 {
                         outcomes.push((
@@ -712,29 +701,6 @@ impl<C> CurrentBatchedJob<C> {
                             BatchItemOutcome::Fail(message.clone()),
                         ));
                         last_error = Some(message);
-                    } else if !escalated && streak >= streak_threshold {
-                        escalated = true;
-                        last_error = Some(message);
-                        tracing::warn!(
-                            target: "job.batch_bisect",
-                            streak,
-                            probes_used,
-                            "bisect escalating to singleton scan"
-                        );
-                        // Drain this range plus everything still pending
-                        // into singletons — see the module docs: under
-                        // largest-first ordering a streak of big-range
-                        // failures is strong all-bad evidence.
-                        let mut remaining: Vec<usize> = (range.start..range.end).collect();
-                        while let Some(pending) = heap.pop() {
-                            remaining.extend(pending.start..pending.end);
-                        }
-                        for idx in remaining {
-                            heap.push(PendingRange {
-                                start: idx,
-                                end: idx + 1,
-                            });
-                        }
                     } else {
                         last_error = Some(message);
                         let mid = range.start + range.len() / 2;

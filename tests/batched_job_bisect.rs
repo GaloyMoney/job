@@ -317,8 +317,8 @@ async fn largest_first_salvage_under_tight_budget() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn all_culprits_escalate_and_isolate_every_item() -> anyhow::Result<()> {
-    let table = "bisect_all_bad_escalation";
+async fn all_bad_batch_resolves_every_item_under_full_resolution() -> anyhow::Result<()> {
+    let table = "bisect_all_bad_full_resolution";
     let pool = helpers::init_pool().await?;
     reset_scratch_table(&pool, table).await?;
     seed_sentinel(&pool, table).await?;
@@ -327,7 +327,7 @@ async fn all_culprits_escalate_and_isolate_every_item() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let spawner = jobs.add_batched_initializer(BisectInitializer {
-        job_type: JobType::new("bisect-all-bad-escalation"),
+        job_type: JobType::new("bisect-all-bad-full-resolution"),
         table: table.to_string(),
         budget: BisectBudget::FullResolution,
         probes: Arc::clone(&probes),
@@ -335,7 +335,7 @@ async fn all_culprits_escalate_and_isolate_every_item() -> anyhow::Result<()> {
         // is already covered (with less simultaneous retry churn) by
         // `single_culprit_isolates_under_default_auto_budget` and
         // `largest_first_salvage_under_tight_budget`. This test's only job
-        // is the escalation math on the FIRST dispatch, so it doesn't need
+        // is the search's shape on the FIRST dispatch, so it doesn't need
         // 6 concurrent backoff+reclaim round trips to prove that — those
         // round trips were observed to make the test load-sensitive (timed
         // out under full-suite concurrency even at 45s) without adding any
@@ -343,9 +343,6 @@ async fn all_culprits_escalate_and_isolate_every_item() -> anyhow::Result<()> {
         n_attempts: Some(1),
     });
 
-    // N=6, not 10: the escalation streak threshold T = max(4, ceil(log2 N))
-    // is pinned at 4 for any N <= 16, so N=6 exercises the identical
-    // escalation mechanism a larger N would.
     let culprits: Vec<usize> = (0..6).collect();
     let ids = spawn_batch(&spawner, table, 6, &culprits).await?;
     jobs.start_poll().await?;
@@ -359,14 +356,80 @@ async fn all_culprits_escalate_and_isolate_every_item() -> anyhow::Result<()> {
         outcomes.iter().map(|o| o.state()).collect::<Vec<_>>()
     );
     assert_eq!(scratch_values(&pool, table).await?, vec![SENTINEL_KEY]);
-    // First (only) dispatch, all 6 bad, largest-first: [0,6)F, [0,3)F,
-    // [3,6)F, [1,3)F — streak hits T=4 on the 4th consecutive failure —
-    // then singleton-scans the remaining 6 indices: 4 + 6 = 10 probes.
+    // The pathological case: `FullResolution` keeps halving until every
+    // culprit sits in its own singleton, so an all-bad batch costs the full
+    // `2N-1`. First (only) dispatch, largest-first: [0,6)F, [0,3)F, [3,6)F,
+    // [1,3)F, [4,6)F, then the 6 singletons = 11 probes. This is the cost
+    // the `# Cost` docs warn about — a type whose dominant failure mode is
+    // "everything fails together" should return `Err` from `run_batch`
+    // rather than reach for this helper.
     assert_eq!(
         probes.load(Ordering::SeqCst),
+        11,
+        "expected full resolution's exact probe count; a different total \
+         means the search's shape changed"
+    );
+
+    Ok(())
+}
+
+/// Regression test for the false-escalation bug: a *streak* of consecutive
+/// failing probes was once read as "the whole batch is bad" and used to
+/// shred every pending range — including unprobed, entirely clean ones —
+/// into singletons.
+///
+/// The signal was invalid. Largest-first probing walks the frontier
+/// breadth-first, so a run of failures means the culprits are widely
+/// *spread*, not that they are *dense*: with N=16 and just two culprits
+/// (one per half) the run reached 4 before a single clean range had been
+/// tried. Escalation then fired and burned the remaining budget on
+/// singletons, completing 4 items instead of 10.
+#[tokio::test]
+async fn scattered_culprits_do_not_poison_their_clean_siblings() -> anyhow::Result<()> {
+    let table = "bisect_scattered_culprits";
+    let pool = helpers::init_pool().await?;
+    reset_scratch_table(&pool, table).await?;
+    seed_sentinel(&pool, table).await?;
+
+    let probes = Arc::new(AtomicUsize::new(0));
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_batched_initializer(BisectInitializer {
+        job_type: JobType::new("bisect-scattered-culprits"),
+        table: table.to_string(),
+        budget: BisectBudget::default(),
+        probes: Arc::clone(&probes),
+        // Terminal on the first failure: this test asserts the salvage of
+        // the FIRST dispatch exactly, so no retry churn to account for.
+        n_attempts: Some(1),
+    });
+
+    // One culprit per half of a 16-item batch — the minimum that used to
+    // trip the old streak threshold.
+    let ids = spawn_batch(&spawner, table, 16, &[0, 8]).await?;
+    jobs.start_poll().await?;
+    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+
+    // Largest-first under Auto (cap 2*ceil(log2 16)+1 = 9):
+    //   [0,16)F [0,8)F [8,16)F [0,4)F [4,8)OK [8,12)F [12,16)OK [0,2)F [2,4)OK
+    // salvaging 2..7 and 12..15 = 10 items; 0,1,8,9,10,11 budget-fail.
+    // Under the old escalation heuristic this dispatch completed only 4.
+    let completed = outcomes
+        .iter()
+        .filter(|o| o.state() == JobTerminalState::Completed)
+        .count();
+    assert_eq!(
+        completed,
         10,
-        "expected the escalated dispatch's exact probe count; a different \
-         total means the escalation math changed"
+        "two scattered culprits must not cost their clean siblings a \
+         completion, saw {:?}",
+        outcomes.iter().map(|o| o.state()).collect::<Vec<_>>()
+    );
+    assert_eq!(probes.load(Ordering::SeqCst), 9, "Auto's cap at N=16");
+    assert_eq!(
+        scratch_values(&pool, table).await?,
+        vec![2, 3, 4, 5, 6, 7, 12, 13, 14, 15, SENTINEL_KEY],
+        "exactly the salvaged items' keys must be committed"
     );
 
     Ok(())
