@@ -15,7 +15,36 @@ use job::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+
+/// Holds a runner inside `run` until the test opens the gate.
+///
+/// An execution row exists iff its job is pending/parked/running -- it is
+/// DELETED on terminal. So any test that spawns an instantly-completing job
+/// and then reads that row is racing its own job: claim -> dispatch -> run
+/// -> complete -> delete can finish before the read, and the read then
+/// fails with "no rows returned by a query that expected to return at least
+/// one row" rather than any assertion. The window is exactly the
+/// claim-to-completion latency, so every improvement to the claim path
+/// (#177's type-leading index, #180's `enable_seqscan` pin) narrows it;
+/// #180 narrowed it enough to turn this into a reproducible CI failure.
+/// Gating the runner removes the race outright instead of widening the
+/// window again: the row cannot reach terminal, so it cannot be deleted,
+/// so the assertion reads exactly the state the code under test produced.
+///
+/// A `Semaphore` rather than the `Notify` handshake `HoldableRunner` uses:
+/// these types can have more than one row in flight, and permits added
+/// BEFORE a runner parks still release it, so a dispatch that lands late
+/// cannot strand a test's `shutdown()`.
+type Gate = Arc<Semaphore>;
+
+fn closed_gate() -> Gate {
+    Arc::new(Semaphore::new(0))
+}
+
+fn open(gate: &Gate) {
+    gate.add_permits(1024);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Cfg;
@@ -378,10 +407,14 @@ struct ImmediateInitializer {
     job_type: JobType,
     completed: Arc<Notify>,
     short_circuit: bool,
+    /// `Some` for every test that asserts on this type's execution row:
+    /// see [`Gate`]. `None` completes immediately, as the name suggests.
+    gate: Option<Gate>,
 }
 
 struct ImmediateRunner {
     completed: Arc<Notify>,
+    gate: Option<Gate>,
 }
 
 #[async_trait]
@@ -390,7 +423,12 @@ impl JobRunner for ImmediateRunner {
         &self,
         _current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        // Before the gate, so `completed` still proves the runner body ran
+        // even while it is being held.
         self.completed.notify_one();
+        if let Some(gate) = &self.gate {
+            let _permit = gate.acquire().await?;
+        }
         Ok(JobCompletion::Complete)
     }
 }
@@ -410,6 +448,7 @@ impl JobInitializer for ImmediateInitializer {
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(ImmediateRunner {
             completed: Arc::clone(&self.completed),
+            gate: self.gate.clone(),
         }))
     }
 }
@@ -428,10 +467,12 @@ async fn short_circuit_spawn_lands_running_immediately_on_commit() -> anyhow::Re
     let mut jobs = Jobs::init(config).await?;
 
     let completed = Arc::new(Notify::new());
+    let gate = closed_gate();
     let spawner = jobs.add_initializer(ImmediateInitializer {
         job_type: job_type("short-circuit-immediate"),
         completed: Arc::clone(&completed),
         short_circuit: true,
+        gate: Some(Arc::clone(&gate)),
     });
     jobs.start_poll().await?;
 
@@ -452,6 +493,8 @@ async fn short_circuit_spawn_lands_running_immediately_on_commit() -> anyhow::Re
         "a running row must be owned by an instance"
     );
 
+    // The row has been observed; let it reach terminal (and be deleted).
+    open(&gate);
     let outcome = jobs
         .handle(id)
         .await_completion(std::time::Duration::from_secs(10))
@@ -476,10 +519,12 @@ async fn short_circuit_disabled_lands_pending() -> anyhow::Result<()> {
     let mut jobs = Jobs::init(config).await?;
 
     let completed = Arc::new(Notify::new());
+    let gate = closed_gate();
     let spawner = jobs.add_initializer(ImmediateInitializer {
         job_type: job_type("short-circuit-disabled"),
         completed,
         short_circuit: false,
+        gate: Some(Arc::clone(&gate)),
     });
     jobs.start_poll().await?;
 
@@ -497,6 +542,10 @@ async fn short_circuit_disabled_lands_pending() -> anyhow::Result<()> {
     // The poll loop may independently win a race to claim it right after
     // commit; what matters is that it never lands `running` directly from
     // the spawn's own transaction, the way a short-circuited type would.
+    // `running` is only reachable here via that claim, which is why the
+    // gate above is what keeps this readable at all: without it the row is
+    // deleted on completion and the read fails outright.
+    open(&gate);
 
     Ok(())
 }
@@ -511,10 +560,12 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
     let mut jobs = Jobs::init(config).await?;
 
     let jt = job_type("fairness");
+    let gate = closed_gate();
     let spawner = jobs.add_initializer(ImmediateInitializer {
         job_type: jt.clone(),
         completed: Arc::new(Notify::new()),
         short_circuit: true,
+        gate: Some(Arc::clone(&gate)),
     });
     jobs.start_poll().await?;
 
@@ -574,6 +625,11 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
         "the OLDER due row must be the one the spawn's own claim served \
          (new_id is {new_state})"
     );
+    // Both rows are read as scalar subqueries, so a deleted row would
+    // arrive as NULL and fail to decode into `String` rather than as a
+    // missing row -- same race, different symptom. The gate keeps both
+    // alive for the snapshot.
+    open(&gate);
 
     Ok(())
 }

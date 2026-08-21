@@ -16,12 +16,44 @@ use job::{
     JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Cfg;
 
-struct NoopRunner;
+/// Holds a runner inside `run` until the test opens the gate.
+///
+/// An execution row exists iff its job is pending/parked/running -- it is
+/// DELETED on terminal. So a test that spawns an instantly-completing job
+/// and then reads that row is racing its own job: claim -> dispatch -> run
+/// -> complete -> delete can finish first, and the read then fails with
+/// "no rows returned by a query that expected to return at least one row"
+/// (or, for the scalar-subquery reads below, a NULL that will not decode)
+/// rather than as any assertion. The window is the claim-to-completion
+/// latency, so every improvement to the claim path narrows it; #180's
+/// `enable_seqscan` pin narrowed it enough to make this a CI failure.
+/// Gating the runner removes the race outright rather than widening the
+/// window again: the row cannot reach terminal, so it cannot be deleted.
+///
+/// A `Semaphore` rather than a `Notify` handshake: these types can have
+/// more than one row in flight, and permits added BEFORE a runner parks
+/// still release it, so a dispatch that lands late cannot strand
+/// `shutdown()`.
+type Gate = Arc<Semaphore>;
+
+fn closed_gate() -> Gate {
+    Arc::new(Semaphore::new(0))
+}
+
+fn open(gate: &Gate) {
+    gate.add_permits(1024);
+}
+
+struct NoopRunner {
+    gate: Option<Gate>,
+}
 
 #[async_trait]
 impl JobRunner for NoopRunner {
@@ -29,6 +61,9 @@ impl JobRunner for NoopRunner {
         &self,
         _current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        if let Some(gate) = &self.gate {
+            let _permit = gate.acquire().await?;
+        }
         Ok(JobCompletion::Complete)
     }
 }
@@ -41,6 +76,9 @@ struct NoopInitializer {
     /// units than the backlog it's choosing from, so it deterministically
     /// picks the OLDEST due row rather than whichever row a test just spawned.
     max_concurrent_per_process: Option<usize>,
+    /// `Some` for every test that asserts on this type's execution row:
+    /// see [`Gate`].
+    gate: Option<Gate>,
 }
 
 impl JobInitializer for NoopInitializer {
@@ -59,7 +97,9 @@ impl JobInitializer for NoopInitializer {
         _job: &Job,
         _: JobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
-        Ok(Box::new(NoopRunner))
+        Ok(Box::new(NoopRunner {
+            gate: self.gate.clone(),
+        }))
     }
 }
 
@@ -115,10 +155,12 @@ async fn self_claimed_spawn_suppresses_its_own_notify() -> anyhow::Result<()> {
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let jt = job_type("notify-suppress-claimed");
+    let gate = closed_gate();
     let spawner = jobs.add_initializer(NoopInitializer {
         job_type: jt.clone(),
         short_circuit: true,
         max_concurrent_per_process: None,
+        gate: Some(Arc::clone(&gate)),
     });
     jobs.start_poll().await?;
 
@@ -143,6 +185,8 @@ async fn self_claimed_spawn_suppresses_its_own_notify() -> anyhow::Result<()> {
         "a self-claimed spawn must not also notify: {stray:?}"
     );
 
+    // Opened before `shutdown()`, which drains running jobs.
+    open(&gate);
     jobs.shutdown().await?;
     Ok(())
 }
@@ -167,7 +211,11 @@ async fn unclaimed_spawn_still_notifies() -> anyhow::Result<()> {
     let spawner = jobs.add_initializer(NoopInitializer {
         job_type: jt.clone(),
         short_circuit: false,
+        // No gate needed: with no poller there is nothing to dispatch this
+        // row, so it stays `pending` and is never deleted -- the same
+        // property the test relies on for its own precondition.
         max_concurrent_per_process: None,
+        gate: None,
     });
     // No `start_poll()`: no poller, no `ClaimHook`, nothing to suppress with.
 
@@ -213,10 +261,12 @@ async fn spawn_not_itself_claimed_still_notifies_even_though_type_was_claimed_fr
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
     let jt = job_type("notify-older-backlog");
+    let gate = closed_gate();
     let spawner = jobs.add_initializer(NoopInitializer {
         job_type: jt.clone(),
         short_circuit: true,
         max_concurrent_per_process: Some(1),
+        gate: Some(Arc::clone(&gate)),
     });
     jobs.start_poll().await?;
 
@@ -269,6 +319,10 @@ async fn spawn_not_itself_claimed_still_notifies_even_though_type_was_claimed_fr
         "the newer row is un-claimed and un-notified -- stuck until the next poll wake: {found:?}"
     );
 
+    // Holding the older row also pins the cap-1 slot, which is what keeps
+    // `newer_state == "pending"` a fact rather than a race: the newer row
+    // cannot be admitted while the older one is in flight.
+    open(&gate);
     jobs.shutdown().await?;
     Ok(())
 }
