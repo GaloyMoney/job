@@ -151,13 +151,24 @@ by the backlog.
 ### Ordered index access is mandatory
 
 The claim query runs on a dedicated two-connection pool (`build_poll_pool`)
-whose connections carry `plan_cache_mode = force_generic_plan` and
-`enable_bitmapscan = off` from `after_connect`.
+whose connections carry `plan_cache_mode = force_generic_plan`,
+`enable_bitmapscan = off`, and `enable_seqscan = off` from `after_connect`.
 
 - **`enable_bitmapscan = off`** is not a micro-optimisation. A bitmap scan
   returns rows in heap order, destroying the index ordering the prefix scan
   depends on and forcing a sort of every candidate: **10.3 ms vs 1.4 ms** on
   identical data.
+- **`enable_seqscan = off`** closes the other escape hatch. Under a generic
+  plan built while `job_executions` stats read near-empty, index bloat
+  inflates the pending index's cost estimate enough that the planner prefers
+  a heap scan for each of the poll's per-type LATERAL probes — one seq scan
+  of the whole (churn-bloated) heap per registered type, ~57 per poll on a
+  registry this crate's size. That is the entire backlog-independent poll
+  floor: **3,192 -> 59 shared blocks/call** measured idle on a bench replaying
+  production churn, with the pin at parity (within 1%) in every claiming
+  regime (backlog / spin / storm). REINDEX-only mitigation decays back to the
+  unpinned floor within hours of further churn; the pin is immune to bloat by
+  construction. (sb-max9 evidence, 2026-08-21.)
 - **A dedicated pool, not `SET LOCAL`.** Session-level overrides must never
   leak onto the shared application pool, and setting them once per connection
   instead of inside a `BEGIN`/`COMMIT` on every poll turns the claim into a
