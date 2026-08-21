@@ -1,3 +1,19 @@
+# [job release v0.13.3](https://github.com/GaloyMoney/job/releases/tag/0.13.3)
+
+
+
+### Bug Fixes
+
+- Order the lost-handler's multi-row locks by (queue_id, id) (#178)
+
+### Performance
+
+- Lead the pending-claim index with job_type (#177)
+
+### Testing
+
+- Fix two flakes — a shared job type and a racy state snapshot (#179)
+
 # [job release v0.13.2](https://github.com/GaloyMoney/job/releases/tag/0.13.2)
 
 
