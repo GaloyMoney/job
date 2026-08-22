@@ -234,6 +234,7 @@ where
                         job_type: self.job_type.clone(),
                         schedule_at,
                         queue_id: None,
+                        unique_key: None,
                     },
                 )
                 .await?;

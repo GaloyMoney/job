@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT unique_key AS \"unique_key!\" FROM job_executions\n               WHERE job_type = $1 AND unique_key = ANY($2)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "unique_key!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "15761613d4bda9549559d9498f29323db707bdb24ac0139103223425ceda983d"
+}

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use sqlx::PgPool;
 
 use es_entity::*;
@@ -9,6 +11,8 @@ use crate::{
     job_execution::{JobExecutionRow, JobExecutionState},
     snapshot::JobSnapshot,
 };
+
+const DEDUP_KEY_LOCK_CLASS: i32 = 1;
 
 #[derive(EsRepo, Clone)]
 #[es_repo(
@@ -28,6 +32,109 @@ pub struct JobRepo {
 impl JobRepo {
     pub(super) fn new(pool: &PgPool) -> Self {
         Self { pool: pool.clone() }
+    }
+
+    /// [`crate::JobSpec::dedup_key`]'s enforcement point: acquire a
+    /// transaction-scoped advisory lock per distinct `keys` entry, THEN
+    /// report which are currently LIVE (any state -- the same live-window
+    /// definition `idx_job_executions_job_type_unique_key` already enforces
+    /// for keyed jobs) for `job_type`.
+    ///
+    /// Locking BEFORE checking, rather than checking then locking, is what
+    /// closes the race: a concurrent call for an overlapping key blocks at
+    /// its own lock acquisition until this transaction commits or rolls
+    /// back, so by the time it runs its own live-check, this call's rows (if
+    /// any landed) are already visible. Held for the rest of `op`'s
+    /// transaction (`pg_advisory_xact_lock`, released automatically at
+    /// commit/rollback) -- this is why the caller must call this BEFORE
+    /// creating any `jobs` row for a dedup-keyed spec, not after: a spec
+    /// found live here must never get a `jobs` row at all (see
+    /// `spawner.rs::spawn_all_in_op`), closing the "orphan `jobs` row with
+    /// no execution row" risk for the common case (one call, or two calls in
+    /// different transactions). `jobs` row without `job_executions` row is
+    /// not itself a corrupt state -- it's exactly what a terminal keyed job
+    /// looks like -- but an orphan of THIS kind would carry no terminal
+    /// event either, and `load_snapshot_by_id`/`JobSnapshot::state()` both
+    /// treat that combination as impossible (error/panic, never a false
+    /// "Completed"), so avoiding its existence is the goal, not just
+    /// avoiding a misread of it.
+    ///
+    /// Locked in SORTED key order (`ORDER BY` inside a `MATERIALIZED` CTE)
+    /// so two calls racing over an overlapping key set always request their
+    /// locks in the same global order -- the same deadlock-avoidance
+    /// discipline `execution_hooks/insert.rs`'s `input` CTE and
+    /// `lock_queue_occupants` already use for row locks, applied here to
+    /// advisory locks instead.
+    ///
+    /// Does NOT catch two calls sharing one `op` (e.g. two `spawn_all_in_op`
+    /// calls, or `spawn_in_op` + `spawn_all_in_op`, merged by
+    /// `ExecutionInsertHook::merge`) that both target the same key: each
+    /// call's live-check only sees the durable table, not a sibling call's
+    /// still-uncommitted, not-yet-inserted row. `insert_many`'s own
+    /// `DISTINCT ON` collapse is the backstop for that narrower, same-op
+    /// case.
+    /// Deliberately TWO statements, not one -- two single-statement designs
+    /// were tried and both are unsafe:
+    ///
+    /// - `WHERE unique_key = ANY(SELECT key FROM locked)`: a semi-join
+    ///   against an empty `job_executions` match set lets the planner prove
+    ///   the subquery can never contribute a row and skip executing it
+    ///   entirely (`EXPLAIN` shows `locked`/`ordered` as "never executed"),
+    ///   silently skipping every lock whenever none of the requested keys
+    ///   are already live -- precisely the common case this method exists
+    ///   to protect.
+    /// - `locked LEFT JOIN job_executions` (driving the join from the
+    ///   locked/materialized side, so it can't be skipped the same way):
+    ///   this DOES always execute the lock, but is unsafe for a different,
+    ///   more fundamental reason -- under READ COMMITTED a single statement
+    ///   takes ONE snapshot at statement START, before any in-statement lock
+    ///   wait; a caller that blocks on the advisory lock and then unblocks
+    ///   because the holder just committed still evaluates its `LEFT JOIN`
+    ///   against the PRE-wait snapshot, so it never sees what the holder
+    ///   just committed. Confirmed with two real concurrent sessions: A
+    ///   holds the lock, sleeps, inserts, commits; B's single combined
+    ///   statement blocks on A's lock, unblocks after A's commit, and its
+    ///   `LEFT JOIN` still reports NULL for the just-committed key. Both
+    ///   single-statement designs also independently reproduced AC5's
+    ///   ruled-out statement-abort in `concurrent_bulk_spawn_same_dedup_key_exactly_one_lands`.
+    ///
+    /// Two statements is what makes this correct: the lock statement blocks
+    /// until the holder's transaction ends, and the check statement -- a
+    /// SEPARATE statement, hence a FRESH READ COMMITTED snapshot -- then
+    /// correctly observes whatever that holder committed (or didn't).
+    pub(super) async fn lock_and_check_live_keys_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        job_type: &JobType,
+        keys: &[String],
+    ) -> Result<HashSet<String>, JobError> {
+        if keys.is_empty() {
+            return Ok(HashSet::new());
+        }
+        sqlx::query!(
+            r#"
+            WITH ordered AS MATERIALIZED (
+                SELECT DISTINCT key FROM UNNEST($1::text[]) AS t(key) ORDER BY key
+            )
+            SELECT pg_advisory_xact_lock($2, hashtext(concat($3::text, ':', key)))
+            FROM ordered
+            "#,
+            keys,
+            DEDUP_KEY_LOCK_CLASS,
+            job_type.as_str(),
+        )
+        .execute(op.as_executor())
+        .await?;
+
+        let live = sqlx::query_scalar!(
+            r#"SELECT unique_key AS "unique_key!" FROM job_executions
+               WHERE job_type = $1 AND unique_key = ANY($2)"#,
+            job_type as &JobType,
+            keys,
+        )
+        .fetch_all(op.as_executor())
+        .await?;
+        Ok(live.into_iter().collect())
     }
 
     /// Resolve the keyed singleton of `(job_type, key)`: the LIVE job if one
