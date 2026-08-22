@@ -129,6 +129,22 @@ impl ExecutionInsertHook {
     /// batch's own losing rows -- not just pre-existing backlog -- get
     /// swap-checked by [`PromoteHeadsHook`] next.
     ///
+    /// (b) matches `state IN ('pending', 'running')`, not just `'pending'`,
+    /// even though [`PromoteHeadsHook::apply`] only ever swaps a `'pending'`
+    /// occupant: a `'running'` occupant can retry-reschedule to `'pending'`
+    /// in a CONCURRENT transaction that commits after this statement's
+    /// snapshot was taken but before `apply` runs (a few statements later, in
+    /// this same transaction). Filtering here to `'pending'` only would miss
+    /// that occupant entirely -- this row never becomes a `promote_ids`
+    /// candidate, so nothing re-checks it, and the parked row we just
+    /// inserted can be stranded behind a `'pending'` sibling that never gets
+    /// swap-checked (until the next unrelated event on that queue, or
+    /// `sweep_orphaned_parked_rows`). Passing the `'running'` occupant's id
+    /// through is always safe: `apply`'s own statement re-reads state FRESH
+    /// (a separate statement's snapshot) and simply finds nothing to swap if
+    /// the occupant is still genuinely `'running'` by then. Pinned end-to-end
+    /// by `tests/parked_rows.rs::retry_backoff_yields_to_an_older_parked_sibling`.
+    ///
     /// `input` is `MATERIALIZED` and `ORDER BY (queue_id, id)`, deliberately:
     /// the `ins` arbiter insert's `ON CONFLICT` WAITS on a concurrent
     /// uncommitted row holding the same queue slot, and per-row arbiter
@@ -183,7 +199,7 @@ impl ExecutionInsertHook {
                 COALESCE(
                     (SELECT w.id FROM ins w WHERE w.queue_id = p.queue_id),
                     (SELECT o.id FROM job_executions o
-                     WHERE o.queue_id = p.queue_id AND o.state = 'pending')
+                     WHERE o.queue_id = p.queue_id AND o.state IN ('pending', 'running'))
                 ) AS "occupant_id?"
             FROM parked p
             "#,
@@ -243,11 +259,12 @@ impl ExecutionInsertHook {
     /// multi-queue batch completion touching the same two rows in opposite
     /// orders would deadlock.
     ///
-    /// `batch_dispatcher.rs`'s `complete_in_op` still locks its own
-    /// (disjoint, id-addressed) row set by plain `id`, not `(queue_id, id)`
-    /// -- deliberately out of scope here, see the lock-ordering fix's PR
-    /// description for why sorting removes same-shape cycles but cannot
-    /// exclude every heterogeneous one.
+    /// `batch_dispatcher.rs`'s `complete_in_op`, `reschedule_in_op` and
+    /// `fail_in_op`'s retry branch are id-addressed (not queue-addressed,
+    /// unlike the lockers above) but order their own pre-locks by
+    /// `(queue_id, id)` too, for exactly this reason -- a batch spanning
+    /// several queues is otherwise just as capable of disagreeing with this
+    /// lock's order as a multi-queue spawn is.
     ///
     /// The one thing this DOES contend with is the claim: `poll_jobs` and
     /// `claim_due_heads_in_op` take `FOR UPDATE SKIP LOCKED`, which conflicts
