@@ -9,8 +9,21 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
     // nextest every test is its own process with its own pool, so the default
     // multiplies by the runner's width and exhausts the server's connection
     // slots; the failure then surfaces as unrelated tests timing out.
+    //
+    // 8, not 5: `JobPoller::clamp_to_pool_headroom` (pool-aware claiming)
+    // clamps a poll's claim budget to *live* headroom on this exact pool, and
+    // `JobNotificationRouter`'s `LISTEN` connection permanently checks one
+    // out for the life of `Jobs` (`PgListener::connect_with` acquires and
+    // never releases) -- so even fully idle, headroom tops out at
+    // `max_connections - 1`. Several tests spawn and expect to claim
+    // 5-item batches in a single poll; at 5 connections that clamped to 4,
+    // splitting the claim across two polls and changing batch composition
+    // out from under probe-count/batch-shape assertions that have nothing
+    // to do with pool awareness. 8 leaves comfortable headroom above the
+    // largest batch sizes this suite spawns while staying well under
+    // sqlx's own default and the previous ceiling's own reasoning.
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(8)
         .connect(&pg_con)
         .await?;
     Ok(pool)
