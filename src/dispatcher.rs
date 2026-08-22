@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use futures::FutureExt;
+use rand::{RngExt, rng};
 use serde_json::Value as JsonValue;
 use tracing::{Span, instrument};
 
@@ -12,9 +13,10 @@ use std::{
 
 use super::{
     JobId,
+    batch_dispatcher::{CONGESTION_DELAY_MS, CONGESTION_JITTER_MS, CONGESTION_WARN_STREAK},
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
-    error::JobError,
+    error::{JobError, is_pool_congestion},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -143,6 +145,25 @@ impl JobDispatcher {
             .mark_finished_without_releasing_unit(&[self.id]);
     }
 
+    /// A [`JobRepo`] to open `fail_job`'s (and its congestion counterpart's)
+    /// op on: mirrors `BatchDispatcher::terminal_write_repo` -- this write
+    /// may run precisely when the shared pool `self.repo` wraps is the thing
+    /// under pressure that caused the job to fail in the first place, so it
+    /// is bound to `JobPoller::internal_pool` instead, the same dedicated
+    /// pool the claim query uses.
+    ///
+    /// `JobRepo::new` is a cheap pool-handle clone, not a new connection --
+    /// safe to call per failure. Falls back to `self.repo` (the shared pool)
+    /// only if the poller has already been dropped: at that point the
+    /// process is shutting down and there is no internal pool handle left to
+    /// reach, so the write is best-effort either way.
+    fn terminal_write_repo(&self) -> JobRepo {
+        match self.poller.upgrade() {
+            Some(poller) => JobRepo::new(poller.internal_pool()),
+            None => (*self.repo).clone(),
+        }
+    }
+
     #[instrument(name = "job.execute_job", skip_all,
         fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now)
     )]
@@ -187,7 +208,14 @@ impl JobDispatcher {
         );
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
-                span.record("conclusion", "Error");
+                span.record(
+                    "conclusion",
+                    if matches!(e, JobError::PoolCongestion(_)) {
+                        "Congestion"
+                    } else {
+                        "Error"
+                    },
+                );
                 self.fail_job(job.id, e, polled_job.attempt).await?
             }
             Ok(JobCompletion::Complete) => {
@@ -281,11 +309,28 @@ impl JobDispatcher {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
                 let span = Span::current();
+                // Classify BEFORE stringifying -- see
+                // `BatchDispatcher::run_batch`'s identical comment: `e` is
+                // the runner's own `Box<dyn std::error::Error>`, the only
+                // point where a `sqlx::Error::PoolTimedOut` (if that's what
+                // this is) still has its structure to downcast.
+                let congestion = is_pool_congestion(e.as_ref());
                 let error = e.to_string();
                 span.record("error", true);
                 span.record("error.message", tracing::field::display(&error));
-                span.record("error.level", tracing::field::display(tracing::Level::WARN));
-                Err(JobError::JobExecutionError(error))
+                span.record(
+                    "error.level",
+                    tracing::field::display(if congestion {
+                        tracing::Level::INFO
+                    } else {
+                        tracing::Level::WARN
+                    }),
+                );
+                Err(if congestion {
+                    JobError::PoolCongestion(error)
+                } else {
+                    JobError::JobExecutionError(error)
+                })
             }
             Err(panic) => {
                 let span = Span::current();
@@ -336,11 +381,26 @@ impl JobDispatcher {
         )
     )]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id_in_op(&mut op, id).await?;
+        let error_str = match error {
+            JobError::PoolCongestion(message) => {
+                return self.reschedule_congestion(id, message, attempt).await;
+            }
+            other => other.to_string(),
+        };
+
+        // `terminal_write_repo`, not `self.repo`: this is the LAST write
+        // deciding this job's disposition, and it may run precisely when
+        // the shared pool is the thing under pressure that failed the job
+        // in the first place. See `BatchDispatcher::terminal_write_repo`
+        // for the full rationale -- this mirrors it for the single-job
+        // path, closing the gap named in this feature's PR description
+        // ("`dispatcher.rs` has the identical shared-pool pattern, with no
+        // rescue fallback").
+        let repo = self.terminal_write_repo();
+        let mut op = repo.begin_op_with_clock(&self.clock).await?;
+        let mut job = repo.find_by_id_in_op(&mut op, id).await?;
 
         let span = Span::current();
-        let error_str = error.to_string();
         span.record("job_id", tracing::field::display(id));
         span.record("job_type", tracing::field::display(&job.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
@@ -399,8 +459,82 @@ impl JobDispatcher {
             self.delete_execution_in_op(&mut op, id).await?;
         }
 
-        self.repo.update_in_op(&mut op, &mut job).await?;
+        repo.update_in_op(&mut op, &mut job).await?;
         op.commit().await?;
+        Ok(())
+    }
+
+    /// Reschedule after a `PoolCongestion` classification
+    /// (`error::is_pool_congestion`), instead of running the job through
+    /// `fail_job`'s ordinary `RetryPolicy`. The single-job counterpart of
+    /// [`crate::batch_dispatcher::BatchDispatcher::reschedule_congestion`] --
+    /// see that method's doc comment for the full rationale, which applies
+    /// unchanged here: `attempt` stays UNCHANGED (congestion carries no
+    /// evidence the job itself is broken, so it must not spend a
+    /// `RetryPolicy` attempt), and the write opens via `terminal_write_repo`
+    /// (the internal pool) for the same reason `fail_job`'s does.
+    ///
+    /// Deliberately its own write, not a call to [`Self::reschedule_job`]:
+    /// that method hardcodes `attempt_index = 1` (right for an explicit
+    /// runner-requested reschedule, which has no notion of "which attempt"),
+    /// but a congestion reschedule must preserve the job's current attempt.
+    #[instrument(name = "job.congestion_reschedule", skip(self, message),
+        fields(job_id = %id, attempt, congestion_streak)
+    )]
+    async fn reschedule_congestion(
+        &mut self,
+        id: JobId,
+        message: String,
+        attempt: u32,
+    ) -> Result<(), JobError> {
+        self.rescheduled = true;
+        let repo = self.terminal_write_repo();
+        let mut op = repo.begin_op_with_clock(&self.clock).await?;
+        let mut job = repo.find_by_id_in_op(&mut op, id).await?;
+
+        let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        let jitter_ms = rng().random_range(-CONGESTION_JITTER_MS..=CONGESTION_JITTER_MS);
+        let scheduled_at = now + chrono::Duration::milliseconds(CONGESTION_DELAY_MS + jitter_ms);
+
+        // `attempt_index` deliberately absent from the `SET` list -- see
+        // this method's doc comment.
+        sqlx::query!(
+            r#"
+            UPDATE job_executions
+            SET state = 'pending', execute_at = $2, poller_instance_id = NULL
+            WHERE id = $1 AND poller_instance_id = $3
+            "#,
+            id as JobId,
+            scheduled_at,
+            self.instance_id
+        )
+        .execute(op.as_executor())
+        .await?;
+        // Invariant B: same ordering fixup as `reschedule_job` -- the
+        // rescheduled row keeps its queue's active slot, but an older
+        // parked sibling should run first during the delay.
+        PromoteHeadsHook::register(
+            &mut op,
+            &self.notifier,
+            [job.job_type.clone()],
+            vec![uuid::Uuid::from(id)],
+        )
+        .await?;
+
+        let streak = job.reschedule_congestion(message, scheduled_at, attempt);
+        repo.update_in_op(&mut op, &mut job).await?;
+        op.commit().await?;
+
+        let span = Span::current();
+        span.record("congestion_streak", streak);
+        if streak > CONGESTION_WARN_STREAK {
+            tracing::warn!(
+                job_id = %id,
+                streak,
+                "job stuck in congestion-reschedule; the shared pool may not \
+                 be recovering"
+            );
+        }
         Ok(())
     }
 

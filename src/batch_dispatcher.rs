@@ -46,18 +46,25 @@ const SEAL_MAX_ATTEMPTS: u32 = 3;
 /// and short, not the type's exponential `RetryPolicy` schedule: congestion
 /// needs the shared pool a moment to drain, not the escalating backoff meant
 /// for a job that keeps failing on its own.
-const CONGESTION_DELAY_MS: i64 = 2_000;
+///
+/// `pub(crate)`: shared with `dispatcher.rs`'s single-job congestion
+/// reschedule, which uses the exact same delay -- congestion is a pool-wide
+/// condition, not something that should back off differently by dispatch
+/// shape.
+pub(crate) const CONGESTION_DELAY_MS: i64 = 2_000;
 
 /// +/- jitter applied to `CONGESTION_DELAY_MS`, so every job congestion hit
 /// in the same poll doesn't re-claim on the exact same synchronized instant.
-const CONGESTION_JITTER_MS: i64 = 1_000;
+/// `pub(crate)`: see `CONGESTION_DELAY_MS`.
+pub(crate) const CONGESTION_JITTER_MS: i64 = 1_000;
 
 /// A batch whose consecutive congestion-reschedule streak exceeds this gets
 /// a WARN log once per reschedule: still recoverable (this is observability,
 /// not a cap), but "stuck in congestion forever" is no longer
 /// indistinguishable from an ordinary transient blip. See
-/// `Job::consecutive_congestion_reschedules`.
-const CONGESTION_WARN_STREAK: u32 = 10;
+/// `Job::consecutive_congestion_reschedules`. `pub(crate)`: see
+/// `CONGESTION_DELAY_MS`.
+pub(crate) const CONGESTION_WARN_STREAK: u32 = 10;
 
 /// What happened to a batch's claimed rows after the dispatcher failed
 /// terminally. Reported on the `batch dispatcher error` log so an operator
