@@ -12,15 +12,6 @@ use crate::{
     snapshot::JobSnapshot,
 };
 
-/// job's advisory-lock namespace. `pg_advisory_xact_lock(bigint)` (1-arg) and
-/// `pg_advisory_xact_lock(int4, int4)` (2-arg) occupy DIFFERENT lock spaces
-/// and do NOT mutually exclude -- a later lock picking the other arity would
-/// silently fail to exclude against this one, no error, no test failure.
-/// This crate's convention (matching cala's, its only sibling with an
-/// advisory-lock doctrine) is the 2-arg form, first arg a named `_CLASS`
-/// constant. Any future advisory lock added to this crate MUST use the same
-/// 2-arg form -- add a new `_CLASS` constant here rather than reusing this
-/// one for an unrelated purpose.
 const DEDUP_KEY_LOCK_CLASS: i32 = 1;
 
 #[derive(EsRepo, Clone)]
