@@ -62,11 +62,15 @@ pub(crate) struct JobPoller {
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
     clock: ClockHandle,
-    /// Dedicated small pool for the claim query alone (see [`build_poll_pool`]):
-    /// its session-level plan-cache/bitmap-scan overrides must never leak onto
-    /// the shared application pool, so the claim never borrows a connection
-    /// from `repo`'s pool.
-    poll_pool: PgPool,
+    /// Dedicated small pool (see [`build_internal_pool`]), serving two
+    /// tenants that must never compete with the shared application pool for
+    /// a connection: the claim query, whose session-level plan-cache/scan
+    /// overrides (see `build_internal_pool`) must never leak onto `repo`'s
+    /// pool; and `BatchDispatcher`'s terminal writes (`fail_batch`,
+    /// `rescue_claimed_rows`) -- see those methods' doc comments for why a
+    /// terminal write cannot afford to compete with the shared pool it is
+    /// often trying to write *because* that pool is under pressure.
+    internal_pool: PgPool,
     /// Set once `ShutdownCoordinator::perform` begins (shared with it, not
     /// owned -- both must observe the SAME flip). Checked by the
     /// completion-time recycle claim (`ClaimHook::pre_commit`) so a
@@ -76,8 +80,11 @@ pub(crate) struct JobPoller {
     shutdown_started: Arc<AtomicBool>,
 }
 
-/// A tiny dedicated pool for [`poll_jobs`], reusing the main pool's connect
-/// options. The claim query needs `plan_cache_mode = force_generic_plan`,
+/// A small dedicated pool reusing the main pool's connect options, serving
+/// two tenants: [`poll_jobs`], and `BatchDispatcher`'s terminal writes
+/// (`fail_batch`, `rescue_claimed_rows`).
+///
+/// The claim query needs `plan_cache_mode = force_generic_plan`,
 /// `enable_bitmapscan = off`, and `enable_seqscan = off` (see
 /// PERFORMANCE.md, "Ordered index access is mandatory") on every connection
 /// it runs on; setting them once per connection here — instead of `SET
@@ -95,10 +102,27 @@ pub(crate) struct JobPoller {
 /// heap and index bloat. Measured: idle poll 3,192 -> 59 shared
 /// blocks/call; no regression in any claiming regime (sb-max9 evidence,
 /// 2026-08-21).
-async fn build_poll_pool(main_pool: &PgPool) -> Result<PgPool, sqlx::Error> {
+///
+/// These same GUCs are safe for the terminal-write tenant even though it
+/// runs none of the claim's SELECTs: `fail_batch`/`rescue_claimed_rows`
+/// issue fully-parameterized, PK- or `poller_instance_id`-targeted
+/// `UPDATE`/`DELETE` statements, so a generic plan is what they would get
+/// anyway (no literal to specialize on), and bitmap/seq-scan suppression is
+/// simply irrelevant to a single-row index lookup. There is no session
+/// state here that could leak between the two tenants in a way that
+/// matters.
+///
+/// Sized for both tenants: 2 connections stay effectively reserved for poll
+/// cadence, 2 more absorb terminal-write bursts. Under a mass-failure storm,
+/// fail-writes could momentarily queue behind each other here -- acceptable,
+/// they're short PK-targeted statements, and the alternative (borrowing the
+/// shared pool) is the multi-minute claimed-row strand this pool exists to
+/// prevent (see `handoff-pool-aware-claiming-and-fail-path.md` §5, and
+/// `BatchDispatcher::fail_batch`/`rescue_claimed_rows`).
+async fn build_internal_pool(main_pool: &PgPool) -> Result<PgPool, sqlx::Error> {
     let options: PgConnectOptions = (*main_pool.connect_options()).clone();
     PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(4)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 sqlx::query("SET plan_cache_mode = force_generic_plan")
@@ -238,7 +262,7 @@ impl JobPoller {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >(1);
-        let poll_pool = build_poll_pool(repo.pool()).await?;
+        let internal_pool = build_internal_pool(repo.pool()).await?;
         Ok(Self {
             tracker,
             notifier,
@@ -249,7 +273,7 @@ impl JobPoller {
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
             clock,
-            poll_pool,
+            internal_pool,
             shutdown_started: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -258,6 +282,13 @@ impl JobPoller {
     /// `shutdown_started` field doc.
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutdown_started.load(Ordering::SeqCst)
+    }
+
+    /// The dedicated pool backing the claim query and `BatchDispatcher`'s
+    /// terminal writes. See the `internal_pool` field doc and
+    /// `build_internal_pool`.
+    pub(crate) fn internal_pool(&self) -> &PgPool {
+        &self.internal_pool
     }
 
     pub fn registered_job_types(&self) -> Vec<JobType> {
@@ -409,7 +440,7 @@ impl JobPoller {
         }
 
         let result = poll_jobs(
-            &self.poll_pool,
+            &self.internal_pool,
             n_jobs_to_poll,
             self.instance_id,
             &plan.types,
@@ -2084,7 +2115,7 @@ async fn poll_jobs(
     Span::current().record("now", tracing::field::display(sim_now));
 
     // A single autocommit statement on `pool` -- a dedicated pool
-    // (`build_poll_pool`) whose connections already carry
+    // (`build_internal_pool`) whose connections already carry
     // `plan_cache_mode = force_generic_plan` / `enable_bitmapscan = off` from
     // `after_connect`, so there is no `BEGIN`/`SET LOCAL`/`COMMIT` here to pay
     // for on every poll (5 round trips -> 1). See PERFORMANCE.md, "Ordered

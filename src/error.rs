@@ -37,6 +37,14 @@ pub enum JobError {
     NoInitializerPresent,
     #[error("JobError - JobExecutionError: {0}")]
     JobExecutionError(String),
+    /// A batch runner error classified as pool congestion
+    /// (`is_pool_congestion`) rather than a genuine failure -- distinct from
+    /// [`Self::JobExecutionError`] so `BatchDispatcher::fail_batch` can route
+    /// it to a reschedule that skips the retry policy's attempt escalation.
+    /// See `BatchDispatcher::run_batch`'s `Ok(Err(e))` branch, the only
+    /// place this is constructed.
+    #[error("JobError - PoolCongestion: {0}")]
+    PoolCongestion(String),
     #[error("JobError - BatchOutcomeMismatch: {0}")]
     BatchOutcomeMismatch(String),
     #[error("JobError - DuplicateId: {0:?}")]
@@ -99,6 +107,34 @@ pub(crate) fn retryable_conflict_code(
 /// [`retryable_conflict_code`] as a predicate.
 pub(crate) fn is_retryable_conflict(err: &(dyn std::error::Error + 'static)) -> bool {
     retryable_conflict_code(err).is_some()
+}
+
+/// Whether this error (or anything it wraps) is `sqlx::Error::PoolTimedOut`
+/// -- the shared pool had no connection to hand out within its acquire
+/// timeout. This carries no evidence the job is broken: it says the pool was
+/// busy, not that the work is wrong. Classified separately from a batch's
+/// real failures so it can skip the retry-policy's attempt escalation (see
+/// `BatchDispatcher::fail_batch`'s congestion branch) instead of walking a
+/// perfectly good job toward `max_attempts` termination for congestion it
+/// didn't cause.
+///
+/// Same source-chain walk as [`retryable_conflict_code`] and for the same
+/// reason: a batched runner's error crosses an object-erasure boundary
+/// (`BatchedJobRunner::run_batch` returns `Box<dyn std::error::Error>`)
+/// before it reaches this crate's own error handling, so the check has to
+/// happen on the *original* error there -- once it's been `.to_string()`'d
+/// into `JobError::JobExecutionError`, the structure (and this function)
+/// can no longer see it. See `BatchDispatcher::run_batch`'s `Ok(Err(e))`
+/// branch, which is where this is actually called.
+pub(crate) fn is_pool_congestion(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(e) = source {
+        if let Some(sqlx::Error::PoolTimedOut) = e.downcast_ref::<sqlx::Error>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 impl From<Box<dyn std::error::Error>> for JobError {
