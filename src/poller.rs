@@ -400,26 +400,44 @@ impl JobPoller {
     /// batched type's whole claim, however many rows, becomes as few as one
     /// `run_batch` call.
     ///
-    /// `PER_DISPATCH_UNIT_CONNECTION_COST` is deliberately 2, not 1: the
-    /// crate's own single-connection idiom (`begin_op` + the `_in_op`
-    /// method family) holds exactly one, but nothing stops a runner from
-    /// also calling the non-`_in_op` convenience methods
-    /// (`BatchedJobItem::update_execution_state`/`set_result`,
-    /// `CurrentJob::update_execution_state`/`set_result`) while its own
-    /// `op` is still open -- those commit in their OWN transaction, on a
-    /// second connection, per their doc comments. Confirmed by reading
-    /// `batched.rs`/`current.rs`: the crate's OWN claim/dispatch machinery
-    /// (`run_batch`, `run_isolated`, `run_bisected`) never holds more than
-    /// one, but a runner using the convenience methods concurrently with
-    /// its own op is a realistic, documented-idiom case this clamp has to
-    /// budget for, not a pathological one. A runner that fans the
-    /// convenience methods out across many items *concurrently* (e.g. via
-    /// `join_all`) can still exceed this -- that's unbounded arbitrary user
-    /// code, no static clamp can cap it, and it was equally uncapped before
-    /// this feature existed.
+    /// One dispatch unit is priced at exactly one connection -- the crate's
+    /// own claim/dispatch machinery (`run_batch`, `run_isolated`,
+    /// `run_bisected`, and the `begin_op` + `_in_op` method family) never
+    /// holds more than one at a time, confirmed by reading
+    /// `batched.rs`/`current.rs`. That is the only cost this budget can
+    /// know: what a *runner* does inside its own code is opaque to the
+    /// poller and cannot be priced from here. A runner might open zero
+    /// connections of its own (e.g. it does no persistence at all, or reads
+    /// through a permanently-held listener connection like
+    /// `JobNotificationRouter`'s), or it might open several -- the
+    /// non-`_in_op` convenience methods (`BatchedJobItem::update_execution_state`/
+    /// `set_result`, `CurrentJob::update_execution_state`/`set_result`)
+    /// commit on a second connection while the runner's own `op` is still
+    /// open, and nothing stops a runner from fanning work out
+    /// *concurrently* (e.g. via `join_all`) for an unbounded number more.
+    /// No uniform per-unit price is correct for both ends of that range, and
+    /// guessing high to cover the worst case taxes the common (cheap or
+    /// free) case for nothing.
+    ///
+    /// So this is a heuristic against the crate's own baseline cost, not a
+    /// hard cap on what a poll's dispatched work can actually consume --
+    /// same as before this budget existed, admission just used to be
+    /// unbounded instead of loosely bounded. A runner that needs more than
+    /// its unit's one connection can still make the shared pool run dry;
+    /// what changed in this same feature is that the consequence is now
+    /// cheap: `error::is_pool_congestion` classifies the resulting
+    /// `PoolTimedOut` and the fail path reschedules the job a few seconds
+    /// out rather than burning a retry attempt (see
+    /// `JobBatchDispatcher::reschedule_congestion` /
+    /// `JobDispatcher::reschedule_congestion`). That asymmetry is why
+    /// undercharging here is an acceptable trade: an occasional real
+    /// `PoolTimedOut` costs a short reschedule delay, while a per-type or
+    /// per-runner declared cost would ask every job author to reason about
+    /// a number they usually cannot know either -- the same "we don't know
+    /// how many connections a runner opens" problem, just pushed onto every
+    /// caller instead of accepted once here.
     fn pool_unit_budget(&self) -> usize {
-        const PER_DISPATCH_UNIT_CONNECTION_COST: usize = 2;
-        pool_connection_headroom(self.repo.pool()) / PER_DISPATCH_UNIT_CONNECTION_COST
+        pool_connection_headroom(self.repo.pool())
     }
 
     #[instrument(
