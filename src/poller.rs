@@ -188,6 +188,42 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 /// See PERFORMANCE.md, "Contention headroom".
 const CONTENTION_HEADROOM: i32 = 4;
 
+/// How many claim units one connection of live shared-pool headroom is worth.
+/// `1` to start: a claimed unit (a batch, or a single job) holds roughly one
+/// shared-pool connection across its execution, so units and connections are
+/// already well-matched -- and the executor is not the pool's only tenant
+/// (GraphQL requests share it), so claiming past 1:1 would claim into
+/// headroom that HTTP traffic is about to need. See
+/// `JobPoller::clamp_to_pool_headroom`.
+const CLAIM_HEADROOM_FACTOR: usize = 1;
+
+/// Clamp a poll's claim budget to the shared pool's live headroom. Factored
+/// out of [`JobPoller::clamp_to_pool_headroom`] as a free function of
+/// `&PgPool` so it's directly unit-testable against a real pool without
+/// needing a full `JobPoller`.
+///
+/// One claimed unit needs roughly one shared-pool connection across its
+/// execution -- claiming past what the pool can hand out doesn't queue the
+/// work, it strands it: a claimed row with no connection to run on is worse
+/// than one left `pending`, because `pending` is durable, observable, and
+/// drainable, while a stuck claim just waits for the lost-handler. So when
+/// headroom is 0, claiming 0 is correct: the backlog stays exactly where
+/// it's safest, and claiming resumes on the very next poll once headroom
+/// returns. Deliberately no floor of 1 "to keep making progress" -- see the
+/// `PoolTimedOut` congestion class this clamp exists to prevent
+/// (`error::is_pool_congestion`).
+///
+/// The `size()`/`num_idle()` read is instantaneous and racy -- headroom can
+/// change the instant after it's read. That's fine: this is a soft clamp
+/// re-evaluated every poll, not an invariant anything else depends on for
+/// correctness.
+fn claim_headroom_clamp(main_pool: &PgPool, n_jobs_to_poll: usize) -> usize {
+    let max_connections = main_pool.options().get_max_connections() as usize;
+    let in_use = (main_pool.size() as usize).saturating_sub(main_pool.num_idle());
+    let headroom = max_connections.saturating_sub(in_use);
+    n_jobs_to_poll.min(headroom.saturating_mul(CLAIM_HEADROOM_FACTOR))
+}
+
 impl JobPoller {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -334,11 +370,27 @@ impl JobPoller {
         let _ = poll_exited_tx.send(true);
     }
 
+    /// Clamp a poll's claim budget to the shared pool's live headroom. See
+    /// [`claim_headroom_clamp`] for the mechanism; this just wires it to the
+    /// span field a stress run watches.
+    fn clamp_to_pool_headroom(&self, n_jobs_to_poll: usize, span: &Span) -> usize {
+        let clamped = claim_headroom_clamp(self.repo.pool(), n_jobs_to_poll);
+        span.record("n_claim_clamped_by_pool", clamped < n_jobs_to_poll);
+        clamped
+    }
+
     #[instrument(
         name = "job.poll_and_dispatch",
         level = "debug",
         skip(self),
-        fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in)
+        fields(
+            poller_id,
+            n_jobs_running,
+            n_jobs_to_start,
+            now,
+            next_poll_in,
+            n_claim_clamped_by_pool
+        )
     )]
     async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
         let span = Span::current();
@@ -348,6 +400,7 @@ impl JobPoller {
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         };
+        let n_jobs_to_poll = self.clamp_to_pool_headroom(n_jobs_to_poll, &span);
         let plan = self.registry.plan_claim(n_jobs_to_poll);
         if plan.types.is_empty() {
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
@@ -2557,6 +2610,67 @@ mod tests {
     async fn init_pool() -> anyhow::Result<PgPool> {
         let pg_con = std::env::var("PG_CON").unwrap();
         Ok(sqlx::PgPool::connect(&pg_con).await?)
+    }
+
+    /// `claim_headroom_clamp` claims 0 when the pool has no headroom left,
+    /// and resumes claiming the instant a connection frees -- work item A of
+    /// `handoff-pool-aware-claiming-and-fail-path.md`. A direct call rather
+    /// than driving it through `poll_and_dispatch`/`main_loop`: those go
+    /// through the tokio timer/notify machinery, which would make a
+    /// negative assertion ("claims stayed 0") either a blind sleep or a
+    /// second, separate piece of test infrastructure this crate's test
+    /// suite doesn't otherwise have. `claim_headroom_clamp` is exactly the
+    /// new mechanism worth pinning; this proves it without either.
+    #[tokio::test]
+    async fn claim_clamps_to_pool_headroom_and_recovers() -> anyhow::Result<()> {
+        let pg_con = std::env::var("PG_CON").unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&pg_con)
+            .await?;
+
+        // Full headroom: an ample budget is left untouched.
+        assert_eq!(claim_headroom_clamp(&pool, 10), 10);
+
+        // Hold 2 of 3 connections -> headroom 1.
+        let c1 = pool.acquire().await?;
+        let c2 = pool.acquire().await?;
+        assert_eq!(
+            claim_headroom_clamp(&pool, 10),
+            1,
+            "budget should clamp to the single free connection"
+        );
+
+        // Hold the last one too -> headroom 0. No floor of 1: claiming must
+        // go all the way to 0, not "at least try one."
+        let c3 = pool.acquire().await?;
+        assert_eq!(
+            claim_headroom_clamp(&pool, 10),
+            0,
+            "budget should clamp to 0 with no headroom left"
+        );
+
+        // Releasing restores headroom immediately -- the clamp is a live
+        // read, not something latched from a prior poll.
+        drop(c3);
+        assert_eq!(
+            claim_headroom_clamp(&pool, 10),
+            1,
+            "releasing a connection should restore claiming on the very next read"
+        );
+
+        drop(c1);
+        drop(c2);
+        assert_eq!(
+            claim_headroom_clamp(&pool, 10),
+            10,
+            "full headroom should restore the full requested budget"
+        );
+
+        // A budget smaller than headroom is never raised, only ever lowered.
+        assert_eq!(claim_headroom_clamp(&pool, 2), 2);
+
+        Ok(())
     }
 
     /// Seed a real `Job` aggregate (events and all) plus a `running` execution
