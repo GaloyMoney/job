@@ -22,7 +22,13 @@
 //! # Guidance for implementors
 //!
 //! - A batch of one is the ordinary case under light load — write `run_batch`
-//!   so it is correct for any length, including 1 and 0.
+//!   so it is correct for any length, including 1 and 0. Concretely: with
+//!   `short_circuit` on (the default) and spare capacity, each spawned item
+//!   dispatches as its *own* single-item batch, so at 2 items with 2 free
+//!   slots `run_batch` never sees `N > 1`. To exercise a multi-item batch —
+//!   in production or in a test — commit the items in **one transaction**
+//!   ([`JobSpawner::spawn_all`], or several [`JobSpawner::spawn_in_op`] calls
+//!   sharing one `op`); see [`BatchedJobInitializer::short_circuit`].
 //! - Treat a batch as *equivalent to running its items one at a time, in order,
 //!   inside one transaction* — later items may observe earlier items' writes.
 //! - `queue_id` uniqueness is not the same as entity disjointness: two items
@@ -133,10 +139,18 @@ pub trait BatchedJobInitializer: Send + Sync + 'static {
 
     /// Whether a due-now spawn or completion of this type may take the
     /// head-swap short-circuit path (a batch slot claimed and dispatched
-    /// with no poll in between). See
-    /// [`crate::JobInitializer::short_circuit`] for the full trade-off --
-    /// identical here, just counted in batches (one unit) rather than rows.
-    /// Defaults to `true`.
+    /// with no poll in between). Defaults to `true`.
+    ///
+    /// With it on and spare capacity, **each spawned item dispatches as its
+    /// own single-item batch** -- at 2 items with 2 free slots, `run_batch`
+    /// never sees `N > 1`. To get a multi-item batch (in production or in a
+    /// test), commit the items in **one transaction**:
+    /// [`JobSpawner::spawn_all`](crate::JobSpawner::spawn_all), or several
+    /// [`spawn_in_op`](crate::JobSpawner::spawn_in_op) calls sharing one
+    /// `op`. Turning this flag off does not help. See
+    /// [`crate::JobInitializer::short_circuit`] for the full trade-off and
+    /// the testing recipe -- identical here, just counted in batches (one
+    /// unit) rather than rows.
     fn short_circuit(&self) -> bool {
         true
     }
