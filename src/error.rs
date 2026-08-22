@@ -109,6 +109,16 @@ pub(crate) fn is_retryable_conflict(err: &(dyn std::error::Error + 'static)) -> 
     retryable_conflict_code(err).is_some()
 }
 
+/// How many times a crate-owned bookkeeping transaction (batch seal / fail,
+/// congestion reschedule) is re-attempted after Postgres aborts it as a
+/// deadlock victim or serialization failure ([`is_retryable_conflict`]).
+///
+/// Small on purpose: these conflicts are resolved by whichever partner
+/// survives, so a re-attempt normally succeeds immediately. If three in a
+/// row lose, something is wrong beyond ordinary contention and the work is
+/// better off going through the rescue path than spinning here.
+pub(crate) const CONFLICT_MAX_ATTEMPTS: u32 = 3;
+
 /// Whether this error (or anything it wraps) is `sqlx::Error::PoolTimedOut`
 /// -- the shared pool had no connection to hand out within its acquire
 /// timeout. This carries no evidence the job is broken: it says the pool was

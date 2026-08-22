@@ -10,7 +10,6 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use futures::FutureExt;
-use rand::{RngExt, rng};
 use tracing::{Span, instrument};
 
 use std::collections::{HashMap, HashSet};
@@ -23,8 +22,9 @@ use super::{
         AnyBatchedJobRunner, BatchItemOutcome, BatchOutcomes, BatchRunCtx, JobBatchCompletion,
         RawBatchItem, ShutdownRx,
     },
+    congestion,
     entity::{Job, JobType, RetryPolicy},
-    error::{JobError, is_pool_congestion, is_retryable_conflict},
+    error::{CONFLICT_MAX_ATTEMPTS, JobError, is_pool_congestion, is_retryable_conflict},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -32,39 +32,6 @@ use super::{
     runner::RetrySettings,
     tracker::{JobTracker, UnitReservation},
 };
-
-/// How many times a crate-owned seal transaction is re-attempted after
-/// Postgres aborts it as a deadlock victim or serialization failure.
-///
-/// Small on purpose: these conflicts are resolved by whichever partner
-/// survives, so a re-attempt normally succeeds immediately. If three in a row
-/// lose, something is wrong beyond ordinary contention and the batch is
-/// better off going through the rescue path than spinning here.
-const SEAL_MAX_ATTEMPTS: u32 = 3;
-
-/// Base delay before a pool-congestion reschedule becomes due again. Fixed
-/// and short, not the type's exponential `RetryPolicy` schedule: congestion
-/// needs the shared pool a moment to drain, not the escalating backoff meant
-/// for a job that keeps failing on its own.
-///
-/// `pub(crate)`: shared with `dispatcher.rs`'s single-job congestion
-/// reschedule, which uses the exact same delay -- congestion is a pool-wide
-/// condition, not something that should back off differently by dispatch
-/// shape.
-pub(crate) const CONGESTION_DELAY_MS: i64 = 2_000;
-
-/// +/- jitter applied to `CONGESTION_DELAY_MS`, so every job congestion hit
-/// in the same poll doesn't re-claim on the exact same synchronized instant.
-/// `pub(crate)`: see `CONGESTION_DELAY_MS`.
-pub(crate) const CONGESTION_JITTER_MS: i64 = 1_000;
-
-/// A batch whose consecutive congestion-reschedule streak exceeds this gets
-/// a WARN log once per reschedule: still recoverable (this is observability,
-/// not a cap), but "stuck in congestion forever" is no longer
-/// indistinguishable from an ordinary transient blip. See
-/// `Job::consecutive_congestion_reschedules`. `pub(crate)`: see
-/// `CONGESTION_DELAY_MS`.
-pub(crate) const CONGESTION_WARN_STREAK: u32 = 10;
 
 /// What happened to a batch's claimed rows after the dispatcher failed
 /// terminally. Reported on the `batch dispatcher error` log so an operator
@@ -641,7 +608,7 @@ impl BatchDispatcher {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < SEAL_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e) if attempt < CONFLICT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
                     tracing::warn!(
                         job_type = %self.job_type,
                         job_ids = %DisplayIds(&self.ids),
@@ -989,7 +956,7 @@ impl BatchDispatcher {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < SEAL_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e) if attempt < CONFLICT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
                     tracing::warn!(
                         job_type = %self.job_type,
                         job_ids = %DisplayIds(&self.ids),
@@ -1005,29 +972,10 @@ impl BatchDispatcher {
     }
 
     /// Reschedule every job in the batch after a `PoolCongestion`
-    /// classification (`error::is_pool_congestion`), instead of running
-    /// them through [`Self::fail_in_op`]'s ordinary `RetryPolicy`.
-    ///
-    /// Deliberately its own write, not a call to [`Self::reschedule_in_op`]:
-    /// that method hardcodes `attempt_index = 1` (right for its one caller,
-    /// `rescue_claimed_rows`'s "we don't know what happened, start fresh"
-    /// last resort), but a congestion reschedule must leave `attempt_index`
-    /// UNCHANGED. That's load-bearing beyond just the retry policy: the
-    /// poller's retry-solo rule (`poller.rs`, `attempt > 1` is dispatched
-    /// alone, never batched) reads the same column, so resetting it here
-    /// would silently force every congestion-hit job into solo dispatch on
-    /// its next claim -- the opposite of what this reschedule is for. See
-    /// `congestion_reschedule_keeps_job_batchable` in `tests/batched_job.rs`.
-    ///
-    /// Delayed by `CONGESTION_DELAY_MS` +/- `CONGESTION_JITTER_MS` rather
-    /// than immediately due: the pool that just timed out needs a moment to
-    /// drain, and a fixed short delay (not `RetryPolicy`'s exponential
-    /// schedule, which this deliberately bypasses) keeps every job
-    /// congested in the same poll from synchronizing on the exact same next
-    /// claim instant.
-    ///
-    /// Opens its op via `terminal_write_repo` (the internal pool), same as
-    /// `fail_batch` and for the same reason.
+    /// classification, via the shared [`congestion::reschedule_congested`]
+    /// -- see `congestion.rs`'s module doc for the full rationale (attempt
+    /// preserved, fixed jittered delay, `CongestionRescheduled` event,
+    /// terminal-write repo).
     ///
     /// Deliberately does NOT call [`Self::try_recycle_own_type`], unlike
     /// every other terminal path (`seal`, `fail_batch`): that call hands the
@@ -1046,115 +994,18 @@ impl BatchDispatcher {
     /// releases through the ORDINARY path (`Drop`'s `batch_completed`)
     /// instead -- picked back up by the next POOL-AWARE poll, which does
     /// check `pool_unit_budget` fresh.
-    #[instrument(name = "job.batch_congestion_reschedule", skip_all,
-        fields(job_type = %self.job_type, n_items = self.ids.len(), congestion_streak)
-    )]
     async fn reschedule_congestion(&mut self, message: String) -> Result<(), JobError> {
-        let span = Span::current();
-        let mut attempt_no = 1;
-        loop {
-            let result = async {
-                let repo = self.terminal_write_repo();
-                let mut op = repo.begin_op_with_clock(&self.clock).await?;
-                let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                let jitter_ms = rng().random_range(-CONGESTION_JITTER_MS..=CONGESTION_JITTER_MS);
-                let scheduled_at =
-                    now + chrono::Duration::milliseconds(CONGESTION_DELAY_MS + jitter_ms);
-                let streak = self
-                    .congestion_reschedule_in_op(&mut op, message.clone(), scheduled_at)
-                    .await?;
-                op.commit().await?;
-                Ok::<_, JobError>(streak)
-            }
-            .await;
-
-            match result {
-                Ok(streak) => {
-                    span.record("congestion_streak", streak);
-                    if streak > CONGESTION_WARN_STREAK {
-                        tracing::warn!(
-                            job_type = %self.job_type,
-                            job_ids = %DisplayIds(&self.ids),
-                            streak,
-                            "batch stuck in congestion-reschedule; the shared \
-                             pool may not be recovering"
-                        );
-                    }
-                    return Ok(());
-                }
-                Err(e) if attempt_no < SEAL_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
-                    tracing::warn!(
-                        job_type = %self.job_type,
-                        job_ids = %DisplayIds(&self.ids),
-                        attempt_no,
-                        exception.message = %e,
-                        "batch congestion-reschedule lost a lock conflict; retrying"
-                    );
-                    attempt_no += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// The write half of [`Self::reschedule_congestion`]: every job in the
-    /// batch goes back to `pending` at `scheduled_at`, `attempt_index`
-    /// UNCHANGED (see that method's doc comment for why), on a fresh
-    /// `CongestionRescheduled` entity event rather than `ExecutionErrored`.
-    /// Returns the batch's highest post-reschedule consecutive-congestion
-    /// streak, for the caller's stuck-forever WARN.
-    async fn congestion_reschedule_in_op(
-        &mut self,
-        op: &mut impl AtomicOperation,
-        message: String,
-        scheduled_at: DateTime<Utc>,
-    ) -> Result<u32, JobError> {
         self.rescheduled = true;
-        let uuids: Vec<uuid::Uuid> = self.ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
-
-        // `(queue_id, id)`-ordered lock before the write, same reason and
-        // same `MATERIALIZED` shape as `reschedule_in_op`/`fail_in_op` --
-        // see `reschedule_in_op`'s doc comment. `attempt_index` is
-        // deliberately absent from the `SET` list: this write must not
-        // touch it either way.
-        sqlx::query!(
-            r#"
-            WITH to_reschedule AS MATERIALIZED (
-                SELECT id FROM job_executions
-                WHERE id = ANY($1) AND poller_instance_id = $2
-                ORDER BY queue_id, id
-                FOR UPDATE
-            )
-            UPDATE job_executions AS je
-            SET state = 'pending', execute_at = $3, poller_instance_id = NULL
-            FROM to_reschedule t
-            WHERE je.id = t.id
-            "#,
-            &uuids,
+        congestion::reschedule_congested(
+            &self.terminal_write_repo(),
+            &self.clock,
+            &self.notifier,
             self.instance_id,
-            scheduled_at,
+            &self.ids,
+            &self.attempts,
+            message,
         )
-        .execute(op.as_executor())
-        .await?;
-
-        let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &self.ids).await?;
-        let mut jobs = Vec::with_capacity(self.ids.len());
-        let mut max_streak = 0;
-        for id in &self.ids {
-            if let Some(mut job) = entities.remove(id) {
-                let attempt = self.attempts.get(id).copied().unwrap_or(1);
-                let streak = job.reschedule_congestion(message.clone(), scheduled_at, attempt);
-                max_streak = max_streak.max(streak);
-                jobs.push(job);
-            }
-        }
-        self.repo.update_all_in_op(op, &mut jobs).await?;
-
-        // Same freed-queue promotion as `reschedule_in_op` -- a congestion
-        // reschedule only ever demotes rows back to `pending`, it never
-        // frees a queue, so this is the retry-side registration only.
-        PromoteHeadsHook::register(op, &self.notifier, [self.job_type.clone()], uuids).await?;
-        Ok(max_streak)
+        .await
     }
 }
 
