@@ -9,6 +9,34 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
     // nextest every test is its own process with its own pool, so the default
     // multiplies by the runner's width and exhausts the server's connection
     // slots; the failure then surfaces as unrelated tests timing out.
+    //
+    // Worth knowing when sizing this: `JobNotificationRouter`'s `LISTEN`
+    // connection permanently checks one connection out of whichever pool
+    // `Jobs` is given, for the life of `Jobs` (`PgListener::connect_with`
+    // in sqlx-core acquires and never releases it). So even fully idle,
+    // live headroom on this pool tops out at `max_connections - 1`, not
+    // `max_connections`. `JobPoller::pool_unit_budget` (pool-aware
+    // claiming) reads exactly that live headroom as a poll's dispatch-unit
+    // budget, one connection per unit -- so at `max_connections(5)`, budget
+    // bottoms out at `5 - 1 = 4` units per poll REGARDLESS of how fairly
+    // it's spent across types (see `JobRegistry::plan_claim`'s
+    // smallest-first ordering).
+    //
+    // An earlier revision of this pool-aware claiming feature priced a unit
+    // at 2 connections (to cover a runner using non-`_in_op` convenience
+    // methods alongside its own open op) rather than 1, which more than
+    // halved the above budget and needed `max_connections(8)` to pass
+    // reliably. That per-unit price was dropped in favor of the simpler,
+    // uniform 1: the crate cannot know how many connections an arbitrary
+    // runner's own code opens (zero, one, or many), so pricing for a
+    // specific worst case taxed every OTHER case for nothing, and the
+    // asymmetry that justified taxing high in the first place (an
+    // under-priced unit hitting a real `PoolTimedOut`) got much cheaper in
+    // this same feature: `error::is_pool_congestion` now reschedules that
+    // job a few seconds out instead of burning a `RetrySettings` attempt.
+    // Measured: `max_connections(5)` with the 1-connection-per-unit budget
+    // passed the full suite cleanly across 8 repeated runs -- back to this
+    // pool's size before pool-aware claiming existed at all.
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .connect(&pg_con)

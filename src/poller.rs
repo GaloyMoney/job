@@ -62,11 +62,15 @@ pub(crate) struct JobPoller {
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
     clock: ClockHandle,
-    /// Dedicated small pool for the claim query alone (see [`build_poll_pool`]):
-    /// its session-level plan-cache/bitmap-scan overrides must never leak onto
-    /// the shared application pool, so the claim never borrows a connection
-    /// from `repo`'s pool.
-    poll_pool: PgPool,
+    /// Dedicated small pool (see [`build_internal_pool`]), serving two
+    /// tenants that must never compete with the shared application pool for
+    /// a connection: the claim query, whose session-level plan-cache/scan
+    /// overrides (see `build_internal_pool`) must never leak onto `repo`'s
+    /// pool; and `BatchDispatcher`'s terminal writes (`fail_batch`,
+    /// `rescue_claimed_rows`) -- see those methods' doc comments for why a
+    /// terminal write cannot afford to compete with the shared pool it is
+    /// often trying to write *because* that pool is under pressure.
+    internal_pool: PgPool,
     /// Set once `ShutdownCoordinator::perform` begins (shared with it, not
     /// owned -- both must observe the SAME flip). Checked by the
     /// completion-time recycle claim (`ClaimHook::pre_commit`) so a
@@ -76,8 +80,11 @@ pub(crate) struct JobPoller {
     shutdown_started: Arc<AtomicBool>,
 }
 
-/// A tiny dedicated pool for [`poll_jobs`], reusing the main pool's connect
-/// options. The claim query needs `plan_cache_mode = force_generic_plan`,
+/// A small dedicated pool reusing the main pool's connect options, serving
+/// two tenants: [`poll_jobs`], and `BatchDispatcher`'s terminal writes
+/// (`fail_batch`, `rescue_claimed_rows`).
+///
+/// The claim query needs `plan_cache_mode = force_generic_plan`,
 /// `enable_bitmapscan = off`, and `enable_seqscan = off` (see
 /// PERFORMANCE.md, "Ordered index access is mandatory") on every connection
 /// it runs on; setting them once per connection here — instead of `SET
@@ -95,10 +102,27 @@ pub(crate) struct JobPoller {
 /// heap and index bloat. Measured: idle poll 3,192 -> 59 shared
 /// blocks/call; no regression in any claiming regime (sb-max9 evidence,
 /// 2026-08-21).
-async fn build_poll_pool(main_pool: &PgPool) -> Result<PgPool, sqlx::Error> {
+///
+/// These same GUCs are safe for the terminal-write tenant even though it
+/// runs none of the claim's SELECT statements: `fail_batch`/`rescue_claimed_rows`
+/// issue fully-parameterized, PK- or `poller_instance_id`-targeted
+/// `UPDATE`/`DELETE` statements, so a generic plan is what they would get
+/// anyway (no literal to specialize on), and bitmap/seq-scan suppression is
+/// simply irrelevant to a single-row index lookup. There is no session
+/// state here that could leak between the two tenants in a way that
+/// matters.
+///
+/// Sized for both tenants: 2 connections stay effectively reserved for poll
+/// cadence, 2 more absorb terminal-write bursts. Under a mass-failure storm,
+/// fail-writes could momentarily queue behind each other here -- acceptable,
+/// they're short PK-targeted statements, and the alternative (borrowing the
+/// shared pool) is the multi-minute claimed-row strand this pool exists to
+/// prevent (see `handoff-pool-aware-claiming-and-fail-path.md` §5, and
+/// `BatchDispatcher::fail_batch`/`rescue_claimed_rows`).
+async fn build_internal_pool(main_pool: &PgPool) -> Result<PgPool, sqlx::Error> {
     let options: PgConnectOptions = (*main_pool.connect_options()).clone();
     PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(4)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 sqlx::query("SET plan_cache_mode = force_generic_plan")
@@ -188,6 +212,29 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 /// See PERFORMANCE.md, "Contention headroom".
 const CONTENTION_HEADROOM: i32 = 4;
 
+/// Live headroom on the shared pool: how many more connections it could
+/// hand out right now without exceeding `max_connections`. Factored out as
+/// a free function of `&PgPool` so it's directly unit-testable against a
+/// real pool without needing a full `JobPoller`. See
+/// `JobPoller::pool_unit_budget`, the only caller, for how this becomes a
+/// dispatch-unit budget.
+///
+/// This is the raw capacity signal and deliberately reads 0 when the pool
+/// is fully checked out -- the admission floor of one unit (so a saturated
+/// pool throttles claiming rather than halting it) is
+/// `JobPoller::pool_unit_budget`'s concern, not this function's; see its
+/// doc comment for why a floor is safe.
+///
+/// The `size()`/`num_idle()` read is instantaneous and racy -- headroom can
+/// change the instant after it's read. That's fine: this is a soft budget
+/// re-evaluated every poll, not an invariant anything else depends on for
+/// correctness.
+fn pool_connection_headroom(main_pool: &PgPool) -> usize {
+    let max_connections = main_pool.options().get_max_connections() as usize;
+    let in_use = (main_pool.size() as usize).saturating_sub(main_pool.num_idle());
+    max_connections.saturating_sub(in_use)
+}
+
 impl JobPoller {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -202,7 +249,7 @@ impl JobPoller {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >(1);
-        let poll_pool = build_poll_pool(repo.pool()).await?;
+        let internal_pool = build_internal_pool(repo.pool()).await?;
         Ok(Self {
             tracker,
             notifier,
@@ -213,7 +260,7 @@ impl JobPoller {
             instance_id: uuid::Uuid::now_v7(),
             shutdown_tx,
             clock,
-            poll_pool,
+            internal_pool,
             shutdown_started: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -222,6 +269,13 @@ impl JobPoller {
     /// `shutdown_started` field doc.
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutdown_started.load(Ordering::SeqCst)
+    }
+
+    /// The dedicated pool backing the claim query and `BatchDispatcher`'s
+    /// terminal writes. See the `internal_pool` field doc and
+    /// `build_internal_pool`.
+    pub(crate) fn internal_pool(&self) -> &PgPool {
+        &self.internal_pool
     }
 
     pub fn registered_job_types(&self) -> Vec<JobType> {
@@ -334,11 +388,96 @@ impl JobPoller {
         let _ = poll_exited_tx.send(true);
     }
 
+    /// This poll's dispatch-unit budget, from the shared pool's live
+    /// headroom -- fed into [`crate::registry::JobRegistry::plan_claim`],
+    /// which does the actual per-type spending. NOT a row-count clamp: see
+    /// `plan_claim`'s doc comment for why a unit (roughly one shared-pool
+    /// connection's worth of work) is a *dispatch*, not a *row* -- a
+    /// batched type's whole claim, however many rows, becomes as few as one
+    /// `run_batch` call.
+    ///
+    /// One dispatch unit is priced at exactly one connection -- the crate's
+    /// own claim/dispatch machinery (`run_batch`, `run_isolated`,
+    /// `run_bisected`, and the `begin_op` + `_in_op` method family) never
+    /// holds more than one at a time, confirmed by reading
+    /// `batched.rs`/`current.rs`. That is the only cost this budget can
+    /// know: what a *runner* does inside its own code is opaque to the
+    /// poller and cannot be priced from here. A runner might open zero
+    /// connections of its own (e.g. it does no persistence at all, or reads
+    /// through a permanently-held listener connection like
+    /// `JobNotificationRouter`'s), or it might open several -- the
+    /// non-`_in_op` convenience methods (`BatchedJobItem::update_execution_state`/
+    /// `set_result`, `CurrentJob::update_execution_state`/`set_result`)
+    /// commit on a second connection while the runner's own `op` is still
+    /// open, and nothing stops a runner from fanning work out
+    /// *concurrently* (e.g. via `join_all`) for an unbounded number more.
+    /// No uniform per-unit price is correct for both ends of that range, and
+    /// guessing high to cover the worst case taxes the common (cheap or
+    /// free) case for nothing.
+    ///
+    /// So this is a heuristic against the crate's own baseline cost, not a
+    /// hard cap on what a poll's dispatched work can actually consume --
+    /// same as before this budget existed, admission just used to be
+    /// unbounded instead of loosely bounded. A runner that needs more than
+    /// its unit's one connection can still make the shared pool run dry;
+    /// what changed in this same feature is that the consequence is now
+    /// cheap: `error::is_pool_congestion` classifies the resulting
+    /// `PoolTimedOut` and the fail path reschedules the job a few seconds
+    /// out rather than burning a retry attempt (see
+    /// `JobBatchDispatcher::reschedule_congestion` /
+    /// `JobDispatcher::reschedule_congestion`). That asymmetry is why
+    /// undercharging here is an acceptable trade: an occasional real
+    /// `PoolTimedOut` costs a short reschedule delay, while a per-type or
+    /// per-runner declared cost would ask every job author to reason about
+    /// a number they usually cannot know either -- the same "we don't know
+    /// how many connections a runner opens" problem, just pushed onto every
+    /// caller instead of accepted once here.
+    ///
+    /// Floored at one unit, so a fully-checked-out pool throttles claiming
+    /// to a trickle instead of halting it. Three reasons a floor beats a
+    /// hard stop at zero:
+    ///
+    /// - **Zero headroom says nothing about the next job's cost.** The same
+    ///   opacity that makes a uniform price of 1 the only defensible guess
+    ///   cuts both ways: the clamped job might need no shared-pool
+    ///   connection at all and would run fine right now. A hard zero blocks
+    ///   it behind pool traffic it would never have touched.
+    /// - **The acquire queue is the wake signal a zero-claim poll lacks.**
+    ///   The tracker's `notified()` wake only fires on this crate's own
+    ///   lifecycle events -- it cannot observe a connection freed by OTHER
+    ///   users of a shared pool, so a poll that claimed nothing could only
+    ///   re-check on a timer. A claimed job blocked in `acquire()` instead
+    ///   runs the instant a connection frees. (This floor replaced exactly
+    ///   such a timer, a 2s clamped-poll retry.)
+    /// - **The failure mode is already paid for.** A floored-in job that
+    ///   genuinely cannot acquire hits `PoolTimedOut` -> congestion
+    ///   reschedule (above): a short jittered delay, no attempt burned, all
+    ///   state writes on `internal_pool`. And the pile-up is bounded: each
+    ///   blocked job counts toward `JobTracker`'s running total, so
+    ///   `next_batch_size` stops the poller at `min_jobs_per_process`
+    ///   blocked acquires, recycling from there on the pool's
+    ///   `acquire_timeout` cadence.
+    ///
+    /// The floor means jobs keep competing for a saturated pool rather than
+    /// yielding it. If that pool is shared with an application and the
+    /// competition hurts, the fix is deployment-shaped, not more poller
+    /// machinery: hand `Jobs` its own pool.
+    fn pool_unit_budget(&self) -> usize {
+        pool_connection_headroom(self.repo.pool()).max(1)
+    }
+
     #[instrument(
         name = "job.poll_and_dispatch",
         level = "debug",
         skip(self),
-        fields(poller_id, n_jobs_running, n_jobs_to_start, now, next_poll_in)
+        fields(
+            poller_id,
+            n_jobs_running,
+            n_jobs_to_start,
+            now,
+            next_poll_in,
+            n_claim_clamped_by_pool
+        )
     )]
     async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
         let span = Span::current();
@@ -348,15 +487,21 @@ impl JobPoller {
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         };
-        let plan = self.registry.plan_claim(n_jobs_to_poll);
+        let unit_budget = self.pool_unit_budget();
+        let plan = self.registry.plan_claim(n_jobs_to_poll, unit_budget);
+        span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
         if plan.types.is_empty() {
+            // `pool_unit_budget`'s floor of one unit means the pool clamp
+            // alone can never empty the plan -- an empty plan is exactly
+            // "no type has anything to claim", so the full wait is right.
+            // (`clamped_by_pool` stays recorded above as telemetry only.)
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         }
 
         let result = poll_jobs(
-            &self.poll_pool,
+            &self.internal_pool,
             n_jobs_to_poll,
             self.instance_id,
             &plan.types,
@@ -2031,7 +2176,7 @@ async fn poll_jobs(
     Span::current().record("now", tracing::field::display(sim_now));
 
     // A single autocommit statement on `pool` -- a dedicated pool
-    // (`build_poll_pool`) whose connections already carry
+    // (`build_internal_pool`) whose connections already carry
     // `plan_cache_mode = force_generic_plan` / `enable_bitmapscan = off` from
     // `after_connect`, so there is no `BEGIN`/`SET LOCAL`/`COMMIT` here to pay
     // for on every poll (5 round trips -> 1). See PERFORMANCE.md, "Ordered
@@ -2557,6 +2702,75 @@ mod tests {
     async fn init_pool() -> anyhow::Result<PgPool> {
         let pg_con = std::env::var("PG_CON").unwrap();
         Ok(sqlx::PgPool::connect(&pg_con).await?)
+    }
+
+    /// `PoolConnection`'s `Drop` spawns a task to actually return the
+    /// connection to the pool (sqlx-core's `return_to_pool`) instead of
+    /// doing it inline, so `size()`/`num_idle()` don't reflect a `drop()`
+    /// until that task gets a turn on the executor. Yields until they do,
+    /// bounded so a real bug shows up as a failed assertion rather than a
+    /// hang -- not a sleep, since nothing here waits on real time.
+    async fn settle(pool: &PgPool, expected_idle: u32) {
+        for _ in 0..1000 {
+            if pool.num_idle() as u32 == expected_idle {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// `pool_connection_headroom` reads 0 when the pool has no headroom
+    /// left, and resumes reading the true count the instant a connection
+    /// frees -- work item A of `handoff-pool-aware-claiming-and-fail-path.md`.
+    /// A direct call rather than driving it through
+    /// `poll_and_dispatch`/`main_loop`: those go through the tokio
+    /// timer/notify machinery, which would make a negative assertion
+    /// ("claims stayed 0") either a blind sleep or a second, separate piece
+    /// of test infrastructure this crate's test suite doesn't otherwise
+    /// have. `pool_connection_headroom` is exactly the new mechanism worth
+    /// pinning; this proves it without either -- including that the raw
+    /// read deliberately reaches 0, since the one-unit admission floor is
+    /// layered on in `JobPoller::pool_unit_budget`, not here. (That
+    /// conversion and the per-type spending in `JobRegistry::plan_claim`
+    /// are covered by
+    /// `tests/pool_congestion.rs`/`tests/pool_terminal_write_safety.rs`
+    /// end to end.)
+    #[tokio::test]
+    async fn pool_headroom_tracks_live_connections() -> anyhow::Result<()> {
+        let pg_con = std::env::var("PG_CON").unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&pg_con)
+            .await?;
+
+        // Full headroom: never exceeds `max_connections`.
+        assert_eq!(pool_connection_headroom(&pool), 3);
+
+        // Hold 2 of 3 connections -> headroom 1.
+        let c1 = pool.acquire().await?;
+        let c2 = pool.acquire().await?;
+        assert_eq!(pool_connection_headroom(&pool), 1);
+
+        // Hold the last one too -> headroom 0.
+        let c3 = pool.acquire().await?;
+        assert_eq!(pool_connection_headroom(&pool), 0);
+
+        // Releasing restores headroom -- this is a live read, not something
+        // latched from a prior poll. `PoolConnection`'s `Drop` spawns a task
+        // to actually hand the connection back (sqlx-core's
+        // `return_to_pool`) rather than doing it inline, so
+        // `size()`/`num_idle()` only reflect a `drop()` once that task gets
+        // a turn on the executor -- `settle` yields until they do.
+        drop(c3);
+        settle(&pool, 1).await;
+        assert_eq!(pool_connection_headroom(&pool), 1);
+
+        drop(c1);
+        drop(c2);
+        settle(&pool, 3).await;
+        assert_eq!(pool_connection_headroom(&pool), 3);
+
+        Ok(())
     }
 
     /// Seed a real `Job` aggregate (events and all) plus a `running` execution

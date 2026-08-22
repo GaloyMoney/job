@@ -22,8 +22,9 @@ use super::{
         AnyBatchedJobRunner, BatchItemOutcome, BatchOutcomes, BatchRunCtx, JobBatchCompletion,
         RawBatchItem, ShutdownRx,
     },
+    congestion::CongestionHandler,
     entity::{Job, JobType, RetryPolicy},
-    error::{JobError, is_retryable_conflict},
+    error::{CONFLICT_MAX_ATTEMPTS, JobError, is_pool_congestion, is_retryable_conflict},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -31,15 +32,6 @@ use super::{
     runner::RetrySettings,
     tracker::{JobTracker, UnitReservation},
 };
-
-/// How many times a crate-owned seal transaction is re-attempted after
-/// Postgres aborts it as a deadlock victim or serialization failure.
-///
-/// Small on purpose: these conflicts are resolved by whichever partner
-/// survives, so a re-attempt normally succeeds immediately. If three in a row
-/// lose, something is wrong beyond ordinary contention and the batch is
-/// better off going through the rescue path than spinning here.
-const SEAL_MAX_ATTEMPTS: u32 = 3;
 
 /// What happened to a batch's claimed rows after the dispatcher failed
 /// terminally. Reported on the `batch dispatcher error` log so an operator
@@ -109,6 +101,7 @@ pub(crate) struct BatchDispatcher {
     recycled: bool,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
+    congestion: CongestionHandler,
 }
 
 impl BatchDispatcher {
@@ -139,6 +132,13 @@ impl BatchDispatcher {
             .map(|item| (item.job.id, item.attempt))
             .collect();
         tracker.dispatch_batch(&job_type, &ids);
+        let congestion = CongestionHandler::new(
+            poller.clone(),
+            repo.clone(),
+            notifier.clone(),
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
@@ -154,6 +154,7 @@ impl BatchDispatcher {
             recycled: false,
             instance_id,
             clock,
+            congestion,
         }
     }
 
@@ -182,6 +183,13 @@ impl BatchDispatcher {
             .map(|item| (item.job.id, item.attempt))
             .collect();
         reservation.into_live_batch(&ids);
+        let congestion = CongestionHandler::new(
+            poller.clone(),
+            repo.clone(),
+            notifier.clone(),
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
@@ -197,6 +205,7 @@ impl BatchDispatcher {
             recycled: false,
             instance_id,
             clock,
+            congestion,
         }
     }
 
@@ -297,7 +306,18 @@ impl BatchDispatcher {
         let outcome = match Self::run_batch(runner, items, ctx).await {
             Ok(completion) => self.apply(completion).await,
             Err(e) => {
-                span.record("conclusion", "Error");
+                // Decided here, not inside `fail_batch`: `fail_batch` runs
+                // in its own child span (`job.fail_batch`), so it cannot
+                // record onto this "job.execute_batch" span's `conclusion`
+                // field.
+                span.record(
+                    "conclusion",
+                    if matches!(e, JobError::PoolCongestion(_)) {
+                        "Congestion"
+                    } else {
+                        "Error"
+                    },
+                );
                 self.fail_batch(e).await
             }
         };
@@ -346,6 +366,16 @@ impl BatchDispatcher {
     /// terminal. The rows go back to `pending` with `execute_at = now` and
     /// `attempt_index = 1`, which is what the next poll re-dispatches.
     ///
+    /// Opens its op via `terminal_write_repo` (the internal pool), same as
+    /// `fail_batch`: this is the LAST chance to record a disposition before
+    /// the lost-handler is the only thing left, so it cannot afford to
+    /// compete with the shared pool for a connection -- especially since
+    /// this rescue is often reached BECAUSE the shared pool was the thing
+    /// under pressure. Before that pool existed for this purpose, both this
+    /// write and `fail_batch`'s acquired from the shared pool, so sustained
+    /// exhaustion could fail both and strand the row exactly as
+    /// `handoff-pool-aware-claiming-and-fail-path.md` §1 describes.
+    ///
     /// Best-effort by construction: if this fails too there is nothing left
     /// to try, and the lost-handler remains as the final backstop -- but the
     /// return value makes that outcome visible instead of silent.
@@ -358,7 +388,8 @@ impl BatchDispatcher {
             self.ids.iter().map(|id| (*id, now)).collect();
 
         let attempt = async {
-            let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+            let repo = self.congestion.terminal_write_repo();
+            let mut op = repo.begin_op_with_clock(&self.clock).await?;
             self.reschedule_in_op(&mut op, reschedules).await?;
             op.commit().await?;
             Ok::<_, JobError>(())
@@ -396,11 +427,31 @@ impl BatchDispatcher {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
                 let span = Span::current();
+                // Classify BEFORE stringifying: `e` is the runner's own
+                // `Box<dyn std::error::Error>`, the only point where the
+                // original `sqlx::Error::PoolTimedOut` (if that's what this
+                // is) still has its structure. `e.to_string()` below is a
+                // one-way trip into `JobExecutionError(String)` -- a plain
+                // `String` has no `.source()`, so `is_pool_congestion`
+                // could never see through it afterward. See
+                // `error::is_pool_congestion`'s doc comment.
+                let congestion = is_pool_congestion(e.as_ref());
                 let error = e.to_string();
                 span.record("error", true);
                 span.record("error.message", tracing::field::display(&error));
-                span.record("error.level", tracing::field::display(tracing::Level::WARN));
-                Err(JobError::JobExecutionError(error))
+                span.record(
+                    "error.level",
+                    tracing::field::display(if congestion {
+                        tracing::Level::INFO
+                    } else {
+                        tracing::Level::WARN
+                    }),
+                );
+                Err(if congestion {
+                    JobError::PoolCongestion(error)
+                } else {
+                    JobError::JobExecutionError(error)
+                })
             }
             Err(panic) => {
                 let span = Span::current();
@@ -554,7 +605,7 @@ impl BatchDispatcher {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < SEAL_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e) if attempt < CONFLICT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
                     tracing::warn!(
                         job_type = %self.job_type,
                         job_ids = %DisplayIds(&self.ids),
@@ -866,11 +917,20 @@ impl BatchDispatcher {
 
     /// Fail every job in the batch with the same error — the batch's work was
     /// rolled back, so no job in it can be considered done.
+    ///
+    /// A `PoolCongestion` error is routed to [`Self::reschedule_congestion`]
+    /// instead of the ordinary retry-policy path below: congestion carries
+    /// no evidence any of these jobs is broken, so applying `RetryPolicy`'s
+    /// attempt escalation to it would walk perfectly good jobs toward
+    /// `max_attempts` termination for a condition they didn't cause.
     #[instrument(name = "job.fail_batch", skip_all,
         fields(job_type = %self.job_type, n_items = self.ids.len(), error = true, error.message = %error)
     )]
     async fn fail_batch(&mut self, error: JobError) -> Result<(), JobError> {
-        let message = error.to_string();
+        let message = match error {
+            JobError::PoolCongestion(message) => return self.reschedule_congestion(message).await,
+            other => other.to_string(),
+        };
         // Same bounded conflict retry as `seal_in_own_op`, and sound for the
         // same reason: this transaction is the crate's own. Losing the
         // failure-recording transaction to a deadlock is the worst time to
@@ -879,7 +939,8 @@ impl BatchDispatcher {
         let mut attempt = 1;
         loop {
             let result = async {
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                let repo = self.congestion.terminal_write_repo();
+                let mut op = repo.begin_op_with_clock(&self.clock).await?;
                 let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 let fails: Vec<(JobId, String)> =
                     self.ids.iter().map(|id| (*id, message.clone())).collect();
@@ -892,7 +953,7 @@ impl BatchDispatcher {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < SEAL_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e) if attempt < CONFLICT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
                     tracing::warn!(
                         job_type = %self.job_type,
                         job_ids = %DisplayIds(&self.ids),
@@ -905,6 +966,36 @@ impl BatchDispatcher {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Reschedule every job in the batch after a `PoolCongestion`
+    /// classification, via the shared [`congestion::reschedule_congested`]
+    /// -- see `congestion.rs`'s module doc for the full rationale (attempt
+    /// preserved, fixed jittered delay, `CongestionRescheduled` event,
+    /// terminal-write repo).
+    ///
+    /// Deliberately does NOT call [`Self::try_recycle_own_type`], unlike
+    /// every other terminal path (`seal`, `fail_batch`): that call hands the
+    /// just-freed unit straight to [`crate::poller::ClaimHook`], which
+    /// claims and immediately DISPATCHES more due work of this SAME type --
+    /// a short-circuit path that has no idea about `pool_unit_budget` and
+    /// so cannot check whether the shared pool it's about to hand a fresh
+    /// dispatch to has actually recovered. Right after a completion or an
+    /// ordinary error, that blindness is fine (neither is evidence the pool
+    /// is unhealthy). Right after a CONGESTION reschedule it is exactly
+    /// backwards: the freed unit would immediately re-claim and re-dispatch
+    /// into the same pool that JUST failed to give this batch a connection,
+    /// with no backoff and no headroom check, which can feed a tight
+    /// claim-dispatch-fail-reschedule loop for this type specifically
+    /// instead of letting it cool off. Not calling it here means the unit
+    /// releases through the ORDINARY path (`Drop`'s `batch_completed`)
+    /// instead -- picked back up by the next POOL-AWARE poll, which does
+    /// check `pool_unit_budget` fresh.
+    async fn reschedule_congestion(&mut self, message: String) -> Result<(), JobError> {
+        self.rescheduled = true;
+        self.congestion
+            .reschedule(&self.ids, &self.attempts, message)
+            .await
     }
 }
 

@@ -361,6 +361,7 @@
 mod batch_dispatcher;
 mod batched;
 mod config;
+mod congestion;
 mod current;
 mod dispatcher;
 mod entity;

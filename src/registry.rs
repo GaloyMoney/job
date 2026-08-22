@@ -134,6 +134,14 @@ pub(crate) struct BatchPolicy {
 pub(super) struct ClaimPlan {
     pub types: Vec<JobType>,
     pub row_limits: Vec<i32>,
+    /// Whether `unit_budget` (see [`JobRegistry::plan_claim`]) bound any
+    /// type's row limit below what it would otherwise have claimed --
+    /// specifically "the pool's headroom was the limiting factor."
+    /// Telemetry only (recorded on the poll span): since
+    /// `JobPoller::pool_unit_budget` floors the budget at one unit, the
+    /// pool clamp can shrink a plan but never empty it, so nothing branches
+    /// on this.
+    pub clamped_by_pool: bool,
 }
 
 /// Keeps track of registered job types and their retry behaviour.
@@ -351,28 +359,109 @@ impl JobRegistry {
     /// is dropped. This is the ONLY admission budget the claim query gets —
     /// each type's queued and unqueued scans are bounded by it directly, so
     /// there is no overscan multiplier and no type can crowd out another.
-    pub(super) fn plan_claim(&self, n_jobs_to_poll: usize) -> ClaimPlan {
+    /// `unit_budget` bounds *dispatch units*, not claimed rows -- see
+    /// `JobPoller::pool_unit_budget`'s doc comment for why the
+    /// distinction matters (a batched type's whole claim becomes as few as
+    /// one `run_batch` call, not one per row). For a batched type, one unit
+    /// is one eventual `dispatch_batches` chunk: `free_concurrent_slots =
+    /// max_concurrent_per_process - units_in_flight` chunks of up to
+    /// `max_batch_size` rows each is the worst case where every claimed row
+    /// is "fresh" (attempt 1) -- see `dispatch_batches`' chunking loop.
+    /// Retries (attempt > 1) are dispatched one-per-unit on top of that and
+    /// aren't accounted for here, since they're the minority case; a poll
+    /// with an unusually large retry batch could therefore claim slightly
+    /// past `unit_budget` in practice, which is the same direction of
+    /// imprecision as under-claiming elsewhere in this clamp -- never an
+    /// increase in the STEADY-STATE worst case, only in a scenario already
+    /// bounded by `RetrySettings`. For a plain type, one unit is one row
+    /// (one `JobDispatcher` each).
+    pub(super) fn plan_claim(&self, n_jobs_to_poll: usize, unit_budget: usize) -> ClaimPlan {
+        // First pass: every type's UNCONSTRAINED (pool-budget-ignoring)
+        // limit and dispatch-unit cost -- everything `plan_claim` already
+        // computed before pool-awareness existed, just also carrying the
+        // unit cost alongside each row limit now.
+        let natural: Vec<(JobType, usize, usize)> = self
+            .registered_job_types()
+            .into_iter()
+            .filter_map(|job_type| {
+                let (limit, units) = match self.batch_policy(&job_type) {
+                    Some(policy) => {
+                        let limit = policy
+                            .max_concurrent_per_process
+                            .saturating_sub(self.tracker.units_in_flight(&job_type))
+                            .saturating_mul(policy.max_batch_size)
+                            .min(n_jobs_to_poll);
+                        (limit, limit.div_ceil(policy.max_batch_size.max(1)))
+                    }
+                    None => {
+                        let limit = match self.per_process_cap(&job_type) {
+                            Some(cap) => {
+                                cap.saturating_sub(self.tracker.units_in_flight(&job_type))
+                            }
+                            None => n_jobs_to_poll,
+                        }
+                        .min(n_jobs_to_poll);
+                        (limit, limit)
+                    }
+                };
+                (limit > 0).then_some((job_type, limit, units))
+            })
+            .collect();
+
+        // Second pass: spend `unit_budget` across that list, trimming
+        // (never growing) each type's row limit to fit -- for a batched
+        // type in whole-`max_batch_size`-chunk increments, since a partial
+        // chunk is still one full dispatch unit's connection cost.
+        //
+        // Smallest-demand types first, NOT `registered_job_types`' order
+        // (a `HashMap` iteration order, randomized per process): under a
+        // scarce budget, spending it in registration order lets whichever
+        // type happens to be iterated first -- however large its own
+        // uncapped demand -- exhaust the WHOLE budget before a small,
+        // explicitly-capped type (e.g. `max_concurrent_per_process:
+        // Some(1)`, needing exactly one unit) ever gets a turn. That is
+        // exactly the type-starvation failure per-type windowing exists to
+        // prevent elsewhere in the claim path (see PERFORMANCE.md,
+        // "Contention headroom") -- this clamp must not reintroduce it at
+        // the row_limit-assignment level. Smallest-first means a type only
+        // ever loses budget to types with EQUAL OR GREATER demand, and a
+        // type asking for just 1-2 units is served before an uncapped
+        // type's effectively-unbounded appetite can crowd it out.
+        let mut natural = natural;
+        natural.sort_by_key(|(_, _, units)| *units);
+        let clamped_by_pool = natural.iter().map(|(.., units)| units).sum::<usize>() > unit_budget;
         let mut types = Vec::new();
         let mut row_limits = Vec::new();
-        for job_type in self.registered_job_types() {
-            let limit = match self.batch_policy(&job_type) {
-                Some(policy) => policy
-                    .max_concurrent_per_process
-                    .saturating_sub(self.tracker.units_in_flight(&job_type))
-                    .saturating_mul(policy.max_batch_size),
-                None => match self.per_process_cap(&job_type) {
-                    Some(cap) => cap.saturating_sub(self.tracker.units_in_flight(&job_type)),
-                    None => n_jobs_to_poll,
-                },
+        let mut units_used = 0;
+        for (job_type, limit, units) in natural {
+            let remaining_units = unit_budget.saturating_sub(units_used);
+            if remaining_units == 0 {
+                continue;
+            }
+            let (limit, units) = if units <= remaining_units {
+                (limit, units)
+            } else if let Some(policy) = self.batch_policy(&job_type) {
+                (
+                    remaining_units
+                        .saturating_mul(policy.max_batch_size)
+                        .min(limit),
+                    remaining_units,
+                )
+            } else {
+                (remaining_units, remaining_units)
             };
-            let limit = limit.min(n_jobs_to_poll);
             if limit == 0 {
                 continue;
             }
             types.push(job_type);
             row_limits.push(limit as i32);
+            units_used += units;
         }
-        ClaimPlan { types, row_limits }
+        ClaimPlan {
+            types,
+            row_limits,
+            clamped_by_pool,
+        }
     }
 }
 

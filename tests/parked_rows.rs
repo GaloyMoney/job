@@ -68,10 +68,18 @@ impl JobRunner for HoldableRunner {
     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         let attempt = self.attempts_so_far.fetch_add(1, Ordering::SeqCst) + 1;
         self.started.notify_one();
+        // Gates BOTH outcomes, failing included: a caller that wants to
+        // assert on state while this attempt is still "running" (e.g. a
+        // sibling's park/swap check) needs that to hold for a
+        // `fail_first_n`-covered attempt exactly as much as for a
+        // completing one. Every OTHER test using this runner passes
+        // `fail_first_n: 0`, for which `attempt <= self.fail_first_n` is
+        // never true, so moving the wait ahead of the check changes nothing
+        // for them.
+        self.release.notified().await;
         if attempt <= self.fail_first_n {
             return Err("intentional failure to exercise retry backoff".into());
         }
-        self.release.notified().await;
         Ok(JobCompletion::Complete)
     }
 }
@@ -285,22 +293,42 @@ async fn retry_backoff_yields_to_an_older_parked_sibling() -> anyhow::Result<()>
     spawner.spawn_with_queue_id(a, Cfg, queue.clone()).await?;
 
     started.notified().await;
-
+    // A's `run` is now gated in `release.notified().await`, BEFORE its
+    // `fail_first_n` check -- so A is guaranteed still `running` (not yet
+    // failed, not yet rescheduled) until this test explicitly releases it
+    // below. Without this gate, B's spawn below races A's own failure ->
+    // reschedule: whichever wins determines which of the two independent
+    // swap-check paths ends up responsible for the eventual promote (B's
+    // own insert-time occupant recheck vs A's own retry's swap check -- see
+    // `PromoteHeadsHook::apply`'s doc comment), and if BOTH paths' checks
+    // land in the narrow gap between them, NEITHER catches it and nothing
+    // but `sweep_orphaned_parked_rows` (five minutes later, by default)
+    // would ever resolve it -- a real, if rare, edge this test's fixed
+    // wait budget was never meant to have to outlast. Gating removes the
+    // race outright instead of trying to out-run it, same fix shape as
+    // this file's own `HoldableRunner`/`Gate` header comment describes for
+    // the claim-to-completion race.
     let b = JobId::new();
     let older = chrono::Utc::now() - chrono::Duration::seconds(5);
     let b_op_result = spawner
         .spawn_at_with_queue_id(b, Cfg, older, queue.clone())
         .await;
     b_op_result?;
-    // Racy by construction: if B's spawn lands while A is still running, B
-    // parks and waits for the retry's own swap; if A has already failed and
-    // rescheduled by then, B's insert-time swap takes the slot immediately.
-    // Both are correct.
-    let b_after_spawn = row_state(&pool, b).await?;
-    assert!(
-        b_after_spawn == "parked" || b_after_spawn == "running",
-        "B must be waiting behind A or have already swapped in: got {b_after_spawn}"
+    // Deterministic now: A is still `running`, so B's insert can only park
+    // behind it.
+    assert_eq!(
+        row_state(&pool, b).await?,
+        "parked",
+        "B must park behind A, which is still running"
     );
+
+    // Let A's gated attempt proceed: it fails (fail_first_n: 1) and
+    // reschedules, landing `pending` with a future `execute_at`. B already
+    // exists and is `parked` by this point, so A's OWN retry's
+    // `PromoteHeadsHook::apply` call (registered inside `fail_job`) is
+    // guaranteed to find it and swap them in that same transaction --
+    // no reliance on B's insert-time occupant recheck at all.
+    release.notify_one();
 
     wait_until(
         async || Ok(row_state(&pool, a).await? == "parked"),

@@ -12,9 +12,10 @@ use std::{
 
 use super::{
     JobId,
+    congestion::CongestionHandler,
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
-    error::JobError,
+    error::{JobError, is_pool_congestion},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -53,6 +54,7 @@ pub(crate) struct JobDispatcher {
     id: JobId,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
+    congestion: CongestionHandler,
 }
 impl JobDispatcher {
     /// Claims the type's per-process slot **synchronously**, at construction.
@@ -80,6 +82,13 @@ impl JobDispatcher {
         clock: ClockHandle,
     ) -> Self {
         tracker.dispatch_job(id, &job_type);
+        let congestion = CongestionHandler::new(
+            poller.clone(),
+            repo.clone(),
+            notifier.clone(),
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
@@ -94,6 +103,7 @@ impl JobDispatcher {
             id,
             instance_id,
             clock,
+            congestion,
         }
     }
 
@@ -117,6 +127,13 @@ impl JobDispatcher {
         clock: ClockHandle,
     ) -> Self {
         reservation.into_live(id);
+        let congestion = CongestionHandler::new(
+            poller.clone(),
+            repo.clone(),
+            notifier.clone(),
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
@@ -131,6 +148,7 @@ impl JobDispatcher {
             id,
             instance_id,
             clock,
+            congestion,
         }
     }
 
@@ -187,7 +205,14 @@ impl JobDispatcher {
         );
         match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
             Err(e) => {
-                span.record("conclusion", "Error");
+                span.record(
+                    "conclusion",
+                    if matches!(e, JobError::PoolCongestion(_)) {
+                        "Congestion"
+                    } else {
+                        "Error"
+                    },
+                );
                 self.fail_job(job.id, e, polled_job.attempt).await?
             }
             Ok(JobCompletion::Complete) => {
@@ -281,11 +306,28 @@ impl JobDispatcher {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
                 let span = Span::current();
+                // Classify BEFORE stringifying -- see
+                // `BatchDispatcher::run_batch`'s identical comment: `e` is
+                // the runner's own `Box<dyn std::error::Error>`, the only
+                // point where a `sqlx::Error::PoolTimedOut` (if that's what
+                // this is) still has its structure to downcast.
+                let congestion = is_pool_congestion(e.as_ref());
                 let error = e.to_string();
                 span.record("error", true);
                 span.record("error.message", tracing::field::display(&error));
-                span.record("error.level", tracing::field::display(tracing::Level::WARN));
-                Err(JobError::JobExecutionError(error))
+                span.record(
+                    "error.level",
+                    tracing::field::display(if congestion {
+                        tracing::Level::INFO
+                    } else {
+                        tracing::Level::WARN
+                    }),
+                );
+                Err(if congestion {
+                    JobError::PoolCongestion(error)
+                } else {
+                    JobError::JobExecutionError(error)
+                })
             }
             Err(panic) => {
                 let span = Span::current();
@@ -336,11 +378,23 @@ impl JobDispatcher {
         )
     )]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id_in_op(&mut op, id).await?;
+        let error_str = match error {
+            JobError::PoolCongestion(message) => {
+                return self.reschedule_congestion(id, message, attempt).await;
+            }
+            other => other.to_string(),
+        };
+
+        // `terminal_write_repo`, not `self.repo`: this is the LAST write
+        // deciding this job's disposition, and it may run precisely when
+        // the shared pool is the thing under pressure that failed the job
+        // in the first place. See `CongestionHandler::terminal_write_repo`
+        // for the full rationale.
+        let repo = self.congestion.terminal_write_repo();
+        let mut op = repo.begin_op_with_clock(&self.clock).await?;
+        let mut job = repo.find_by_id_in_op(&mut op, id).await?;
 
         let span = Span::current();
-        let error_str = error.to_string();
         span.record("job_id", tracing::field::display(id));
         span.record("job_type", tracing::field::display(&job.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
@@ -399,9 +453,24 @@ impl JobDispatcher {
             self.delete_execution_in_op(&mut op, id).await?;
         }
 
-        self.repo.update_in_op(&mut op, &mut job).await?;
+        repo.update_in_op(&mut op, &mut job).await?;
         op.commit().await?;
         Ok(())
+    }
+
+    /// Reschedule after a `PoolCongestion` classification, via the shared
+    /// [`CongestionHandler`] (a single job is just a batch of one there) --
+    /// see `congestion.rs`'s module doc for the full rationale (attempt
+    /// preserved, fixed jittered delay, `CongestionRescheduled` event,
+    /// terminal-write repo).
+    async fn reschedule_congestion(
+        &mut self,
+        id: JobId,
+        message: String,
+        attempt: u32,
+    ) -> Result<(), JobError> {
+        self.rescheduled = true;
+        self.congestion.reschedule_one(id, attempt, message).await
     }
 
     /// Delete the execution row and report what its removal makes true: the
