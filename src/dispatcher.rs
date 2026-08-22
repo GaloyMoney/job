@@ -11,7 +11,8 @@ use std::{
 };
 
 use super::{
-    JobId, congestion,
+    JobId,
+    congestion::CongestionHandler,
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
     error::{JobError, is_pool_congestion},
@@ -53,6 +54,7 @@ pub(crate) struct JobDispatcher {
     id: JobId,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
+    congestion: CongestionHandler,
 }
 impl JobDispatcher {
     /// Claims the type's per-process slot **synchronously**, at construction.
@@ -80,6 +82,13 @@ impl JobDispatcher {
         clock: ClockHandle,
     ) -> Self {
         tracker.dispatch_job(id, &job_type);
+        let congestion = CongestionHandler::new(
+            poller.clone(),
+            repo.clone(),
+            notifier.clone(),
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
@@ -94,6 +103,7 @@ impl JobDispatcher {
             id,
             instance_id,
             clock,
+            congestion,
         }
     }
 
@@ -117,6 +127,13 @@ impl JobDispatcher {
         clock: ClockHandle,
     ) -> Self {
         reservation.into_live(id);
+        let congestion = CongestionHandler::new(
+            poller.clone(),
+            repo.clone(),
+            notifier.clone(),
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
@@ -131,6 +148,7 @@ impl JobDispatcher {
             id,
             instance_id,
             clock,
+            congestion,
         }
     }
 
@@ -141,25 +159,6 @@ impl JobDispatcher {
         self.dispatched = false;
         self.tracker
             .mark_finished_without_releasing_unit(&[self.id]);
-    }
-
-    /// A [`JobRepo`] to open `fail_job`'s (and its congestion counterpart's)
-    /// op on: mirrors `BatchDispatcher::terminal_write_repo` -- this write
-    /// may run precisely when the shared pool `self.repo` wraps is the thing
-    /// under pressure that caused the job to fail in the first place, so it
-    /// is bound to `JobPoller::internal_pool` instead, the same dedicated
-    /// pool the claim query uses.
-    ///
-    /// `JobRepo::new` is a cheap pool-handle clone, not a new connection --
-    /// safe to call per failure. Falls back to `self.repo` (the shared pool)
-    /// only if the poller has already been dropped: at that point the
-    /// process is shutting down and there is no internal pool handle left to
-    /// reach, so the write is best-effort either way.
-    fn terminal_write_repo(&self) -> JobRepo {
-        match self.poller.upgrade() {
-            Some(poller) => JobRepo::new(poller.internal_pool()),
-            None => (*self.repo).clone(),
-        }
     }
 
     #[instrument(name = "job.execute_job", skip_all,
@@ -389,12 +388,9 @@ impl JobDispatcher {
         // `terminal_write_repo`, not `self.repo`: this is the LAST write
         // deciding this job's disposition, and it may run precisely when
         // the shared pool is the thing under pressure that failed the job
-        // in the first place. See `BatchDispatcher::terminal_write_repo`
-        // for the full rationale -- this mirrors it for the single-job
-        // path, closing the gap named in this feature's PR description
-        // ("`dispatcher.rs` has the identical shared-pool pattern, with no
-        // rescue fallback").
-        let repo = self.terminal_write_repo();
+        // in the first place. See `CongestionHandler::terminal_write_repo`
+        // for the full rationale.
+        let repo = self.congestion.terminal_write_repo();
         let mut op = repo.begin_op_with_clock(&self.clock).await?;
         let mut job = repo.find_by_id_in_op(&mut op, id).await?;
 
@@ -463,10 +459,10 @@ impl JobDispatcher {
     }
 
     /// Reschedule after a `PoolCongestion` classification, via the shared
-    /// [`congestion::reschedule_congested`] (a single job is just a batch of
-    /// one there) -- see `congestion.rs`'s module doc for the full rationale
-    /// (attempt preserved, fixed jittered delay, `CongestionRescheduled`
-    /// event, terminal-write repo).
+    /// [`CongestionHandler`] (a single job is just a batch of one there) --
+    /// see `congestion.rs`'s module doc for the full rationale (attempt
+    /// preserved, fixed jittered delay, `CongestionRescheduled` event,
+    /// terminal-write repo).
     async fn reschedule_congestion(
         &mut self,
         id: JobId,
@@ -474,17 +470,7 @@ impl JobDispatcher {
         attempt: u32,
     ) -> Result<(), JobError> {
         self.rescheduled = true;
-        let attempts = std::collections::HashMap::from([(id, attempt)]);
-        congestion::reschedule_congested(
-            &self.terminal_write_repo(),
-            &self.clock,
-            &self.notifier,
-            self.instance_id,
-            &[id],
-            &attempts,
-            message,
-        )
-        .await
+        self.congestion.reschedule_one(id, attempt, message).await
     }
 
     /// Delete the execution row and report what its removal makes true: the

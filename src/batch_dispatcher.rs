@@ -22,7 +22,7 @@ use super::{
         AnyBatchedJobRunner, BatchItemOutcome, BatchOutcomes, BatchRunCtx, JobBatchCompletion,
         RawBatchItem, ShutdownRx,
     },
-    congestion,
+    congestion::CongestionHandler,
     entity::{Job, JobType, RetryPolicy},
     error::{CONFLICT_MAX_ATTEMPTS, JobError, is_pool_congestion, is_retryable_conflict},
     execution_hooks::PromoteHeadsHook,
@@ -101,6 +101,7 @@ pub(crate) struct BatchDispatcher {
     recycled: bool,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
+    congestion: CongestionHandler,
 }
 
 impl BatchDispatcher {
@@ -131,6 +132,13 @@ impl BatchDispatcher {
             .map(|item| (item.job.id, item.attempt))
             .collect();
         tracker.dispatch_batch(&job_type, &ids);
+        let congestion = CongestionHandler::new(
+            poller.clone(),
+            repo.clone(),
+            notifier.clone(),
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
@@ -146,6 +154,7 @@ impl BatchDispatcher {
             recycled: false,
             instance_id,
             clock,
+            congestion,
         }
     }
 
@@ -174,6 +183,13 @@ impl BatchDispatcher {
             .map(|item| (item.job.id, item.attempt))
             .collect();
         reservation.into_live_batch(&ids);
+        let congestion = CongestionHandler::new(
+            poller.clone(),
+            repo.clone(),
+            notifier.clone(),
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
@@ -189,6 +205,7 @@ impl BatchDispatcher {
             recycled: false,
             instance_id,
             clock,
+            congestion,
         }
     }
 
@@ -239,26 +256,6 @@ impl BatchDispatcher {
         self.recycle_unit();
         let reservation = self.tracker.recycle(&self.job_type);
         poller.register_claim_recycle(op, &self.job_type, reservation);
-    }
-
-    /// A [`JobRepo`] to open terminal-write ops on: `fail_batch`,
-    /// `rescue_claimed_rows`, and `reschedule_congestion` all need to record
-    /// a disposition precisely when the shared pool `self.repo` wraps may be
-    /// the thing under pressure that caused the batch to fail in the first
-    /// place. Bound to `JobPoller::internal_pool` instead -- the same
-    /// dedicated pool the claim query uses, sized to absorb both (see
-    /// `build_internal_pool`).
-    ///
-    /// `JobRepo::new` is a cheap pool-handle clone, not a new connection --
-    /// safe to call per attempt. Falls back to `self.repo` (the shared pool)
-    /// only if the poller has already been dropped: at that point the
-    /// process is shutting down and there is no internal pool handle left to
-    /// reach, so the write is best-effort either way.
-    fn terminal_write_repo(&self) -> JobRepo {
-        match self.poller.upgrade() {
-            Some(poller) => JobRepo::new(poller.internal_pool()),
-            None => (*self.repo).clone(),
-        }
     }
 
     #[instrument(name = "job.execute_batch", skip_all,
@@ -391,7 +388,7 @@ impl BatchDispatcher {
             self.ids.iter().map(|id| (*id, now)).collect();
 
         let attempt = async {
-            let repo = self.terminal_write_repo();
+            let repo = self.congestion.terminal_write_repo();
             let mut op = repo.begin_op_with_clock(&self.clock).await?;
             self.reschedule_in_op(&mut op, reschedules).await?;
             op.commit().await?;
@@ -942,7 +939,7 @@ impl BatchDispatcher {
         let mut attempt = 1;
         loop {
             let result = async {
-                let repo = self.terminal_write_repo();
+                let repo = self.congestion.terminal_write_repo();
                 let mut op = repo.begin_op_with_clock(&self.clock).await?;
                 let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 let fails: Vec<(JobId, String)> =
@@ -996,16 +993,9 @@ impl BatchDispatcher {
     /// check `pool_unit_budget` fresh.
     async fn reschedule_congestion(&mut self, message: String) -> Result<(), JobError> {
         self.rescheduled = true;
-        congestion::reschedule_congested(
-            &self.terminal_write_repo(),
-            &self.clock,
-            &self.notifier,
-            self.instance_id,
-            &self.ids,
-            &self.attempts,
-            message,
-        )
-        .await
+        self.congestion
+            .reschedule(&self.ids, &self.attempts, message)
+            .await
     }
 }
 
