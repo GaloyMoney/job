@@ -11,7 +11,7 @@ mod helpers;
 use async_trait::async_trait;
 use job::{
     BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob, JobBatchCompletion, JobId,
-    JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
+    JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Postgres;
@@ -31,6 +31,15 @@ struct Cfg {
 /// give. Held connections live in `held`, owned by the test, not dropped
 /// until the test's own assertions are done: `fail_batch` has to succeed
 /// while the exhaustion is still real, not merely at some point after.
+///
+/// Drains by repeatedly acquiring under a short per-attempt timeout rather
+/// than looping `max_connections` times: `Jobs`' own notification router
+/// permanently checks out one connection for its `LISTEN` for as long as
+/// `Jobs` is running (`PgListener::connect_with` acquires and never
+/// releases), so fewer than `max_connections` are ever actually
+/// obtainable. A bounded acquire that gives up once nothing is available
+/// -- rather than a fixed count -- drains whatever the pool can truly give
+/// up, regardless of what else is ambiently holding a connection.
 struct StarvePoolThenFailRunner {
     held: Arc<Mutex<Vec<PoolConnection<Postgres>>>>,
 }
@@ -44,10 +53,15 @@ impl BatchedJobRunner for StarvePoolThenFailRunner {
         current_batch: CurrentBatchedJob<Cfg>,
     ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         let pool = current_batch.pool().clone();
-        let max = pool.options().get_max_connections();
         let mut held = self.held.lock().await;
-        for _ in 0..max {
-            held.push(pool.acquire().await?);
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), pool.acquire()).await {
+                Ok(Ok(conn)) => held.push(conn),
+                Ok(Err(e)) => return Err(Box::new(e)),
+                // No connection became available within the timeout: the
+                // pool has given up everything it's going to give up.
+                Err(_) => break,
+            }
         }
         Err("real failure, shared pool now fully starved".into())
     }
@@ -85,6 +99,42 @@ impl BatchedJobInitializer for StarvePoolThenFailInitializer {
     }
 }
 
+/// Poll `job_executions` for `id` going away via a connection OUTSIDE the
+/// pool this test starves.
+///
+/// `Jobs`' own await-completion path (`handles().await_all()`) reads job
+/// state back through the same shared pool the runner just drained to
+/// zero -- so awaiting completion that way would itself starve on this
+/// test's own exhaustion, independent of whether `fail_batch` used the
+/// shared or the internal pool. `observer_pool` is a wholly separate
+/// connection (from `helpers::init_pool`, never touched by
+/// `StarvePoolThenFailRunner`), so this observes the actual database
+/// outcome without depending on the thing under test.
+///
+/// A deleted row is `fail_in_op`'s terminal branch's signature (see
+/// `batch_dispatcher.rs`'s terminal `DELETE FROM job_executions`): with
+/// `n_attempts: 1` this is the only way this test's job execution row can
+/// disappear.
+async fn wait_for_execution_row_deleted(
+    observer_pool: &sqlx::PgPool,
+    id: JobId,
+) -> anyhow::Result<()> {
+    for _ in 0..150 {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(id))
+            .fetch_one(observer_pool)
+            .await?;
+        if count == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "job_executions row for {id} was never deleted -- the failure write \
+         never landed (the row stranded exactly as sb-max11 observed)"
+    );
+}
+
 /// A batch's failure write must land even when the shared pool is fully
 /// exhausted at the moment it's recorded -- the actual lost-job fix
 /// (`handoff-pool-aware-claiming-and-fail-path.md` §5, work item C). Before
@@ -93,15 +143,20 @@ impl BatchedJobInitializer for StarvePoolThenFailInitializer {
 /// condition the row would strand `running` until the lost-handler swept it
 /// minutes later. Revert `terminal_write_repo` to always return
 /// `(*self.repo).clone()` (i.e. undo the internal-pool routing) to see this
-/// test time out for the right reason.
+/// test fail for the right reason (`wait_for_execution_row_deleted` times
+/// out).
 #[tokio::test]
 async fn terminal_write_survives_shared_pool_exhaustion() -> anyhow::Result<()> {
+    // A separate connection this test's own exhaustion can never touch --
+    // see `wait_for_execution_row_deleted`.
+    let observer_pool = helpers::init_pool().await?;
+
     let pg_con = std::env::var("PG_CON").unwrap();
-    // Small and known on purpose: the runner drains exactly this many
-    // connections, so the test can assert the pool was truly at zero idle
-    // when the write had to happen.
+    // Small and known on purpose: the runner drains it to whatever it can
+    // truly give up (see `StarvePoolThenFailRunner`'s doc comment), and the
+    // test asserts on that afterward.
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(4)
         .connect(&pg_con)
         .await?;
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
@@ -128,29 +183,16 @@ async fn terminal_write_survives_shared_pool_exhaustion() -> anyhow::Result<()> 
     // If `fail_batch` still opened its op on the shared pool (the pre-fix
     // behaviour), this would time out: the write could never acquire a
     // connection, and the row would strand exactly as sb-max11 observed
-    // instead of reaching `Errored` here.
-    let outcomes = jobs
-        .handles(vec![id])
-        .await_all(Duration::from_secs(15))
-        .await?;
-    assert_eq!(
-        outcomes[0].state(),
-        JobTerminalState::Errored,
-        "the failure write must land (terminating the job, n_attempts=1) even \
-         though the shared pool was fully exhausted when it had to be written"
-    );
+    // instead of being deleted here.
+    wait_for_execution_row_deleted(&observer_pool, id).await?;
 
-    // The exhaustion was real and sustained throughout, not just before the
-    // runner started.
-    assert_eq!(
-        pool.size(),
-        2,
-        "the runner should have grown the pool to its cap"
-    );
+    // The exhaustion was real when the write had to happen: every
+    // connection the shared pool could give the runner is still held right
+    // now, well after the write already landed via the internal pool.
     assert_eq!(
         pool.num_idle(),
         0,
-        "every shared-pool connection should still be held at this point"
+        "every shared-pool connection the runner could get should still be held"
     );
 
     held.lock().await.clear();

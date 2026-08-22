@@ -2643,6 +2643,21 @@ mod tests {
         Ok(sqlx::PgPool::connect(&pg_con).await?)
     }
 
+    /// `PoolConnection`'s `Drop` spawns a task to actually return the
+    /// connection to the pool (sqlx-core's `return_to_pool`) instead of
+    /// doing it inline, so `size()`/`num_idle()` don't reflect a `drop()`
+    /// until that task gets a turn on the executor. Yields until they do,
+    /// bounded so a real bug shows up as a failed assertion rather than a
+    /// hang -- not a sleep, since nothing here waits on real time.
+    async fn settle(pool: &PgPool, expected_idle: u32) {
+        for _ in 0..1000 {
+            if pool.num_idle() as u32 == expected_idle {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// `claim_headroom_clamp` claims 0 when the pool has no headroom left,
     /// and resumes claiming the instant a connection frees -- work item A of
     /// `handoff-pool-aware-claiming-and-fail-path.md`. A direct call rather
@@ -2660,8 +2675,12 @@ mod tests {
             .connect(&pg_con)
             .await?;
 
-        // Full headroom: an ample budget is left untouched.
-        assert_eq!(claim_headroom_clamp(&pool, 10), 10);
+        // Full headroom: a budget within the pool's capacity is left
+        // untouched, and a budget past the pool's capacity clamps to that
+        // capacity -- headroom can never exceed `max_connections`, budget
+        // or no budget.
+        assert_eq!(claim_headroom_clamp(&pool, 3), 3);
+        assert_eq!(claim_headroom_clamp(&pool, 10), 3);
 
         // Hold 2 of 3 connections -> headroom 1.
         let c1 = pool.acquire().await?;
@@ -2681,21 +2700,27 @@ mod tests {
             "budget should clamp to 0 with no headroom left"
         );
 
-        // Releasing restores headroom immediately -- the clamp is a live
-        // read, not something latched from a prior poll.
+        // Releasing restores headroom -- the clamp is a live read, not
+        // something latched from a prior poll. `PoolConnection`'s `Drop`
+        // spawns a task to actually hand the connection back
+        // (sqlx-core's `return_to_pool`) rather than doing it inline, so
+        // `size()`/`num_idle()` only reflect a `drop()` once that task gets
+        // a turn on the executor -- `settle` yields until they do.
         drop(c3);
+        settle(&pool, 1).await;
         assert_eq!(
             claim_headroom_clamp(&pool, 10),
             1,
-            "releasing a connection should restore claiming on the very next read"
+            "releasing a connection should restore claiming once the pool settles"
         );
 
         drop(c1);
         drop(c2);
+        settle(&pool, 3).await;
         assert_eq!(
             claim_headroom_clamp(&pool, 10),
-            10,
-            "full headroom should restore the full requested budget"
+            3,
+            "full headroom should restore claiming up to the pool's capacity"
         );
 
         // A budget smaller than headroom is never raised, only ever lowered.
