@@ -163,6 +163,7 @@ mod hook_ordering_tests {
                 job_type: jt.clone(),
                 schedule_at: Utc::now(),
                 queue_id: Some(queue.clone()),
+                unique_key: None,
             }],
         })
         .map_err(|_| anyhow::anyhow!("op must support commit hooks"))?;

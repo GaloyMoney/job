@@ -15,11 +15,17 @@ use crate::poller::PollerHandle;
 use super::promote::{PromoteHeadsHook, PromotedRow};
 
 /// One `job_executions` row to insert, as gathered by [`ExecutionInsertHook`].
-/// `unique_key` is deliberately absent -- keyed and bulk/single spawning are
-/// disjoint APIs (keyed spawn's own conflict resolution needs the row back
-/// in the SAME round trip to resolve a live-key race, so it stays inline;
-/// see `keyed.rs::KeyedJobSpawner::spawn`), so nothing ever registers this
-/// hook with a `unique_key`'d row.
+/// `unique_key` is `Some` only for a [`crate::JobSpec::dedup_key`]-bearing
+/// bulk-spawn row; `spawn_in_op`/`spawn_at_in_op`/`spawn_with_queue_id_in_op`
+/// (the single-item convenience methods) never set it. Keyed spawn's own
+/// insert stays entirely separate and inline (`keyed.rs::KeyedJobSpawner::spawn`)
+/// rather than going through this hook -- it needs the live-holder's id back
+/// in the SAME round trip to resolve a conflict, which a deferred, merged,
+/// multi-row batch insert cannot give it. `spawn_all_in_op` resolves a
+/// dedup-key row's liveness BEFORE registering it here (see
+/// `JobRepo::lock_and_check_live_keys_in_op`), so by the time a row reaches
+/// this hook its key (if any) is either free or a cross-call collision
+/// `Self::insert_many`'s `deduped` CTE still has to catch (see there).
 ///
 /// `Clone` exists for [`ExecutionInsertHook::adopt_orphaned_queues`], which
 /// re-submits a subset of these rows through [`ExecutionInsertHook::insert_many`]
@@ -30,6 +36,7 @@ pub(crate) struct NewExecutionRow {
     pub job_type: JobType,
     pub schedule_at: DateTime<Utc>,
     pub queue_id: Option<String>,
+    pub unique_key: Option<String>,
 }
 
 /// One row returned by [`ExecutionInsertHook`]'s insert statement:
@@ -145,7 +152,54 @@ impl ExecutionInsertHook {
     /// the occupant is still genuinely `'running'` by then. Pinned end-to-end
     /// by `tests/parked_rows.rs::retry_backoff_yields_to_an_older_parked_sibling`.
     ///
-    /// `input` is `MATERIALIZED` and `ORDER BY (queue_id, id)`, deliberately:
+    /// `deduped` collapses same-`(job_type, unique_key)` rows to one BEFORE
+    /// `input` applies the file's usual `(queue_id, id)` order: the merged
+    /// batch can contain two rows sharing a dedup key when two
+    /// `spawn_in_op`/`spawn_all_in_op` calls on the SAME `op` both target it
+    /// (see `NewExecutionRow`'s doc) -- each call's own
+    /// `lock_and_check_live_keys_in_op` pre-check only sees the durable
+    /// table, not a sibling call's still-queued row, so both can pass their
+    /// own check. Left uncaught, both rows would reach the `ins` INSERT
+    /// together and unique-violate `idx_job_executions_job_type_unique_key`
+    /// in one statement -- aborting this ENTIRE batch, including every
+    /// unrelated keyless row sharing the transaction, which is exactly what
+    /// AC5 (no statement-abort surfaced to the caller) rules out. There is
+    /// no second `ON CONFLICT` arbiter available to catch it inline (see
+    /// below), so it has to be filtered out before `ins` ever sees it.
+    ///
+    /// The `DISTINCT ON`/`ORDER BY` key is `(job_type,
+    /// COALESCE(unique_key, id::text))`, matching
+    /// `idx_job_executions_job_type_unique_key` exactly -- NOT `unique_key`
+    /// alone (a real regression this crate shipped and caught in review:
+    /// two DIFFERENT job types sharing one dedup_key STRING, e.g.
+    /// facility-scoped cross-type work keyed by the facility id, collapsed
+    /// to one execution row even though the index would happily hold both,
+    /// silently -- both calls' own per-type live-checks had already passed,
+    /// so both reported success while one ended up with an orphan `jobs`
+    /// row and no execution row ever created). `COALESCE(unique_key,
+    /// id::text)` is the fallback for keyless rows (`unique_key IS NULL`) so
+    /// they never collapse against EACH OTHER -- Postgres treats all NULLs
+    /// as one `DISTINCT ON` group per the leading key, and every row's own
+    /// `id` is unique, so a keyless row's fallback key never collides with a
+    /// sibling's; adding `job_type` to the key cannot introduce a NEW
+    /// collapse here either, since `id` is already globally unique
+    /// regardless of `job_type` -- prepending a column can only split an
+    /// existing `DISTINCT ON` group further, never merge two apart.
+    /// `ORDER BY ..., id` picks the earliest-created (`id` is a v7 uuid) row
+    /// of a true collision deterministically. The loser's `jobs` row
+    /// (already created by its own call's `create_all_in_op`, since dedup
+    /// resolution for a same-op collision only surfaces here, at commit
+    /// time) is left behind with an `Initialized` event and no execution
+    /// row and no terminal event -- a state
+    /// `load_snapshot_by_id`/`JobSnapshot::state()` treat as impossible
+    /// (surfaces as an error/panic on lookup, never a false "Completed"),
+    /// not silent corruption, but still worth avoiding: this is scoped to
+    /// the narrow same-op, overlapping-`(job_type, dedup_key)` case, and is
+    /// called out as a known edge in the PR rather than fixed further
+    /// here.
+    ///
+    /// `input` is `MATERIALIZED` and re-`ORDER BY (queue_id, id)` over
+    /// `deduped`'s already-collapsed rows, deliberately:
     /// the `ins` arbiter insert's `ON CONFLICT` WAITS on a concurrent
     /// uncommitted row holding the same queue slot, and per-row arbiter
     /// processing follows a materialized CTE's stored (i.e. sorted) row
@@ -166,18 +220,24 @@ impl ExecutionInsertHook {
         let job_types: Vec<JobType> = rows.iter().map(|r| r.job_type.clone()).collect();
         let queue_ids: Vec<Option<String>> = rows.iter().map(|r| r.queue_id.clone()).collect();
         let schedule_times: Vec<DateTime<Utc>> = rows.iter().map(|r| r.schedule_at).collect();
+        let unique_keys: Vec<Option<String>> = rows.iter().map(|r| r.unique_key.clone()).collect();
 
         sqlx::query_as!(
             InsertedRow,
             r#"
-            WITH input AS MATERIALIZED (
-                SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[])
-                    AS t(id, job_type, queue_id, execute_at)
-                ORDER BY queue_id, id
+            WITH raw AS (
+                SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[], $6::text[])
+                    AS t(id, job_type, queue_id, execute_at, unique_key)
+            ), deduped AS MATERIALIZED (
+                SELECT DISTINCT ON (job_type, COALESCE(unique_key, id::text)) *
+                FROM raw
+                ORDER BY job_type, COALESCE(unique_key, id::text), id
+            ), input AS MATERIALIZED (
+                SELECT * FROM deduped ORDER BY queue_id, id
             ), ins AS (
                 INSERT INTO job_executions
                     (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-                SELECT id, job_type, queue_id, NULL, 'pending', 1, execute_at,
+                SELECT id, job_type, queue_id, unique_key, 'pending', 1, execute_at,
                        COALESCE($5, NOW()), COALESCE($5, NOW())
                 FROM input
                 ON CONFLICT (queue_id) WHERE state IN ('pending','running') AND queue_id IS NOT NULL
@@ -186,7 +246,7 @@ impl ExecutionInsertHook {
             ), parked AS (
                 INSERT INTO job_executions
                     (id, job_type, queue_id, unique_key, state, attempt_index, execute_at, alive_at, created_at)
-                SELECT i.id, i.job_type, i.queue_id, NULL, 'parked', 1, i.execute_at,
+                SELECT i.id, i.job_type, i.queue_id, i.unique_key, 'parked', 1, i.execute_at,
                        COALESCE($5, NOW()), COALESCE($5, NOW())
                 FROM input i
                 WHERE i.id NOT IN (SELECT id FROM ins)
@@ -208,6 +268,7 @@ impl ExecutionInsertHook {
             &queue_ids as _,
             &schedule_times,
             op.maybe_now(),
+            &unique_keys as _,
         )
         .fetch_all(op.as_executor())
         .await
@@ -612,6 +673,7 @@ mod tests {
             job_type,
             schedule_at,
             queue_id: None,
+            unique_key: None,
         }
     }
 
