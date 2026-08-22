@@ -199,24 +199,6 @@ pub(crate) type PollerHandle = Arc<std::sync::OnceLock<std::sync::Weak<JobPoller
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
-/// Retry interval when a poll had due work but `pool_unit_budget` clamped
-/// every type's claim down to zero units -- distinct from `MAX_WAIT`, which
-/// is for a poll with genuinely nothing due. Much shorter than `MAX_WAIT`:
-/// pool exhaustion is typically a query-duration-scale event (milliseconds
-/// to low single-digit seconds), not something worth waiting a full minute
-/// to recheck.
-///
-/// This matters because the tracker's own `notified()` wake -- raced
-/// against `poll_and_dispatch`'s returned duration in the same `select!`
-/// the poll loop runs -- only fires on THIS crate's own job lifecycle
-/// events (spawns, completions, recycles). It has no way to observe a
-/// shared-pool connection freed by unrelated APPLICATION traffic, so due
-/// work that got clamped to zero units could otherwise sit unclaimed for
-/// up to `MAX_WAIT` even after the pool has already recovered -- exactly
-/// the silent-stall shape pool-aware claiming exists to prevent, just
-/// shifted from "claimed too much" to "waited too long to re-check."
-const POOL_CLAMP_RETRY: Duration = Duration::from_secs(2);
-
 /// How far past its admission budget a poll gathers candidates, so
 /// `FOR UPDATE ... SKIP LOCKED` has somewhere to fall through when a peer
 /// instance holds locks on the rows this poll would target. Sized for
@@ -237,15 +219,11 @@ const CONTENTION_HEADROOM: i32 = 4;
 /// `JobPoller::pool_unit_budget`, the only caller, for how this becomes a
 /// dispatch-unit budget.
 ///
-/// Claiming past what the pool can hand out doesn't queue the work, it
-/// strands it: a claimed row with no connection to run on is worse than one
-/// left `pending`, because `pending` is durable, observable, and drainable,
-/// while a stuck claim just waits for the lost-handler. So when headroom is
-/// 0, claiming 0 is correct: the backlog stays exactly where it's safest,
-/// and claiming resumes on the very next poll once headroom returns.
-/// Deliberately no floor of 1 "to keep making progress" -- see the
-/// `PoolTimedOut` congestion class this clamp exists to prevent
-/// (`error::is_pool_congestion`).
+/// This is the raw capacity signal and deliberately reads 0 when the pool
+/// is fully checked out -- the admission floor of one unit (so a saturated
+/// pool throttles claiming rather than halting it) is
+/// `JobPoller::pool_unit_budget`'s concern, not this function's; see its
+/// doc comment for why a floor is safe.
 ///
 /// The `size()`/`num_idle()` read is instantaneous and racy -- headroom can
 /// change the instant after it's read. That's fine: this is a soft budget
@@ -454,8 +432,38 @@ impl JobPoller {
     /// a number they usually cannot know either -- the same "we don't know
     /// how many connections a runner opens" problem, just pushed onto every
     /// caller instead of accepted once here.
+    ///
+    /// Floored at one unit, so a fully-checked-out pool throttles claiming
+    /// to a trickle instead of halting it. Three reasons a floor beats a
+    /// hard stop at zero:
+    ///
+    /// - **Zero headroom says nothing about the next job's cost.** The same
+    ///   opacity that makes a uniform price of 1 the only defensible guess
+    ///   cuts both ways: the clamped job might need no shared-pool
+    ///   connection at all and would run fine right now. A hard zero blocks
+    ///   it behind pool traffic it would never have touched.
+    /// - **The acquire queue is the wake signal a zero-claim poll lacks.**
+    ///   The tracker's `notified()` wake only fires on this crate's own
+    ///   lifecycle events -- it cannot observe a connection freed by OTHER
+    ///   users of a shared pool, so a poll that claimed nothing could only
+    ///   re-check on a timer. A claimed job blocked in `acquire()` instead
+    ///   runs the instant a connection frees. (This floor replaced exactly
+    ///   such a timer, a 2s clamped-poll retry.)
+    /// - **The failure mode is already paid for.** A floored-in job that
+    ///   genuinely cannot acquire hits `PoolTimedOut` -> congestion
+    ///   reschedule (above): a short jittered delay, no attempt burned, all
+    ///   state writes on `internal_pool`. And the pile-up is bounded: each
+    ///   blocked job counts toward `JobTracker`'s running total, so
+    ///   `next_batch_size` stops the poller at `min_jobs_per_process`
+    ///   blocked acquires, recycling from there on the pool's
+    ///   `acquire_timeout` cadence.
+    ///
+    /// The floor means jobs keep competing for a saturated pool rather than
+    /// yielding it. If that pool is shared with an application and the
+    /// competition hurts, the fix is deployment-shaped, not more poller
+    /// machinery: hand `Jobs` its own pool.
     fn pool_unit_budget(&self) -> usize {
-        pool_connection_headroom(self.repo.pool())
+        pool_connection_headroom(self.repo.pool()).max(1)
     }
 
     #[instrument(
@@ -483,18 +491,13 @@ impl JobPoller {
         let plan = self.registry.plan_claim(n_jobs_to_poll, unit_budget);
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
         if plan.types.is_empty() {
-            // `clamped_by_pool` distinguishes "genuinely nothing due" from
-            // "due work exists, but the pool clamp reduced every type's
-            // claim to zero" -- see `POOL_CLAMP_RETRY`'s doc comment for why
-            // these two cases must not share the same wait.
-            let wait = if plan.clamped_by_pool {
-                POOL_CLAMP_RETRY
-            } else {
-                MAX_WAIT
-            };
-            span.record("next_poll_in", tracing::field::debug(wait));
+            // `pool_unit_budget`'s floor of one unit means the pool clamp
+            // alone can never empty the plan -- an empty plan is exactly
+            // "no type has anything to claim", so the full wait is right.
+            // (`clamped_by_pool` stays recorded above as telemetry only.)
+            span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
-            return Ok(wait);
+            return Ok(MAX_WAIT);
         }
 
         let result = poll_jobs(
@@ -2725,9 +2728,11 @@ mod tests {
     /// ("claims stayed 0") either a blind sleep or a second, separate piece
     /// of test infrastructure this crate's test suite doesn't otherwise
     /// have. `pool_connection_headroom` is exactly the new mechanism worth
-    /// pinning; this proves it without either. (The unit-budget conversion
-    /// and its "no floor of 1" property live in `JobPoller::pool_unit_budget`
-    /// and `JobRegistry::plan_claim`, covered by
+    /// pinning; this proves it without either -- including that the raw
+    /// read deliberately reaches 0, since the one-unit admission floor is
+    /// layered on in `JobPoller::pool_unit_budget`, not here. (That
+    /// conversion and the per-type spending in `JobRegistry::plan_claim`
+    /// are covered by
     /// `tests/pool_congestion.rs`/`tests/pool_terminal_write_safety.rs`
     /// end to end.)
     #[tokio::test]

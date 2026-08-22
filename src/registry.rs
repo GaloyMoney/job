@@ -135,10 +135,12 @@ pub(super) struct ClaimPlan {
     pub types: Vec<JobType>,
     pub row_limits: Vec<i32>,
     /// Whether `unit_budget` (see [`JobRegistry::plan_claim`]) bound any
-    /// type's row limit below what it would otherwise have claimed. Distinct
-    /// from an empty `types`/`row_limits` (which can also mean nothing was
-    /// due, or every type's own concurrency cap was already saturated) --
-    /// this is specifically "the pool's headroom was the limiting factor."
+    /// type's row limit below what it would otherwise have claimed --
+    /// specifically "the pool's headroom was the limiting factor."
+    /// Telemetry only (recorded on the poll span): since
+    /// `JobPoller::pool_unit_budget` floors the budget at one unit, the
+    /// pool clamp can shrink a plan but never empty it, so nothing branches
+    /// on this.
     pub clamped_by_pool: bool,
 }
 
@@ -358,7 +360,7 @@ impl JobRegistry {
     /// each type's queued and unqueued scans are bounded by it directly, so
     /// there is no overscan multiplier and no type can crowd out another.
     /// `unit_budget` bounds *dispatch units*, not claimed rows -- see
-    /// `JobPoller::clamp_to_pool_headroom`'s doc comment for why the
+    /// `JobPoller::pool_unit_budget`'s doc comment for why the
     /// distinction matters (a batched type's whole claim becomes as few as
     /// one `run_batch` call, not one per row). For a batched type, one unit
     /// is one eventual `dispatch_batches` chunk: `free_concurrent_slots =
