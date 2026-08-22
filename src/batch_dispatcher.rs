@@ -1028,6 +1028,24 @@ impl BatchDispatcher {
     ///
     /// Opens its op via `terminal_write_repo` (the internal pool), same as
     /// `fail_batch` and for the same reason.
+    ///
+    /// Deliberately does NOT call [`Self::try_recycle_own_type`], unlike
+    /// every other terminal path (`seal`, `fail_batch`): that call hands the
+    /// just-freed unit straight to [`crate::poller::ClaimHook`], which
+    /// claims and immediately DISPATCHES more due work of this SAME type --
+    /// a short-circuit path that has no idea about `pool_unit_budget` and
+    /// so cannot check whether the shared pool it's about to hand a fresh
+    /// dispatch to has actually recovered. Right after a completion or an
+    /// ordinary error, that blindness is fine (neither is evidence the pool
+    /// is unhealthy). Right after a CONGESTION reschedule it is exactly
+    /// backwards: the freed unit would immediately re-claim and re-dispatch
+    /// into the same pool that JUST failed to give this batch a connection,
+    /// with no backoff and no headroom check, which can feed a tight
+    /// claim-dispatch-fail-reschedule loop for this type specifically
+    /// instead of letting it cool off. Not calling it here means the unit
+    /// releases through the ORDINARY path (`Drop`'s `batch_completed`)
+    /// instead -- picked back up by the next POOL-AWARE poll, which does
+    /// check `pool_unit_budget` fresh.
     #[instrument(name = "job.batch_congestion_reschedule", skip_all,
         fields(job_type = %self.job_type, n_items = self.ids.len(), congestion_streak)
     )]
@@ -1045,7 +1063,6 @@ impl BatchDispatcher {
                 let streak = self
                     .congestion_reschedule_in_op(&mut op, message.clone(), scheduled_at)
                     .await?;
-                self.try_recycle_own_type(&mut op);
                 op.commit().await?;
                 Ok::<_, JobError>(streak)
             }

@@ -199,6 +199,24 @@ pub(crate) type PollerHandle = Arc<std::sync::OnceLock<std::sync::Weak<JobPoller
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
+/// Retry interval when a poll had due work but `pool_unit_budget` clamped
+/// every type's claim down to zero units -- distinct from `MAX_WAIT`, which
+/// is for a poll with genuinely nothing due. Much shorter than `MAX_WAIT`:
+/// pool exhaustion is typically a query-duration-scale event (milliseconds
+/// to low single-digit seconds), not something worth waiting a full minute
+/// to recheck.
+///
+/// This matters because the tracker's own `notified()` wake -- raced
+/// against `poll_and_dispatch`'s returned duration in the same `select!`
+/// the poll loop runs -- only fires on THIS crate's own job lifecycle
+/// events (spawns, completions, recycles). It has no way to observe a
+/// shared-pool connection freed by unrelated APPLICATION traffic, so due
+/// work that got clamped to zero units could otherwise sit unclaimed for
+/// up to `MAX_WAIT` even after the pool has already recovered -- exactly
+/// the silent-stall shape pool-aware claiming exists to prevent, just
+/// shifted from "claimed too much" to "waited too long to re-check."
+const POOL_CLAMP_RETRY: Duration = Duration::from_secs(2);
+
 /// How far past its admission budget a poll gathers candidates, so
 /// `FOR UPDATE ... SKIP LOCKED` has somewhere to fall through when a peer
 /// instance holds locks on the rows this poll would target. Sized for
@@ -465,9 +483,18 @@ impl JobPoller {
         let plan = self.registry.plan_claim(n_jobs_to_poll, unit_budget);
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
         if plan.types.is_empty() {
-            span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
+            // `clamped_by_pool` distinguishes "genuinely nothing due" from
+            // "due work exists, but the pool clamp reduced every type's
+            // claim to zero" -- see `POOL_CLAMP_RETRY`'s doc comment for why
+            // these two cases must not share the same wait.
+            let wait = if plan.clamped_by_pool {
+                POOL_CLAMP_RETRY
+            } else {
+                MAX_WAIT
+            };
+            span.record("next_poll_in", tracing::field::debug(wait));
             span.record("n_jobs_to_start", 0);
-            return Ok(MAX_WAIT);
+            return Ok(wait);
         }
 
         let result = poll_jobs(
