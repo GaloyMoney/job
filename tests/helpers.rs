@@ -10,18 +10,29 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
     // multiplies by the runner's width and exhausts the server's connection
     // slots; the failure then surfaces as unrelated tests timing out.
     //
-    // 8, not 5: `JobPoller::clamp_to_pool_headroom` (pool-aware claiming)
-    // clamps a poll's claim budget to *live* headroom on this exact pool, and
-    // `JobNotificationRouter`'s `LISTEN` connection permanently checks one
-    // out for the life of `Jobs` (`PgListener::connect_with` acquires and
-    // never releases) -- so even fully idle, headroom tops out at
-    // `max_connections - 1`. Several tests spawn and expect to claim
-    // 5-item batches in a single poll; at 5 connections that clamped to 4,
-    // splitting the claim across two polls and changing batch composition
-    // out from under probe-count/batch-shape assertions that have nothing
-    // to do with pool awareness. 8 leaves comfortable headroom above the
-    // largest batch sizes this suite spawns while staying well under
-    // sqlx's own default and the previous ceiling's own reasoning.
+    // Worth knowing when sizing this: `JobNotificationRouter`'s `LISTEN`
+    // connection permanently checks one connection out of whichever pool
+    // `Jobs` is given, for the life of `Jobs` (`PgListener::connect_with`
+    // in sqlx-core acquires and never releases it). So even fully idle,
+    // live headroom on this pool tops out at `max_connections - 1`, not
+    // `max_connections`. `JobPoller::pool_unit_budget` (pool-aware
+    // claiming) reads exactly that live headroom and divides it by
+    // `PER_DISPATCH_UNIT_CONNECTION_COST` (2) to get a poll's dispatch-unit
+    // budget -- so at `max_connections(5)` (this pool's size before
+    // pool-aware claiming existed), budget bottoms out at
+    // `(5 - 1) / 2 = 2` units per poll REGARDLESS of how fairly it's
+    // spent across types (see `JobRegistry::plan_claim`'s smallest-first
+    // ordering). 2 is workably tight for a single capped-to-1 type, but
+    // several existing tests spawn backlogs sized assuming a much more
+    // generous per-poll claim (e.g. 20 items at `max_batch_size: 3`,
+    // wanting several batch-slots' worth of units at once) -- at budget 2
+    // those need several EXTRA poll round-trips to drain, which is not
+    // wrong, just slower, and occasionally slow enough to brush a test's
+    // own timeout under full-suite load. Measured: `max_connections(5)`
+    // reproduces real, if intermittent, timeouts across repeated full-suite
+    // runs even with pool-aware claiming's dispatch-unit accounting (not
+    // row-count accounting) in place; `max_connections(8)` (budget
+    // `(8 - 1) / 2 = 3`) did not, across 5 repeated full-suite runs.
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(8)
         .connect(&pg_con)
