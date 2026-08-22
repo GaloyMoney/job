@@ -52,10 +52,11 @@ const CONGESTION_DELAY_MS: i64 = 2_000;
 /// in the same poll doesn't re-claim on the exact same synchronized instant.
 const CONGESTION_JITTER_MS: i64 = 1_000;
 
-/// A batch whose consecutive congestion-reschedule streak exceeds this is
-/// WARNed once per reschedule: still recoverable (this is observability, not
-/// a cap), but "stuck in congestion forever" is no longer indistinguishable
-/// from an ordinary transient blip. See `Job::consecutive_congestion_reschedules`.
+/// A batch whose consecutive congestion-reschedule streak exceeds this gets
+/// a WARN log once per reschedule: still recoverable (this is observability,
+/// not a cap), but "stuck in congestion forever" is no longer
+/// indistinguishable from an ordinary transient blip. See
+/// `Job::consecutive_congestion_reschedules`.
 const CONGESTION_WARN_STREAK: u32 = 10;
 
 /// What happened to a batch's claimed rows after the dispatcher failed

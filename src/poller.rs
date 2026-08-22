@@ -104,7 +104,7 @@ pub(crate) struct JobPoller {
 /// 2026-08-21).
 ///
 /// These same GUCs are safe for the terminal-write tenant even though it
-/// runs none of the claim's SELECTs: `fail_batch`/`rescue_claimed_rows`
+/// runs none of the claim's SELECT statements: `fail_batch`/`rescue_claimed_rows`
 /// issue fully-parameterized, PK- or `poller_instance_id`-targeted
 /// `UPDATE`/`DELETE` statements, so a generic plan is what they would get
 /// anyway (no literal to specialize on), and bitmap/seq-scan suppression is
