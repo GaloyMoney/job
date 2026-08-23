@@ -136,11 +136,12 @@ pub(super) struct ClaimPlan {
     pub row_limits: Vec<i32>,
     /// Whether `unit_budget` (see [`JobRegistry::plan_claim`]) bound any
     /// type's row limit below what it would otherwise have claimed --
-    /// specifically "the pool's headroom was the limiting factor."
-    /// Telemetry only (recorded on the poll span): since
-    /// `JobPoller::pool_unit_budget` floors the budget at one unit, the
-    /// pool clamp can shrink a plan but never empty it, so nothing branches
-    /// on this.
+    /// specifically "the pool's headroom was the limiting factor." Recorded
+    /// on the poll span, and read by `poll_and_dispatch`'s empty-plan
+    /// branch: an empty-but-clamped plan means due work exists that a zero
+    /// budget kept unclaimed, which arms the pool-headroom waiter
+    /// (`JobPoller::arm_pool_headroom_waiter`) so recovery does not wait
+    /// out the idle-poll fallback.
     pub clamped_by_pool: bool,
 }
 

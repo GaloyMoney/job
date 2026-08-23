@@ -146,6 +146,17 @@ impl JobTracker {
         self.notify.notified()
     }
 
+    /// Wake the poll loop unconditionally. Used by the poller's
+    /// pool-headroom waiter (`JobPoller::arm_pool_headroom_waiter`), whose
+    /// wake condition -- shared-pool headroom returning -- is not a job
+    /// lifecycle event and so has no other path to this `Notify`.
+    /// `notify_one` holds at most one permit, so a wake landing while the
+    /// loop is mid-poll is not lost: the next `notified()` returns
+    /// immediately.
+    pub fn wake(&self) {
+        self.notify.notify_one();
+    }
+
     /// Wake the poll loop if this process polls `job_type`. `notify_one` holds
     /// at most one permit, so repeated reports collapse into one wake-up.
     pub fn job_execution_inserted(&self, job_type: &str) {
@@ -373,6 +384,20 @@ impl Drop for UnitReservation {
         if !self.resolved {
             self.tracker.running_jobs.fetch_sub(1, Ordering::SeqCst);
             self.tracker.release_unit(&self.job_type);
+            // Always wake the poll loop, for the same reason
+            // [`JobTracker::batch_completed`] always does: a freed unit is
+            // what makes this type's backlog claimable again, and nothing
+            // else would trigger that poll. Concretely load-bearing for the
+            // short-circuit's pool-aware gate: when `ClaimHook::pre_commit`
+            // skips a recycled reservation because the pool has no
+            // headroom, THIS drop is the only release that unit gets -- its
+            // dispatcher already detached from the ordinary Drop-triggered
+            // `batch_completed`/`job_completed` release (and their
+            // notifies) via `recycle_unit`. Without a wake here the freed
+            // slot sits invisible until the idle-poll fallback (up to
+            // `MAX_WAIT`), turning every gate-skipped recycle into a
+            // minute-long stall of a drainable backlog.
+            self.tracker.notify.notify_one();
         }
     }
 }
