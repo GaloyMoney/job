@@ -1,3 +1,16 @@
+# [job release v0.13.6](https://github.com/GaloyMoney/job/releases/tag/0.13.6)
+
+
+
+### Bug Fixes
+
+- Pool-aware claim clamp and congestion-safe fail path (#186)
+- Recheck a swap-eligible occupant even if it was still running at insert time (#184)
+
+### Features
+
+- Opt-in dedup key on bulk spawn (JobSpec::dedup_key) (#185)
+
 # [job release v0.13.5](https://github.com/GaloyMoney/job/releases/tag/0.13.5)
 
 
