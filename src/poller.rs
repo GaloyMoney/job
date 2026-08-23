@@ -1811,10 +1811,26 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
         // carries at most a handful of reservations from one commit, and
         // whatever gets truncated simply releases and stays claimable by
         // the ordinary smallest-demand-first poll.
+        //
+        // Excess reservations are released via `UnitReservation::release`
+        // -- the QUIET release -- not by dropping them: the truncation
+        // happens precisely because the budget just ran out, so `Drop`'s
+        // poll-loop wake would immediately start a poll that re-reads live
+        // headroom -- which cannot yet see the connections this hook's own
+        // remaining claims are about to consume -- and admit MORE work on
+        // top of them, double-spending the very budget this bound
+        // enforces. The truncated units' backlog is re-examined at the
+        // next natural wake instead (this hook's surviving dispatches
+        // completing, at the latest). Contrast the zero-budget gate above,
+        // where the wake IS wanted: there the woken poll's own budget is
+        // also zero, so it cannot over-admit -- it just arms the headroom
+        // waiter.
         let mut remaining_units = unit_budget;
         for reservations in units_by_type.values_mut() {
             if reservations.len() > remaining_units {
-                reservations.truncate(remaining_units);
+                for reservation in reservations.drain(remaining_units..) {
+                    reservation.release();
+                }
             }
             remaining_units -= reservations.len();
         }

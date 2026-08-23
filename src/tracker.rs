@@ -357,8 +357,15 @@ impl UnitReservation {
             .started(id);
     }
 
-    /// The write did not land running (conflicted and parked instead, or the
-    /// operation rolled back) -- undo the provisional claim.
+    /// The unit is given back WITHOUT waking the poll loop -- the quiet
+    /// counterpart to just dropping the reservation (whose `Drop` releases
+    /// AND wakes). For a write that did not land running (conflicted and
+    /// parked instead, or the operation rolled back), and for
+    /// `ClaimHook::pre_commit`'s budget truncation, where the wake would be
+    /// actively wrong: the truncation happens because the pool budget just
+    /// ran out, and a poll woken at that instant re-reads headroom that
+    /// cannot yet see the hook's own surviving claims and over-admits on
+    /// top of them.
     pub(crate) fn release(mut self) {
         self.resolved = true;
         self.tracker.running_jobs.fetch_sub(1, Ordering::SeqCst);
@@ -396,7 +403,12 @@ impl Drop for UnitReservation {
             // notifies) via `recycle_unit`. Without a wake here the freed
             // slot sits invisible until the idle-poll fallback (up to
             // `MAX_WAIT`), turning every gate-skipped recycle into a
-            // minute-long stall of a drainable backlog.
+            // minute-long stall of a drainable backlog. (That zero-budget
+            // wake cannot over-admit -- the woken poll's budget is also
+            // zero, so it only arms the headroom waiter. A release where
+            // the wake WOULD over-admit -- the gate's partial-budget
+            // truncation -- goes through [`UnitReservation::release`], the
+            // quiet path, instead of this drop.)
             self.tracker.notify.notify_one();
         }
     }
@@ -480,5 +492,45 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), notified)
             .await
             .expect("a freed slot on a capped type must wake the poll loop");
+    }
+
+    /// The two `UnitReservation` release paths differ in exactly one
+    /// observable: `release()` is QUIET (used by `ClaimHook::pre_commit`'s
+    /// budget truncation, where a wake would let a woken poll over-admit
+    /// against headroom the hook's surviving claims are about to consume),
+    /// while dropping unresolved wakes the poll loop (load-bearing for the
+    /// gate's zero-budget skip, where the freed unit otherwise sits
+    /// invisible until the idle-poll fallback). Both must release the unit.
+    #[tokio::test]
+    async fn reservation_release_is_quiet_but_unresolved_drop_wakes() {
+        let tracker = Arc::new(JobTracker::new(0, 10));
+        let job_type = JobType::from_owned("quiet-release".to_string());
+
+        tracker.dispatch_job(JobId::new(), &job_type);
+        tracker.dispatch_job(JobId::new(), &job_type);
+        assert_eq!(tracker.units_in_flight(&job_type), 2);
+
+        tracker.recycle(&job_type).release();
+        assert_eq!(
+            tracker.units_in_flight(&job_type),
+            1,
+            "release() must free the unit"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), tracker.notified())
+                .await
+                .is_err(),
+            "release() must NOT wake the poll loop"
+        );
+
+        drop(tracker.recycle(&job_type));
+        assert_eq!(
+            tracker.units_in_flight(&job_type),
+            0,
+            "drop must free the unit"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(100), tracker.notified())
+            .await
+            .expect("an unresolved drop must wake the poll loop");
     }
 }
