@@ -598,22 +598,17 @@ impl JobPoller {
         let unit_budget = self.pool_unit_budget();
         let plan = self.registry.plan_claim(n_jobs_to_poll, unit_budget);
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
-        if plan.clamped_by_pool {
-            // Due work exists that `unit_budget` priced out of this plan --
-            // either the whole poll came up empty, or some type(s) got
-            // fewer rows than their real demand (`plan_claim`'s per-type
-            // floor keeps a type IN the plan, it does not guarantee the
-            // type got everything it could use). Either way, arm the
-            // waiter so a connection freeing wakes this loop instead of
-            // waiting out the fallback; harmless when headroom is already
-            // sufficient, since the waiter's own check no-ops immediately.
-            self.arm_pool_headroom_waiter();
-        }
         if plan.types.is_empty() {
-            // Due work exists but the pool has zero headroom. Claim
-            // nothing -- the rows stay `pending`, where a PEER instance
-            // with a healthy pool can claim them. `MAX_WAIT` below is only
-            // the fallback should the waiter's wake be lost.
+            if plan.clamped_by_pool {
+                // Due work exists but the pool has zero headroom. Claim
+                // nothing and arm the headroom waiter to wake this loop
+                // once a connection frees. Gated on an empty plan, not
+                // `clamped_by_pool` alone: an elastic type's assumed
+                // `n_jobs_to_poll` demand keeps that true on almost every
+                // poll, healthy headroom included -- arming unconditionally
+                // would wake the loop right back out of its sleep and spin.
+                self.arm_pool_headroom_waiter();
+            }
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
