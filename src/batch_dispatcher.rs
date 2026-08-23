@@ -24,7 +24,7 @@ use super::{
     },
     congestion::CongestionHandler,
     entity::{Job, JobType, RetryPolicy},
-    error::{CONFLICT_MAX_ATTEMPTS, JobError, is_pool_congestion, is_retryable_conflict},
+    error::{CONFLICT_MAX_ATTEMPTS, JobError, is_retryable_conflict},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -303,7 +303,7 @@ impl BatchDispatcher {
         };
 
         let runner = self.runner.take().expect("runner");
-        let outcome = match Self::run_batch(runner, items, ctx).await {
+        let outcome = match Self::run_batch(&self.congestion, runner, items, ctx).await {
             Ok(completion) => self.apply(completion).await,
             Err(e) => {
                 // Decided here, not inside `fail_batch`: `fail_batch` runs
@@ -366,7 +366,8 @@ impl BatchDispatcher {
     /// terminal. The rows go back to `pending` with `execute_at = now` and
     /// `attempt_index = 1`, which is what the next poll re-dispatches.
     ///
-    /// Opens its op via `terminal_write_repo` (the internal pool), same as
+    /// Opens its op via `CongestionHandler::begin_terminal_write_op` (the
+    /// internal pool), same as
     /// `fail_batch`: this is the LAST chance to record a disposition before
     /// the lost-handler is the only thing left, so it cannot afford to
     /// compete with the shared pool for a connection -- especially since
@@ -388,8 +389,7 @@ impl BatchDispatcher {
             self.ids.iter().map(|id| (*id, now)).collect();
 
         let attempt = async {
-            let repo = self.congestion.terminal_write_repo();
-            let mut op = repo.begin_op_with_clock(&self.clock).await?;
+            let mut op = self.congestion.begin_terminal_write_op().await?;
             self.reschedule_in_op(&mut op, reschedules).await?;
             op.commit().await?;
             Ok::<_, JobError>(())
@@ -416,6 +416,7 @@ impl BatchDispatcher {
     }
 
     async fn run_batch(
+        congestion: &CongestionHandler,
         runner: Box<dyn AnyBatchedJobRunner>,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
@@ -425,34 +426,7 @@ impl BatchDispatcher {
             .await
         {
             Ok(Ok(completion)) => Ok(completion),
-            Ok(Err(e)) => {
-                let span = Span::current();
-                // Classify BEFORE stringifying: `e` is the runner's own
-                // `Box<dyn std::error::Error>`, the only point where the
-                // original `sqlx::Error::PoolTimedOut` (if that's what this
-                // is) still has its structure. `e.to_string()` below is a
-                // one-way trip into `JobExecutionError(String)` -- a plain
-                // `String` has no `.source()`, so `is_pool_congestion`
-                // could never see through it afterward. See
-                // `error::is_pool_congestion`'s doc comment.
-                let congestion = is_pool_congestion(e.as_ref());
-                let error = e.to_string();
-                span.record("error", true);
-                span.record("error.message", tracing::field::display(&error));
-                span.record(
-                    "error.level",
-                    tracing::field::display(if congestion {
-                        tracing::Level::INFO
-                    } else {
-                        tracing::Level::WARN
-                    }),
-                );
-                Err(if congestion {
-                    JobError::PoolCongestion(error)
-                } else {
-                    JobError::JobExecutionError(error)
-                })
-            }
+            Ok(Err(e)) => Err(congestion.maybe_reclassify(e)),
             Err(panic) => {
                 let span = Span::current();
                 let message = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -939,8 +913,7 @@ impl BatchDispatcher {
         let mut attempt = 1;
         loop {
             let result = async {
-                let repo = self.congestion.terminal_write_repo();
-                let mut op = repo.begin_op_with_clock(&self.clock).await?;
+                let mut op = self.congestion.begin_terminal_write_op().await?;
                 let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
                 let fails: Vec<(JobId, String)> =
                     self.ids.iter().map(|id| (*id, message.clone())).collect();

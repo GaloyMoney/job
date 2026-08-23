@@ -1,9 +1,10 @@
 //! Pool-congestion rescheduling: the one path both dispatchers route a
-//! [`JobError::PoolCongestion`] classification (`error::is_pool_congestion`)
-//! through at the end of a job, instead of the ordinary `RetryPolicy` fail
-//! path. A batch is just N ids and a single job is N = 1 -- the write, the
-//! delay, the entity event, and the stuck-streak WARN are identical, so they
-//! live here once.
+//! [`JobError::PoolCongestion`] classification
+//! ([`CongestionHandler::maybe_reclassify`]) through at the end of a job,
+//! instead of the ordinary `RetryPolicy` fail path. A batch is just N ids
+//! and a single job is N = 1 -- the classification, the write, the delay,
+//! the entity event, and the stuck-streak WARN are identical, so they live
+//! here once.
 //!
 //! Why congestion is its own path, not a retry:
 //!
@@ -27,9 +28,10 @@
 //! - **A `CongestionRescheduled` entity event**, not `ExecutionErrored`
 //!   (see [`Job::reschedule_congestion`]), which is also how the
 //!   consecutive-congestion streak is counted for the stuck-forever WARN.
-//! - **The write opens on [`CongestionHandler::terminal_write_repo`]** (the
-//!   internal pool): it may run precisely when the shared pool is the thing
-//!   under pressure that congested the job in the first place.
+//! - **The write's op opens via
+//!   [`CongestionHandler::begin_terminal_write_op`]** (the internal pool):
+//!   it may run precisely when the shared pool is the thing under pressure
+//!   that congested the job in the first place.
 
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
@@ -73,11 +75,15 @@ const CONGESTION_WARN_STREAK: u32 = 10;
 /// clones).
 #[derive(Clone)]
 pub(crate) struct CongestionHandler {
-    /// Reaches this process's poller for `terminal_write_repo`'s internal
-    /// pool. `Weak` for the same reason the dispatchers hold their poller
-    /// `Weak`: a dispatcher must never keep the poller alive on its own.
+    /// Reaches this process's poller for `begin_terminal_write_op`'s
+    /// internal pool. `Weak` for the same reason the dispatchers hold their
+    /// poller `Weak`: a dispatcher must never keep the poller alive on its
+    /// own.
     poller: Weak<JobPoller>,
-    /// The shared-pool repo, as `terminal_write_repo`'s shutdown fallback.
+    /// The shared-pool repo: `begin_terminal_write_op`'s shutdown fallback,
+    /// and the repo instance `reschedule_once`'s `_in_op` entity calls go
+    /// through (the op carries the connection, so which repo instance is
+    /// irrelevant there).
     repo: Arc<JobRepo>,
     notifier: Arc<JobEventNotifier>,
     instance_id: uuid::Uuid,
@@ -101,23 +107,59 @@ impl CongestionHandler {
         }
     }
 
-    /// A [`JobRepo`] to open terminal-write ops on -- the congestion
+    /// Begin the atomic op every terminal write runs on -- the congestion
     /// reschedule below, and the dispatchers' fail / rescue paths, all need
-    /// to record a disposition precisely when the shared pool `self.repo`
-    /// wraps may be the thing under pressure that caused the failure in the
-    /// first place. Bound to `JobPoller::internal_pool` instead -- the same
+    /// to record a disposition precisely when the shared pool may be the
+    /// thing under pressure that caused the failure in the first place. The
+    /// op's connection comes from `JobPoller::internal_pool` -- the same
     /// dedicated pool the claim query uses, sized to absorb both (see
-    /// `build_internal_pool`).
+    /// `build_internal_pool`) -- falling back to the shared pool only if
+    /// the poller has already been dropped: at that point the process is
+    /// shutting down and the write is best-effort either way.
     ///
-    /// `JobRepo::new` is a cheap pool-handle clone, not a new connection --
-    /// safe to call per attempt. Falls back to `self.repo` (the shared pool)
-    /// only if the poller has already been dropped: at that point the
-    /// process is shutting down and there is no internal pool handle left to
-    /// reach, so the write is best-effort either way.
-    pub(crate) fn terminal_write_repo(&self) -> JobRepo {
-        match self.poller.upgrade() {
+    /// Only the OP carries the connection. Callers keep using their own
+    /// `JobRepo` instance's `_in_op` methods against it -- an `_in_op` call
+    /// runs on the op's connection regardless of which repo instance it is
+    /// invoked through, so no repo handle needs to travel with the op.
+    pub(crate) async fn begin_terminal_write_op(
+        &self,
+    ) -> Result<es_entity::DbOp<'static>, sqlx::Error> {
+        let repo = match self.poller.upgrade() {
             Some(poller) => JobRepo::new(poller.internal_pool()),
             None => (*self.repo).clone(),
+        };
+        repo.begin_op_with_clock(&self.clock).await
+    }
+
+    /// Classify a runner's error and convert it into the right `JobError`,
+    /// recording the `error`/`error.message`/`error.level` fields on the
+    /// CURRENT span. Classification happens BEFORE stringifying: `error` is
+    /// the runner's own boxed error, the only point where an underlying
+    /// `sqlx::Error::PoolTimedOut` still has its structure to downcast --
+    /// `.to_string()` is a one-way trip into `JobExecutionError(String)`,
+    /// and a plain `String` has no `.source()` chain for
+    /// [`is_pool_congestion`] to walk afterward.
+    ///
+    /// Congestion logs at INFO -- it is the expected, non-punitive signal
+    /// this module exists for (see the module doc) -- real errors at WARN.
+    pub(crate) fn maybe_reclassify(&self, error: Box<dyn std::error::Error>) -> JobError {
+        let span = Span::current();
+        let congestion = is_pool_congestion(error.as_ref());
+        let error = error.to_string();
+        span.record("error", true);
+        span.record("error.message", tracing::field::display(&error));
+        span.record(
+            "error.level",
+            tracing::field::display(if congestion {
+                tracing::Level::INFO
+            } else {
+                tracing::Level::WARN
+            }),
+        );
+        if congestion {
+            JobError::PoolCongestion(error)
+        } else {
+            JobError::JobExecutionError(error)
         }
     }
 
@@ -195,8 +237,7 @@ impl CongestionHandler {
         attempts: &HashMap<JobId, u32>,
         message: &str,
     ) -> Result<(Option<JobType>, u32), JobError> {
-        let repo = self.terminal_write_repo();
-        let mut op = repo.begin_op_with_clock(&self.clock).await?;
+        let mut op = self.begin_terminal_write_op().await?;
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
         let jitter_ms = rng().random_range(-CONGESTION_JITTER_MS..=CONGESTION_JITTER_MS);
         let scheduled_at: DateTime<Utc> =
@@ -229,7 +270,7 @@ impl CongestionHandler {
         .execute(op.as_executor())
         .await?;
 
-        let mut entities = repo.find_all_in_op::<Job>(&mut op, ids).await?;
+        let mut entities = self.repo.find_all_in_op::<Job>(&mut op, ids).await?;
         let mut jobs = Vec::with_capacity(ids.len());
         let mut own_types = HashSet::new();
         let mut max_streak = 0;
@@ -242,7 +283,7 @@ impl CongestionHandler {
                 jobs.push(job);
             }
         }
-        repo.update_all_in_op(&mut op, &mut jobs).await?;
+        self.repo.update_all_in_op(&mut op, &mut jobs).await?;
         let job_type = own_types.iter().next().cloned();
 
         // Same freed-queue promotion registration as the dispatchers'
@@ -255,6 +296,28 @@ impl CongestionHandler {
         op.commit().await?;
         Ok((job_type, max_streak))
     }
+}
+
+/// Whether this error (or anything it wraps) is `sqlx::Error::PoolTimedOut`
+/// -- the shared pool had no connection to hand out within its acquire
+/// timeout. This carries no evidence the job is broken: it says the pool
+/// was busy, not that the work is wrong.
+///
+/// Walks the `source()` chain because a runner's error crosses an
+/// object-erasure boundary (`run`/`run_batch_erased` return
+/// `Box<dyn std::error::Error>`) before it reaches this crate's own error
+/// handling, so the check has to happen on the *original* error --
+/// [`CongestionHandler::maybe_reclassify`], the only caller, does exactly
+/// that before stringifying.
+fn is_pool_congestion(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(e) = source {
+        if let Some(sqlx::Error::PoolTimedOut) = e.downcast_ref::<sqlx::Error>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 /// Renders the ids as a comma-separated list for one log field, so a warn

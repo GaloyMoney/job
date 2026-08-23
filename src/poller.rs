@@ -462,10 +462,10 @@ impl JobPoller {
     /// unbounded instead of loosely bounded. A runner that needs more than
     /// its unit's one connection can still make the shared pool run dry;
     /// what changed in this same feature is that the consequence is now
-    /// cheap: `error::is_pool_congestion` classifies the resulting
-    /// `PoolTimedOut` and the fail path reschedules the job a few seconds
-    /// out rather than burning a retry attempt (see
-    /// `JobBatchDispatcher::reschedule_congestion` /
+    /// cheap: `CongestionHandler::maybe_reclassify` classifies the
+    /// resulting `PoolTimedOut` and the fail path reschedules the job a few
+    /// seconds out rather than burning a retry attempt (see
+    /// `BatchDispatcher::reschedule_congestion` /
     /// `JobDispatcher::reschedule_congestion`). That asymmetry is why
     /// undercharging here is an acceptable trade: an occasional real
     /// `PoolTimedOut` costs a short reschedule delay, while a per-type or

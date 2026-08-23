@@ -1,6 +1,7 @@
-//! Live-PG coverage for `BatchDispatcher::fail_batch`/`terminal_write_repo`
-//! routing terminal writes through the internal pool instead of the shared
-//! one (`handoff-pool-aware-claiming-and-fail-path.md` §5).
+//! Live-PG coverage for `BatchDispatcher::fail_batch`/
+//! `CongestionHandler::begin_terminal_write_op` routing terminal writes
+//! through the internal pool instead of the shared one
+//! (`handoff-pool-aware-claiming-and-fail-path.md` §5).
 //!
 //! Deliberately its own file: this is the one test in the suite that
 //! deliberately exhausts the shared pool it hands to `Jobs`, which would
@@ -141,10 +142,10 @@ async fn wait_for_execution_row_deleted(
 /// that fix, both `fail_batch` and its `rescue_claimed_rows` fallback opened
 /// their op on the same shared pool this test starves, so under this exact
 /// condition the row would strand `running` until the lost-handler swept it
-/// minutes later. Revert `terminal_write_repo` to always return
-/// `(*self.repo).clone()` (i.e. undo the internal-pool routing) to see this
-/// test fail for the right reason (`wait_for_execution_row_deleted` times
-/// out).
+/// minutes later. Revert `CongestionHandler::begin_terminal_write_op` to
+/// always begin on `(*self.repo).clone()` (i.e. undo the internal-pool
+/// routing) to see this test fail for the right reason
+/// (`wait_for_execution_row_deleted` times out).
 #[tokio::test]
 async fn terminal_write_survives_shared_pool_exhaustion() -> anyhow::Result<()> {
     // A separate connection this test's own exhaustion can never touch --

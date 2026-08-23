@@ -1,6 +1,7 @@
 //! Live-PG coverage for the pool-congestion classification
-//! (`error::is_pool_congestion`, `JobDispatcher::reschedule_congestion`) on
-//! the single-job (non-batched) path.
+//! (`CongestionHandler::maybe_reclassify`,
+//! `JobDispatcher::reschedule_congestion`) on the single-job (non-batched)
+//! path.
 //!
 //! Deliberately a separate file from `pool_congestion.rs` (the batched
 //! counterpart): a solo job has no batchability to preserve, so what this

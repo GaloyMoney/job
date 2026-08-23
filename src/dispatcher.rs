@@ -15,7 +15,7 @@ use super::{
     congestion::CongestionHandler,
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
-    error::{JobError, is_pool_congestion},
+    error::JobError,
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -203,7 +203,8 @@ impl JobDispatcher {
             self.clock.clone(),
             Arc::clone(&self.repo),
         );
-        match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
+        let runner = self.runner.take().expect("runner");
+        match Self::dispatch_job(&self.congestion, runner, current_job).await {
             Err(e) => {
                 span.record(
                     "conclusion",
@@ -296,6 +297,7 @@ impl JobDispatcher {
     }
 
     async fn dispatch_job(
+        congestion: &CongestionHandler,
         runner: Box<dyn JobRunner>,
         current_job: CurrentJob,
     ) -> Result<JobCompletion, JobError> {
@@ -304,31 +306,7 @@ impl JobDispatcher {
             .await
         {
             Ok(Ok(completion)) => Ok(completion),
-            Ok(Err(e)) => {
-                let span = Span::current();
-                // Classify BEFORE stringifying -- see
-                // `BatchDispatcher::run_batch`'s identical comment: `e` is
-                // the runner's own `Box<dyn std::error::Error>`, the only
-                // point where a `sqlx::Error::PoolTimedOut` (if that's what
-                // this is) still has its structure to downcast.
-                let congestion = is_pool_congestion(e.as_ref());
-                let error = e.to_string();
-                span.record("error", true);
-                span.record("error.message", tracing::field::display(&error));
-                span.record(
-                    "error.level",
-                    tracing::field::display(if congestion {
-                        tracing::Level::INFO
-                    } else {
-                        tracing::Level::WARN
-                    }),
-                );
-                Err(if congestion {
-                    JobError::PoolCongestion(error)
-                } else {
-                    JobError::JobExecutionError(error)
-                })
-            }
+            Ok(Err(e)) => Err(congestion.maybe_reclassify(e)),
             Err(panic) => {
                 let span = Span::current();
                 let message = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -385,14 +363,15 @@ impl JobDispatcher {
             other => other.to_string(),
         };
 
-        // `terminal_write_repo`, not `self.repo`: this is the LAST write
-        // deciding this job's disposition, and it may run precisely when
-        // the shared pool is the thing under pressure that failed the job
-        // in the first place. See `CongestionHandler::terminal_write_repo`
-        // for the full rationale.
-        let repo = self.congestion.terminal_write_repo();
-        let mut op = repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = repo.find_by_id_in_op(&mut op, id).await?;
+        // A terminal-write op (the internal pool), not one on `self.repo`'s
+        // shared pool: this is the LAST write deciding this job's
+        // disposition, and it may run precisely when the shared pool is the
+        // thing under pressure that failed the job in the first place. See
+        // `CongestionHandler::begin_terminal_write_op` for the full
+        // rationale -- the op carries the connection, so the `_in_op` calls
+        // below go through `self.repo` as usual.
+        let mut op = self.congestion.begin_terminal_write_op().await?;
+        let mut job = self.repo.find_by_id_in_op(&mut op, id).await?;
 
         let span = Span::current();
         span.record("job_id", tracing::field::display(id));
@@ -453,7 +432,7 @@ impl JobDispatcher {
             self.delete_execution_in_op(&mut op, id).await?;
         }
 
-        repo.update_in_op(&mut op, &mut job).await?;
+        self.repo.update_in_op(&mut op, &mut job).await?;
         op.commit().await?;
         Ok(())
     }
