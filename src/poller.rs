@@ -255,6 +255,26 @@ fn pool_connection_headroom(main_pool: &PgPool) -> usize {
     max_connections.saturating_sub(in_use)
 }
 
+/// Convert live connection headroom into a dispatch-unit budget at
+/// `connections_per_job` connections per unit
+/// (`JobPollerConfig::connections_per_job`; validated finite and positive
+/// at config build). Free function of its two inputs so the arithmetic is
+/// unit-testable without a `JobPoller`.
+///
+/// Rounds DOWN (`floor`): the conservative reading, and with a factor above
+/// 1.0 it means a budget of e.g. `floor(1 / 1.5) = 0` -- one free
+/// connection is deliberately NOT enough when the operator has declared
+/// each dispatch costs one and a half. That truncated-to-zero budget cannot
+/// silently stall claiming, because everything that waits on admission
+/// waits on THIS number, not on raw headroom: the pool-headroom waiter
+/// (`JobPoller::arm_pool_headroom_waiter`) re-checks `pool_unit_budget() >
+/// 0` and so wakes the poll loop exactly when enough headroom for one
+/// whole unit has accumulated. (Watching raw headroom there instead would
+/// spin: wake at one free connection, claim nothing, re-arm, wake again.)
+fn unit_budget(headroom: usize, connections_per_job: f64) -> usize {
+    (headroom as f64 / connections_per_job).floor() as usize
+}
+
 impl JobPoller {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -454,6 +474,14 @@ impl JobPoller {
     /// how many connections a runner opens" problem, just pushed onto every
     /// caller instead of accepted once here.
     ///
+    /// The `1.0` above is only the DEFAULT price:
+    /// `JobPollerConfig::connections_per_job` lets a deployment tune it,
+    /// fractionally, in either direction -- the operator knows their
+    /// workload's real shape where the crate cannot (mostly connection-free
+    /// runners: set e.g. `0.5` and admit twice the headroom; fan-out-heavy
+    /// runners: `1.5`/`2.0` and admit less, leaning less on congestion
+    /// reschedules). See [`unit_budget`] for the arithmetic and rounding.
+    ///
     /// A zero budget means: claim NOTHING and arm the pool-headroom waiter
     /// ([`Self::arm_pool_headroom_waiter`], done by `poll_and_dispatch`'s
     /// clamped-empty branch) instead of claiming a probe job into the
@@ -470,7 +498,10 @@ impl JobPoller {
     /// for a freed connection) is bought instead by the waiter, at
     /// claim-nothing prices.
     fn pool_unit_budget(&self) -> usize {
-        pool_connection_headroom(self.repo.pool())
+        unit_budget(
+            pool_connection_headroom(self.repo.pool()),
+            self.config.connections_per_job,
+        )
     }
 
     /// Spawn (at most one) background task that re-checks shared-pool
@@ -490,10 +521,13 @@ impl JobPoller {
     /// catch them and its 1s ceiling keeps a genuinely stuck pool cheap to
     /// watch.
     ///
-    /// The check is [`Self::pool_unit_budget`]` > 0`, not `num_idle() >=
-    /// 1`: the budget's headroom also counts capacity the pool has never
-    /// opened (`size() < max_connections`), where an acquire would succeed
-    /// by opening a fresh connection despite zero idle ones.
+    /// The check is [`Self::pool_unit_budget`]` > 0` -- not `num_idle() >=
+    /// 1`, for two reasons: headroom also counts capacity the pool has
+    /// never opened (`size() < max_connections`), where an acquire would
+    /// succeed by opening a fresh connection despite zero idle ones; and
+    /// with `connections_per_job` above 1.0 a single freed connection can
+    /// still mean a zero budget, so waking on raw headroom would claim
+    /// nothing and spin (see [`unit_budget`]).
     ///
     /// The waiter holds only a `Weak` on the poller: it can never keep the
     /// instance alive, and it exits within one backoff step of the poller
@@ -517,6 +551,11 @@ impl JobPoller {
                     let Some(poller) = poller.upgrade() else {
                         return;
                     };
+                    // The wake condition is the unit BUDGET, not raw
+                    // headroom: with `connections_per_job` above 1.0 a
+                    // single freed connection can still mean a zero budget,
+                    // and waking the poll loop on it would claim nothing
+                    // and spin re-arming. See `unit_budget`.
                     if poller.pool_unit_budget() > 0 {
                         poller.pool_waiter_armed.store(false, Ordering::Release);
                         poller.tracker.wake();
@@ -2870,6 +2909,28 @@ mod tests {
         assert_eq!(pool_connection_headroom(&pool), 3);
 
         Ok(())
+    }
+
+    /// `unit_budget`'s factor arithmetic: the default 1.0 is the identity
+    /// (current behaviour exactly), fractional factors shift admission in
+    /// the expected direction, and rounding is `floor` -- including the
+    /// deliberate `floor(1 / 1.5) = 0` case the pool-headroom waiter's
+    /// budget-not-headroom wake condition exists for.
+    #[test]
+    fn unit_budget_applies_connections_per_job_factor() {
+        // Default 1.0: identity.
+        for headroom in [0, 1, 5, 50] {
+            assert_eq!(unit_budget(headroom, 1.0), headroom);
+        }
+        // Cheaper jobs admit more...
+        assert_eq!(unit_budget(5, 0.5), 10);
+        // ...expensive jobs admit less, rounding down.
+        assert_eq!(unit_budget(5, 1.5), 3);
+        assert_eq!(unit_budget(5, 2.0), 2);
+        assert_eq!(unit_budget(1, 1.5), 0);
+        // Zero headroom is a zero budget at any price.
+        assert_eq!(unit_budget(0, 0.5), 0);
+        assert_eq!(unit_budget(0, 2.0), 0);
     }
 
     /// Seed a real `Job` aggregate (events and all) plus a `running` execution
