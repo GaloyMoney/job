@@ -532,7 +532,8 @@ impl Finalizer {
             staged.insert(*id, job);
         }
 
-        // Applied-row gating: every row write RETURNs the ids it actually
+        // Applied-row gating: every row write returns (`RETURNING`) the ids
+        // it actually
         // transitioned -- the `poller_instance_id` filter drops rows this
         // instance no longer owns -- and only those ids feed the outcome,
         // the promote registrations, and the entity persistence below.
