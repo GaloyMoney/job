@@ -108,15 +108,18 @@ pub(crate) fn is_retryable_conflict(err: &(dyn std::error::Error + 'static)) -> 
     retryable_conflict_code(err).is_some()
 }
 
-/// How many times a crate-owned bookkeeping transaction (batch seal / fail,
-/// congestion reschedule) is re-attempted after Postgres aborts it as a
-/// deadlock victim or serialization failure ([`is_retryable_conflict`]).
+/// Total attempts a crate-owned bookkeeping transaction (batch seal / fail,
+/// congestion reschedule) gets when Postgres keeps ABORTING it as a
+/// deadlock victim or serialization failure ([`is_retryable_conflict`]) --
+/// transient aborts where the transaction lost to a concurrent partner and
+/// is safe to simply re-run. Counted as attempts, not retries: `3` means
+/// the original try plus two re-runs.
 ///
-/// Small on purpose: these conflicts are resolved by whichever partner
+/// Small on purpose: these aborts are resolved by whichever partner
 /// survives, so a re-attempt normally succeeds immediately. If three in a
 /// row lose, something is wrong beyond ordinary contention and the work is
 /// better off going through the rescue path than spinning here.
-pub(crate) const CONFLICT_MAX_ATTEMPTS: u32 = 3;
+pub(crate) const TX_ABORT_MAX_ATTEMPTS: u32 = 3;
 
 impl From<Box<dyn std::error::Error>> for JobError {
     fn from(error: Box<dyn std::error::Error>) -> Self {

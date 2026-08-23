@@ -45,7 +45,7 @@ use std::sync::{Arc, Weak};
 use super::{
     JobId,
     entity::{Job, JobType},
-    error::{CONFLICT_MAX_ATTEMPTS, JobError, is_retryable_conflict},
+    error::{JobError, TX_ABORT_MAX_ATTEMPTS, is_retryable_conflict},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -179,7 +179,7 @@ impl CongestionHandler {
     /// [`CONGESTION_JITTER_MS`], `attempt_index` untouched (see the module
     /// doc), on a fresh `CongestionRescheduled` entity event. Retried on
     /// deadlock / serialization abort like the batch seal paths
-    /// ([`CONFLICT_MAX_ATTEMPTS`]).
+    /// ([`TX_ABORT_MAX_ATTEMPTS`]).
     ///
     /// `attempts` maps each id to its in-flight attempt number, recorded
     /// unchanged on the entity's next `ExecutionScheduled` event; an id
@@ -212,7 +212,7 @@ impl CongestionHandler {
                     }
                     return Ok(());
                 }
-                Err(e) if attempt_no < CONFLICT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
                     tracing::warn!(
                         job_ids = %display_ids(ids),
                         attempt_no,

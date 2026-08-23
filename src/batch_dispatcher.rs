@@ -24,7 +24,7 @@ use super::{
     },
     congestion::CongestionHandler,
     entity::{Job, JobType, RetryPolicy},
-    error::{CONFLICT_MAX_ATTEMPTS, JobError, is_retryable_conflict},
+    error::{JobError, TX_ABORT_MAX_ATTEMPTS, is_retryable_conflict},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -579,7 +579,7 @@ impl BatchDispatcher {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < CONFLICT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e) if attempt < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
                     tracing::warn!(
                         job_type = %self.job_type,
                         job_ids = %DisplayIds(&self.ids),
@@ -926,7 +926,7 @@ impl BatchDispatcher {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < CONFLICT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e) if attempt < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
                     tracing::warn!(
                         job_type = %self.job_type,
                         job_ids = %DisplayIds(&self.ids),
