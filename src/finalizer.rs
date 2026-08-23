@@ -101,19 +101,21 @@ const CONGESTION_JITTER_MS: i64 = 1_000;
 /// event stream by [`Job::consecutive_congestion_reschedules`].
 const CONGESTION_WARN_STREAK: u32 = 10;
 
-/// Deadline on the PRE-COMMIT phase (acquire + writes) of
-/// [`Finalizer::finalize`]'s shared-pool attempt -- deliberately much
-/// shorter than any plausible pool `acquire_timeout` (sqlx default 30s) and
+/// Deadline on ACQUIRING the shared-pool connection for
+/// [`Finalizer::finalize`]'s first attempt -- deliberately much shorter
+/// than any plausible pool `acquire_timeout` (sqlx default 30s) and
 /// independent of pool config: a disposition write is the last write
-/// deciding a job's fate, and if the shared pool cannot serve it within a
-/// second, the internal pool exists precisely to take over.
-///
-/// NEVER covers the `COMMIT` itself: cancelling a commit in flight is
-/// AMBIGUOUS -- the server may have committed before the cancellation --
-/// and an ambiguous outcome must not be retried (see `finalize`'s commit
-/// handling). Cancelling the pre-commit phase is unambiguous: nothing has
-/// committed, so re-running on the internal pool re-applies plain data.
-/// Applies only to the shared attempt; internal-pool attempts run uncapped
+/// deciding a job's fate, and if the shared pool cannot hand out a
+/// connection within a second, the internal pool exists precisely to take
+/// over. It covers only the acquire ([`Finalizer::begin_op`]): once a
+/// connection is held the writes no longer compete for pool capacity, so
+/// they run undeadlined -- and cancelling mid-`COMMIT` would be AMBIGUOUS
+/// (the server may have committed first), so the commit must never sit
+/// under a timeout at all (see `finalize`'s commit handling). Enforced with
+/// `tokio::time::timeout`, NOT the injected [`ClockHandle`]: this deadline
+/// exists to bound real waiting on a real pool, and a manual test clock
+/// that never advances must not be able to hold it open forever.
+/// Applies only to the shared attempt; internal-pool acquires run uncapped
 /// (that pool is dedicated and its statements are short).
 const SHARED_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -344,9 +346,13 @@ impl Finalizer {
     ///
     /// `after_write` runs after the disposition writes, before commit, once
     /// per attempt -- the dispatchers hang their completion-recycle
-    /// registration here (guarded exactly-once on their side, since a
-    /// rolled-back attempt's dropped reservation already released the
-    /// unit).
+    /// registration here, which must land in the SAME transaction as the
+    /// row writes: `BatchDispatcher::seal_in_own_op` /
+    /// `rescue_claimed_rows` pass `try_recycle_own_type`, and
+    /// `JobDispatcher::fail_job` passes `recycle_into_claim` for the
+    /// exhausted-retries terminal delete (each guarded exactly-once on
+    /// their side, since a rolled-back attempt's dropped reservation
+    /// already released the unit).
     pub(crate) async fn finalize(
         &self,
         items: &[(JobId, Disposition)],
@@ -355,36 +361,40 @@ impl Finalizer {
         let mut attempt_no = 1;
         let mut use_internal = !self.shared_pool_has_headroom();
         loop {
-            // Phase 1 -- acquire + writes, NOT the commit. Everything here
-            // is unambiguous on failure or cancellation: nothing has
-            // committed, so re-running on another pool re-applies plain
-            // data.
-            let prepare = async {
-                let mut op = self.begin_op(use_internal).await?;
-                let outcome = self.finalize_in_op(&mut op, items).await?;
-                after_write(&mut op, &outcome);
-                Ok::<_, JobError>((op, outcome))
-            };
-            let prepared = if use_internal {
-                prepare.await
+            // Phase 1a -- acquire. Only the shared acquire sits under the
+            // hard [`SHARED_ATTEMPT_TIMEOUT`] deadline (wall-clock, see its
+            // doc): if the shared pool can hand out a connection quickly we
+            // use it, otherwise we go internal without burning the pool's
+            // own ~30s acquire timeout.
+            let acquired = if use_internal {
+                self.begin_op(true).await
             } else {
-                // The shared attempt's pre-commit phase gets a hard
-                // [`SHARED_ATTEMPT_TIMEOUT`] deadline regardless of the
-                // pool's own acquire timeout -- a doomed shared acquire
-                // must not stall the disposition for ~30s before the
-                // fallback kicks in.
-                match self.clock.timeout(SHARED_ATTEMPT_TIMEOUT, prepare).await {
-                    Ok(result) => result,
+                match tokio::time::timeout(SHARED_ATTEMPT_TIMEOUT, self.begin_op(false)).await {
+                    Ok(acquired) => acquired,
                     Err(_elapsed) => {
                         tracing::warn!(
                             job_ids = %Self::display_ids_of(items),
-                            "disposition write exceeded 1s on the shared pool \
-                             before commit; retrying on the internal pool"
+                            "shared-pool acquire for the disposition write \
+                             exceeded 1s; retrying on the internal pool"
                         );
                         use_internal = true;
                         continue;
                     }
                 }
+            };
+            // Phase 1b -- the writes, NOT the commit. Undeadlined: the held
+            // connection no longer competes for pool capacity. Everything
+            // here is unambiguous on failure: nothing has committed, so
+            // re-running on another pool re-applies plain data.
+            let prepared = match acquired {
+                Ok(mut op) => match self.finalize_in_op(&mut op, items).await {
+                    Ok(outcome) => {
+                        after_write(&mut op, &outcome);
+                        Ok((op, outcome))
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e.into()),
             };
             let (op, outcome) = match prepared {
                 Ok(prepared) => prepared,
