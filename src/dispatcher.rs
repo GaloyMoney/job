@@ -15,7 +15,7 @@ use super::{
     congestion::CongestionHandler,
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
-    error::JobError,
+    error::{JobError, TX_ABORT_MAX_ATTEMPTS, is_retryable_conflict},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -363,6 +363,44 @@ impl JobDispatcher {
             other => other.to_string(),
         };
 
+        // Same bounded abort retry as `BatchDispatcher::fail_batch`, and
+        // sound for the same reason: this transaction is the crate's own,
+        // and losing the failure-recording transaction is the worst time to
+        // give up -- the row would strand `running` until the lost-handler.
+        // The single-row UPDATE alone could not deadlock, but the
+        // `PromoteHeadsHook` registered on the retry branch takes multi-row
+        // `(queue_id, id)`-ordered locks at commit, so this write can lose
+        // to a concurrent partner exactly like the batch's can.
+        let mut attempt_no = 1;
+        loop {
+            let result = self.fail_job_once(id, error_str.clone(), attempt).await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                    tracing::warn!(
+                        job_id = %id,
+                        attempt_no,
+                        exception.message = %e,
+                        "fail-record lost a lock conflict; retrying"
+                    );
+                    attempt_no += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One attempt of [`Self::fail_job`]'s write: retry-or-terminal
+    /// decision, execution-row update, entity events, commit. Records onto
+    /// `fail_job`'s span (this is deliberately NOT its own instrumented
+    /// span). Reloads the entity fresh each attempt, so a retried attempt
+    /// never replays events staged by a rolled-back one.
+    async fn fail_job_once(
+        &mut self,
+        id: JobId,
+        error_str: String,
+        attempt: u32,
+    ) -> Result<(), JobError> {
         // A terminal-write op (the internal pool), not one on `self.repo`'s
         // shared pool: this is the LAST write deciding this job's
         // disposition, and it may run precisely when the shared pool is the
