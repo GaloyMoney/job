@@ -1,6 +1,6 @@
 //! Live-PG coverage for the pool-congestion classification
-//! (`CongestionHandler::maybe_reclassify`,
-//! `JobDispatcher::reschedule_congestion`) on the single-job (non-batched)
+//! (`Finalizer::maybe_reclassify`,
+//! `Finalizer::reschedule_congested`) on the single-job (non-batched)
 //! path.
 //!
 //! Deliberately a separate file from `pool_congestion.rs` (the batched

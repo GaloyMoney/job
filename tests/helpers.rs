@@ -33,7 +33,7 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
     // asymmetry that justified taxing high in the first place (an
     // under-priced unit hitting a real `PoolTimedOut`) got much cheaper in
     // this same feature: the congestion classification (`congestion.rs`,
-    // `CongestionHandler::maybe_reclassify`) now reschedules that
+    // `Finalizer::maybe_reclassify`) now reschedules that
     // job a few seconds out instead of burning a `RetrySettings` attempt.
     // Measured: `max_connections(5)` with the 1-connection-per-unit budget
     // passed the full suite cleanly across 8 repeated runs -- back to this

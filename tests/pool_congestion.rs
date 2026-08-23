@@ -1,6 +1,6 @@
 //! Live-PG coverage for the pool-congestion classification
-//! (`CongestionHandler::maybe_reclassify`,
-//! `BatchDispatcher::reschedule_congestion`).
+//! (`Finalizer::maybe_reclassify`,
+//! `Finalizer::reschedule_congested`).
 //!
 //! Deliberately a separate file from `batched_job.rs`: these tests assert on
 //! the exact SEQUENCE and SHAPE of `run_batch` invocations (attempt numbers,
@@ -28,7 +28,7 @@ struct Cfg {
 
 /// A runner that fails its FIRST invocation with
 /// `sqlx::Error::PoolTimedOut` (the client-side "no connection available"
-/// error `CongestionHandler::maybe_reclassify` classifies as congestion, never a
+/// error `Finalizer::maybe_reclassify` classifies as congestion, never a
 /// database-side error a real runner's body could hit) and completes
 /// every subsequent invocation. Failing by call-count rather than by
 /// `attempt` is deliberate: a congestion reschedule must NOT bump

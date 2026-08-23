@@ -356,7 +356,7 @@ impl Job {
     }
 
     /// Reschedule after a pool-congestion classification
-    /// (`CongestionHandler::maybe_reclassify`, `congestion.rs`): same shape
+    /// (`Finalizer::maybe_reclassify`, `finalizer.rs`): same shape
     /// as [`Self::schedule_retry`]
     /// but at the SAME `attempt` rather than the next one, and via
     /// `CongestionRescheduled` rather than `ExecutionErrored` -- congestion

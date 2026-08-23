@@ -240,7 +240,7 @@ impl JobRepo {
     ///
     /// The execution state, however, is read independently of the row/status
     /// pairing above: a **keyed** job's state row is retained on terminal
-    /// (`dispatcher.rs`'s `delete_execution_in_op`), so once the entity is
+    /// (`finalizer.rs`'s retains-state terminal delete), so once the entity is
     /// terminal this re-reads `job_execution_states` directly by id rather
     /// than reusing the (now stale/absent) value the row's join produced —
     /// otherwise a terminal keyed job's retained state would be

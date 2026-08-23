@@ -1,7 +1,6 @@
-//! Live-PG coverage for `JobDispatcher::fail_job`/
-//! `CongestionHandler::begin_terminal_write_op` routing terminal writes
-//! through the internal pool instead of the shared one, on the single-job
-//! (non-batched) path.
+//! Live-PG coverage for `JobDispatcher::fail_job`/`Finalizer::finalize`
+//! routing terminal writes to the internal pool when the shared one is
+//! under pressure, on the single-job (non-batched) path.
 //!
 //! Deliberately its own file, same reason as `pool_terminal_write_safety.rs`
 //! (its batched counterpart): this test deliberately exhausts the shared
@@ -120,9 +119,9 @@ async fn wait_for_execution_row_deleted(
 /// `pool_terminal_write_safety.rs`'s `terminal_write_survives_shared_pool_exhaustion`,
 /// closing the gap this feature's PR named (`dispatcher.rs` had the
 /// identical shared-pool pattern with no rescue fallback). Revert
-/// `CongestionHandler::begin_terminal_write_op` to always begin on
-/// `(*self.repo).clone()` to see this test fail for the right reason
-/// (`wait_for_execution_row_deleted` times out).
+/// `Finalizer::begin_op` to always begin on the shared pool to see this
+/// test fail for the right reason (`wait_for_execution_row_deleted` times
+/// out).
 #[tokio::test]
 async fn terminal_write_survives_shared_pool_exhaustion() -> anyhow::Result<()> {
     // A separate connection this test's own exhaustion can never touch --

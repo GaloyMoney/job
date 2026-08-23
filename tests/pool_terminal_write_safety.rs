@@ -1,7 +1,6 @@
-//! Live-PG coverage for `BatchDispatcher::fail_batch`/
-//! `CongestionHandler::begin_terminal_write_op` routing terminal writes
-//! through the internal pool instead of the shared one
-//! (`handoff-pool-aware-claiming-and-fail-path.md` §5).
+//! Live-PG coverage for `BatchDispatcher::fail_batch`/`Finalizer::finalize`
+//! routing terminal writes to the internal pool when the shared one is
+//! under pressure (`handoff-pool-aware-claiming-and-fail-path.md` §5).
 //!
 //! Deliberately its own file: this is the one test in the suite that
 //! deliberately exhausts the shared pool it hands to `Jobs`, which would
@@ -112,8 +111,8 @@ impl BatchedJobInitializer for StarvePoolThenFailInitializer {
 /// `StarvePoolThenFailRunner`), so this observes the actual database
 /// outcome without depending on the thing under test.
 ///
-/// A deleted row is `fail_in_op`'s terminal branch's signature (see
-/// `batch_dispatcher.rs`'s terminal `DELETE FROM job_executions`): with
+/// A deleted row is the exhausted-retries terminal signature (see
+/// `finalizer.rs`'s terminal `DELETE FROM job_executions`): with
 /// `n_attempts: 1` this is the only way this test's job execution row can
 /// disappear.
 async fn wait_for_execution_row_deleted(
@@ -142,10 +141,9 @@ async fn wait_for_execution_row_deleted(
 /// that fix, both `fail_batch` and its `rescue_claimed_rows` fallback opened
 /// their op on the same shared pool this test starves, so under this exact
 /// condition the row would strand `running` until the lost-handler swept it
-/// minutes later. Revert `CongestionHandler::begin_terminal_write_op` to
-/// always begin on `(*self.repo).clone()` (i.e. undo the internal-pool
-/// routing) to see this test fail for the right reason
-/// (`wait_for_execution_row_deleted` times out).
+/// minutes later. Revert `Finalizer::begin_op` to always begin on the
+/// shared pool (i.e. undo the internal-pool fallback) to see this test fail
+/// for the right reason (`wait_for_execution_row_deleted` times out).
 #[tokio::test]
 async fn terminal_write_survives_shared_pool_exhaustion() -> anyhow::Result<()> {
     // A separate connection this test's own exhaustion can never touch --

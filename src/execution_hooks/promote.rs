@@ -17,8 +17,8 @@ use crate::notifier::JobEventNotifier;
 ///   sibling ahead of them wherever one exists and is older -- swap them
 ///   (the newly-pending row → `parked`, the sibling → `pending`).
 /// - **`freed_queues`** -- queues whose active row a completer just deleted
-///   ([`crate::dispatcher::JobDispatcher::delete_execution_in_op`] and
-///   `batch_dispatcher.rs`'s two completers): promote each one's oldest
+///   (`finalizer.rs`'s terminal delete, serving completions and exhausted
+///   retries for both dispatchers): promote each one's oldest
 ///   parked sibling outright. This runs here, as a commit-hook statement
 ///   strictly AFTER the deleting statement, and never as a CTE of the
 ///   `DELETE` itself, for a snapshot-visibility reason: the `DELETE` blocks

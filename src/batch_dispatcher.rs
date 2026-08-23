@@ -22,44 +22,15 @@ use super::{
         AnyBatchedJobRunner, BatchItemOutcome, BatchOutcomes, BatchRunCtx, JobBatchCompletion,
         RawBatchItem, ShutdownRx,
     },
-    congestion::CongestionHandler,
-    entity::{Job, JobType, RetryPolicy},
-    error::{JobError, TX_ABORT_MAX_ATTEMPTS, is_retryable_conflict},
-    execution_hooks::PromoteHeadsHook,
+    entity::JobType,
+    error::JobError,
+    finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer},
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
     runner::RetrySettings,
     tracker::{JobTracker, UnitReservation},
 };
-
-/// What happened to a batch's claimed rows after the dispatcher failed
-/// terminally. Reported on the `batch dispatcher error` log so an operator
-/// can tell a self-healing blip from a genuine stall.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaimDisposition {
-    /// Rows were handed back as `pending` with `execute_at = now`; the next
-    /// poll re-dispatches them.
-    Rescheduled,
-    /// The batch had already dispositioned its rows (they are terminal or
-    /// pending by the seal's own doing) -- nothing was left claimed.
-    AlreadyDisposed,
-    /// The rescue itself failed. Rows stay `running` under this instance and
-    /// only the lost-handler will recover them, one `job_lost_interval`
-    /// later. This is the case that used to be silent.
-    Leaked,
-}
-
-impl std::fmt::Display for ClaimDisposition {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            ClaimDisposition::Rescheduled => "rescheduled",
-            ClaimDisposition::AlreadyDisposed => "already-disposed",
-            ClaimDisposition::Leaked => "leaked",
-        };
-        f.write_str(s)
-    }
-}
 
 /// Renders a batch's ids as a comma-separated list for one log field.
 ///
@@ -86,10 +57,8 @@ pub(crate) struct BatchDispatcher {
     /// poller alive on its own -- mirrors `JobDispatcher`'s identical field.
     poller: Weak<JobPoller>,
     repo: Arc<JobRepo>,
-    retry_settings: RetrySettings,
     runner: Option<Box<dyn AnyBatchedJobRunner>>,
     tracker: Arc<JobTracker>,
-    notifier: Arc<JobEventNotifier>,
     job_type: JobType,
     ids: Vec<JobId>,
     attempts: HashMap<JobId, u32>,
@@ -101,7 +70,7 @@ pub(crate) struct BatchDispatcher {
     recycled: bool,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
-    congestion: CongestionHandler,
+    finalizer: Finalizer,
 }
 
 impl BatchDispatcher {
@@ -132,20 +101,20 @@ impl BatchDispatcher {
             .map(|item| (item.job.id, item.attempt))
             .collect();
         tracker.dispatch_batch(&job_type, &ids);
-        let congestion = CongestionHandler::new(
+        let finalizer = Finalizer::new(
             poller.clone(),
             repo.clone(),
-            notifier.clone(),
+            notifier,
+            retry_settings,
+            false, // batched types are never keyed, so never retain state
             instance_id,
             clock.clone(),
         );
         Self {
             poller,
             repo,
-            retry_settings,
             runner: Some(runner),
             tracker,
-            notifier,
             job_type,
             ids,
             attempts,
@@ -154,7 +123,7 @@ impl BatchDispatcher {
             recycled: false,
             instance_id,
             clock,
-            congestion,
+            finalizer,
         }
     }
 
@@ -183,20 +152,20 @@ impl BatchDispatcher {
             .map(|item| (item.job.id, item.attempt))
             .collect();
         reservation.into_live_batch(&ids);
-        let congestion = CongestionHandler::new(
+        let finalizer = Finalizer::new(
             poller.clone(),
             repo.clone(),
-            notifier.clone(),
+            notifier,
+            retry_settings,
+            false, // batched types are never keyed, so never retain state
             instance_id,
             clock.clone(),
         );
         Self {
             poller,
             repo,
-            retry_settings,
             runner: Some(runner),
             tracker,
-            notifier,
             job_type,
             ids,
             attempts,
@@ -205,7 +174,7 @@ impl BatchDispatcher {
             recycled: false,
             instance_id,
             clock,
-            congestion,
+            finalizer,
         }
     }
 
@@ -231,11 +200,11 @@ impl BatchDispatcher {
     /// the reservation the hook holds simply releases, identical to not
     /// recycling at all. Called exactly ONCE per `execute_batch` -- from the
     /// end of `seal` for a disposed batch, from `fail_batch` for a
-    /// whole-batch error -- never once per sub-outcome branch: a batch is
+    /// whole-batch error -- never once per disposition kind: a batch is
     /// always exactly one execution unit (`JobTracker::dispatch_batch`), so
-    /// recycling it from inside `complete_in_op` AND the terminal branch of
-    /// `fail_in_op` would try to spend the SAME freed unit twice whenever
-    /// one batch disposes items through both branches.
+    /// recycling per completed AND per terminally-failed item would try to
+    /// spend the SAME freed unit twice whenever one batch disposes items
+    /// both ways.
     fn try_recycle_own_type(&mut self, op: &mut impl AtomicOperation) {
         // "Exactly once" has to hold across the conflict retries in
         // `seal_in_own_op`/`fail_batch` too, not just across sub-outcome
@@ -303,7 +272,7 @@ impl BatchDispatcher {
         };
 
         let runner = self.runner.take().expect("runner");
-        let outcome = match Self::run_batch(&self.congestion, runner, items, ctx).await {
+        let outcome = match Self::run_batch(&self.finalizer, runner, items, ctx).await {
             Ok(completion) => self.apply(completion).await,
             Err(e) => {
                 // Decided here, not inside `fail_batch`: `fail_batch` runs
@@ -360,14 +329,13 @@ impl BatchDispatcher {
     /// Last-resort release of rows this batch still holds, in a fresh
     /// transaction (the failed one is poisoned).
     ///
-    /// Deliberately `reschedule_in_op` rather than `fail_in_op`: a deadlock
-    /// victim or a dead connection says nothing about the job's own
-    /// correctness, so it must not burn a retry attempt or push the job
+    /// Deliberately [`Disposition::Fresh`] rather than [`Disposition::Fail`]:
+    /// a deadlock victim or a dead connection says nothing about the job's
+    /// own correctness, so it must not burn a retry attempt or push the job
     /// terminal. The rows go back to `pending` with `execute_at = now` and
     /// `attempt_index = 1`, which is what the next poll re-dispatches.
     ///
-    /// Opens its op via `CongestionHandler::begin_terminal_write_op` (the
-    /// internal pool), same as
+    /// Runs through [`Finalizer::finalize`]'s pool policy, same as
     /// `fail_batch`: this is the LAST chance to record a disposition before
     /// the lost-handler is the only thing left, so it cannot afford to
     /// compete with the shared pool for a connection -- especially since
@@ -385,22 +353,20 @@ impl BatchDispatcher {
             return ClaimDisposition::AlreadyDisposed;
         }
         let now = self.clock.now();
-        let reschedules: Vec<(JobId, DateTime<Utc>)> =
-            self.ids.iter().map(|id| (*id, now)).collect();
+        let items: Vec<(JobId, Disposition)> = self
+            .ids
+            .iter()
+            .map(|id| (*id, Disposition::Fresh { at: now }))
+            .collect();
 
-        let attempt = async {
-            let mut op = self.congestion.begin_terminal_write_op().await?;
-            self.reschedule_in_op(&mut op, reschedules).await?;
-            op.commit().await?;
-            Ok::<_, JobError>(())
-        }
-        .await;
-
-        match attempt {
-            // `reschedule_in_op` filters on `poller_instance_id`, so a batch
+        match self.finalizer.finalize(&items, |_, _| {}).await {
+            // The row writes filter on `poller_instance_id`, so a batch
             // whose rows were already dispositioned matches nothing and
             // still lands here -- harmless either way.
-            Ok(()) => ClaimDisposition::Rescheduled,
+            Ok(_) => {
+                self.rescheduled = true;
+                ClaimDisposition::Rescheduled
+            }
             Err(e) => {
                 tracing::error!(
                     job_type = %self.job_type,
@@ -416,7 +382,7 @@ impl BatchDispatcher {
     }
 
     async fn run_batch(
-        congestion: &CongestionHandler,
+        finalizer: &Finalizer,
         runner: Box<dyn AnyBatchedJobRunner>,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
@@ -426,7 +392,7 @@ impl BatchDispatcher {
             .await
         {
             Ok(Ok(completion)) => Ok(completion),
-            Ok(Err(e)) => Err(congestion.maybe_reclassify(e)),
+            Ok(Err(e)) => Err(finalizer.maybe_reclassify(e)),
             Err(panic) => {
                 let span = Span::current();
                 let message = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -555,420 +521,132 @@ impl BatchDispatcher {
         Ok(())
     }
 
-    /// Seal into a transaction this dispatcher owns, re-attempting the whole
-    /// transaction when Postgres aborts it as a deadlock victim or
-    /// serialization failure.
+    /// Seal into a transaction this dispatcher owns, via
+    /// [`Finalizer::finalize`]'s pool-choice and abort-retry policy.
     ///
     /// Retrying is only sound *because* the transaction is the crate's own:
-    /// it holds nothing but this batch's bookkeeping, the abort rolled all of
-    /// it back, and `outcomes` is plain data that re-applies identically. The
-    /// `*WithOp`/`*WithTx` completions cannot use this -- the runner's own
-    /// writes live in that same transaction, so an abort destroys work this
-    /// dispatcher cannot recreate. Those fall through to the rescue in
-    /// `execute_batch`, which hands the rows back so the runner runs again.
+    /// it holds nothing but this batch's bookkeeping, an abort rolled all of
+    /// it back, and the dispositions are plain data that re-apply
+    /// identically. The `*WithOp`/`*WithTx` completions cannot use this --
+    /// the runner's own writes live in that same transaction, so an abort
+    /// destroys work this dispatcher cannot recreate. Those fall through to
+    /// the rescue in `execute_batch`, which hands the rows back so the
+    /// runner runs again.
     async fn seal_in_own_op(&mut self, outcomes: BatchOutcomes) -> Result<(), JobError> {
-        let mut attempt = 1;
-        loop {
-            let result = async {
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                self.seal(&mut op, outcomes.clone()).await?;
-                op.commit().await?;
-                Ok::<_, JobError>(())
-            }
-            .await;
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(e) if attempt < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
-                    tracing::warn!(
-                        job_type = %self.job_type,
-                        job_ids = %DisplayIds(&self.ids),
-                        attempt,
-                        exception.message = %e,
-                        "batch seal lost a lock conflict; retrying"
-                    );
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let items = self.disposition_items(outcomes, self.clock.now());
+        let finalizer = self.finalizer.clone();
+        let outcome = finalizer
+            .finalize(&items, |op, _| self.try_recycle_own_type(op))
+            .await?;
+        self.record_seal_outcome(&outcome);
+        Ok(())
     }
 
+    /// Seal onto the caller's op (the runner's own transaction, for the
+    /// `*WithOp`/`*WithTx` completions): one [`Finalizer::finalize_in_op`]
+    /// pass over every disposition, then the completion-recycle.
     async fn seal(
         &mut self,
         op: &mut impl AtomicOperation,
         outcomes: BatchOutcomes,
     ) -> Result<(), JobError> {
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-
-        let mut completes = Vec::new();
-        let mut reschedules = Vec::new();
-        let mut fails = Vec::new();
-        for (id, outcome) in outcomes {
-            match outcome {
-                BatchItemOutcome::Complete => completes.push(id),
-                BatchItemOutcome::RescheduleIn(d) => reschedules.push((id, now + d)),
-                BatchItemOutcome::RescheduleAt(t) => reschedules.push((id, t)),
-                BatchItemOutcome::Fail(reason) => fails.push((id, reason)),
-            }
-        }
-
-        self.complete_in_op(op, completes).await?;
-        self.reschedule_in_op(op, reschedules).await?;
-        self.fail_in_op(op, fails, now).await?;
+        let items = self.disposition_items(outcomes, now);
+        let outcome = self.finalizer.finalize_in_op(op, &items).await?;
+        self.record_seal_outcome(&outcome);
         self.try_recycle_own_type(op);
         Ok(())
     }
 
-    /// Deletes every completed row's execution (batched jobs are never
-    /// keyed, so no retained-state guard is needed) and promotes each freed
-    /// queue's oldest parked sibling via a [`PromoteHeadsHook`] freed-queue
-    /// registration on this same transaction — deliberately NOT a CTE of the
-    /// `DELETE`; see that hook for the snapshot-visibility reason —
-    /// mirroring `dispatcher.rs`'s `delete_execution_in_op`. A batch can
-    /// free several distinct queues in one commit, and each one's next job
-    /// can be a different type than this batch's own; the hook wakes every
-    /// promoted type itself.
-    ///
-    /// The `to_delete` CTE locks the rows in `(queue_id, id)` order BEFORE
-    /// the `DELETE` touches them, for deadlock avoidance rather than for
-    /// correctness: a spawn parking into several queues locks those queues'
-    /// occupants in that same order (`execution_hooks::insert`'s
-    /// `lock_queue_occupants`), as does the promote swap
-    /// (`PromoteHeadsHook::apply`/`apply_freed`) and
-    /// `ExecutionInsertHook::insert_many`'s `input` CTE, and this statement
-    /// contends with them for exactly those rows. A bare `DELETE ... WHERE
-    /// id = ANY(...)` would acquire in scan order -- unordered under a
-    /// bitmap scan -- so a spawn and a batch completion touching the same
-    /// two rows could each hold what the other wants. `MATERIALIZED` plus
-    /// `ORDER BY` puts `LockRows` above `Sort`, which is what makes the
-    /// order actually hold at execution time. Ordering by `queue_id` here
-    /// even though this CTE is id-addressed (not queue-addressed, unlike
-    /// the other lockers) is what makes the agreement crate-wide rather
-    /// than local: a bare `id` order was internally consistent with itself
-    /// but not with a `queue_id`-leading locker touching an overlapping row
-    /// set.
-    #[instrument(name = "job.batch_complete", skip_all, fields(n = ids.len()))]
-    async fn complete_in_op(
-        &mut self,
-        op: &mut impl AtomicOperation,
-        ids: Vec<JobId>,
-    ) -> Result<(), JobError> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
-        let rows = sqlx::query!(
-            r#"
-            WITH to_delete AS MATERIALIZED (
-                SELECT id FROM job_executions
-                WHERE id = ANY($1) AND poller_instance_id = $2
-                ORDER BY queue_id, id
-                FOR UPDATE
-            ), deleted AS (
-                DELETE FROM job_executions je USING to_delete t WHERE je.id = t.id
-                RETURNING je.id, je.queue_id
-            ), cleanup AS (
-                DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
-            )
-            SELECT id AS "id!: JobId", queue_id AS "queue_id?"
-            FROM deleted
-            "#,
-            &uuids,
-            self.instance_id,
-        )
-        .fetch_all(op.as_executor())
-        .await?;
-
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let deleted: Vec<JobId> = rows.iter().map(|row| row.id).collect();
-        let freed_queues: Vec<String> =
-            rows.iter().filter_map(|row| row.queue_id.clone()).collect();
-        PromoteHeadsHook::register_freed_queues(op, &self.notifier, freed_queues).await?;
-
-        let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &deleted).await?;
-        let mut jobs = Vec::with_capacity(deleted.len());
-        for id in &deleted {
-            if let Some(mut job) = entities.remove(id) {
-                job.complete_job();
-                jobs.push(job);
-            }
-        }
-        self.repo.update_all_in_op(op, &mut jobs).await?;
-
-        for id in &deleted {
-            self.notifier.job_terminal_in_op(op, *id).await?;
-        }
-        Ok(())
-    }
-
-    #[instrument(name = "job.batch_reschedule", skip_all, fields(n = reschedules.len()))]
-    async fn reschedule_in_op(
-        &mut self,
-        op: &mut impl AtomicOperation,
-        reschedules: Vec<(JobId, DateTime<Utc>)>,
-    ) -> Result<(), JobError> {
-        if reschedules.is_empty() {
-            return Ok(());
-        }
-        self.rescheduled = true;
-
-        let uuids: Vec<uuid::Uuid> = reschedules
-            .iter()
-            .map(|(id, _)| uuid::Uuid::from(*id))
-            .collect();
-        let times: Vec<DateTime<Utc>> = reschedules.iter().map(|(_, at)| *at).collect();
-
-        // `(queue_id, id)`-ordered lock before the write, same reason and
-        // same `MATERIALIZED` shape as `complete_in_op` -- see its doc
-        // comment. A bare `UPDATE ... FROM UNNEST(...)` acquires in join
-        // order, which is not an order any other writer agrees with.
-        sqlx::query!(
-            r#"
-            WITH to_reschedule AS MATERIALIZED (
-                SELECT je.id, u.execute_at
-                FROM job_executions je
-                JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
-                  ON je.id = u.id
-                WHERE je.poller_instance_id = $3
-                ORDER BY je.queue_id, je.id
-                FOR UPDATE
-            )
-            UPDATE job_executions AS je
-            SET state = 'pending', execute_at = t.execute_at, attempt_index = 1,
-                poller_instance_id = NULL
-            FROM to_reschedule t
-            WHERE je.id = t.id
-            "#,
-            &uuids,
-            &times,
-            self.instance_id,
-        )
-        .execute(op.as_executor())
-        .await?;
-        let ids: Vec<JobId> = reschedules.iter().map(|(id, _)| *id).collect();
-        let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?;
-        let mut jobs = Vec::with_capacity(ids.len());
-        for (id, at) in &reschedules {
-            if let Some(mut job) = entities.remove(id) {
-                job.reschedule_execution(*at);
-                jobs.push(job);
-            }
-        }
-        self.repo.update_all_in_op(op, &mut jobs).await?;
-        // Invariant B: a swap only demotes the ONE row whose queue actually
-        // had an older parked sibling, so any other row in `uuids` is still
-        // `pending` and still needs its own type's wake.
-        PromoteHeadsHook::register(op, &self.notifier, [self.job_type.clone()], uuids).await?;
-        Ok(())
-    }
-
-    /// Apply the type's retry policy to each failed job independently: some may
-    /// be rescheduled for another attempt while others exhaust their attempts
-    /// and become terminal, all in the same transaction.
-    #[instrument(name = "job.batch_fail", skip_all,
-        fields(n = fails.len(), n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
-    )]
-    async fn fail_in_op(
-        &mut self,
-        op: &mut impl AtomicOperation,
-        fails: Vec<(JobId, String)>,
+    /// Translate a runner's [`BatchOutcomes`] into finalizer
+    /// [`Disposition`]s -- per-item attempt numbers come from
+    /// `self.attempts`, and `RescheduleIn` resolves against the caller's
+    /// `now` (the sealing transaction's time where one exists).
+    fn disposition_items(
+        &self,
+        outcomes: BatchOutcomes,
         now: DateTime<Utc>,
-    ) -> Result<(), JobError> {
-        if fails.is_empty() {
-            return Ok(());
-        }
+    ) -> Vec<(JobId, Disposition)> {
+        outcomes
+            .into_iter()
+            .map(|(id, outcome)| {
+                let disposition = match outcome {
+                    BatchItemOutcome::Complete => Disposition::Complete,
+                    BatchItemOutcome::RescheduleIn(d) => Disposition::Fresh { at: now + d },
+                    BatchItemOutcome::RescheduleAt(t) => Disposition::Fresh { at: t },
+                    BatchItemOutcome::Fail(reason) => Disposition::Fail {
+                        error: reason,
+                        attempt: self.attempts.get(&id).copied().unwrap_or(1),
+                    },
+                };
+                (id, disposition)
+            })
+            .collect()
+    }
+
+    /// Span fields + `rescheduled` flag from what the finalizer actually
+    /// did.
+    fn record_seal_outcome(&mut self, outcome: &FinalizeOutcome) {
         let span = Span::current();
-        let retry_policy = RetryPolicy::from(&self.retry_settings);
-
-        let ids: Vec<JobId> = fails.iter().map(|(id, _)| *id).collect();
-        let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?;
-
-        let mut retry_uuids = Vec::new();
-        let mut retry_times = Vec::new();
-        let mut retry_attempts = Vec::new();
-        let mut terminal_uuids = Vec::new();
-        let mut jobs = Vec::with_capacity(ids.len());
-
-        for (id, reason) in fails {
-            let Some(mut job) = entities.remove(&id) else {
-                continue;
-            };
-            let attempt = self.attempts.get(&id).copied().unwrap_or(1);
-            match job.maybe_schedule_retry(now, attempt, &retry_policy, reason) {
-                Some((reschedule_at, next_attempt)) => {
-                    retry_uuids.push(uuid::Uuid::from(id));
-                    retry_times.push(reschedule_at);
-                    retry_attempts.push(next_attempt as i32);
-                    self.rescheduled = true;
-                }
-                None => terminal_uuids.push(uuid::Uuid::from(id)),
-            }
-            jobs.push(job);
-        }
-
-        span.record("n_retried", retry_uuids.len());
-        span.record("n_errored", terminal_uuids.len());
-
-        if !retry_uuids.is_empty() {
-            // Same `(queue_id, id)`-ordered lock as the reschedule path
-            // above, for the same deadlock-avoidance reason.
-            sqlx::query!(
-                r#"
-                WITH to_retry AS MATERIALIZED (
-                    SELECT je.id, u.execute_at, u.attempt_index
-                    FROM job_executions je
-                    JOIN UNNEST($1::uuid[], $2::timestamptz[], $3::int4[])
-                        AS u(id, execute_at, attempt_index)
-                      ON je.id = u.id
-                    WHERE je.poller_instance_id = $4
-                    ORDER BY je.queue_id, je.id
-                    FOR UPDATE
-                )
-                UPDATE job_executions AS je
-                SET state = 'pending', execute_at = t.execute_at,
-                    attempt_index = t.attempt_index, poller_instance_id = NULL
-                FROM to_retry t
-                WHERE je.id = t.id
-                "#,
-                &retry_uuids,
-                &retry_times,
-                &retry_attempts,
-                self.instance_id,
-            )
-            .execute(op.as_executor())
-            .await?;
-            // Invariant B: same ordering fixup as the reschedule path above.
-            // See `PromoteHeadsHook`'s doc comment for the notify policy.
-            PromoteHeadsHook::register(op, &self.notifier, [self.job_type.clone()], retry_uuids)
-                .await?;
-        }
-
-        if !terminal_uuids.is_empty() {
-            // Same per-freed-queue promotion as `complete_in_op` -- a
-            // `PromoteHeadsHook` freed-queue registration, never a CTE of
-            // the DELETE (see that hook for the snapshot-visibility
-            // reason; here it also merges with the retry registration
-            // above into one hook execution) -- including its
-            // `(queue_id, id)`-ordered `to_delete` lock; see
-            // `complete_in_op`'s doc comment for why the ordering (and
-            // leading with `queue_id`) is load-bearing.
-            let rows = sqlx::query!(
-                r#"
-                WITH to_delete AS MATERIALIZED (
-                    SELECT id FROM job_executions
-                    WHERE id = ANY($1) AND poller_instance_id = $2
-                    ORDER BY queue_id, id
-                    FOR UPDATE
-                ), deleted AS (
-                    DELETE FROM job_executions je USING to_delete t WHERE je.id = t.id
-                    RETURNING je.id, je.queue_id
-                ), cleanup AS (
-                    DELETE FROM job_execution_states s USING deleted d WHERE s.id = d.id
-                )
-                SELECT id AS "id!: JobId", queue_id AS "queue_id?"
-                FROM deleted
-                "#,
-                &terminal_uuids,
-                self.instance_id,
-            )
-            .fetch_all(op.as_executor())
-            .await?;
-
-            let freed_queues: Vec<String> =
-                rows.iter().filter_map(|row| row.queue_id.clone()).collect();
-            PromoteHeadsHook::register_freed_queues(op, &self.notifier, freed_queues).await?;
-            for row in &rows {
-                self.notifier.job_terminal_in_op(op, row.id).await?;
-            }
-        }
-
-        self.repo.update_all_in_op(op, &mut jobs).await?;
-        Ok(())
+        span.record("n_retried", outcome.retried.len());
+        span.record("n_errored", outcome.errored_terminal.len());
+        self.rescheduled |= outcome.any_rescheduled();
     }
 
     /// Fail every job in the batch with the same error — the batch's work was
-    /// rolled back, so no job in it can be considered done.
+    /// rolled back, so no job in it can be considered done. One
+    /// [`Disposition::Fail`] per id through [`Finalizer::finalize`]: the
+    /// retry policy is applied to each job independently — some may be
+    /// rescheduled for another attempt while others exhaust their attempts
+    /// and become terminal, all in the same transaction.
     ///
-    /// A `PoolCongestion` error is routed to [`Self::reschedule_congestion`]
-    /// instead of the ordinary retry-policy path below: congestion carries
-    /// no evidence any of these jobs is broken, so applying `RetryPolicy`'s
+    /// A `PoolCongestion` error is routed to the finalizer's congestion
+    /// reschedule instead of the retry-policy path: congestion carries no
+    /// evidence any of these jobs is broken, so applying `RetryPolicy`'s
     /// attempt escalation to it would walk perfectly good jobs toward
-    /// `max_attempts` termination for a condition they didn't cause.
+    /// `max_attempts` termination for a condition they didn't cause. The
+    /// congestion branch also deliberately skips
+    /// [`Self::try_recycle_own_type`], unlike the ordinary-error branch:
+    /// right after evidence the pool is unhealthy, an immediate same-type
+    /// re-claim -- even through `ClaimHook`'s budget gate -- would bypass
+    /// the congestion delay's cool-off, so the unit releases through the
+    /// ORDINARY path (`Drop`'s `batch_completed`) and the backlog is picked
+    /// back up by the next pool-aware poll instead.
     #[instrument(name = "job.fail_batch", skip_all,
-        fields(job_type = %self.job_type, n_items = self.ids.len(), error = true, error.message = %error)
+        fields(job_type = %self.job_type, n_items = self.ids.len(), error = true,
+               error.message = %error,
+               n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
     )]
     async fn fail_batch(&mut self, error: JobError) -> Result<(), JobError> {
         let message = match error {
-            JobError::PoolCongestion(message) => return self.reschedule_congestion(message).await,
+            JobError::PoolCongestion(message) => {
+                self.rescheduled = true;
+                return self
+                    .finalizer
+                    .reschedule_congested(&self.ids, &self.attempts, message)
+                    .await;
+            }
             other => other.to_string(),
         };
-        // Same bounded conflict retry as `seal_in_own_op`, and sound for the
-        // same reason: this transaction is the crate's own. Losing the
-        // failure-recording transaction to a deadlock is the worst time to
-        // give up -- it would strand rows whose disposition was already
-        // decided.
-        let mut attempt = 1;
-        loop {
-            let result = async {
-                let mut op = self.congestion.begin_terminal_write_op().await?;
-                let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                let fails: Vec<(JobId, String)> =
-                    self.ids.iter().map(|id| (*id, message.clone())).collect();
-                self.fail_in_op(&mut op, fails, now).await?;
-                self.try_recycle_own_type(&mut op);
-                op.commit().await?;
-                Ok::<_, JobError>(())
-            }
-            .await;
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(e) if attempt < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
-                    tracing::warn!(
-                        job_type = %self.job_type,
-                        job_ids = %DisplayIds(&self.ids),
-                        attempt,
-                        exception.message = %e,
-                        "batch fail-record lost a lock conflict; retrying"
-                    );
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// Reschedule every job in the batch after a `PoolCongestion`
-    /// classification, via the shared [`congestion::reschedule_congested`]
-    /// -- see `congestion.rs`'s module doc for the full rationale (attempt
-    /// preserved, fixed jittered delay, `CongestionRescheduled` event,
-    /// terminal-write repo).
-    ///
-    /// Deliberately does NOT call [`Self::try_recycle_own_type`], unlike
-    /// every other terminal path (`seal`, `fail_batch`): that call hands the
-    /// just-freed unit straight to [`crate::poller::ClaimHook`], which
-    /// claims and immediately DISPATCHES more due work of this SAME type --
-    /// a short-circuit path that has no idea about `pool_unit_budget` and
-    /// so cannot check whether the shared pool it's about to hand a fresh
-    /// dispatch to has actually recovered. Right after a completion or an
-    /// ordinary error, that blindness is fine (neither is evidence the pool
-    /// is unhealthy). Right after a CONGESTION reschedule it is exactly
-    /// backwards: the freed unit would immediately re-claim and re-dispatch
-    /// into the same pool that JUST failed to give this batch a connection,
-    /// with no backoff and no headroom check, which can feed a tight
-    /// claim-dispatch-fail-reschedule loop for this type specifically
-    /// instead of letting it cool off. Not calling it here means the unit
-    /// releases through the ORDINARY path (`Drop`'s `batch_completed`)
-    /// instead -- picked back up by the next POOL-AWARE poll, which does
-    /// check `pool_unit_budget` fresh.
-    async fn reschedule_congestion(&mut self, message: String) -> Result<(), JobError> {
-        self.rescheduled = true;
-        self.congestion
-            .reschedule(&self.ids, &self.attempts, message)
-            .await
+        let items: Vec<(JobId, Disposition)> = self
+            .ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    Disposition::Fail {
+                        error: message.clone(),
+                        attempt: self.attempts.get(id).copied().unwrap_or(1),
+                    },
+                )
+            })
+            .collect();
+        let finalizer = self.finalizer.clone();
+        let outcome = finalizer
+            .finalize(&items, |op, _| self.try_recycle_own_type(op))
+            .await?;
+        self.record_seal_outcome(&outcome);
+        Ok(())
     }
 }
 

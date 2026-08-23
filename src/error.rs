@@ -41,7 +41,7 @@ pub enum JobError {
     /// failure -- distinct from [`Self::JobExecutionError`] so the
     /// dispatchers' fail paths can route it to a reschedule that skips the
     /// retry policy's attempt escalation. Constructed only by
-    /// `CongestionHandler::maybe_reclassify` (see `congestion.rs`).
+    /// `Finalizer::maybe_reclassify` (see `finalizer.rs`).
     #[error("JobError - PoolCongestion: {0}")]
     PoolCongestion(String),
     #[error("JobError - BatchOutcomeMismatch: {0}")]

@@ -249,7 +249,7 @@ const CONTENTION_HEADROOM: i32 = 4;
 /// change the instant after it's read. That's fine: this is a soft budget
 /// re-evaluated every poll, not an invariant anything else depends on for
 /// correctness.
-fn pool_connection_headroom(main_pool: &PgPool) -> usize {
+pub(crate) fn pool_connection_headroom(main_pool: &PgPool) -> usize {
     let max_connections = main_pool.options().get_max_connections() as usize;
     let in_use = (main_pool.size() as usize).saturating_sub(main_pool.num_idle());
     max_connections.saturating_sub(in_use)
@@ -462,11 +462,10 @@ impl JobPoller {
     /// unbounded instead of loosely bounded. A runner that needs more than
     /// its unit's one connection can still make the shared pool run dry;
     /// what changed in this same feature is that the consequence is now
-    /// cheap: `CongestionHandler::maybe_reclassify` classifies the
+    /// cheap: `Finalizer::maybe_reclassify` classifies the
     /// resulting `PoolTimedOut` and the fail path reschedules the job a few
     /// seconds out rather than burning a retry attempt (see
-    /// `BatchDispatcher::reschedule_congestion` /
-    /// `JobDispatcher::reschedule_congestion`). That asymmetry is why
+    /// `Finalizer::reschedule_congested`). That asymmetry is why
     /// undercharging here is an acceptable trade: an occasional real
     /// `PoolTimedOut` costs a short reschedule delay, while a per-type or
     /// per-runner declared cost would ask every job author to reason about
@@ -857,9 +856,10 @@ impl JobPoller {
                         // there and in sb-max9. One unordered writer
                         // re-poisons every ordered one it overlaps, so this
                         // adopts the same `MATERIALIZED` + `ORDER BY
-                        // queue_id, id` lock pattern `complete_in_op` uses --
-                        // see its doc comment for why the ordering (and
-                        // leading with `queue_id`) is load-bearing.
+                        // queue_id, id` lock pattern the finalizer's
+                        // disposition writes use -- see
+                        // `Finalizer::finalize_in_op` for why the ordering
+                        // (and leading with `queue_id`) is load-bearing.
                         //
                         // `SKIP LOCKED` on top: a heartbeat has nothing to
                         // gain by waiting for a contended row. Whoever holds
@@ -2340,8 +2340,8 @@ async fn poll_jobs(
         r#"
         -- Claim admission, head-only. `state = 'pending'` contains ONLY
         -- already-claimable rows: a queue's blocked backlog is `parked`
-        -- instead (promoted at completion time -- see
-        -- `dispatcher.rs::delete_execution_in_op`), so queued and unqueued
+        -- instead (promoted at completion time -- see the freed-queue
+        -- promotion in `finalizer.rs`), so queued and unqueued
         -- rows share one ordered scan with no anti-join and no per-queue
         -- LATERAL. See PERFORMANCE.md ("Claim admission") for the shape this
         -- replaced and the measurements behind this one.
@@ -2457,9 +2457,9 @@ async fn poll_jobs(
             -- `next_due_at` is the honest next deadline -- exact now, not
             -- merely a heuristic: every window row is by construction
             -- already a candidate. Blocked queues are
-            -- covered by a wake rather than a spin: `delete_execution_in_op`/
-            -- the orphan sweeper report `execution_ready` when a queue's
-            -- head is promoted.
+            -- covered by a wake rather than a spin: the finalizer's
+            -- terminal delete / the orphan sweeper report `execution_ready`
+            -- when a queue's head is promoted.
             SELECT ((SELECT COUNT(*) FROM locked) >= $1
                  OR (EXISTS (
                         SELECT 1 FROM window_counts wc
