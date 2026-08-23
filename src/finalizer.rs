@@ -101,13 +101,20 @@ const CONGESTION_JITTER_MS: i64 = 1_000;
 /// event stream by [`Job::consecutive_congestion_reschedules`].
 const CONGESTION_WARN_STREAK: u32 = 10;
 
-/// Deadline on [`Finalizer::finalize`]'s FIRST, shared-pool attempt --
-/// deliberately much shorter than any plausible pool `acquire_timeout`
-/// (sqlx default 30s) and independent of pool config: a disposition write
-/// is the last write deciding a job's fate, and if the shared pool cannot
-/// serve it within a second, the internal pool exists precisely to take
-/// over. Applies only to the shared attempt; internal-pool attempts run
-/// uncapped (that pool is dedicated and its statements are short).
+/// Deadline on the PRE-COMMIT phase (acquire + writes) of
+/// [`Finalizer::finalize`]'s shared-pool attempt -- deliberately much
+/// shorter than any plausible pool `acquire_timeout` (sqlx default 30s) and
+/// independent of pool config: a disposition write is the last write
+/// deciding a job's fate, and if the shared pool cannot serve it within a
+/// second, the internal pool exists precisely to take over.
+///
+/// NEVER covers the `COMMIT` itself: cancelling a commit in flight is
+/// AMBIGUOUS -- the server may have committed before the cancellation --
+/// and an ambiguous outcome must not be retried (see `finalize`'s commit
+/// handling). Cancelling the pre-commit phase is unambiguous: nothing has
+/// committed, so re-running on the internal pool re-applies plain data.
+/// Applies only to the shared attempt; internal-pool attempts run uncapped
+/// (that pool is dedicated and its statements are short).
 const SHARED_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What should become of one claimed row. See the module doc for the exact
@@ -348,42 +355,44 @@ impl Finalizer {
         let mut attempt_no = 1;
         let mut use_internal = !self.shared_pool_has_headroom();
         loop {
-            let attempt = async {
+            // Phase 1 -- acquire + writes, NOT the commit. Everything here
+            // is unambiguous on failure or cancellation: nothing has
+            // committed, so re-running on another pool re-applies plain
+            // data.
+            let prepare = async {
                 let mut op = self.begin_op(use_internal).await?;
                 let outcome = self.finalize_in_op(&mut op, items).await?;
                 after_write(&mut op, &outcome);
-                op.commit().await?;
-                Ok::<_, JobError>(outcome)
+                Ok::<_, JobError>((op, outcome))
             };
-            let result = if use_internal {
-                attempt.await
+            let prepared = if use_internal {
+                prepare.await
             } else {
-                // The shared attempt gets a hard [`SHARED_ATTEMPT_TIMEOUT`]
-                // deadline regardless of the pool's own acquire timeout --
-                // a doomed shared acquire must not stall the disposition
-                // for ~30s before the fallback kicks in. Dropping the
-                // attempt mid-transaction rolls it back; re-applying on the
-                // internal pool is sound because `items` is plain data.
-                match self.clock.timeout(SHARED_ATTEMPT_TIMEOUT, attempt).await {
+                // The shared attempt's pre-commit phase gets a hard
+                // [`SHARED_ATTEMPT_TIMEOUT`] deadline regardless of the
+                // pool's own acquire timeout -- a doomed shared acquire
+                // must not stall the disposition for ~30s before the
+                // fallback kicks in.
+                match self.clock.timeout(SHARED_ATTEMPT_TIMEOUT, prepare).await {
                     Ok(result) => result,
                     Err(_elapsed) => {
                         tracing::warn!(
                             job_ids = %Self::display_ids_of(items),
-                            "disposition write exceeded 1s on the shared pool; \
-                             retrying on the internal pool"
+                            "disposition write exceeded 1s on the shared pool \
+                             before commit; retrying on the internal pool"
                         );
                         use_internal = true;
                         continue;
                     }
                 }
             };
-
-            match result {
-                Ok(outcome) => return Ok(outcome),
-                // Any failure of a shared-pool attempt -- not just a
-                // retryable abort: a `PoolTimedOut` there is precisely the
-                // case the internal pool exists for -- falls back to the
-                // internal pool without spending an abort-retry attempt.
+            let (op, outcome) = match prepared {
+                Ok(prepared) => prepared,
+                // Any pre-commit failure of a shared-pool attempt -- not
+                // just a retryable abort: a `PoolTimedOut` there is
+                // precisely the case the internal pool exists for -- falls
+                // back to the internal pool without spending an abort-retry
+                // attempt.
                 Err(e) if !use_internal => {
                     tracing::warn!(
                         job_ids = %Self::display_ids_of(items),
@@ -392,6 +401,7 @@ impl Finalizer {
                          retrying on the internal pool"
                     );
                     use_internal = true;
+                    continue;
                 }
                 Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
                     tracing::warn!(
@@ -401,8 +411,34 @@ impl Finalizer {
                         "disposition write lost a lock conflict; retrying"
                     );
                     attempt_no += 1;
+                    continue;
                 }
                 Err(e) => return Err(e),
+            };
+
+            // Phase 2 -- the commit, uncapped and retried ONLY on a
+            // server-reported abort (`is_retryable_conflict`: deadlock
+            // victim / serialization failure), which guarantees the
+            // transaction rolled back. Every other commit error is
+            // AMBIGUOUS -- the server may have committed before the
+            // connection died -- and re-running an ambiguous attempt could
+            // double-apply the dispositions' entity events, so it
+            // propagates instead (the row writes' `poller_instance_id`
+            // filter plus `finalize_in_op`'s applied-row gating make any
+            // later rescue of an actually-committed attempt a no-op).
+            match op.commit().await {
+                Ok(()) => return Ok(outcome),
+                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                    tracing::warn!(
+                        job_ids = %Self::display_ids_of(items),
+                        attempt_no,
+                        exception.message = %e,
+                        "disposition commit lost a lock conflict; retrying"
+                    );
+                    use_internal = true;
+                    attempt_no += 1;
+                }
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -430,20 +466,28 @@ impl Finalizer {
         let ids: Vec<JobId> = items.iter().map(|(id, _)| *id).collect();
         let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?;
 
-        let mut jobs: Vec<Job> = Vec::with_capacity(items.len());
+        // Decision phase: push events on the IN-MEMORY entities and bucket
+        // the row transitions. Nothing staged here persists on its own --
+        // an entity's events only reach `update_all_in_op` below if this
+        // instance's row write actually applied (the "applied-row gating"
+        // below), which is what makes re-running this whole pass over an
+        // already-committed attempt (an ambiguous commit's rescue, a row
+        // another instance took over) a no-op instead of a double-write.
+        let mut staged: HashMap<JobId, Job> = HashMap::new();
         let mut own_types: HashSet<JobType> = HashSet::new();
 
         let mut fresh_uuids: Vec<uuid::Uuid> = Vec::new();
         let mut fresh_times: Vec<DateTime<Utc>> = Vec::new();
         let mut congestion_uuids: Vec<uuid::Uuid> = Vec::new();
         let mut congestion_times: Vec<DateTime<Utc>> = Vec::new();
+        let mut congestion_streaks: HashMap<JobId, u32> = HashMap::new();
         let mut retry_uuids: Vec<uuid::Uuid> = Vec::new();
         let mut retry_times: Vec<DateTime<Utc>> = Vec::new();
         let mut retry_attempts: Vec<i32> = Vec::new();
+        let mut retry_next: HashMap<JobId, u32> = HashMap::new();
         let mut delete_uuids: Vec<uuid::Uuid> = Vec::new();
-        // Completion events are pushed only for rows this instance actually
-        // deletes, so the entities wait here for the delete's RETURNING.
-        let mut pending_complete: Vec<(JobId, Job)> = Vec::new();
+        let mut complete_ids: HashSet<JobId> = HashSet::new();
+        let mut fail_terminal_ids: HashSet<JobId> = HashSet::new();
 
         for (id, disposition) in items {
             let Some(mut job) = entities.remove(id) else {
@@ -453,14 +497,12 @@ impl Finalizer {
             match disposition {
                 Disposition::Complete => {
                     delete_uuids.push(uuid::Uuid::from(*id));
-                    pending_complete.push((*id, job));
+                    complete_ids.insert(*id);
                 }
                 Disposition::Fresh { at } => {
                     fresh_uuids.push(uuid::Uuid::from(*id));
                     fresh_times.push(*at);
                     job.reschedule_execution(*at);
-                    outcome.rescheduled_pending = true;
-                    jobs.push(job);
                 }
                 Disposition::Congestion {
                     at,
@@ -470,9 +512,7 @@ impl Finalizer {
                     congestion_uuids.push(uuid::Uuid::from(*id));
                     congestion_times.push(*at);
                     let streak = job.reschedule_congestion(message.clone(), *at, *attempt);
-                    outcome.congestion_streak = outcome.congestion_streak.max(streak);
-                    outcome.rescheduled_pending = true;
-                    jobs.push(job);
+                    congestion_streaks.insert(*id, streak);
                 }
                 Disposition::Fail { error, attempt } => {
                     match job.maybe_schedule_retry(now, *attempt, &retry_policy, error.clone()) {
@@ -480,20 +520,27 @@ impl Finalizer {
                             retry_uuids.push(uuid::Uuid::from(*id));
                             retry_times.push(reschedule_at);
                             retry_attempts.push(next_attempt as i32);
-                            outcome.retried.push((*id, next_attempt));
+                            retry_next.insert(*id, next_attempt);
                         }
                         None => {
                             delete_uuids.push(uuid::Uuid::from(*id));
-                            outcome.errored_terminal.push(*id);
+                            fail_terminal_ids.insert(*id);
                         }
                     }
-                    jobs.push(job);
                 }
             }
+            staged.insert(*id, job);
         }
 
+        // Applied-row gating: every row write RETURNs the ids it actually
+        // transitioned -- the `poller_instance_id` filter drops rows this
+        // instance no longer owns -- and only those ids feed the outcome,
+        // the promote registrations, and the entity persistence below.
+        let mut applied: HashSet<JobId> = HashSet::new();
+        let mut applied_pending_uuids: Vec<uuid::Uuid> = Vec::new();
+
         if !fresh_uuids.is_empty() {
-            sqlx::query!(
+            let rows = sqlx::query!(
                 r#"
                 WITH to_reschedule AS MATERIALIZED (
                     SELECT je.id, u.execute_at
@@ -509,19 +556,25 @@ impl Finalizer {
                     poller_instance_id = NULL
                 FROM to_reschedule t
                 WHERE je.id = t.id
+                RETURNING je.id AS "id!: JobId"
                 "#,
                 &fresh_uuids,
                 &fresh_times,
                 self.instance_id,
             )
-            .execute(op.as_executor())
+            .fetch_all(op.as_executor())
             .await?;
+            for row in rows {
+                applied.insert(row.id);
+                applied_pending_uuids.push(uuid::Uuid::from(row.id));
+                outcome.rescheduled_pending = true;
+            }
         }
 
         if !congestion_uuids.is_empty() {
             // `attempt_index` is deliberately absent from the `SET` list:
             // this write must not touch it either way (see the module doc).
-            sqlx::query!(
+            let rows = sqlx::query!(
                 r#"
                 WITH to_reschedule AS MATERIALIZED (
                     SELECT je.id, u.execute_at
@@ -536,17 +589,26 @@ impl Finalizer {
                 SET state = 'pending', execute_at = t.execute_at, poller_instance_id = NULL
                 FROM to_reschedule t
                 WHERE je.id = t.id
+                RETURNING je.id AS "id!: JobId"
                 "#,
                 &congestion_uuids,
                 &congestion_times,
                 self.instance_id,
             )
-            .execute(op.as_executor())
+            .fetch_all(op.as_executor())
             .await?;
+            for row in rows {
+                applied.insert(row.id);
+                applied_pending_uuids.push(uuid::Uuid::from(row.id));
+                outcome.rescheduled_pending = true;
+                if let Some(streak) = congestion_streaks.get(&row.id) {
+                    outcome.congestion_streak = outcome.congestion_streak.max(*streak);
+                }
+            }
         }
 
         if !retry_uuids.is_empty() {
-            sqlx::query!(
+            let rows = sqlx::query!(
                 r#"
                 WITH to_retry AS MATERIALIZED (
                     SELECT je.id, u.execute_at, u.attempt_index
@@ -563,14 +625,22 @@ impl Finalizer {
                     attempt_index = t.attempt_index, poller_instance_id = NULL
                 FROM to_retry t
                 WHERE je.id = t.id
+                RETURNING je.id AS "id!: JobId"
                 "#,
                 &retry_uuids,
                 &retry_times,
                 &retry_attempts,
                 self.instance_id,
             )
-            .execute(op.as_executor())
+            .fetch_all(op.as_executor())
             .await?;
+            for row in rows {
+                applied.insert(row.id);
+                applied_pending_uuids.push(uuid::Uuid::from(row.id));
+                if let Some(next_attempt) = retry_next.get(&row.id) {
+                    outcome.retried.push((row.id, *next_attempt));
+                }
+            }
         }
 
         let mut freed_queues: Vec<String> = Vec::new();
@@ -607,32 +677,29 @@ impl Finalizer {
             .fetch_all(op.as_executor())
             .await?;
             for row in rows {
+                applied.insert(row.id);
                 deleted_ids.insert(row.id);
                 if let Some(queue_id) = row.queue_id {
                     freed_queues.push(queue_id);
                 }
+                if complete_ids.contains(&row.id) {
+                    if let Some(job) = staged.get_mut(&row.id) {
+                        job.complete_job();
+                    }
+                    outcome.completed.push(row.id);
+                } else if fail_terminal_ids.contains(&row.id) {
+                    outcome.errored_terminal.push(row.id);
+                }
             }
         }
 
-        for (id, mut job) in pending_complete {
-            if deleted_ids.contains(&id) {
-                job.complete_job();
-                outcome.completed.push(id);
-                jobs.push(job);
-            }
-        }
-
-        // Invariant B for every row that went back to `pending`: it keeps
-        // its queue's active slot, but an older parked sibling should run
-        // first during the backoff/delay. Multiple registrations on one op
-        // merge into a single hook execution.
-        let promote_uuids: Vec<uuid::Uuid> = fresh_uuids
-            .into_iter()
-            .chain(congestion_uuids)
-            .chain(retry_uuids)
-            .collect();
-        if !promote_uuids.is_empty() {
-            PromoteHeadsHook::register(op, &self.notifier, own_types, promote_uuids).await?;
+        // Invariant B for every row that ACTUALLY went back to `pending`:
+        // it keeps its queue's active slot, but an older parked sibling
+        // should run first during the backoff/delay. Multiple registrations
+        // on one op merge into a single hook execution.
+        if !applied_pending_uuids.is_empty() {
+            PromoteHeadsHook::register(op, &self.notifier, own_types, applied_pending_uuids)
+                .await?;
         }
         if !freed_queues.is_empty() {
             PromoteHeadsHook::register_freed_queues(op, &self.notifier, freed_queues).await?;
@@ -641,6 +708,10 @@ impl Finalizer {
             self.notifier.job_terminal_in_op(op, *id).await?;
         }
 
+        // Persist only entities whose row transition this instance actually
+        // performed -- staged events for unapplied ids are discarded with
+        // their entities.
+        let mut jobs: Vec<Job> = applied.iter().filter_map(|id| staged.remove(id)).collect();
         self.repo.update_all_in_op(op, &mut jobs).await?;
         Ok(outcome)
     }
