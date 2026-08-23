@@ -546,7 +546,7 @@ impl JobPoller {
                 // Scoped so the upgraded `Arc` is dropped before the sleep:
                 // the waiter must not extend the poller's lifetime across a
                 // backoff step.
-                let sleep = {
+                {
                     let Some(poller) = poller.upgrade() else {
                         return;
                     };
@@ -560,9 +560,15 @@ impl JobPoller {
                         poller.tracker.wake();
                         return;
                     }
-                    poller.clock.sleep(backoff)
                 };
-                sleep.await;
+                // Wall-clock, not `poller.clock`: shared-pool headroom is a
+                // real-resource question, independent of any manual
+                // application clock a test/simulation drives `poller.clock`
+                // with -- same doctrine as the lost-handler heartbeat
+                // above. A manual clock that is never advanced would
+                // otherwise mean this backoff never elapses and a poll
+                // that armed this waiter never gets woken.
+                tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(POOL_WAITER_MAX_BACKOFF);
             }
         });
@@ -592,16 +598,22 @@ impl JobPoller {
         let unit_budget = self.pool_unit_budget();
         let plan = self.registry.plan_claim(n_jobs_to_poll, unit_budget);
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
+        if plan.clamped_by_pool {
+            // Due work exists that `unit_budget` priced out of this plan --
+            // either the whole poll came up empty, or some type(s) got
+            // fewer rows than their real demand (`plan_claim`'s per-type
+            // floor keeps a type IN the plan, it does not guarantee the
+            // type got everything it could use). Either way, arm the
+            // waiter so a connection freeing wakes this loop instead of
+            // waiting out the fallback; harmless when headroom is already
+            // sufficient, since the waiter's own check no-ops immediately.
+            self.arm_pool_headroom_waiter();
+        }
         if plan.types.is_empty() {
-            if plan.clamped_by_pool {
-                // Due work exists but the pool has zero headroom. Claim
-                // nothing -- the rows stay `pending`, where a PEER instance
-                // with a healthy pool can claim them -- and arm the
-                // headroom waiter to wake this loop the moment a connection
-                // frees. `MAX_WAIT` below is only the fallback should the
-                // wake be lost.
-                self.arm_pool_headroom_waiter();
-            }
+            // Due work exists but the pool has zero headroom. Claim
+            // nothing -- the rows stay `pending`, where a PEER instance
+            // with a healthy pool can claim them. `MAX_WAIT` below is only
+            // the fallback should the waiter's wake be lost.
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);

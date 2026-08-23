@@ -380,84 +380,132 @@ impl JobRegistry {
         // First pass: every type's UNCONSTRAINED (pool-budget-ignoring)
         // limit and dispatch-unit cost -- everything `plan_claim` already
         // computed before pool-awareness existed, just also carrying the
-        // unit cost alongside each row limit now.
-        let natural: Vec<(JobType, usize, usize)> = self
+        // unit cost alongside each row limit now, plus whether the type is
+        // ELASTIC: an uncapped plain type, whose `n_jobs_to_poll` "cost"
+        // below is only the window ceiling standing in for demand this
+        // planner has no way to measure (it doesn't know the type's real
+        // due-row count) -- never a real obligation the way a capped
+        // plain type's free-slot count or a batched type's free-chunk
+        // count is. That distinction is why elastic types get a separate
+        // allocation step below instead of competing in the same sort.
+        let natural: Vec<(JobType, usize, usize, bool)> = self
             .registered_job_types()
             .into_iter()
             .filter_map(|job_type| {
-                let (limit, units) = match self.batch_policy(&job_type) {
+                let (limit, units, elastic) = match self.batch_policy(&job_type) {
                     Some(policy) => {
                         let limit = policy
                             .max_concurrent_per_process
                             .saturating_sub(self.tracker.units_in_flight(&job_type))
                             .saturating_mul(policy.max_batch_size)
                             .min(n_jobs_to_poll);
-                        (limit, limit.div_ceil(policy.max_batch_size.max(1)))
+                        (limit, limit.div_ceil(policy.max_batch_size.max(1)), false)
                     }
-                    None => {
-                        let limit = match self.per_process_cap(&job_type) {
-                            Some(cap) => {
-                                cap.saturating_sub(self.tracker.units_in_flight(&job_type))
-                            }
-                            None => n_jobs_to_poll,
+                    None => match self.per_process_cap(&job_type) {
+                        Some(cap) => {
+                            let limit = cap
+                                .saturating_sub(self.tracker.units_in_flight(&job_type))
+                                .min(n_jobs_to_poll);
+                            (limit, limit, false)
                         }
-                        .min(n_jobs_to_poll);
-                        (limit, limit)
-                    }
+                        None => (n_jobs_to_poll, n_jobs_to_poll, true),
+                    },
                 };
-                (limit > 0).then_some((job_type, limit, units))
+                (limit > 0).then_some((job_type, limit, units, elastic))
             })
             .collect();
+        let clamped_by_pool =
+            natural.iter().map(|(.., units, _)| units).sum::<usize>() > unit_budget;
 
-        // Second pass: spend `unit_budget` across that list, trimming
-        // (never growing) each type's row limit to fit -- for a batched
-        // type in whole-`max_batch_size`-chunk increments, since a partial
-        // chunk is still one full dispatch unit's connection cost.
+        // Second pass: spend `unit_budget` in two steps.
         //
-        // Smallest-demand types first, NOT `registered_job_types`' order
-        // (a `HashMap` iteration order, randomized per process): under a
-        // scarce budget, spending it in registration order lets whichever
-        // type happens to be iterated first -- however large its own
-        // uncapped demand -- exhaust the WHOLE budget before a small,
-        // explicitly-capped type (e.g. `max_concurrent_per_process:
-        // Some(1)`, needing exactly one unit) ever gets a turn. That is
-        // exactly the type-starvation failure per-type windowing exists to
-        // prevent elsewhere in the claim path (see PERFORMANCE.md,
-        // "Contention headroom") -- this clamp must not reintroduce it at
-        // the row_limit-assignment level. Smallest-first means a type only
-        // ever loses budget to types with EQUAL OR GREATER demand, and a
-        // type asking for just 1-2 units is served before an uncapped
-        // type's effectively-unbounded appetite can crowd it out.
-        let mut natural = natural;
-        natural.sort_by_key(|(_, _, units)| *units);
-        let clamped_by_pool = natural.iter().map(|(.., units)| units).sum::<usize>() > unit_budget;
+        // Step 1 -- reserve a floor of ONE unit per elastic type, off the
+        // top, before bounded types (batched / capped plain, whose demand
+        // is a real, finite obligation) get to compete for anything. This
+        // is the mirror image of step 2's smallest-demand-first rule
+        // below: without it, bounded types' own worst-case demands --
+        // individually small, but potentially summing to the whole
+        // budget across many registered types -- can exhaust `unit_budget`
+        // before an elastic type's inflated `n_jobs_to_poll` cost ever
+        // sorts into reach, excluding it from the plan entirely on every
+        // poll (see `elastic_type_is_not_starved_by_many_bounded_types`).
+        // A type with due work must never be silently unclaimable while
+        // budget remains -- this floor is what guarantees that for
+        // elastic types the way step 2's sort guarantees it for bounded
+        // ones. (If `unit_budget` is smaller than the number of elastic
+        // types, the floor itself is scarce; the deterministic
+        // job-type-order tie-break below decides who gets it, same as any
+        // other resource exhausted below demand.)
+        let (bounded, mut elastic): (Vec<_>, Vec<_>) =
+            natural.into_iter().partition(|(.., elastic)| !*elastic);
+        elastic.sort_by(|(a, ..), (b, ..)| a.as_str().cmp(b.as_str()));
+        let floor_count = elastic.len().min(unit_budget);
+        let mut elastic_units: Vec<usize> = (0..elastic.len())
+            .map(|i| if i < floor_count { 1 } else { 0 })
+            .collect();
+        let mut remaining_budget = unit_budget - floor_count;
+
+        // Step 2 -- bounded types spend whatever the floor left, smallest-
+        // demand-first, NOT `registered_job_types`' order (a `HashMap`
+        // iteration order, randomized per process): under a scarce
+        // budget, spending it in registration order lets whichever type
+        // happens to be iterated first -- however large its own demand --
+        // exhaust the WHOLE remaining budget before a small, explicitly-
+        // capped type (e.g. `max_concurrent_per_process: Some(1)`,
+        // needing exactly one unit) ever gets a turn. That is exactly the
+        // type-starvation failure per-type windowing exists to prevent
+        // elsewhere in the claim path (see PERFORMANCE.md, "Contention
+        // headroom") -- this clamp must not reintroduce it at the
+        // row_limit-assignment level. Smallest-first means a bounded type
+        // only ever loses budget to another bounded type with EQUAL OR
+        // GREATER demand.
+        let mut bounded = bounded;
+        bounded.sort_by_key(|(_, _, units, _)| *units);
         let mut types = Vec::new();
         let mut row_limits = Vec::new();
-        let mut units_used = 0;
-        for (job_type, limit, units) in natural {
-            let remaining_units = unit_budget.saturating_sub(units_used);
-            if remaining_units == 0 {
+        for (job_type, limit, units, _) in bounded {
+            if remaining_budget == 0 {
                 continue;
             }
-            let (limit, units) = if units <= remaining_units {
+            let (limit, units) = if units <= remaining_budget {
                 (limit, units)
             } else if let Some(policy) = self.batch_policy(&job_type) {
                 (
-                    remaining_units
+                    remaining_budget
                         .saturating_mul(policy.max_batch_size)
                         .min(limit),
-                    remaining_units,
+                    remaining_budget,
                 )
             } else {
-                (remaining_units, remaining_units)
+                (remaining_budget, remaining_budget)
             };
             if limit == 0 {
                 continue;
             }
             types.push(job_type);
             row_limits.push(limit as i32);
-            units_used += units;
+            remaining_budget -= units;
         }
+
+        // Step 3 -- grow elastic types beyond their floor with whatever
+        // budget the bounded types didn't end up needing, first-come
+        // against the same deterministic order used for the floor.
+        for ((job_type, limit, _, _), floor) in elastic.into_iter().zip(elastic_units.iter_mut()) {
+            if *floor == 0 {
+                // Missed the floor entirely: `unit_budget` was smaller
+                // than the number of elastic types. Left out of the plan
+                // this poll, same as a bounded type that lost the sort.
+                continue;
+            }
+            if remaining_budget > 0 {
+                let extra = remaining_budget.min(limit.saturating_sub(*floor));
+                *floor += extra;
+                remaining_budget -= extra;
+            }
+            types.push(job_type);
+            row_limits.push(*floor as i32);
+        }
+
         ClaimPlan {
             types,
             row_limits,
@@ -500,5 +548,130 @@ mod tests {
         let job_type = registry.add_initializer(ZeroCapInitializer);
 
         assert_eq!(registry.per_process_cap(&job_type), Some(1));
+    }
+
+    /// A capped plain type, keyed by its own job type so several can be
+    /// registered side by side in one registry.
+    struct FixedCapInitializer {
+        job_type: JobType,
+        cap: Option<usize>,
+    }
+
+    impl JobInitializer for FixedCapInitializer {
+        type Config = ();
+
+        fn job_type(&self) -> JobType {
+            self.job_type.clone()
+        }
+
+        fn max_concurrent_per_process(&self) -> Option<usize> {
+            self.cap
+        }
+
+        fn init(
+            &self,
+            _job: &Job,
+            _: JobSpawner<Self::Config>,
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+            unimplemented!("never invoked by this test")
+        }
+    }
+
+    /// An uncapped ("elastic") plain type -- `max_concurrent_per_process`
+    /// defaults to `None`.
+    struct UncappedInitializer(JobType);
+
+    impl JobInitializer for UncappedInitializer {
+        type Config = ();
+
+        fn job_type(&self) -> JobType {
+            self.0.clone()
+        }
+
+        fn init(
+            &self,
+            _job: &Job,
+            _: JobSpawner<Self::Config>,
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+            unimplemented!("never invoked by this test")
+        }
+    }
+
+    /// D6 at the `plan_claim` level (mirrors `capped_type_does_not_starve_others`
+    /// in `tests/job.rs`): a capped type's small, bounded demand must be met
+    /// in full even when an uncapped sibling is also competing for the same
+    /// budget.
+    #[test]
+    fn capped_type_gets_full_demand_despite_uncapped_sibling() {
+        let mut registry = JobRegistry::new(Arc::new(JobTracker::new(0, 10)));
+        let capped = registry.add_initializer(FixedCapInitializer {
+            job_type: JobType::new("registry-plan-claim-capped-sibling"),
+            cap: Some(1),
+        });
+        registry.add_initializer(UncappedInitializer(JobType::new(
+            "registry-plan-claim-uncapped-sibling",
+        )));
+
+        let plan = registry.plan_claim(50, 6);
+
+        let idx = plan
+            .types
+            .iter()
+            .position(|t| t == &capped)
+            .expect("the capped type must be in the plan");
+        assert_eq!(
+            plan.row_limits[idx], 1,
+            "the capped type's whole (small) demand must be met"
+        );
+    }
+
+    /// The converse of `capped_type_does_not_starve_others`: several small,
+    /// correctly-priced bounded (capped) demands that together consume the
+    /// entire `unit_budget` must not crowd an UNCAPPED plain type out of the
+    /// plan entirely. `plan_claim` has no real due-row count for an uncapped
+    /// type -- only the window ceiling `n_jobs_to_poll` standing in for
+    /// demand -- so under a pure smallest-demand-first sort that inflated
+    /// cost always sorts last and can see a `remaining_units` of zero. This
+    /// pins the fix: a floor of at least one row is reserved for the
+    /// uncapped type before bounded types compete for anything.
+    #[test]
+    fn elastic_type_is_not_starved_by_many_bounded_types() {
+        let mut registry = JobRegistry::new(Arc::new(JobTracker::new(0, 10)));
+        const BOUNDED: [&str; 4] = [
+            "registry-plan-claim-bounded-0",
+            "registry-plan-claim-bounded-1",
+            "registry-plan-claim-bounded-2",
+            "registry-plan-claim-bounded-3",
+        ];
+        for job_type in BOUNDED {
+            registry.add_initializer(FixedCapInitializer {
+                job_type: JobType::new(job_type),
+                cap: Some(1),
+            });
+        }
+        let uncapped = registry.add_initializer(UncappedInitializer(JobType::new(
+            "registry-plan-claim-uncapped-starved",
+        )));
+
+        // n_jobs_to_poll well above every real demand; unit_budget equals
+        // the bounded types' combined real demand exactly, so under the
+        // OLD algorithm (smallest-demand-first with no floor) the
+        // uncapped type's inflated `n_jobs_to_poll` cost sorts dead last
+        // and is excluded outright once the four capped types have spent
+        // the whole budget on their genuine one-unit-each demand.
+        let plan = registry.plan_claim(50, 4);
+
+        let idx = plan.types.iter().position(|t| t == &uncapped);
+        assert!(
+            idx.is_some(),
+            "an uncapped plain type must not be excluded from the plan while \
+             unit_budget > 0, even when bounded types' combined real demand \
+             consumes the rest of the budget -- got plan.types = {:?}",
+            plan.types
+        );
+        assert!(
+            plan.row_limits[idx.unwrap()] >= 1,
+            "the uncapped type must get at least its floor of one claimable row"
+        );
     }
 }
