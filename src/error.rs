@@ -37,6 +37,13 @@ pub enum JobError {
     NoInitializerPresent,
     #[error("JobError - JobExecutionError: {0}")]
     JobExecutionError(String),
+    /// A runner error classified as pool congestion rather than a genuine
+    /// failure -- distinct from [`Self::JobExecutionError`] so the
+    /// dispatchers' fail paths can route it to a reschedule that skips the
+    /// retry policy's attempt escalation. Constructed only by
+    /// `Finalizer::maybe_reclassify` (see `finalizer.rs`).
+    #[error("JobError - PoolCongestion: {0}")]
+    PoolCongestion(String),
     #[error("JobError - BatchOutcomeMismatch: {0}")]
     BatchOutcomeMismatch(String),
     #[error("JobError - DuplicateId: {0:?}")]
@@ -100,6 +107,19 @@ pub(crate) fn retryable_conflict_code(
 pub(crate) fn is_retryable_conflict(err: &(dyn std::error::Error + 'static)) -> bool {
     retryable_conflict_code(err).is_some()
 }
+
+/// Total attempts a crate-owned bookkeeping transaction (batch seal / fail,
+/// congestion reschedule) gets when Postgres keeps ABORTING it as a
+/// deadlock victim or serialization failure ([`is_retryable_conflict`]) --
+/// transient aborts where the transaction lost to a concurrent partner and
+/// is safe to simply re-run. Counted as attempts, not retries: `3` means
+/// the original try plus two re-runs.
+///
+/// Small on purpose: these aborts are resolved by whichever partner
+/// survives, so a re-attempt normally succeeds immediately. If three in a
+/// row lose, something is wrong beyond ordinary contention and the work is
+/// better off going through the rescue path than spinning here.
+pub(crate) const TX_ABORT_MAX_ATTEMPTS: u32 = 3;
 
 impl From<Box<dyn std::error::Error>> for JobError {
     fn from(error: Box<dyn std::error::Error>) -> Self {

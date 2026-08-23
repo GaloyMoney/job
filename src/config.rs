@@ -38,6 +38,25 @@ pub struct JobPollerConfig {
     #[serde(default = "default_pending_jobs_check_interval")]
     /// How often to check for pending jobs that are past their scheduled execution time.
     pub pending_jobs_check_interval: Duration,
+    #[serde(default = "default_connections_per_job")]
+    /// How many shared-pool connections one dispatched job is assumed to
+    /// cost, for pool-aware claim admission: each poll's dispatch budget is
+    /// `live pool headroom / connections_per_job`, rounded down. A "job"
+    /// here is one dispatch unit -- a whole batch of a batched type counts
+    /// once, not per row.
+    ///
+    /// Defaults to `1.0`, which prices exactly what the crate's own
+    /// claim/dispatch machinery holds. Deliberately fractional: the crate
+    /// cannot know what YOUR runners do with connections, but you can. A
+    /// deployment whose jobs are mostly connection-free can set e.g. `0.5`
+    /// to admit twice the headroom; one whose runners open extra
+    /// connections (the non-`_in_op` convenience methods, concurrent
+    /// fan-out) can set `1.5` or `2.0` to admit less and rely less on
+    /// congestion reschedules. Must be finite and greater than zero
+    /// (validated by [`JobSvcConfigBuilder::build`]); note that a value
+    /// larger than the pool's `max_connections` means no work is ever
+    /// admitted.
+    pub connections_per_job: f64,
 }
 
 impl Default for JobPollerConfig {
@@ -50,6 +69,7 @@ impl Default for JobPollerConfig {
             terminal_channel_size: default_terminal_channel_size(),
             sweep_interval: default_sweep_interval(),
             pending_jobs_check_interval: default_pending_jobs_check_interval(),
+            connections_per_job: default_connections_per_job(),
         }
     }
 }
@@ -149,6 +169,20 @@ impl JobSvcConfigBuilder {
             self.exec_migrations = Some(true);
         }
 
+        if let Some(poller_config) = self.poller_config.as_ref() {
+            let factor = poller_config.connections_per_job;
+            // Zero/negative would turn the admission division into a claim
+            // -everything (or NaN) hazard; the upper bound is a typo guard
+            // (e.g. a value written in "milli-connections") -- no real
+            // workload prices a single dispatch at more than a few
+            // connections.
+            if !(factor.is_finite() && factor > 0.0 && factor <= 100.0) {
+                return Err(format!(
+                    "connections_per_job must be a finite value in (0.0, 100.0], got {factor}"
+                ));
+            }
+        }
+
         Ok(JobSvcConfig {
             pg_con: self.pg_con.clone().flatten(),
             max_connections: self.max_connections.flatten(),
@@ -189,4 +223,50 @@ fn default_sweep_interval() -> Duration {
 
 fn default_pending_jobs_check_interval() -> Duration {
     Duration::from_secs(5 * 60)
+}
+
+fn default_connections_per_job() -> f64 {
+    1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Existing configs (no `connections_per_job` key) must keep working
+    /// untouched: the field is additive with a serde default of 1.0.
+    #[test]
+    fn connections_per_job_serde_default_is_one() {
+        let config: JobPollerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.connections_per_job, 1.0);
+        assert_eq!(JobPollerConfig::default().connections_per_job, 1.0);
+    }
+
+    /// The builder rejects factors that would break the admission division:
+    /// zero, negative, non-finite, and absurdly large (typo guard).
+    #[test]
+    fn invalid_connections_per_job_is_rejected_at_build() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 101.0] {
+            let result = JobSvcConfig::builder()
+                .pg_con("postgres://unused")
+                .poller_config(JobPollerConfig {
+                    connections_per_job: invalid,
+                    ..Default::default()
+                })
+                .build();
+            assert!(
+                result.is_err(),
+                "connections_per_job = {invalid} should be rejected"
+            );
+        }
+
+        let ok = JobSvcConfig::builder()
+            .pg_con("postgres://unused")
+            .poller_config(JobPollerConfig {
+                connections_per_job: 1.5,
+                ..Default::default()
+            })
+            .build();
+        assert!(ok.is_ok(), "connections_per_job = 1.5 should be accepted");
+    }
 }

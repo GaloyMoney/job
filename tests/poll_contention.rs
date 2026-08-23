@@ -64,7 +64,21 @@ impl JobRunner for CountingRunner {
 /// transaction holds between its `FOR UPDATE SKIP LOCKED` and its commit.
 #[tokio::test]
 async fn poller_falls_through_locked_head_rows_to_later_due_jobs() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
+    // A dedicated pool, not `helpers::init_pool`'s shared 5 connections:
+    // this test deliberately wants `max_jobs_per_process: 5` units of
+    // pool-aware claim budget available in one poll (see below), and
+    // `JobPoller::pool_unit_budget` prices one unit at one connection, plus
+    // the 1 connection `JobNotificationRouter`'s `LISTEN` permanently holds
+    // (see `helpers::init_pool`) -- so this needs at least `5 + 1 = 6`
+    // connections of headroom, not 5. Sized with margin above that floor,
+    // not pared to the exact minimum: this is a dedicated single-test pool,
+    // so extra headroom costs nothing and buys slack against small changes
+    // elsewhere in the claim path.
+    let pg_con = std::env::var("PG_CON").unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&pg_con)
+        .await?;
     let job_type = helpers::job_type("poll-contention-fallthrough");
 
     // Small poll budget so `n_jobs_to_poll` (and thus a non-batched type's

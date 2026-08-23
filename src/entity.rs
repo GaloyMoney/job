@@ -114,6 +114,16 @@ pub enum JobEvent {
     },
     JobCompleted,
     AttemptCounterReset,
+    /// A batch's write was rescheduled because the *shared connection pool*
+    /// was under pressure (`sqlx::Error::PoolTimedOut`), not because
+    /// anything about this job was wrong. Deliberately distinct from
+    /// `ExecutionErrored`: it must never drive the retry policy's attempt
+    /// escalation (see `BatchDispatcher::reschedule_congestion`), so it
+    /// can't reuse the event that means "this job's `RetryPolicy` just
+    /// spent an attempt."
+    CongestionRescheduled {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +355,62 @@ impl Job {
         self.events.push(JobEvent::JobCompleted);
     }
 
+    /// Reschedule after a pool-congestion classification
+    /// (`Finalizer::maybe_reclassify`, `finalizer.rs`): same shape
+    /// as [`Self::schedule_retry`]
+    /// but at the SAME `attempt` rather than the next one, and via
+    /// `CongestionRescheduled` rather than `ExecutionErrored` -- congestion
+    /// carries no evidence of a broken job, so it must not spend a
+    /// `RetryPolicy` attempt. Attempt staying unchanged is load-bearing
+    /// beyond the retry policy too: the poller's retry-solo rule
+    /// (`poller.rs`, `attempt > 1` is dispatched alone, never batched) reads
+    /// this same value, so a job that keeps its attempt through a
+    /// congestion reschedule stays eligible for batching on its next claim
+    /// -- see `congestion_reschedule_keeps_job_batchable` in
+    /// `tests/batched_job.rs`.
+    ///
+    /// Returns the new consecutive-congestion streak (see
+    /// [`Self::consecutive_congestion_reschedules`]) for the caller's
+    /// stuck-in-congestion WARN.
+    pub(super) fn reschedule_congestion(
+        &mut self,
+        error: String,
+        scheduled_at: DateTime<Utc>,
+        attempt: u32,
+    ) -> u32 {
+        self.events.push(JobEvent::CongestionRescheduled { error });
+        self.events.push(JobEvent::ExecutionScheduled {
+            attempt,
+            scheduled_at,
+        });
+        self.consecutive_congestion_reschedules()
+    }
+
+    /// How many times in a row this job has just been rescheduled for pool
+    /// congestion, most-recent-first -- including the reschedule just
+    /// pushed by [`Self::reschedule_congestion`] above, which is why this
+    /// reads `iter_all` rather than `iter_persisted`: the streak needs to
+    /// see this call's own not-yet-committed push, or the very first
+    /// congestion event of a new streak would report 0.
+    ///
+    /// Each congestion cycle is the pair `[CongestionRescheduled,
+    /// ExecutionScheduled]` (see `reschedule_congestion`). Walking backward
+    /// from the latest event, this consumes exactly one such pair per
+    /// iteration and stops at the first `ExecutionScheduled` NOT preceded
+    /// by `CongestionRescheduled` -- i.e. the first ordinary retry, rescue
+    /// reschedule, or fresh dispatch, whichever ends the streak.
+    fn consecutive_congestion_reschedules(&self) -> u32 {
+        let mut count = 0;
+        let mut events = self.events.iter_all().rev();
+        while let Some(JobEvent::ExecutionScheduled { .. }) = events.next() {
+            match events.next() {
+                Some(JobEvent::CongestionRescheduled { .. }) => count += 1,
+                _ => break,
+            }
+        }
+        count
+    }
+
     /// Attach or overwrite the return value for this job.
     ///
     /// Returns [`Idempotent::AlreadyApplied`] when the new value is identical
@@ -439,6 +505,7 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ReturnValueUpdated { .. } => {}
                 JobEvent::JobCompleted => {}
                 JobEvent::AttemptCounterReset => {}
+                JobEvent::CongestionRescheduled { .. } => {}
             }
         }
         builder.events(events).build()

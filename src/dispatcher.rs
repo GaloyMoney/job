@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
@@ -13,9 +12,9 @@ use std::{
 use super::{
     JobId,
     current::CurrentJob,
-    entity::{Job, JobType, RetryPolicy},
+    entity::{Job, JobType},
     error::JobError,
-    execution_hooks::PromoteHeadsHook,
+    finalizer::{ClaimDisposition, Disposition, Finalizer},
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -36,23 +35,25 @@ pub struct PolledJob {
 
 pub(crate) struct JobDispatcher {
     /// Reaches this process's poller for the head-swap completion-recycle
-    /// claim (`delete_execution_in_op`). `Weak` so a dispatcher never keeps
+    /// claim (`recycle_into_claim`). `Weak` so a dispatcher never keeps
     /// the poller alive on its own -- mirrors `spawner.rs`'s `PollerHandle`.
     poller: Weak<JobPoller>,
     repo: Arc<JobRepo>,
     retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
-    notifier: Arc<JobEventNotifier>,
     job_type: JobType,
-    /// Whether this type keeps its execution state past terminal, i.e. it is
-    /// keyed with `inherits_state`. See `delete_execution_in_op`.
-    retains_state: bool,
     rescheduled: bool,
     dispatched: bool,
+    /// Whether this job's unit has already been handed to a recycle
+    /// reservation. See [`Self::recycle_into_claim`] -- it must happen at
+    /// most once, including across [`Finalizer::finalize`]'s retried
+    /// attempts.
+    recycled: bool,
     id: JobId,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
+    finalizer: Finalizer,
 }
 impl JobDispatcher {
     /// Claims the type's per-process slot **synchronously**, at construction.
@@ -80,20 +81,29 @@ impl JobDispatcher {
         clock: ClockHandle,
     ) -> Self {
         tracker.dispatch_job(id, &job_type);
+        let finalizer = Finalizer::new(
+            poller.clone(),
+            repo.clone(),
+            notifier,
+            retry_settings.clone(),
+            retains_state,
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
             retry_settings,
             runner: Some(runner),
             tracker,
-            notifier,
             job_type,
-            retains_state,
             rescheduled: false,
             dispatched: true,
+            recycled: false,
             id,
             instance_id,
             clock,
+            finalizer,
         }
     }
 
@@ -117,25 +127,34 @@ impl JobDispatcher {
         clock: ClockHandle,
     ) -> Self {
         reservation.into_live(id);
+        let finalizer = Finalizer::new(
+            poller.clone(),
+            repo.clone(),
+            notifier,
+            retry_settings.clone(),
+            retains_state,
+            instance_id,
+            clock.clone(),
+        );
         Self {
             poller,
             repo,
             retry_settings,
             runner: Some(runner),
             tracker,
-            notifier,
             job_type,
-            retains_state,
             rescheduled: false,
             dispatched: true,
+            recycled: false,
             id,
             instance_id,
             clock,
+            finalizer,
         }
     }
 
     /// Detach this dispatcher's unit from the ordinary Drop-triggered
-    /// release: `delete_execution_in_op` is handing the about-to-be-freed
+    /// release: [`Self::recycle_into_claim`] is handing the about-to-be-freed
     /// unit to [`JobTracker::recycle`] instead of releasing it plainly.
     fn recycle_unit(&mut self) {
         self.dispatched = false;
@@ -144,7 +163,8 @@ impl JobDispatcher {
     }
 
     #[instrument(name = "job.execute_job", skip_all,
-        fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now)
+        fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now,
+               claim_disposition)
     )]
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_job(
@@ -185,92 +205,165 @@ impl JobDispatcher {
             self.clock.clone(),
             Arc::clone(&self.repo),
         );
-        match Self::dispatch_job(self.runner.take().expect("runner"), current_job).await {
-            Err(e) => {
-                span.record("conclusion", "Error");
-                self.fail_job(job.id, e, polled_job.attempt).await?
+        let runner = self.runner.take().expect("runner");
+        let completion = Self::dispatch_job(&self.finalizer, runner, current_job).await;
+        let disposition: Result<(), JobError> = async {
+            match completion {
+                Err(e) => {
+                    span.record(
+                        "conclusion",
+                        if matches!(e, JobError::PoolCongestion(_)) {
+                            "Congestion"
+                        } else {
+                            "Error"
+                        },
+                    );
+                    self.fail_job(job.id, e, polled_job.attempt).await?
+                }
+                Ok(JobCompletion::Complete) => {
+                    span.record("conclusion", "Complete");
+                    let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                    self.complete_job(&mut op, job.id).await?;
+                    op.commit().await?;
+                }
+                #[cfg(feature = "es-entity")]
+                Ok(JobCompletion::CompleteWithOp(mut op)) => {
+                    span.record("conclusion", "CompleteWithOp");
+                    self.complete_job(&mut op, job.id).await?;
+                    op.commit().await?;
+                }
+                Ok(JobCompletion::CompleteWithTx(mut tx)) => {
+                    span.record("conclusion", "CompleteWithTx");
+                    self.complete_job(&mut tx, job.id).await?;
+                    tx.commit().await?;
+                }
+                Ok(JobCompletion::RescheduleNow) => {
+                    span.record("conclusion", "RescheduleNow");
+                    let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                    let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
+                    self.reschedule_job(&mut op, job.id, t).await?;
+                    op.commit().await?;
+                }
+                #[cfg(feature = "es-entity")]
+                Ok(JobCompletion::RescheduleNowWithOp(mut op)) => {
+                    span.record("conclusion", "RescheduleNowWithOp");
+                    let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
+                    self.reschedule_job(&mut op, job.id, t).await?;
+                    op.commit().await?;
+                }
+                Ok(JobCompletion::RescheduleNowWithTx(mut tx)) => {
+                    span.record("conclusion", "RescheduleNowWithTx");
+                    let t = self.clock.now();
+                    self.reschedule_job(&mut tx, job.id, t).await?;
+                    tx.commit().await?;
+                }
+                Ok(JobCompletion::RescheduleIn(d)) => {
+                    span.record("conclusion", "RescheduleIn");
+                    let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                    let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
+                    let t = t + d;
+                    self.reschedule_job(&mut op, job.id, t).await?;
+                    op.commit().await?;
+                }
+                #[cfg(feature = "es-entity")]
+                Ok(JobCompletion::RescheduleInWithOp(mut op, d)) => {
+                    span.record("conclusion", "RescheduleInWithOp");
+                    let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
+                    let t = t + d;
+                    self.reschedule_job(&mut op, job.id, t).await?;
+                    op.commit().await?;
+                }
+                Ok(JobCompletion::RescheduleInWithTx(mut tx, d)) => {
+                    span.record("conclusion", "RescheduleInWithOp");
+                    let t = self.clock.now() + d;
+                    self.reschedule_job(&mut tx, job.id, t).await?;
+                    tx.commit().await?;
+                }
+                Ok(JobCompletion::RescheduleAt(t)) => {
+                    span.record("conclusion", "RescheduleAt");
+                    let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                    self.reschedule_job(&mut op, job.id, t).await?;
+                    op.commit().await?;
+                }
+                #[cfg(feature = "es-entity")]
+                Ok(JobCompletion::RescheduleAtWithOp(mut op, t)) => {
+                    span.record("conclusion", "RescheduleAtWithOp");
+                    self.reschedule_job(&mut op, job.id, t).await?;
+                    op.commit().await?;
+                }
+                Ok(JobCompletion::RescheduleAtWithTx(mut tx, t)) => {
+                    span.record("conclusion", "RescheduleAtWithTx");
+                    self.reschedule_job(&mut tx, job.id, t).await?;
+                    tx.commit().await?;
+                }
             }
-            Ok(JobCompletion::Complete) => {
-                span.record("conclusion", "Complete");
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                self.complete_job(&mut op, job.id).await?;
-                op.commit().await?;
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::CompleteWithOp(mut op)) => {
-                span.record("conclusion", "CompleteWithOp");
-                self.complete_job(&mut op, job.id).await?;
-                op.commit().await?;
-            }
-            Ok(JobCompletion::CompleteWithTx(mut tx)) => {
-                span.record("conclusion", "CompleteWithTx");
-                self.complete_job(&mut tx, job.id).await?;
-                tx.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleNow) => {
-                span.record("conclusion", "RescheduleNow");
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleNowWithOp(mut op)) => {
-                span.record("conclusion", "RescheduleNowWithOp");
-                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleNowWithTx(mut tx)) => {
-                span.record("conclusion", "RescheduleNowWithTx");
-                let t = self.clock.now();
-                self.reschedule_job(&mut tx, job.id, t).await?;
-                tx.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleIn(d)) => {
-                span.record("conclusion", "RescheduleIn");
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                let t = t + d;
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleInWithOp(mut op, d)) => {
-                span.record("conclusion", "RescheduleInWithOp");
-                let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
-                let t = t + d;
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleInWithTx(mut tx, d)) => {
-                span.record("conclusion", "RescheduleInWithOp");
-                let t = self.clock.now() + d;
-                self.reschedule_job(&mut tx, job.id, t).await?;
-                tx.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleAt(t)) => {
-                span.record("conclusion", "RescheduleAt");
-                let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            #[cfg(feature = "es-entity")]
-            Ok(JobCompletion::RescheduleAtWithOp(mut op, t)) => {
-                span.record("conclusion", "RescheduleAtWithOp");
-                self.reschedule_job(&mut op, job.id, t).await?;
-                op.commit().await?;
-            }
-            Ok(JobCompletion::RescheduleAtWithTx(mut tx, t)) => {
-                span.record("conclusion", "RescheduleAtWithTx");
-                self.reschedule_job(&mut tx, job.id, t).await?;
-                tx.commit().await?;
-            }
+            Ok(())
+        }
+        .await;
+
+        // Every disposition failure funnels here, and every one of them
+        // leaves this job's row still `running` under this instance --
+        // mirror of `BatchDispatcher::execute_batch`'s rescue funnel and
+        // for the same reason: without handing the row back, it sits
+        // frozen until the lost-handler notices it a full
+        // `job_lost_interval` later. Hand it back instead, so the
+        // lost-handler is a true backstop rather than the primary
+        // recovery path.
+        if let Err(e) = disposition {
+            let claim_disposition = self.rescue_claimed_row().await;
+            span.record(
+                "claim_disposition",
+                tracing::field::display(claim_disposition),
+            );
+            tracing::error!(
+                job_id = %self.id,
+                job_type = %self.job_type,
+                exception.message = %e,
+                exception.type = std::any::type_name_of_val(&e),
+                claim_disposition = %claim_disposition,
+                "job disposition failed"
+            );
+            return Err(e);
         }
         Ok(())
     }
 
+    /// Best-effort last resort when a disposition write itself failed: hand
+    /// the claimed row back as `pending` with `execute_at = now` and
+    /// `attempt_index = 1` ([`Disposition::Fresh`] -- "we don't know what
+    /// happened, start fresh"), so the next poll re-dispatches it. The
+    /// solo counterpart of `BatchDispatcher::rescue_claimed_rows`.
+    async fn rescue_claimed_row(&mut self) -> ClaimDisposition {
+        let items = [(
+            self.id,
+            Disposition::Fresh {
+                at: self.clock.now(),
+            },
+        )];
+        match self.finalizer.clone().finalize(&items, |_, _| {}).await {
+            // The row write filters on `poller_instance_id`, so a job whose
+            // row was already dispositioned matches nothing and still lands
+            // here -- harmless either way.
+            Ok(_) => {
+                self.rescheduled = true;
+                ClaimDisposition::Rescheduled
+            }
+            Err(e) => {
+                tracing::error!(
+                    job_id = %self.id,
+                    job_type = %self.job_type,
+                    exception.message = %e,
+                    exception.type = std::any::type_name_of_val(&e),
+                    "could not release the claimed row; it stays running until \
+                     the lost-handler reclaims it"
+                );
+                ClaimDisposition::Leaked
+            }
+        }
+    }
+
     async fn dispatch_job(
+        finalizer: &Finalizer,
         runner: Box<dyn JobRunner>,
         current_job: CurrentJob,
     ) -> Result<JobCompletion, JobError> {
@@ -279,14 +372,7 @@ impl JobDispatcher {
             .await
         {
             Ok(Ok(completion)) => Ok(completion),
-            Ok(Err(e)) => {
-                let span = Span::current();
-                let error = e.to_string();
-                span.record("error", true);
-                span.record("error.message", tracing::field::display(&error));
-                span.record("error.level", tracing::field::display(tracing::Level::WARN));
-                Err(JobError::JobExecutionError(error))
-            }
+            Ok(Err(e)) => Err(finalizer.maybe_reclassify(e)),
             Err(panic) => {
                 let span = Span::current();
                 let message = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -336,168 +422,119 @@ impl JobDispatcher {
         )
     )]
     async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
-        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let mut job = self.repo.find_by_id_in_op(&mut op, id).await?;
-
         let span = Span::current();
-        let error_str = error.to_string();
         span.record("job_id", tracing::field::display(id));
-        span.record("job_type", tracing::field::display(&job.job_type));
+        span.record("job_type", tracing::field::display(&self.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
+
+        let error_str = match error {
+            JobError::PoolCongestion(message) => {
+                self.rescheduled = true;
+                return self
+                    .finalizer
+                    .reschedule_congested_one(id, attempt, message)
+                    .await;
+            }
+            other => other.to_string(),
+        };
         span.record("error", true);
         span.record("error.message", tracing::field::display(&error_str));
 
-        let retry_policy = RetryPolicy::from(&self.retry_settings);
+        let items = [(
+            id,
+            Disposition::Fail {
+                error: error_str,
+                attempt,
+            },
+        )];
+        let finalizer = self.finalizer.clone();
+        let outcome = finalizer
+            .finalize(&items, |op, outcome| {
+                // The exhausted-retries terminal delete frees this job's
+                // unit -- recycle it into an immediate same-type claim,
+                // exactly like a completion does.
+                if !outcome.errored_terminal.is_empty() {
+                    self.recycle_into_claim(op);
+                }
+            })
+            .await?;
 
-        if let Some((reschedule_at, next_attempt)) =
-            job.maybe_schedule_retry(self.clock.now(), attempt, &retry_policy, error_str)
-        {
+        if let Some((_, next_attempt)) = outcome.retried.first() {
             let exceeded_warn_attempts = self
                 .retry_settings
                 .n_warn_attempts
-                .is_some_and(|limit| next_attempt > limit);
-
+                .is_some_and(|limit| *next_attempt > limit);
             let level = if exceeded_warn_attempts {
                 tracing::Level::ERROR
             } else {
                 tracing::Level::WARN
             };
             span.record("error.level", tracing::field::display(level));
-            self.rescheduled = true;
             span.record("will_retry", true);
-
-            sqlx::query!(
-                r#"
-                UPDATE job_executions
-                SET state = 'pending', execute_at = $2, attempt_index = $3, poller_instance_id = NULL
-                WHERE id = $1 AND poller_instance_id = $4
-              "#,
-                id as JobId,
-                reschedule_at,
-                next_attempt as i32,
-                self.instance_id
-            )
-            .execute(op.as_executor())
-            .await?;
-            // Invariant B: the retrying row keeps its queue's active slot,
-            // but an older parked sibling should run first during the
-            // backoff.
-            PromoteHeadsHook::register(
-                &mut op,
-                &self.notifier,
-                [job.job_type.clone()],
-                vec![uuid::Uuid::from(id)],
-            )
-            .await?;
+            self.rescheduled = true;
         } else {
             span.record(
                 "error.level",
                 tracing::field::display(tracing::Level::ERROR),
             );
             span.record("will_retry", false);
-
-            self.delete_execution_in_op(&mut op, id).await?;
         }
-
-        self.repo.update_in_op(&mut op, &mut job).await?;
-        op.commit().await?;
         Ok(())
     }
 
-    /// Delete the execution row and report what its removal makes true: the
-    /// job is terminal, and — if it held a `queue_id` — that queue's oldest
-    /// parked sibling (if any) gets promoted to `pending` by a
-    /// [`PromoteHeadsHook`] freed-queue registration on this same
-    /// transaction. Promoting matters because the queue's backlog was, until
-    /// this moment, entirely unclaimable — `parked` rows never appear in the
-    /// claim scan — and the hook's notify is also the only wake for that
-    /// backlog: the poll loop sleeps on `next_due_at`, and a promoted row is
-    /// already due. The hook wakes the PROMOTED job's type, not this job's
-    /// own type — a poller only wakes for types it polls, and the two are
-    /// frequently different.
+    /// Hand this job's about-to-free unit of capacity to a `ClaimHook` so
+    /// it can be spent immediately on this SAME type's oldest due backlog
+    /// -- registered on `op`, claimed at its pre-commit (subject to the
+    /// pool-aware budget gate there). `ClaimHook` runs after
+    /// `PromoteHeadsHook` (its `RUNS_AFTER`), so a sibling the finalizer
+    /// promoted on this same op is already claimable by the short-circuit.
     ///
-    /// Also hands this job's about-to-free unit of capacity to a `ClaimHook`
-    /// so it can be spent immediately on this SAME type's own oldest due
-    /// backlog, independent of whichever type got promoted above.
-    /// `ClaimHook` runs after `PromoteHeadsHook` (its `RUNS_AFTER`), so a
-    /// sibling promoted here is already claimable by the short-circuit.
-    ///
-    /// This `DELETE` is what a spawner's `FOR KEY SHARE` on the same row
-    /// blocks (see `execution_hooks::insert`'s `lock_queue_occupants`): a
-    /// completion racing an in-flight spawn into this queue waits out that
-    /// spawn's commit tail. The promote deliberately runs as its OWN
-    /// later statement (the hook's), never as a CTE of the `DELETE` — see
-    /// [`PromoteHeadsHook`] for why folding it in silently orphans
-    /// the freshly parked row. Unlike `batch_dispatcher.rs`'s
-    /// multi-row completers this needs no id-ordered pre-lock -- a
-    /// single-row `DELETE` takes exactly one lock and so cannot be one side
-    /// of an ordering cycle.
-    ///
-    /// The `job_execution_states` row is deleted with the execution unless
-    /// this type sets [`KeyedJobInitializer::inherits_state`], which is the
-    /// only reason to keep one: the next generation of that key seeds from it
-    /// (and the key's next spawn compacts older rows away). Retention is
-    /// therefore something a type opts into, not a side effect of being keyed
-    /// — a keyed type that does not inherit state cleans up exactly like every
-    /// other flavor.
-    ///
-    /// [`KeyedJobInitializer::inherits_state`]: crate::KeyedJobInitializer::inherits_state
-    async fn delete_execution_in_op(
-        &mut self,
-        op: &mut impl es_entity::AtomicOperation,
-        id: JobId,
-    ) -> Result<(), JobError> {
-        let deleted = sqlx::query!(
-            r#"
-          WITH deleted AS (
-              DELETE FROM job_executions
-              WHERE id = $1 AND poller_instance_id = $2
-              RETURNING id, queue_id
-          ), cleanup AS (
-              DELETE FROM job_execution_states s USING deleted d
-              WHERE s.id = d.id AND NOT $3::boolean
-          )
-          SELECT d.queue_id AS "queue_id?" FROM deleted d
-        "#,
-            id as JobId,
-            self.instance_id,
-            self.retains_state,
-        )
-        .fetch_optional(op.as_executor())
-        .await?;
-
-        let Some(row) = deleted else {
-            return Ok(());
+    /// "At most once" has to hold across [`Finalizer::finalize`]'s retried
+    /// attempts, not just call sites: a rolled-back attempt drops its
+    /// `UnitReservation`, and dropping one *releases* the unit -- handing
+    /// out a second reservation for the same unit would release it twice
+    /// and hand the tracker capacity it does not have. A retried attempt
+    /// therefore forfeits the recycle optimisation, which costs at most one
+    /// extra poll: `recycle_unit` has already cleared `dispatched`, so
+    /// `Drop` correctly declines to release the unit a second time.
+    /// Mirrors `BatchDispatcher::try_recycle_own_type`.
+    fn recycle_into_claim(&mut self, op: &mut impl es_entity::AtomicOperation) {
+        if self.recycled {
+            return;
+        }
+        let Some(poller) = self.poller.upgrade() else {
+            return;
         };
-
-        self.notifier.job_terminal_in_op(op, id).await?;
-
-        if let Some(queue_id) = row.queue_id {
-            PromoteHeadsHook::register_freed_queues(op, &self.notifier, vec![queue_id]).await?;
-        }
-
-        if let Some(poller) = self.poller.upgrade() {
-            self.recycle_unit();
-            let reservation = self.tracker.recycle(&self.job_type);
-            poller.register_claim_recycle(op, &self.job_type, reservation);
-        }
-
-        Ok(())
+        self.recycled = true;
+        self.recycle_unit();
+        let reservation = self.tracker.recycle(&self.job_type);
+        poller.register_claim_recycle(op, &self.job_type, reservation);
     }
 
+    /// Complete via [`Disposition::Complete`] on the caller's op (the
+    /// runner's own transaction for the `*WithOp`/`*WithTx` completions).
+    /// The finalizer deletes the execution row, promotes the freed queue's
+    /// oldest parked sibling, and emits the terminal notification; the
+    /// freed unit recycles into an immediate same-type claim when the row
+    /// was actually this instance's to delete.
     #[instrument(name = "job.complete_job", skip(self, op), fields(id = %id))]
     async fn complete_job(
         &mut self,
         op: &mut impl es_entity::AtomicOperation,
         id: JobId,
     ) -> Result<(), JobError> {
-        let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
-        self.delete_execution_in_op(op, id).await?;
-        job.complete_job();
-        self.repo.update_in_op(op, &mut job).await?;
+        let items = [(id, Disposition::Complete)];
+        let outcome = self.finalizer.finalize_in_op(op, &items).await?;
+        if !outcome.completed.is_empty() {
+            self.recycle_into_claim(op);
+        }
         Ok(())
     }
 
+    /// Runner-requested reschedule via [`Disposition::Fresh`] on the
+    /// caller's op: back to `pending` at `reschedule_at` with
+    /// `attempt_index = 1` (an explicit reschedule has no notion of "which
+    /// attempt"), plus the finalizer's invariant-B promote registration.
     #[instrument(name = "job.reschedule_job", skip(self, op), fields(id = %id, reschedule_at = %reschedule_at, attempt = 1))]
     async fn reschedule_job(
         &mut self,
@@ -506,31 +543,8 @@ impl JobDispatcher {
         reschedule_at: DateTime<Utc>,
     ) -> Result<(), JobError> {
         self.rescheduled = true;
-        let mut job = self.repo.find_by_id_in_op(&mut *op, &id).await?;
-        sqlx::query!(
-            r#"
-          UPDATE job_executions
-          SET state = 'pending', execute_at = $2, attempt_index = 1, poller_instance_id = NULL
-          WHERE id = $1 AND poller_instance_id = $3
-        "#,
-            id as JobId,
-            reschedule_at,
-            self.instance_id
-        )
-        .execute(op.as_executor())
-        .await?;
-        // Invariant B: same ordering fixup as the retry branch of
-        // `fail_job` — the rescheduled row keeps its queue's active slot,
-        // but an older parked sibling should run first.
-        PromoteHeadsHook::register(
-            op,
-            &self.notifier,
-            [job.job_type.clone()],
-            vec![uuid::Uuid::from(id)],
-        )
-        .await?;
-        job.reschedule_execution(reschedule_at);
-        self.repo.update_in_op(op, &mut job).await?;
+        let items = [(id, Disposition::Fresh { at: reschedule_at })];
+        self.finalizer.finalize_in_op(op, &items).await?;
         Ok(())
     }
 }

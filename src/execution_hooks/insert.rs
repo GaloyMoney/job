@@ -320,8 +320,8 @@ impl ExecutionInsertHook {
     /// multi-queue batch completion touching the same two rows in opposite
     /// orders would deadlock.
     ///
-    /// `batch_dispatcher.rs`'s `complete_in_op`, `reschedule_in_op` and
-    /// `fail_in_op`'s retry branch are id-addressed (not queue-addressed,
+    /// `finalizer.rs`'s disposition writes (the reschedule updates and the
+    /// terminal delete) are id-addressed (not queue-addressed,
     /// unlike the lockers above) but order their own pre-locks by
     /// `(queue_id, id)` too, for exactly this reason -- a batch spanning
     /// several queues is otherwise just as capable of disagreeing with this
