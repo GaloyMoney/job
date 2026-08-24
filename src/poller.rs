@@ -9,10 +9,14 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
+// Only referenced by the #[cfg(test)]-gated waiter-spawn counter below --
+// unused (and denied by fail-on-warnings) in a normal build otherwise.
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 use super::{
     JobId,
