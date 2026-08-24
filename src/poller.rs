@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -91,6 +91,13 @@ pub(crate) struct JobPoller {
     /// so the poll that wakeup triggers can arm a fresh one if rotation still
     /// hasn't covered every elastic type.
     elastic_rotation_waiter_armed: AtomicBool,
+    /// Test-only instrumentation: counts every waiter task actually spawned
+    /// by [`Self::arm_elastic_rotation_waiter`] (i.e. every time the guard
+    /// above was NOT already held). Proves the guard collapses repeated/
+    /// concurrent arm calls into at most one live task rather than one per
+    /// call -- see `elastic_rotation_waiter_arm_is_idempotent_while_pending`.
+    #[cfg(test)]
+    elastic_rotation_waiter_spawns: AtomicUsize,
 }
 
 /// A small dedicated pool reusing the main pool's connect options, serving
@@ -346,6 +353,8 @@ impl JobPoller {
             shutdown_started: Arc::new(AtomicBool::new(false)),
             pool_waiter_armed: AtomicBool::new(false),
             elastic_rotation_waiter_armed: AtomicBool::new(false),
+            #[cfg(test)]
+            elastic_rotation_waiter_spawns: AtomicUsize::new(0),
         })
     }
 
@@ -643,6 +652,9 @@ impl JobPoller {
         {
             return;
         }
+        #[cfg(test)]
+        self.elastic_rotation_waiter_spawns
+            .fetch_add(1, Ordering::SeqCst);
         let poller = Arc::downgrade(self);
         spawn_named_task!("job-elastic-rotation-waiter", async move {
             tokio::time::sleep(ELASTIC_ROTATION_RECHECK).await;
@@ -3008,6 +3020,65 @@ mod tests {
         drop(c2);
         settle(&pool, 3).await;
         assert_eq!(pool_connection_headroom(&pool), 3);
+
+        Ok(())
+    }
+
+    /// The guard behind `arm_elastic_rotation_waiter` -- an `AtomicBool` CAS,
+    /// the same shape `arm_pool_headroom_waiter` uses -- must collapse many
+    /// concurrent/repeated arm calls into AT MOST ONE live waiter task, not
+    /// one per call. Without it, every poll that observed
+    /// `elastic_rotation_partial` would start its own independent
+    /// wake-in-`ELASTIC_ROTATION_RECHECK` chain -- and since that condition
+    /// is STANDING under load (elastic types outnumbering their tier
+    /// budget), unlike the pool-headroom waiter's transient one, nothing
+    /// would ever stop new chains from starting: the number of live chains
+    /// would grow without bound over the process lifetime, against the
+    /// dedicated poll pool.
+    ///
+    /// Proven by direct observation, not by re-reading the guard: calls
+    /// `arm_elastic_rotation_waiter` many times back to back with no
+    /// `.await` between them -- simulating a burst of notify-driven polls
+    /// all observing the same standing condition, the exact shape a
+    /// production accumulation would start from -- and asserts exactly one
+    /// task was ever spawned.
+    #[tokio::test]
+    async fn elastic_rotation_waiter_arm_is_idempotent_while_pending() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = Arc::new(JobRepo::new(&pool));
+        let tracker = Arc::new(JobTracker::new(0, 10));
+        let registry = JobRegistry::new(Arc::clone(&tracker));
+        let router = Arc::new(JobNotificationRouter::new(
+            &pool,
+            Arc::clone(&repo),
+            16,
+            Duration::from_secs(60),
+        ));
+        let notifier =
+            JobEventNotifier::spawn(&pool, Arc::clone(&tracker), router.terminal_sender());
+        let poller = Arc::new(
+            JobPoller::new(
+                JobPollerConfig::default(),
+                repo,
+                registry,
+                tracker,
+                router,
+                notifier,
+                ClockHandle::realtime(),
+            )
+            .await?,
+        );
+
+        for _ in 0..50 {
+            poller.arm_elastic_rotation_waiter();
+        }
+
+        assert_eq!(
+            poller.elastic_rotation_waiter_spawns.load(Ordering::SeqCst),
+            1,
+            "many arm calls while a waiter is already pending must spawn \
+             at most one task, not one per call"
+        );
 
         Ok(())
     }

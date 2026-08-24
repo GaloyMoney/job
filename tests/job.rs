@@ -4005,6 +4005,15 @@ async fn elastic_type_excluded_by_rotation_still_runs_promptly() -> anyhow::Resu
     // NOT `TestJobInitializer`: the head-swap short-circuit path claims a
     // due spawn on its own commit, bypassing `plan_claim`'s rotation
     // entirely -- this test needs the row to go through the ordinary poll.
+    // This isn't a synthetic detour from lana's actual failure: the
+    // resident outbox-handler jobs at the center of that bug never take
+    // the short-circuit path AT ALL, for any type, regardless of the
+    // initializer's own `short_circuit()` setting -- `JobRegistry::
+    // short_circuit`'s doc comment: "resident types never reach this
+    // check (`ResidentJobSpawner` holds no poller reference)". Forcing it
+    // off here for a plain type reaches the exact same "unclaimed and
+    // dependent on the ordinary poller" state lana's resident jobs are
+    // always in, not a different bug.
     let target_spawner = jobs.add_initializer(NoShortCircuitJobInitializer {
         job_type: helpers::job_type("rotation-recheck-z-target"),
     });
