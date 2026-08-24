@@ -1,3 +1,11 @@
+# [job release v0.13.7](https://github.com/GaloyMoney/job/releases/tag/0.13.7)
+
+
+
+### Bug Fixes
+
+- Reserve a claim-budget floor for uncapped types, wall-clock the pool waiter (#187)
+
 # [job release v0.13.6](https://github.com/GaloyMoney/job/releases/tag/0.13.6)
 
 
