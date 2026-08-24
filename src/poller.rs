@@ -546,7 +546,7 @@ impl JobPoller {
                 // Scoped so the upgraded `Arc` is dropped before the sleep:
                 // the waiter must not extend the poller's lifetime across a
                 // backoff step.
-                let sleep = {
+                {
                     let Some(poller) = poller.upgrade() else {
                         return;
                     };
@@ -560,9 +560,8 @@ impl JobPoller {
                         poller.tracker.wake();
                         return;
                     }
-                    poller.clock.sleep(backoff)
                 };
-                sleep.await;
+                tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(POOL_WAITER_MAX_BACKOFF);
             }
         });
@@ -594,12 +593,6 @@ impl JobPoller {
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
         if plan.types.is_empty() {
             if plan.clamped_by_pool {
-                // Due work exists but the pool has zero headroom. Claim
-                // nothing -- the rows stay `pending`, where a PEER instance
-                // with a healthy pool can claim them -- and arm the
-                // headroom waiter to wake this loop the moment a connection
-                // frees. `MAX_WAIT` below is only the fallback should the
-                // wake be lost.
                 self.arm_pool_headroom_waiter();
             }
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
