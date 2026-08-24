@@ -561,13 +561,6 @@ impl JobPoller {
                         return;
                     }
                 };
-                // Wall-clock, not `poller.clock`: shared-pool headroom is a
-                // real-resource question, independent of any manual
-                // application clock a test/simulation drives `poller.clock`
-                // with -- same doctrine as the lost-handler heartbeat
-                // above. A manual clock that is never advanced would
-                // otherwise mean this backoff never elapses and a poll
-                // that armed this waiter never gets woken.
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(POOL_WAITER_MAX_BACKOFF);
             }
@@ -600,13 +593,6 @@ impl JobPoller {
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
         if plan.types.is_empty() {
             if plan.clamped_by_pool {
-                // Due work exists but the pool has zero headroom. Claim
-                // nothing and arm the headroom waiter to wake this loop
-                // once a connection frees. Gated on an empty plan, not
-                // `clamped_by_pool` alone: an elastic type's assumed
-                // `n_jobs_to_poll` demand keeps that true on almost every
-                // poll, healthy headroom included -- arming unconditionally
-                // would wake the loop right back out of its sleep and spin.
                 self.arm_pool_headroom_waiter();
             }
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
