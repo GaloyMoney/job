@@ -2600,11 +2600,26 @@ async fn poll_jobs(
             -- claimed. Read-only: nothing in the claim chain (limits ->
             -- window_rows -> locked -> selected_jobs -> updated) references
             -- this CTE, so widening it cannot change what gets claimed.
-            SELECT MIN(execute_at) AS next_due_at
-            FROM job_executions
-            WHERE state = 'pending'
-            AND job_type = ANY($4::text[] || $8::text[])
-            AND execute_at > $2::timestamptz
+            --
+            -- Shaped as one ordered first-row index descent per type (same
+            -- pattern as window_rows), NOT `MIN(..) WHERE job_type =
+            -- ANY(..)`: the aggregate form reads EVERY matching future row
+            -- (measured 7.7k buffers against a 7.6k-row future backlog --
+            -- 11x an entire #172-era poll), while a per-type `ORDER BY ..
+            -- LIMIT 1` probe reads one page path per type through
+            -- `idx_job_executions_pending_execute_at` (68 buffers, flat in
+            -- backlog, same measurement).
+            SELECT MIN(next_due) AS next_due_at
+            FROM UNNEST($4::text[] || $8::text[]) AS mt(job_type)
+            CROSS JOIN LATERAL (
+                SELECT je.execute_at AS next_due
+                FROM job_executions je
+                WHERE je.state = 'pending'
+                  AND je.job_type = mt.job_type
+                  AND je.execute_at > $2::timestamptz
+                ORDER BY je.execute_at
+                LIMIT 1
+            ) probe
         ),
         excluded_due AS (
             -- Whether a row is due RIGHT NOW among the rotation-excluded
@@ -2615,15 +2630,28 @@ async fn poll_jobs(
             -- very poll). Surfaced as its own column, deliberately NOT
             -- folded into may_have_more: the Rust side bounds how long it
             -- may force zero-sleep re-polls (`bounded_recheck_sleep`),
-            -- which needs to tell the two causes apart. One index descent
-            -- per excluded type at most (EXISTS short-circuits on the
-            -- first hit); constant-false with no index work when $8 is
-            -- empty.
+            -- which needs to tell the two causes apart.
+            --
+            -- Same forced per-type LATERAL probe shape as min_wait above,
+            -- and here it is load-bearing for a second reason: a bare
+            -- `EXISTS(.. job_type = ANY(..) ..)` leaves the planner free to
+            -- pick a first-row-optimised seq scan, which measured 354
+            -- buffers wading through 20k non-matching heap rows to find a
+            -- hit -- and in the no-match case reads the ENTIRE table, every
+            -- poll. The LATERAL probe is one index descent per excluded
+            -- type at most, EXISTS stops at the first hit, and it is
+            -- constant-false with no index work when $8 is empty.
             SELECT EXISTS (
-                SELECT 1 FROM job_executions
-                WHERE state = 'pending'
-                  AND job_type = ANY($8::text[])
-                  AND execute_at <= $2::timestamptz
+                SELECT 1
+                FROM UNNEST($8::text[]) AS et(job_type)
+                CROSS JOIN LATERAL (
+                    SELECT 1 AS hit
+                    FROM job_executions je
+                    WHERE je.state = 'pending'
+                      AND je.job_type = et.job_type
+                      AND je.execute_at <= $2::timestamptz
+                    LIMIT 1
+                ) probe
             ) AS excluded_due
         ),
         window_counts AS (
