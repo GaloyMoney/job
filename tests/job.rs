@@ -41,6 +41,35 @@ impl JobInitializer for TestJobInitializer {
     }
 }
 
+/// Same runner as [`TestJobInitializer`], but opted OUT of the head-swap
+/// short-circuit path: a due spawn is claimed only by the ordinary poll,
+/// never on its own commit. Needed by tests that must exercise `plan_claim`
+/// itself (short-circuit claims bypass it entirely).
+struct NoShortCircuitJobInitializer {
+    job_type: JobType,
+}
+
+impl JobInitializer for NoShortCircuitJobInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn short_circuit(&self) -> bool {
+        false
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: TestJobConfig = job.config()?;
+        Ok(Box::new(TestJobRunner { config }))
+    }
+}
+
 struct TestJobRunner {
     config: TestJobConfig,
 }
@@ -3927,6 +3956,77 @@ async fn capped_type_does_not_starve_others() -> anyhow::Result<()> {
     jobs.handles(capped_ids)
         .await_all(Duration::from_secs(30))
         .await?;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Regression for the rotated elastic floor's wake-visibility gap: an
+/// elastic type excluded from this poll's plan (`plan_claim`'s floor
+/// window rotates when elastic types outnumber the tier's budget) must
+/// still run promptly once its due row is spawned, not park until
+/// `MAX_WAIT` -- or, under a frozen clock with nothing else to wake it,
+/// effectively never.
+///
+/// Registers 8 elastic (uncapped plain) types against `helpers::init_pool`'s
+/// small budget so the floor window can only cover a few of them per poll,
+/// spawns ONE due row for the type that sorts alphabetically LAST (the
+/// worst rotation position -- the first poll's window starts at index 0),
+/// and never advances the manual clock: the row can only complete because
+/// the poller keeps re-polling and rotating, never because a deadline it
+/// could see arrived.
+///
+/// Before the fix, `plan_claim`'s excluded types are invisible to both the
+/// claim query and `min_wait`'s next-due computation, so a poll that misses
+/// the target type sees nothing due among the types it DID plan and sleeps
+/// `MAX_WAIT` (60s) -- and with no further spawn to notify it, every
+/// subsequent poll repeats that 60s sleep, so cycling rotation all the way
+/// to the target type takes minutes, not seconds. This test's bound (well
+/// under `MAX_WAIT`) fails deterministically on the pre-fix behaviour.
+#[tokio::test]
+async fn elastic_type_excluded_by_rotation_still_runs_promptly() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let (clock, _controller) = ClockHandle::manual();
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .clock(clock)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+
+    // 7 distractors that sort BEFORE the target and never get any work
+    // spawned -- just registered so the elastic tier has more types than
+    // the pool's budget can cover in one poll.
+    for i in 0..7 {
+        jobs.add_initializer(TestJobInitializer {
+            job_type: helpers::job_type(&format!("rotation-recheck-a{i}")),
+        });
+    }
+    // NOT `TestJobInitializer`: the head-swap short-circuit path claims a
+    // due spawn on its own commit, bypassing `plan_claim`'s rotation
+    // entirely -- this test needs the row to go through the ordinary poll.
+    let target_spawner = jobs.add_initializer(NoShortCircuitJobInitializer {
+        job_type: helpers::job_type("rotation-recheck-z-target"),
+    });
+
+    jobs.start_poll().await?;
+
+    let target_id = JobId::new();
+    target_spawner
+        .spawn(target_id, TestJobConfig { delay_ms: 0 })
+        .await?;
+
+    let outcome = jobs
+        .handle(target_id)
+        .await_completion(Duration::from_secs(15))
+        .await?;
+    assert_eq!(
+        outcome.state(),
+        JobTerminalState::Completed,
+        "a type excluded from the elastic floor's rotation window must still \
+         run promptly once due, not park past MAX_WAIT waiting on a wake \
+         that never comes under a frozen clock"
+    );
 
     jobs.shutdown().await?;
     Ok(())

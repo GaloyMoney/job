@@ -84,6 +84,13 @@ pub(crate) struct JobPoller {
     /// before waking the poll loop, so the poll that wakeup triggers can arm
     /// a fresh one if the headroom is already gone again.
     pool_waiter_armed: AtomicBool,
+    /// Whether an elastic-rotation waiter task (see
+    /// [`Self::arm_elastic_rotation_waiter`]) is currently live. At most one
+    /// at a time: a poll whose plan left `ClaimPlan::elastic_rotation_partial`
+    /// set arms it, and it disarms itself right before waking the poll loop,
+    /// so the poll that wakeup triggers can arm a fresh one if rotation still
+    /// hasn't covered every elastic type.
+    elastic_rotation_waiter_armed: AtomicBool,
 }
 
 /// A small dedicated pool reusing the main pool's connect options, serving
@@ -218,6 +225,41 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 const POOL_WAITER_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const POOL_WAITER_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
+/// Re-check delay for the elastic-rotation waiter
+/// ([`JobPoller::arm_elastic_rotation_waiter`]): armed whenever a poll's
+/// plan left `ClaimPlan::elastic_rotation_partial` set -- i.e. the elastic
+/// floor window excluded at least one registered elastic type this poll
+/// (see `JobRegistry::plan_claim`).
+///
+/// An excluded type's due rows are invisible to BOTH this poll's claim
+/// query and `min_wait`'s next-due computation (both are scoped to
+/// `plan.types`), so the window-derived sleep can't be trusted to reflect
+/// them. That alone would just mean a wrong number -- the reason it needs
+/// its OWN waiter, not a smaller number plugged into the existing sleep, is
+/// that the existing sleep is `self.clock.timeout(..)`-based (`main_loop`):
+/// under a manual/paused clock (exactly the shape this bug was found under
+/// -- lana's tests run on one) that timeout never elapses on its own no
+/// matter how small it is, only `tracker.notified()` firing does. This
+/// waiter uses plain `tokio::time::sleep`, real wall-clock time regardless
+/// of which clock the application clock is, and explicitly calls
+/// `tracker.wake()` -- the same reason [`Self::arm_pool_headroom_waiter`]
+/// does, not a coincidence of style.
+///
+/// A single fixed delay, not a doubling backoff like the pool-headroom
+/// waiter: that waiter loops internally until ITS condition (headroom
+/// returning) clears, which is transient. Elastic types outnumbering their
+/// tier budget is a STANDING condition under load, not transient, so this
+/// waiter is one-shot per arm instead -- it wakes once and exits, and the
+/// next poll re-arms it if `elastic_rotation_partial` is still set. Every
+/// registered elastic type enters the rotation window within `n` polls
+/// regardless of `take` (see
+/// `elastic_types_rotate_through_a_scarce_floor_across_polls`), so
+/// convergence is bounded at `n` re-checks; 1s keeps that bounded in
+/// seconds while holding indefinitely cheaply on an app whose elastic type
+/// count structurally exceeds its tier's share -- same order of magnitude
+/// as `POOL_WAITER_MAX_BACKOFF`'s own steady state, for the same reason.
+const ELASTIC_ROTATION_RECHECK: Duration = Duration::from_secs(1);
+
 /// How far past its admission budget a poll gathers candidates, so
 /// `FOR UPDATE ... SKIP LOCKED` has somewhere to fall through when a peer
 /// instance holds locks on the rows this poll would target. Sized for
@@ -303,6 +345,7 @@ impl JobPoller {
             internal_pool,
             shutdown_started: Arc::new(AtomicBool::new(false)),
             pool_waiter_armed: AtomicBool::new(false),
+            elastic_rotation_waiter_armed: AtomicBool::new(false),
         })
     }
 
@@ -567,6 +610,52 @@ impl JobPoller {
         });
     }
 
+    /// Spawn (at most one) background task that sleeps
+    /// [`ELASTIC_ROTATION_RECHECK`] on real wall-clock time, then wakes the
+    /// poll loop ([`JobTracker::wake`]). Armed by a poll whose plan left
+    /// `ClaimPlan::elastic_rotation_partial` set (`JobRegistry::plan_claim`'s
+    /// floor window excluded a registered elastic type this poll).
+    ///
+    /// One-shot, not a condition-checking loop like
+    /// [`Self::arm_pool_headroom_waiter`]: there is no cheap external signal
+    /// to poll for ("has rotation reached the excluded type yet" is only
+    /// answerable by actually polling), and the underlying condition --
+    /// elastic types outnumbering their tier's budget -- is a standing
+    /// property of the app's registered types under load, not a transient
+    /// one that resolves on its own. So this just forces the next poll to
+    /// happen soon, in real time; that poll's own `plan_claim` call decides
+    /// whether to arm another one.
+    ///
+    /// Plain `tokio::time::sleep`, not `self.clock.sleep`/`self.clock.timeout`:
+    /// `main_loop`'s own sleep between polls IS clock-based
+    /// (`self.clock.timeout(timeout, self.tracker.notified())`), which is
+    /// exactly the problem -- under a manual/paused clock that timeout never
+    /// elapses no matter how short, so a poll that only shortened its
+    /// returned duration would still park forever. This waiter runs on real
+    /// time regardless of which clock the application uses, and calling
+    /// `tracker.wake()` resolves `notified()` immediately, independent of
+    /// the outer clock-based timeout wrapping it -- same mechanism
+    /// `arm_pool_headroom_waiter` already relies on for the same reason.
+    fn arm_elastic_rotation_waiter(self: &Arc<Self>) {
+        if self
+            .elastic_rotation_waiter_armed
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let poller = Arc::downgrade(self);
+        spawn_named_task!("job-elastic-rotation-waiter", async move {
+            tokio::time::sleep(ELASTIC_ROTATION_RECHECK).await;
+            let Some(poller) = poller.upgrade() else {
+                return;
+            };
+            poller
+                .elastic_rotation_waiter_armed
+                .store(false, Ordering::Release);
+            poller.tracker.wake();
+        });
+    }
+
     #[instrument(
         name = "job.poll_and_dispatch",
         level = "debug",
@@ -591,6 +680,9 @@ impl JobPoller {
         let unit_budget = self.pool_unit_budget();
         let plan = self.registry.plan_claim(n_jobs_to_poll, unit_budget);
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
+        if plan.elastic_rotation_partial {
+            self.arm_elastic_rotation_waiter();
+        }
         if plan.types.is_empty() {
             if plan.clamped_by_pool {
                 self.arm_pool_headroom_waiter();

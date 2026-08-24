@@ -144,6 +144,17 @@ pub(super) struct ClaimPlan {
     /// (`JobPoller::arm_pool_headroom_waiter`) so recovery does not wait
     /// out the idle-poll fallback.
     pub clamped_by_pool: bool,
+    /// Whether this poll's elastic floor window (see [`JobRegistry::plan_claim`])
+    /// excluded at least one registered elastic type. An excluded type's due
+    /// rows are invisible to this poll's claim query AND to `min_wait`'s
+    /// next-due computation (both are scoped to `types`), so a poll with this
+    /// set can't trust a `WaitTillNextJob` window the way a fully-covering
+    /// poll can: read by `poll_and_dispatch` to arm
+    /// `JobPoller::arm_elastic_rotation_waiter`, which forces another poll
+    /// soon on REAL wall-clock time (not the application clock -- see that
+    /// method's doc comment for why the distinction matters) instead of
+    /// parking past a due row this poll structurally cannot see.
+    pub elastic_rotation_partial: bool,
 }
 
 /// Keeps track of registered job types and their retry behaviour.
@@ -486,6 +497,7 @@ impl JobRegistry {
             types,
             row_limits,
             clamped_by_pool,
+            elastic_rotation_partial: take < n,
         }
     }
 }
@@ -744,6 +756,26 @@ mod tests {
             elastic.len(),
             "every elastic type must be picked within enough polls to cycle through them all"
         );
+    }
+
+    /// `elastic_rotation_partial` must be set exactly when the floor window
+    /// left a registered elastic type out of the plan -- it is the signal
+    /// `poll_and_dispatch` reads to stop trusting a window-derived sleep
+    /// that can't see the excluded type's due rows.
+    #[test]
+    fn elastic_rotation_partial_reflects_whether_the_window_covers_every_elastic_type() {
+        let mut registry = JobRegistry::new(Arc::new(JobTracker::new(0, 10)));
+        for i in 0..5 {
+            registry.add_initializer(UncappedInitializer(JobType::new(Box::leak(
+                format!("registry-plan-claim-rotation-partial-{i}").into_boxed_str(),
+            ))));
+        }
+
+        // budget 2 < 5 elastic types: the window can't cover them all.
+        assert!(registry.plan_claim(50, 2).elastic_rotation_partial);
+
+        // budget 5 == 5 elastic types: the window covers every one of them.
+        assert!(!registry.plan_claim(50, 5).elastic_rotation_partial);
     }
 
     /// At `unit_budget == 1` neither tier's demand fits, so a fixed
