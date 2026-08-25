@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -84,6 +84,33 @@ pub(crate) struct JobPoller {
     /// before waking the poll loop, so the poll that wakeup triggers can arm
     /// a fresh one if the headroom is already gone again.
     pool_waiter_armed: AtomicBool,
+    /// Whether a recheck waiter task (see [`Self::arm_recheck_waiter`]) is
+    /// currently live. At most one at a time: a poll whose
+    /// `excluded_due` re-poll was suppressed by the spin bound
+    /// ([`Self::bounded_recheck_sleep`]) arms it, and it disarms itself
+    /// right before waking the poll loop, so the poll that wakeup triggers
+    /// can arm a fresh one if the condition still holds.
+    recheck_waiter_armed: AtomicBool,
+    /// Consecutive completely-unproductive `excluded_due` polls: polls that
+    /// claimed NOTHING while the excluded-due probe was still reporting a
+    /// due row outside the rotation window. [`Self::bounded_recheck_sleep`]
+    /// grants `Duration::ZERO` re-polls only while this stays within two
+    /// full rotation laps; past that the row is provably not claimable
+    /// right now and re-polling degrades to the real-time backoff waiter.
+    /// Reset by any poll that claims a row or observes `excluded_due`
+    /// clear.
+    recheck_streak: AtomicUsize,
+    /// Current backoff for [`Self::arm_recheck_waiter`], in milliseconds.
+    /// Doubles per tripped poll from [`RECHECK_INITIAL_BACKOFF`] up to
+    /// [`RECHECK_MAX_BACKOFF`]; reset alongside `recheck_streak`.
+    recheck_backoff_ms: AtomicUsize,
+    /// Test-only instrumentation: counts every waiter task actually spawned
+    /// by [`Self::arm_recheck_waiter`] (i.e. every time the guard above was
+    /// NOT already held). Proves the guard collapses repeated/concurrent arm
+    /// calls into at most one live task rather than one per call -- see
+    /// `recheck_waiter_arm_is_idempotent_while_pending`.
+    #[cfg(test)]
+    recheck_waiter_spawns: AtomicUsize,
 }
 
 /// A small dedicated pool reusing the main pool's connect options, serving
@@ -218,6 +245,31 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 const POOL_WAITER_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const POOL_WAITER_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
+/// Backoff schedule for the recheck waiter
+/// ([`JobPoller::arm_recheck_waiter`]), armed only when the spin bound
+/// trips ([`JobPoller::bounded_recheck_sleep`]): a due row exists among the
+/// rotation-excluded elastic types (`excluded_due`), but two full rotation
+/// laps of zero-sleep re-polls claimed nothing, so the row is provably not
+/// claimable right now (e.g. its head is locked by a peer's in-flight
+/// claim) and immediate re-polling has stopped buying anything.
+///
+/// Real wall-clock `tokio::time::sleep`, not `self.clock.sleep`: the poll
+/// loop's own sleep is application-clock-based
+/// (`self.clock.timeout(timeout, self.tracker.notified())`), which under a
+/// manual/paused clock only ever fires via `tracker.notified()` -- and the
+/// lock-holder releasing a row emits no notification. `tracker.wake()`
+/// resolves `notified()` immediately regardless of clock mode, same as
+/// [`JobPoller::arm_pool_headroom_waiter`], for the same reason.
+///
+/// Same schedule as the pool-headroom waiter and for the same shape of
+/// condition: the common unclaimable-row cause (a peer's claim transaction
+/// holding the row's lock) clears on query-duration timescales, so the
+/// fine-grained early rechecks (10/20/40/80ms) catch it within tens of
+/// milliseconds, while doubling caps a genuinely stuck row at one poll per
+/// second instead of an unbounded zero-sleep spin.
+const RECHECK_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const RECHECK_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
 /// How far past its admission budget a poll gathers candidates, so
 /// `FOR UPDATE ... SKIP LOCKED` has somewhere to fall through when a peer
 /// instance holds locks on the rows this poll would target. Sized for
@@ -303,6 +355,11 @@ impl JobPoller {
             internal_pool,
             shutdown_started: Arc::new(AtomicBool::new(false)),
             pool_waiter_armed: AtomicBool::new(false),
+            recheck_waiter_armed: AtomicBool::new(false),
+            recheck_streak: AtomicUsize::new(0),
+            recheck_backoff_ms: AtomicUsize::new(RECHECK_INITIAL_BACKOFF.as_millis() as usize),
+            #[cfg(test)]
+            recheck_waiter_spawns: AtomicUsize::new(0),
         })
     }
 
@@ -567,6 +624,99 @@ impl JobPoller {
         });
     }
 
+    /// The re-poll policy for `excluded_due`: a poll's claim couldn't see a
+    /// due row because its type sat outside the elastic rotation window
+    /// (`JobRegistry::plan_claim`), so the honest response is to re-poll
+    /// immediately -- each re-poll advances the rotation by one position, so
+    /// the window reaches any excluded type within one lap
+    /// (`plan.n_elastic` polls) and the row is claimed within milliseconds.
+    /// `Duration::ZERO` is safe under a manual/paused clock (unlike any
+    /// positive duration, which only `tracker.notified()` can pre-empt
+    /// there): the manual `ClockSleep` completes whenever `now >= wake_at`,
+    /// which a zero delay satisfies without the clock ever advancing.
+    ///
+    /// The BOUND, and why it must exist: "due" does not imply "claimable".
+    /// A due row whose head is locked by a peer stays pending -- and with
+    /// two or more such rows of elastic types sitting further apart in the
+    /// rotation order than the window is wide, at least one is excluded on
+    /// EVERY poll, so an unconditional zero-sleep re-poll would spin the
+    /// claim query at full rate for as long as the rows stay locked.
+    /// `recheck_streak` counts consecutive completely-unproductive
+    /// `excluded_due` polls (nothing claimed at all); zero-sleep re-polls
+    /// are granted only while the streak is within TWO full rotation laps.
+    /// One lap guarantees every elastic type had a window slot, so a row
+    /// still due-and-excluded after two laps of claim-nothing polls is not
+    /// claimable right now, and this degrades to the real-time backoff
+    /// waiter ([`Self::arm_recheck_waiter`]) plus the honest
+    /// window-derived sleep. Any poll that claims a row, or observes
+    /// `excluded_due` clear, resets both the streak and the backoff.
+    ///
+    /// Claims DO reset the streak: a spin that claims rows every poll is
+    /// the pre-existing drain behaviour (`may_have_more` / full-claim),
+    /// not the pathology this bounds -- the bound targets re-polling that
+    /// buys nothing.
+    fn bounded_recheck_sleep(
+        self: &Arc<Self>,
+        base: Duration,
+        jobs_claimed: usize,
+        excluded_due: bool,
+        n_elastic: usize,
+    ) -> Duration {
+        if !excluded_due {
+            self.recheck_streak.store(0, Ordering::Relaxed);
+            self.recheck_backoff_ms.store(
+                RECHECK_INITIAL_BACKOFF.as_millis() as usize,
+                Ordering::Relaxed,
+            );
+            return base;
+        }
+        if jobs_claimed > 0 {
+            self.recheck_streak.store(0, Ordering::Relaxed);
+            return Duration::ZERO;
+        }
+        let streak = self.recheck_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak <= n_elastic.saturating_mul(2) {
+            return Duration::ZERO;
+        }
+        let backoff_ms = self.recheck_backoff_ms.load(Ordering::Relaxed);
+        self.recheck_backoff_ms.store(
+            backoff_ms
+                .saturating_mul(2)
+                .min(RECHECK_MAX_BACKOFF.as_millis() as usize),
+            Ordering::Relaxed,
+        );
+        self.arm_recheck_waiter(Duration::from_millis(backoff_ms as u64));
+        base
+    }
+
+    /// Spawn (at most one) background task that sleeps `delay` on real
+    /// wall-clock time, then wakes the poll loop ([`JobTracker::wake`]).
+    /// Armed only by [`Self::bounded_recheck_sleep`] when its spin bound
+    /// trips; see [`RECHECK_INITIAL_BACKOFF`] for why this must be real
+    /// time and why the schedule is what it is.
+    ///
+    /// One-shot, not a condition-checking loop like
+    /// [`Self::arm_pool_headroom_waiter`]: whether the excluded row has
+    /// become claimable is only answerable by actually polling, so this
+    /// just forces the next poll to happen soon; that poll re-arms with a
+    /// doubled delay if the condition still holds.
+    fn arm_recheck_waiter(self: &Arc<Self>, delay: Duration) {
+        if self.recheck_waiter_armed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        #[cfg(test)]
+        self.recheck_waiter_spawns.fetch_add(1, Ordering::SeqCst);
+        let poller = Arc::downgrade(self);
+        spawn_named_task!("job-claim-recheck-waiter", async move {
+            tokio::time::sleep(delay).await;
+            let Some(poller) = poller.upgrade() else {
+                return;
+            };
+            poller.recheck_waiter_armed.store(false, Ordering::Release);
+            poller.tracker.wake();
+        });
+    }
+
     #[instrument(
         name = "job.poll_and_dispatch",
         level = "debug",
@@ -605,6 +755,7 @@ impl JobPoller {
             n_jobs_to_poll,
             self.instance_id,
             &plan.types,
+            &plan.rotation_excluded,
             &plan.row_limits,
             CONTENTION_HEADROOM,
             &self.clock,
@@ -613,7 +764,12 @@ impl JobPoller {
 
         let (rows, window) = match result {
             JobPollResult::WaitTillNextJob(window) => {
-                let duration = window.sleep_for(self.clock.now());
+                let duration = self.bounded_recheck_sleep(
+                    window.sleep_for(self.clock.now()),
+                    0,
+                    window.excluded_due,
+                    plan.n_elastic,
+                );
                 span.record("next_poll_in", tracing::field::debug(duration));
                 span.record("n_jobs_to_start", 0);
                 return Ok(duration);
@@ -624,12 +780,17 @@ impl JobPoller {
         span.record("n_jobs_to_start", jobs_len);
 
         // Full claim: budget was the limit, drain immediately. Partial claim: sleep,
-        // unless `may_have_more` says the due backlog wasn't fully seen this poll.
-        let next_poll_in = if jobs_len == n_jobs_to_poll {
+        // unless `may_have_more` says the due backlog wasn't fully seen this poll
+        // or `excluded_due` says a due row sat outside the rotation window
+        // (`bounded_recheck_sleep` turns the latter into a zero-sleep re-poll,
+        // within its spin bound).
+        let base = if jobs_len == n_jobs_to_poll {
             Duration::ZERO
         } else {
             window.sleep_for(self.clock.now())
         };
+        let next_poll_in =
+            self.bounded_recheck_sleep(base, jobs_len, window.excluded_due, plan.n_elastic);
         span.record("next_poll_in", tracing::field::debug(next_poll_in));
 
         // Deliberately not detached from the poll loop: `dispatch_job`/
@@ -2302,7 +2463,7 @@ async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::
 #[instrument(
     name = "job.poll_jobs",
     level = "debug",
-    skip(pool, pollable_types, row_limits, clock),
+    skip(pool, pollable_types, rotation_excluded, row_limits, clock),
     fields(n_jobs_to_poll, instance_id = %instance_id, n_jobs_found = tracing::field::Empty)
 )]
 #[allow(clippy::too_many_arguments)]
@@ -2311,6 +2472,7 @@ async fn poll_jobs(
     n_jobs_to_poll: usize,
     instance_id: uuid::Uuid,
     pollable_types: &[super::entity::JobType],
+    rotation_excluded: &[super::entity::JobType],
     row_limits: &[i32],
     headroom: i32,
     clock: &ClockHandle,
@@ -2431,11 +2593,66 @@ async fn poll_jobs(
             RETURNING je.id, selected_jobs.data_json, je.attempt_index, je.queue_id
         ),
         min_wait AS (
-            SELECT MIN(execute_at) AS next_due_at
-            FROM job_executions
-            WHERE state = 'pending'
-            AND job_type = ANY($4)
-            AND execute_at > $2::timestamptz
+            -- Scoped to the plan's types PLUS the rotation-excluded elastic
+            -- types ($8): the claim above deliberately can't see an excluded
+            -- type's rows, but the sleep deadline must -- otherwise a poll
+            -- could park past work the NEXT poll's rotated window would have
+            -- claimed. Read-only: nothing in the claim chain (limits ->
+            -- window_rows -> locked -> selected_jobs -> updated) references
+            -- this CTE, so widening it cannot change what gets claimed.
+            --
+            -- Shaped as one ordered first-row index descent per type (same
+            -- pattern as window_rows), NOT `MIN(..) WHERE job_type =
+            -- ANY(..)`: the aggregate form reads EVERY matching future row
+            -- (measured 7.7k buffers against a 7.6k-row future backlog --
+            -- 11x an entire #172-era poll), while a per-type `ORDER BY ..
+            -- LIMIT 1` probe reads one page path per type through
+            -- `idx_job_executions_pending_execute_at` (68 buffers, flat in
+            -- backlog, same measurement).
+            SELECT MIN(next_due) AS next_due_at
+            FROM UNNEST($4::text[] || $8::text[]) AS mt(job_type)
+            CROSS JOIN LATERAL (
+                SELECT je.execute_at AS next_due
+                FROM job_executions je
+                WHERE je.state = 'pending'
+                  AND je.job_type = mt.job_type
+                  AND je.execute_at > $2::timestamptz
+                ORDER BY je.execute_at
+                LIMIT 1
+            ) probe
+        ),
+        excluded_due AS (
+            -- Whether a row is due RIGHT NOW among the rotation-excluded
+            -- elastic types. Such a row falls between the two mechanisms
+            -- above: not claimable this poll (its type is outside the
+            -- window) and invisible to min_wait (which is future-only,
+            -- because due-now rows of PLANNED types are claimed by this
+            -- very poll). Surfaced as its own column, deliberately NOT
+            -- folded into may_have_more: the Rust side bounds how long it
+            -- may force zero-sleep re-polls (`bounded_recheck_sleep`),
+            -- which needs to tell the two causes apart.
+            --
+            -- Same forced per-type LATERAL probe shape as min_wait above,
+            -- and here it is load-bearing for a second reason: a bare
+            -- `EXISTS(.. job_type = ANY(..) ..)` leaves the planner free to
+            -- pick a first-row-optimised seq scan, which measured 354
+            -- buffers wading through 20k non-matching heap rows to find a
+            -- hit -- and in the no-match case reads the ENTIRE table, every
+            -- poll. The LATERAL probe is one index descent per excluded
+            -- type at most, EXISTS stops at the first hit, and it is
+            -- constant-false with no index work when $8 is empty.
+            SELECT EXISTS (
+                SELECT 1
+                FROM UNNEST($8::text[]) AS et(job_type)
+                CROSS JOIN LATERAL (
+                    SELECT 1 AS hit
+                    FROM job_executions je
+                    WHERE je.state = 'pending'
+                      AND je.job_type = et.job_type
+                      AND je.execute_at <= $2::timestamptz
+                    LIMIT 1
+                ) probe
+            ) AS excluded_due
         ),
         window_counts AS (
             SELECT job_type, COUNT(*) AS cnt FROM window_rows GROUP BY job_type
@@ -2468,8 +2685,9 @@ async fn poll_jobs(
                 u.attempt_index AS "attempt_index?",
                 u.queue_id AS "queue_id?",
                 NULL::TIMESTAMPTZ AS "next_due_at?",
-                ps.may_have_more AS "may_have_more!"
-            FROM updated u, poll_status ps
+                ps.may_have_more AS "may_have_more!",
+                ed.excluded_due AS "excluded_due!"
+            FROM updated u, poll_status ps, excluded_due ed
             UNION ALL
             SELECT
                 NULL::UUID AS "id?: JobId",
@@ -2477,8 +2695,9 @@ async fn poll_jobs(
                 NULL::INT AS "attempt_index?",
                 NULL::VARCHAR AS "queue_id?",
                 mw.next_due_at AS "next_due_at?",
-                ps.may_have_more AS "may_have_more!"
-            FROM min_wait mw, poll_status ps
+                ps.may_have_more AS "may_have_more!",
+                ed.excluded_due AS "excluded_due!"
+            FROM min_wait mw, poll_status ps, excluded_due ed
         ) AS result
         "#,
         n_jobs_to_poll as i32,
@@ -2488,6 +2707,7 @@ async fn poll_jobs(
         wall_now,
         row_limits,
         headroom,
+        rotation_excluded as _,
     )
     .fetch_all(pool)
     .await?;
@@ -2502,6 +2722,13 @@ async fn poll_jobs(
 struct PollWindow {
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
+    /// A row is due right now among the rotation-excluded elastic types --
+    /// claimable only after the rotation window advances to its type. NOT
+    /// consulted by [`Self::sleep_for`]: unlike `may_have_more`, whose
+    /// zero-sleep is always productive (claimable work was provably left
+    /// behind), this one needs the spin bound in
+    /// `JobPoller::bounded_recheck_sleep`, which is where it is read.
+    excluded_due: bool,
 }
 
 impl PollWindow {
@@ -2533,6 +2760,7 @@ struct JobPollRow {
     queue_id: Option<String>,
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
+    excluded_due: bool,
 }
 
 impl JobPollResult {
@@ -2543,9 +2771,11 @@ impl JobPollResult {
         let mut window = PollWindow {
             next_due_at: None,
             may_have_more: false,
+            excluded_due: false,
         };
         for row in rows {
             window.may_have_more = row.may_have_more;
+            window.excluded_due = row.excluded_due;
             match (row.id, row.attempt_index) {
                 (Some(id), Some(attempt_index)) => jobs.push(PolledJob {
                     id,
@@ -2920,6 +3150,186 @@ mod tests {
         Ok(())
     }
 
+    /// An uncapped ("elastic") plain type for driving `plan_claim` through a
+    /// real `JobPoller` -- `init` is unreachable because the tests using it
+    /// never let a claimed row reach dispatch.
+    struct ElasticInitializer {
+        job_type: JobType,
+    }
+
+    impl crate::JobInitializer for ElasticInitializer {
+        type Config = ();
+
+        fn job_type(&self) -> JobType {
+            self.job_type.clone()
+        }
+
+        fn init(
+            &self,
+            _job: &Job,
+            _: crate::JobSpawner<Self::Config>,
+        ) -> Result<Box<dyn crate::JobRunner>, Box<dyn std::error::Error>> {
+            unimplemented!("never invoked by this test")
+        }
+    }
+
+    async fn build_poller(
+        pool: &PgPool,
+        registry: JobRegistry,
+        tracker: Arc<JobTracker>,
+    ) -> anyhow::Result<Arc<JobPoller>> {
+        let repo = Arc::new(JobRepo::new(pool));
+        let router = Arc::new(JobNotificationRouter::new(
+            pool,
+            Arc::clone(&repo),
+            16,
+            Duration::from_secs(60),
+        ));
+        let notifier =
+            JobEventNotifier::spawn(pool, Arc::clone(&tracker), router.terminal_sender());
+        Ok(Arc::new(
+            JobPoller::new(
+                JobPollerConfig::default(),
+                repo,
+                registry,
+                tracker,
+                router,
+                notifier,
+                ClockHandle::realtime(),
+            )
+            .await?,
+        ))
+    }
+
+    /// The guard behind `arm_recheck_waiter` -- an `AtomicBool` CAS, the
+    /// same shape `arm_pool_headroom_waiter` uses -- must collapse many
+    /// concurrent/repeated arm calls into AT MOST ONE live waiter task, not
+    /// one per call: otherwise every tripped poll would start its own
+    /// independent wake chain and the number of live chains would grow
+    /// without bound for as long as the unclaimable row persists.
+    ///
+    /// Proven by direct observation, not by re-reading the guard: calls
+    /// `arm_recheck_waiter` many times back to back with no `.await`
+    /// between them -- simulating a burst of tripped polls -- and asserts
+    /// exactly one task was ever spawned.
+    #[tokio::test]
+    async fn recheck_waiter_arm_is_idempotent_while_pending() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let tracker = Arc::new(JobTracker::new(0, 10));
+        let registry = JobRegistry::new(Arc::clone(&tracker));
+        let poller = build_poller(&pool, registry, tracker).await?;
+
+        for _ in 0..50 {
+            poller.arm_recheck_waiter(RECHECK_MAX_BACKOFF);
+        }
+
+        assert_eq!(
+            poller.recheck_waiter_spawns.load(Ordering::SeqCst),
+            1,
+            "many arm calls while a waiter is already pending must spawn \
+             at most one task, not one per call"
+        );
+
+        Ok(())
+    }
+
+    /// The spin bound on `excluded_due` re-polls
+    /// ([`JobPoller::bounded_recheck_sleep`]): a due row that CANNOT be
+    /// claimed must not produce an unbounded zero-sleep poll loop.
+    ///
+    /// This constructs the worst-case shape, which is NOT a single stuck
+    /// row: with one, the poll where its type rotates into the window sees
+    /// `excluded_due` clear (the row is no longer excluded) and returns an
+    /// honest positive sleep, breaking the spin after at most one lap. The
+    /// unbounded case needs due-but-locked rows of TWO elastic types
+    /// sitting further apart in the rotation order than the window is wide
+    /// -- then at least one is excluded on every poll, `excluded_due` never
+    /// clears, and an unbounded design would return `Duration::ZERO`
+    /// forever. 24 registered elastic types with stuck rows at sorted
+    /// positions 0 and 12 guarantees that: co-covering both needs a window
+    /// at least 13 wide, above any unit budget a test pool can produce.
+    ///
+    /// Counted observation, deterministic: `poll_and_dispatch` is called
+    /// directly in a loop (no timers, no races -- each call IS one poll),
+    /// counting how many consecutive polls come back `Duration::ZERO`. The
+    /// bound is two full rotation laps (`2 * n_elastic`); the poll after
+    /// that must return a non-zero sleep AND have armed the real-time
+    /// recheck waiter (observed via the spawn counter) so recovery still
+    /// happens in bounded real time once the locks release.
+    #[tokio::test]
+    async fn unclaimable_excluded_due_rows_do_not_spin_unbounded() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        // min_jobs must be nonzero: `next_batch_size` returns `None` (poll
+        // parks at MAX_WAIT before planning anything) once running >= min.
+        let tracker = Arc::new(JobTracker::new(1, 10));
+        let mut registry = JobRegistry::new(Arc::clone(&tracker));
+        let run = uuid::Uuid::now_v7();
+        let n_elastic = 24usize;
+        let mut type_names = Vec::new();
+        for i in 0..n_elastic {
+            let name = format!("spin-bound-{run}-{i:02}");
+            registry.add_initializer(ElasticInitializer {
+                job_type: JobType::from_owned(name.clone()),
+            });
+            type_names.push(name);
+        }
+        let poller = build_poller(&pool, registry, tracker).await?;
+
+        // Two due rows, positions 0 and 12 in the (alphabetical) rotation
+        // order -- never both inside one window.
+        let due = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let stuck_a = seed_pending_job(&pool, &type_names[0], due).await?;
+        let stuck_b = seed_pending_job(&pool, &type_names[12], due).await?;
+
+        // Lock both rows in an open transaction, exactly what a peer
+        // instance's in-flight claim would hold: due, pending, unclaimable.
+        let mut lock_tx = pool.begin().await?;
+        sqlx::query("SELECT id FROM job_executions WHERE id = ANY($1) FOR UPDATE")
+            .bind(vec![uuid::Uuid::from(stuck_a), uuid::Uuid::from(stuck_b)])
+            .fetch_all(&mut *lock_tx)
+            .await?;
+
+        let bound = 2 * n_elastic;
+        let mut zeros = 0usize;
+        let mut first_non_zero = None;
+        for i in 0..(bound + 10) {
+            let sleep = poller.poll_and_dispatch(false).await?;
+            if sleep == Duration::ZERO {
+                zeros += 1;
+            } else {
+                first_non_zero = Some((i, sleep));
+                break;
+            }
+        }
+
+        let (polls_before_stop, sleep) = first_non_zero.unwrap_or_else(|| {
+            panic!(
+                "{} consecutive zero-sleep polls against unclaimable rows and \
+                 still spinning: the bound never engaged",
+                bound + 10
+            )
+        });
+        assert!(
+            polls_before_stop <= bound,
+            "zero-sleep re-polls must stop within two rotation laps \
+             ({bound}): got {polls_before_stop}"
+        );
+        assert_eq!(zeros, polls_before_stop);
+        assert!(
+            sleep > Duration::ZERO,
+            "the tripped poll must fall back to an honest sleep"
+        );
+        assert!(
+            poller.recheck_waiter_spawns.load(Ordering::SeqCst) >= 1,
+            "tripping the bound must arm the real-time recheck waiter -- \
+             the honest sleep alone is inert under a manual clock and the \
+             lock releasing emits no notification"
+        );
+
+        lock_tx.rollback().await?;
+        Ok(())
+    }
+
     /// `unit_budget`'s factor arithmetic: the default 1.0 is the identity
     /// (current behaviour exactly), fractional factors shift admission in
     /// the expected direction, and rounding is `floor` -- including the
@@ -3155,6 +3565,7 @@ mod tests {
             n_jobs_to_poll,
             instance_id,
             &pollable_types,
+            &[],
             &row_limits,
             CONTENTION_HEADROOM,
             &clock,
@@ -3326,6 +3737,7 @@ mod tests {
             n_jobs_to_poll,
             instance_id,
             &pollable_types,
+            &[],
             &row_limits,
             CONTENTION_HEADROOM,
             &clock,

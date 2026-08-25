@@ -144,6 +144,23 @@ pub(super) struct ClaimPlan {
     /// (`JobPoller::arm_pool_headroom_waiter`) so recovery does not wait
     /// out the idle-poll fallback.
     pub clamped_by_pool: bool,
+    /// The elastic types this poll's rotating floor window (see
+    /// [`JobRegistry::plan_claim`]) did NOT include -- empty whenever the
+    /// window covers every registered elastic type. An excluded type's rows
+    /// are deliberately invisible to this poll's CLAIM (that is what the
+    /// rotation is), but must not be invisible to its SLEEP: `poll_jobs`
+    /// folds these types back into `min_wait`'s next-due computation (so the
+    /// poller never over-sleeps past their future work) and probes them for
+    /// already-due rows (`excluded_due`), which forces a prompt re-poll so
+    /// the rotation can advance to them (see
+    /// `JobPoller::bounded_recheck_sleep` for the spin bound on that path).
+    pub rotation_excluded: Vec<JobType>,
+    /// Total registered elastic types this poll (`rotation_excluded.len()`
+    /// plus the window's `take`). One full rotation lap -- the number of
+    /// consecutive polls after which every elastic type is guaranteed to
+    /// have had a window slot -- is exactly this many polls, which is what
+    /// `JobPoller::bounded_recheck_sleep` sizes its spin bound from.
+    pub n_elastic: usize,
 }
 
 /// Keeps track of registered job types and their retry behaviour.
@@ -481,11 +498,16 @@ impl JobRegistry {
             types.push(job_type.clone());
             row_limits.push(units as i32);
         }
+        let rotation_excluded = (take..n)
+            .map(|i| elastic[(offset + i) % n].0.clone())
+            .collect();
 
         ClaimPlan {
             types,
             row_limits,
             clamped_by_pool,
+            rotation_excluded,
+            n_elastic: n,
         }
     }
 }
@@ -744,6 +766,40 @@ mod tests {
             elastic.len(),
             "every elastic type must be picked within enough polls to cycle through them all"
         );
+    }
+
+    /// `rotation_excluded` must name exactly the elastic types the floor
+    /// window left out of the plan -- it is what `poll_jobs` folds back into
+    /// the sleep computation (`min_wait` + the `excluded_due` probe) so a
+    /// poll can't over-sleep past rows its claim structurally can't see.
+    /// The window's picks and the excluded set must partition the elastic
+    /// types: disjoint, and together covering all of them.
+    #[test]
+    fn rotation_excluded_names_the_elastic_types_the_window_left_out() {
+        let mut registry = JobRegistry::new(Arc::new(JobTracker::new(0, 10)));
+        for i in 0..5 {
+            registry.add_initializer(UncappedInitializer(JobType::new(Box::leak(
+                format!("registry-plan-claim-rotation-partial-{i}").into_boxed_str(),
+            ))));
+        }
+
+        // budget 2 < 5 elastic types: the window can't cover them all, and
+        // the 3 it left out are exactly the elastic types not in the plan.
+        let plan = registry.plan_claim(50, 2);
+        assert_eq!(plan.n_elastic, 5);
+        assert_eq!(plan.rotation_excluded.len(), 3);
+        for excluded in &plan.rotation_excluded {
+            assert!(
+                !plan.types.contains(excluded),
+                "an excluded type must not also be in the claim plan"
+            );
+        }
+
+        // budget 5 == 5 elastic types: the window covers every one of them.
+        let plan = registry.plan_claim(50, 5);
+        assert_eq!(plan.n_elastic, 5);
+        assert!(plan.rotation_excluded.is_empty());
+        assert_eq!(plan.types.len(), 5);
     }
 
     /// At `unit_budget == 1` neither tier's demand fits, so a fixed
