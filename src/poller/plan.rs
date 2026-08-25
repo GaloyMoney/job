@@ -20,6 +20,21 @@
 //! prefix winning every single poll. Unspent bounded budget still grows
 //! the picked elastic types past their floor.
 //!
+//! Tie-group rotation only rotates types that share the SAME cost, so a
+//! type whose demand is larger than every tie ahead of it in cost order is
+//! never a tie-group member -- if the cheaper types alone exceed the
+//! tier's budget every poll (the scarce-budget case this module exists
+//! for), that larger type is starved by cost class, not just by identity,
+//! and no amount of tick advancing ever reaches it. `bounded_streak`
+//! tracks, per bounded type, consecutive polls where it had real demand
+//! but lost the budget; once a type's streak reaches the tier's own size,
+//! it is force-included ahead of the normal smallest-first order (ties
+//! among several simultaneously-forced types broken by longest-starved,
+//! then smallest-demand). This is aging, the standard fix for starvation
+//! under a smallest-job-first policy -- it is the fallback that applies
+//! when cost differs; tie-group rotation stays the low-latency path for
+//! the common same-cost case.
+//!
 //! The plan also reports what it could NOT cover: `clamped_by_pool` (due
 //! work exists that a short budget left unclaimed -- arms the headroom
 //! waiter) and `rotation_excluded`/`rotation_lap` (the types EITHER tier's
@@ -48,8 +63,10 @@ pub(super) struct ClaimPlan {
     /// budget; empty whenever nothing was dropped.
     pub rotation_excluded: Vec<JobType>,
     /// Polls needed to guarantee every excluded type -- either tier -- has
-    /// had a turn at least once: `max(elastic type count, largest bounded
-    /// tie-group)`. Sizes the recheck spin bound.
+    /// had a turn at least once: `max(elastic type count, bounded type
+    /// count)` -- the bounded side is sized for the aging fallback's own
+    /// worst case, not just tie-group rotation's. Sizes the recheck spin
+    /// bound.
     pub rotation_lap: usize,
 }
 
@@ -59,6 +76,12 @@ pub(super) struct ClaimPlanner {
     /// Advanced once per plan; rotates which elastic types (and, at
     /// `unit_budget == 1`, which tier) get a scarce claim slot.
     tick: AtomicUsize,
+    /// Consecutive polls each bounded type has had real demand but lost
+    /// the tier's budget; reset to absent (0) the poll it is served. Keyed
+    /// fresh from scratch every poll, so a type with no current demand is
+    /// pruned rather than accumulating a stale streak. See the module doc
+    /// -- this is the aging fallback for cross-cost-class starvation.
+    bounded_streak: std::sync::Mutex<std::collections::HashMap<JobType, usize>>,
 }
 
 impl ClaimPlanner {
@@ -67,6 +90,7 @@ impl ClaimPlanner {
             registry,
             tracker,
             tick: AtomicUsize::new(0),
+            bounded_streak: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -122,11 +146,8 @@ impl ClaimPlanner {
         // but ties (most bounded types cost 1 unit) are broken by rotating
         // each same-cost run by tick, so a scarce budget cycles through
         // WHICH types in a tie win instead of the same registration-order
-        // prefix losing every single poll (handoff-0138). Track the widest
-        // tie group -- its own length is exactly how many polls guarantee
-        // every member of that group has won the rotation at least once.
+        // prefix losing every single poll (handoff-0138).
         bounded.sort_by_key(|(_, _, units, _)| *units);
-        let mut bounded_rotation_lap = 0usize;
         let mut start = 0;
         while start < bounded.len() {
             let units = bounded[start].2;
@@ -135,17 +156,45 @@ impl ClaimPlanner {
                 end += 1;
             }
             let group_len = end - start;
-            bounded_rotation_lap = bounded_rotation_lap.max(group_len);
             bounded[start..end].rotate_left(tick % group_len);
             start = end;
         }
 
+        // Tie-group rotation cannot help a type whose demand is larger
+        // than every tie ahead of it in cost order -- it is never a member
+        // of any tie group, so no amount of tick advancing brings it
+        // forward. Age it in instead: once a type has lost the budget on
+        // `starvation_threshold` consecutive polls where it had real
+        // demand, force it to the front of THIS poll's spend, ahead of the
+        // normal smallest-first order (handoff-0138 follow-up).
+        let n_bounded = bounded.len();
+        let starvation_threshold = n_bounded.max(1);
+        let old_streaks = std::mem::take(
+            &mut *self
+                .bounded_streak
+                .lock()
+                .expect("bounded_streak lock poisoned"),
+        );
+        let (mut forced, mut rest): (Vec<_>, Vec<_>) = bounded
+            .into_iter()
+            .map(|(job_type, limit, units, elastic)| {
+                let streak = old_streaks.get(&job_type).copied().unwrap_or(0);
+                (job_type, limit, units, elastic, streak)
+            })
+            .partition(|(.., streak)| *streak >= starvation_threshold);
+        // Longest-starved wins among several simultaneously-forced types;
+        // smallest-demand stays the secondary key.
+        forced.sort_by(|a, b| b.4.cmp(&a.4).then(a.2.cmp(&b.2)));
+        rest.sort_by_key(|(_, _, units, ..)| *units);
+
         let mut types = Vec::new();
         let mut row_limits = Vec::new();
         let mut rotation_excluded = Vec::new();
+        let mut new_streaks = std::collections::HashMap::new();
         let mut bounded_remaining = bounded_tier_budget;
-        for (job_type, limit, units, _) in bounded {
+        for (job_type, limit, units, _, streak) in forced.into_iter().chain(rest) {
             if bounded_remaining == 0 {
+                new_streaks.insert(job_type.clone(), streak + 1);
                 rotation_excluded.push(job_type);
                 continue;
             }
@@ -162,6 +211,7 @@ impl ClaimPlanner {
                 (bounded_remaining, bounded_remaining)
             };
             if limit == 0 {
+                new_streaks.insert(job_type.clone(), streak + 1);
                 rotation_excluded.push(job_type);
                 continue;
             }
@@ -169,6 +219,10 @@ impl ClaimPlanner {
             row_limits.push(limit as i32);
             bounded_remaining -= units;
         }
+        *self
+            .bounded_streak
+            .lock()
+            .expect("bounded_streak lock poisoned") = new_streaks;
 
         let n = elastic.len();
         let take = elastic_tier_budget.min(n);
@@ -190,7 +244,7 @@ impl ClaimPlanner {
             row_limits,
             clamped_by_pool,
             rotation_excluded,
-            rotation_lap: n.max(bounded_rotation_lap),
+            rotation_lap: n.max(n_bounded),
         }
     }
 }
@@ -501,6 +555,57 @@ mod tests {
             seen.len(),
             bounded.len(),
             bounded.len()
+        );
+    }
+
+    /// RED-FIRST regression, follow-up finding on handoff-0138: tie-group
+    /// rotation only rotates types that share the SAME cost. A bounded type
+    /// whose demand is strictly larger than every tie ahead of it in
+    /// smallest-first order is never a member of any tie group -- if the
+    /// smaller-cost types alone consume the whole tier budget every poll
+    /// (as they will whenever their combined demand exceeds it, which is
+    /// exactly the scarce-budget case this fix targets), the larger type is
+    /// reached with `bounded_remaining == 0` on EVERY poll, forever, and
+    /// tick never changes that: it is not a tie-group member, so no amount
+    /// of rotation ever brings it forward. Smallest-demand-first is
+    /// deliberately preserved by this fix (see the module doc), so this
+    /// type must still make progress some OTHER way -- across-cost-class
+    /// starvation, not just within-tie starvation.
+    #[test]
+    fn bounded_type_with_demand_exceeding_every_tie_still_makes_progress() {
+        let mut registry = JobRegistry::new();
+        for i in 0..30 {
+            registry.add_initializer(FixedCapInitializer {
+                job_type: JobType::new(Box::leak(
+                    format!("plan-claim-cross-cost-small-{i:02}").into_boxed_str(),
+                )),
+                cap: Some(1),
+            });
+        }
+        let heavy = registry.add_initializer(FixedCapInitializer {
+            job_type: JobType::new("plan-claim-cross-cost-heavy"),
+            cap: Some(5),
+        });
+        let planner = planner(registry);
+
+        // budget 4 < the 30 one-unit types' combined demand (30): the
+        // budget is exhausted by cost-1 items alone every single poll,
+        // before smallest-first order ever reaches the cost-5 type.
+        let mut served = false;
+        for _ in 0..60 {
+            let plan = planner.plan(50, 4);
+            if let Some(idx) = plan.types.iter().position(|t| t == &heavy) {
+                assert!(plan.row_limits[idx] >= 1, "a served type must get >=1 row");
+                served = true;
+                break;
+            }
+        }
+
+        assert!(
+            served,
+            "a bounded type whose demand exceeds every tie ahead of it in \
+             smallest-first order must still be planned within a bounded \
+             number of polls, not lose to the same smaller-cost types forever"
         );
     }
 
