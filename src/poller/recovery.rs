@@ -20,19 +20,35 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{JobId, entity::JobType, execution_hooks::PromoteHeadsHook, task::OwnedTaskHandle};
+use es_entity::clock::ClockHandle;
 
-use super::JobPoller;
+use crate::{
+    JobId, entity::JobType, execution_hooks::PromoteHeadsHook, notifier::JobEventNotifier,
+    task::OwnedTaskHandle, tracker::JobTracker,
+};
 
-impl JobPoller {
-    pub(super) fn start_lost_handler(&self) -> OwnedTaskHandle {
-        let job_lost_interval = self.config.job_lost_interval;
-        let pool = self.repo.pool().clone();
+/// The monitors' dependencies, captured once at poller construction; each
+/// `spawn_*` clones what its task needs and holds no poller reference.
+pub(super) struct Recovery {
+    pub(super) pool: PgPool,
+    pub(super) clock: ClockHandle,
+    pub(super) supported_job_types: Vec<JobType>,
+    pub(super) instance_id: uuid::Uuid,
+    pub(super) tracker: Arc<JobTracker>,
+    pub(super) notifier: Arc<JobEventNotifier>,
+    pub(super) job_lost_interval: Duration,
+    pub(super) pending_jobs_check_interval: Duration,
+}
+
+impl Recovery {
+    pub(super) fn spawn_lost_handler(&self) -> OwnedTaskHandle {
+        let pool = self.pool.clone();
         let clock = self.clock.clone();
-        let supported_job_types = self.registry.registered_job_types();
+        let supported_job_types = self.supported_job_types.clone();
         let instance_id = self.instance_id;
         let tracker = Arc::clone(&self.tracker);
         let notifier = Arc::clone(&self.notifier);
+        let job_lost_interval = self.job_lost_interval;
         OwnedTaskHandle::new(spawn_named_task!("job-poller-lost-handler", async move {
             loop {
                 tokio::time::sleep(job_lost_interval / 2).await;
@@ -126,11 +142,11 @@ impl JobPoller {
         }))
     }
 
-    pub(super) fn start_keep_alive_handler(&self) -> OwnedTaskHandle {
-        let job_lost_interval = self.config.job_lost_interval;
-        let pool = self.repo.pool().clone();
+    pub(super) fn spawn_keep_alive_handler(&self) -> OwnedTaskHandle {
+        let pool = self.pool.clone();
         let instance_id = self.instance_id;
         let tracker = Arc::clone(&self.tracker);
+        let job_lost_interval = self.job_lost_interval;
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-keep-alive-handler",
             async move {
@@ -200,11 +216,11 @@ impl JobPoller {
         ))
     }
 
-    pub(super) fn start_stale_jobs_handler(&self) -> OwnedTaskHandle {
-        let pending_jobs_check_interval = self.config.pending_jobs_check_interval;
-        let pool = self.repo.pool().clone();
+    pub(super) fn spawn_stale_jobs_handler(&self) -> OwnedTaskHandle {
+        let pool = self.pool.clone();
         let clock = self.clock.clone();
-        let supported_job_types = self.registry.registered_job_types();
+        let supported_job_types = self.supported_job_types.clone();
+        let pending_jobs_check_interval = self.pending_jobs_check_interval;
         OwnedTaskHandle::new(spawn_named_task!(
             "job-poller-stale-jobs-handler",
             async move {

@@ -13,10 +13,13 @@
 
 use sqlx::postgres::PgPool;
 
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
-use super::JobPoller;
+use crate::tracker::JobTracker;
 
 const POOL_WAITER_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const POOL_WAITER_MAX_BACKOFF: Duration = Duration::from_secs(1);
@@ -31,36 +34,62 @@ pub(crate) fn pool_connection_headroom(main_pool: &PgPool) -> usize {
 }
 
 /// Headroom -> dispatch units at `connections_per_job` per unit, floored.
-pub(super) fn unit_budget(headroom: usize, connections_per_job: f64) -> usize {
+fn unit_budget(headroom: usize, connections_per_job: f64) -> usize {
     (headroom as f64 / connections_per_job).floor() as usize
 }
 
-impl JobPoller {
-    pub(super) fn pool_unit_budget(&self) -> usize {
+pub(super) struct PoolBudget {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    pool: PgPool,
+    connections_per_job: f64,
+    tracker: Arc<JobTracker>,
+    armed: AtomicBool,
+}
+
+impl PoolBudget {
+    pub(super) fn new(pool: &PgPool, connections_per_job: f64, tracker: Arc<JobTracker>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                pool: pool.clone(),
+                connections_per_job,
+                tracker,
+                armed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub(super) fn unit_budget(&self) -> usize {
         unit_budget(
-            pool_connection_headroom(self.repo.pool()),
-            self.config.connections_per_job,
+            pool_connection_headroom(&self.inner.pool),
+            self.inner.connections_per_job,
         )
     }
 
     /// At most one waiter lives at a time (CAS guard); it disarms itself
     /// BEFORE waking so the woken poll can re-arm if headroom is gone again,
-    /// and holds only a `Weak` so it can never keep the poller alive.
-    pub(super) fn arm_pool_headroom_waiter(self: &Arc<Self>) {
-        if self.pool_waiter_armed.swap(true, Ordering::AcqRel) {
+    /// and holds only a `Weak` so it can never outlive its poller.
+    pub(super) fn arm_waiter(&self) {
+        if self.inner.armed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let poller = Arc::downgrade(self);
+        let inner: Weak<Inner> = Arc::downgrade(&self.inner);
         spawn_named_task!("job-pool-headroom-waiter", async move {
             let mut backoff = POOL_WAITER_INITIAL_BACKOFF;
             loop {
                 {
-                    let Some(poller) = poller.upgrade() else {
+                    let Some(inner) = inner.upgrade() else {
                         return;
                     };
-                    if poller.pool_unit_budget() > 0 {
-                        poller.pool_waiter_armed.store(false, Ordering::Release);
-                        poller.tracker.wake();
+                    if unit_budget(
+                        pool_connection_headroom(&inner.pool),
+                        inner.connections_per_job,
+                    ) > 0
+                    {
+                        inner.armed.store(false, Ordering::Release);
+                        inner.tracker.wake();
                         return;
                     }
                 };

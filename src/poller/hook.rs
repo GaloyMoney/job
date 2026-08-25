@@ -253,7 +253,7 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
         // Same pool-aware admission as the ordinary poll: with zero budget
         // claim nothing -- reservations drop into ordinary releases and the
         // rows stay `pending` for healthy peers.
-        let unit_budget = poller.pool_unit_budget();
+        let unit_budget = poller.budget.unit_budget();
         if unit_budget == 0 {
             return es_entity::operation::hooks::PreCommitRet::ok(self, op);
         }

@@ -68,8 +68,10 @@ mod test_support;
 pub(crate) use budget::pool_connection_headroom;
 pub(crate) use hook::ClaimHook;
 
+use budget::PoolBudget;
 use claim_query::{CONTENTION_HEADROOM, JobPollResult, poll_jobs};
 use recheck::Recheck;
+use recovery::Recovery;
 use shutdown::ShutdownCoordinator;
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -89,8 +91,9 @@ pub(crate) struct JobPoller {
     internal_pool: PgPool,
     /// Shared with [`ShutdownCoordinator`]; see `shutdown`.
     shutdown_started: Arc<AtomicBool>,
-    pool_waiter_armed: AtomicBool,
+    budget: PoolBudget,
     recheck: Recheck,
+    recovery: Recovery,
 }
 
 /// A small dedicated pool reusing the main pool's connect options, serving
@@ -160,20 +163,35 @@ impl JobPoller {
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >(1);
         let internal_pool = build_internal_pool(repo.pool()).await?;
+        let instance_id = uuid::Uuid::now_v7();
         Ok(Self {
             recheck: Recheck::new(Arc::clone(&tracker)),
+            budget: PoolBudget::new(
+                repo.pool(),
+                config.connections_per_job,
+                Arc::clone(&tracker),
+            ),
+            recovery: Recovery {
+                pool: repo.pool().clone(),
+                clock: clock.clone(),
+                supported_job_types: registry.registered_job_types(),
+                instance_id,
+                tracker: Arc::clone(&tracker),
+                notifier: Arc::clone(&notifier),
+                job_lost_interval: config.job_lost_interval,
+                pending_jobs_check_interval: config.pending_jobs_check_interval,
+            },
             tracker,
             notifier,
             repo,
             config,
             registry,
             router,
-            instance_id: uuid::Uuid::now_v7(),
+            instance_id,
             shutdown_tx,
             clock,
             internal_pool,
             shutdown_started: Arc::new(AtomicBool::new(false)),
-            pool_waiter_armed: AtomicBool::new(false),
         })
     }
 
@@ -196,9 +214,9 @@ impl JobPoller {
         router_listener_handle: OwnedTaskHandle,
         router_waiter_handle: OwnedTaskHandle,
     ) -> JobPollerHandle {
-        let lost_handle = self.start_lost_handler();
-        let keep_alive_handle = self.start_keep_alive_handler();
-        let stale_jobs_handle = self.start_stale_jobs_handler();
+        let lost_handle = self.recovery.spawn_lost_handler();
+        let keep_alive_handle = self.recovery.spawn_keep_alive_handler();
+        let stale_jobs_handle = self.recovery.spawn_stale_jobs_handler();
         let shutdown_tx = self.shutdown_tx.clone();
         let repo = Arc::clone(&self.repo);
         let instance_id = self.instance_id;
@@ -310,12 +328,12 @@ impl JobPoller {
             span.record("n_jobs_to_start", 0);
             return Ok(MAX_WAIT);
         };
-        let unit_budget = self.pool_unit_budget();
+        let unit_budget = self.budget.unit_budget();
         let plan = self.registry.plan_claim(n_jobs_to_poll, unit_budget);
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
         if plan.types.is_empty() {
             if plan.clamped_by_pool {
-                self.arm_pool_headroom_waiter();
+                self.budget.arm_waiter();
             }
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
