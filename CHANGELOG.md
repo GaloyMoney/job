@@ -1,3 +1,11 @@
+# [job release v0.13.9](https://github.com/GaloyMoney/job/releases/tag/0.13.9)
+
+
+
+### Bug Fixes
+
+- Rotate bounded-tier ties so a scarce budget can't strand the same types forever (#190)
+
 # [job release v0.13.8](https://github.com/GaloyMoney/job/releases/tag/0.13.8)
 
 
