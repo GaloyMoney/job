@@ -465,7 +465,7 @@ impl Jobs {
             config.poller_config.min_jobs_per_process,
             config.poller_config.max_jobs_per_process,
         ));
-        let registry = Arc::new(Mutex::new(Some(JobRegistry::new(Arc::clone(&tracker)))));
+        let registry = Arc::new(Mutex::new(Some(JobRegistry::new())));
         let router = Arc::new(JobNotificationRouter::new(
             &pool,
             Arc::clone(&repo),

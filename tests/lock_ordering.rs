@@ -237,17 +237,21 @@ async fn keep_alive_skips_a_contended_row_and_still_refreshes_the_rest() -> anyh
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let pinned_before = alive_at(&pool, pinned).await?;
-    let free_before = alive_at(&pool, free).await?;
-
     // A competing lock on ONE row, held across several heartbeats. Its own
     // connection, so the pool the poller uses cannot be starved by it.
+    // Pinned BEFORE the alive_at snapshots below: with the lock already
+    // held, no heartbeat can move the pinned row's alive_at between the
+    // snapshot and the assertion -- reading first would race a beat into
+    // that gap.
     let holder_pool = helpers::init_pool().await?;
     let mut holder = holder_pool.begin().await?;
     sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR UPDATE")
         .bind(uuid::Uuid::from(pinned))
         .fetch_one(&mut *holder)
         .await?;
+
+    let pinned_before = alive_at(&pool, pinned).await?;
+    let free_before = alive_at(&pool, free).await?;
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
 

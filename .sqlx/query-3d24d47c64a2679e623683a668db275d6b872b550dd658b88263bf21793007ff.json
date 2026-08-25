@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH locked AS MATERIALIZED (\n                SELECT je.id, u.execute_at FROM job_executions je\n                JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)\n                  ON je.id = u.id\n                WHERE je.state = 'running' AND je.poller_instance_id = $3\n                ORDER BY je.queue_id, je.id\n                FOR NO KEY UPDATE OF je\n            )\n            UPDATE job_executions je\n            SET state = 'pending', poller_instance_id = NULL, execute_at = l.execute_at\n            FROM locked l WHERE je.id = l.id\n            RETURNING je.id AS \"id!: JobId\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: JobId",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TimestamptzArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3d24d47c64a2679e623683a668db275d6b872b550dd658b88263bf21793007ff"
+}
