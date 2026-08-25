@@ -1,16 +1,18 @@
-//! Crash repair, all on real wall-clock time -- liveness must keep moving
-//! even when the application runs a frozen manual clock. The keep-alive
-//! loop heartbeats `alive_at` on this instance's running rows (ordered
-//! `(queue_id, id)`, `FOR NO KEY UPDATE SKIP LOCKED` -- one unordered
-//! multi-row writer re-poisons every ordered one, and a skipped beat can
-//! never look lost: the worst gap is half the liveness threshold). The
-//! lost handler reclaims rows whose heartbeat went stale, with an attempt
-//! bump (the job MAY have run) and a queue re-swap; piggybacked on its
-//! cadence, the orphan sweep promotes parked rows whose queue lost its
-//! active occupant -- a backstop for peers on pre-lock builds, since
-//! `ExecutionInsertHook` closes that race at the source. The stale-jobs
-//! loop only reports. Every multi-row locker here takes `(queue_id, id)`
-//! order, the table's one global lock order.
+//! Crash repair, run on real wall-clock time so liveness keeps moving even
+//! under a frozen manual clock. The keep-alive loop heartbeats `alive_at`
+//! on this instance's running rows, locked in `(queue_id, id)` order with
+//! `FOR NO KEY UPDATE SKIP LOCKED` -- an unordered multi-row writer would
+//! re-poison every ordered one, and a skipped beat still bounds the worst
+//! gap to half the liveness threshold. The lost handler reclaims rows
+//! whose heartbeat went stale, bumping the attempt count (the job MAY
+//! have run) and re-swapping the queue.
+//!
+//! Piggybacked on the lost handler's cadence, the orphan sweep promotes
+//! parked rows whose queue lost its active occupant -- a backstop for
+//! peers on pre-lock builds, since `ExecutionInsertHook` closes that race
+//! at the source. The stale-jobs loop only reports. Every multi-row
+//! locker in this module takes `(queue_id, id)` order, the table's one
+//! global lock order.
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;
@@ -27,8 +29,6 @@ use crate::{
     task::OwnedTaskHandle, tracker::JobTracker,
 };
 
-/// The monitors' dependencies, captured once at poller construction; each
-/// `spawn_*` clones what its task needs and holds no poller reference.
 pub(super) struct Recovery {
     pub(super) pool: PgPool,
     pub(super) clock: ClockHandle,
@@ -293,8 +293,6 @@ impl Recovery {
     }
 }
 
-/// A row the lost-handler took back; `alive_at` is the heartbeat that
-/// froze, so the `lost job` log can report the stall age.
 struct ReclaimedJob {
     id: JobId,
     job_type: JobType,
@@ -352,8 +350,6 @@ async fn reclaim_lost_jobs(
     ))
 }
 
-/// Promote the oldest parked row of every queue with no active occupant.
-/// Returns the promoted types so their pollers can be woken.
 async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar!(
         r#"
@@ -451,8 +447,6 @@ mod tests {
         Ok(())
     }
 
-    /// Seeds one orphaned queue with caller-chosen `queue_id`/`id`, so a
-    /// test can make plain `id` order and `(queue_id, id)` order disagree.
     async fn seed_orphan_with_id(
         pool: &PgPool,
         job_type: &str,
@@ -480,11 +474,6 @@ mod tests {
         Ok(())
     }
 
-    /// The sweep is the widest multi-row waiting locker of the table and
-    /// owes the `(queue_id, id)` order every other one takes. Deterministic
-    /// deadlock construction: two orphaned queues whose `queue_id` order
-    /// and `id` order DISAGREE, plus a holder that takes them in the
-    /// correct order -- any other order cycles, and Postgres aborts a side.
     #[tokio::test]
     async fn orphan_sweep_locks_heads_in_queue_id_order() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -493,8 +482,6 @@ mod tests {
         let qa = format!("orphan-lockorder-qa-{}", uuid::Uuid::now_v7());
         let qb = format!("orphan-lockorder-qb-{}", uuid::Uuid::now_v7());
 
-        // v7 UUIDs are time-ordered: minting `qb`'s first makes the two
-        // orderings disagree.
         let id_b = uuid::Uuid::now_v7();
         let id_a = uuid::Uuid::now_v7();
         assert!(qa < qb && id_b < id_a, "the two orderings must disagree");
@@ -538,17 +525,12 @@ mod tests {
 
         let orphan = seed_queued_job(&pool, &job_type, &queue, base, "parked").await?;
 
-        // Races other live instances' own sweeps in the suite -- assert on
-        // the row's final state, not this call's return value.
         sweep_orphaned_parked_rows(&pool).await?;
         assert_eq!(row_state(&pool, orphan).await?, "pending");
 
         Ok(())
     }
 
-    /// The sweep must promote the OLDEST parked sibling by
-    /// `(execute_at, id)` -- the tiebreak every head-resolving mechanism
-    /// agrees on.
     #[tokio::test]
     async fn orphan_sweeper_promotes_the_oldest_parked_sibling() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -591,8 +573,6 @@ mod tests {
         Ok(())
     }
 
-    /// Invariant B on the reclaim path: an older parked sibling must run
-    /// first during the reclaimed row's backoff.
     #[tokio::test]
     async fn reclaim_lets_an_older_parked_sibling_run_first() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -656,9 +636,6 @@ mod tests {
         Ok(())
     }
 
-    /// A reclaim's swap can promote a sibling of a DIFFERENT type than the
-    /// reclaimed row's -- that type must be reported too, or its poller is
-    /// never woken.
     #[tokio::test]
     async fn reclaim_reports_a_promoted_sibling_of_a_different_type() -> anyhow::Result<()> {
         let pool = init_pool().await?;

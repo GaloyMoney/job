@@ -1,34 +1,29 @@
 //! The claim-and-dispatch poller: one `main_loop` per process parks on
-//! "notification OR deadline" (`clock.timeout(deadline,
-//! tracker.notified())` -- deadlines run on the application clock so
-//! manual-clock tests can time-travel, while lifecycle events wake the
-//! loop instantly and clock-independently via `JobTracker::wake`). Each
-//! pass prices a per-type claim plan against live pool headroom
-//! (`JobRegistry::plan_claim`), claims due rows in one SQL statement, and
-//! dispatches them. Correctness of the sleep is the load-bearing concern:
-//! the poller may only park on a deadline that honestly reflects every row
-//! it is responsible for, and every mechanism that could make that
-//! deadline dishonest gets its own submodule.
+//! "notification OR deadline" (`clock.timeout` against the application
+//! clock, so manual-clock tests can time-travel, while `JobTracker::wake`
+//! wakes it instantly and clock-independently). Each pass prices a
+//! per-type claim plan against live pool headroom (`JobRegistry::plan_claim`),
+//! claims due rows in one SQL statement, and dispatches them. Correctness of
+//! the sleep is the load-bearing concern: the poller may only park on a
+//! deadline that honestly reflects every row it is responsible for, and each
+//! submodule protects that honesty for one mechanism -- `budget` (pool
+//! headroom admission plus a real-time recovery waiter), `recheck` (bounded
+//! zero-sleep re-polls for due rows the elastic rotation window hides from a
+//! poll), `claim_query` (the claim statement and its sleep window), `hook`
+//! (short-circuit claims on the spawner's/completer's own commit, plus
+//! rollback reconciliation), and `recovery`/`shutdown` (real-time
+//! heartbeats, lost-job reclaim, orphan sweep, and drain-then-kill).
 //!
-//! `budget`: pool headroom gates admission, with a real-time waiter for
-//! recovery the tracker cannot observe. `recheck`: the elastic rotation
-//! window hides some types from a poll entirely; due rows there force
-//! bounded zero-sleep re-polls. `claim_query`: the claim statement and the
-//! sleep window it computes. `hook`: short-circuit claims on the
-//! spawner's/completer's own commit, plus their rollback reconciler.
-//! `recovery`: real-time heartbeats, lost-job reclaim, orphan sweep.
-//! `shutdown`: drain-then-kill.
-//!
-//! Dispatch (claimed row to running task) lives here, on the poller
-//! itself: a batched type's claims split into canonical-order batches
-//! (sorted by `queue_id` so concurrent batch transactions lock shared
-//! domain rows in one order) with retries always batched alone, and
-//! dispatchers are built synchronously with the poll loop -- construction
-//! claims the type's tracker slot (which the very next poll's plan reads)
-//! and subscribes shutdown receivers a later broadcast would never reach.
-//! Each task pairs the execution future with a monitor that acks shutdown
-//! and grants the drain timeout; the `_from_reservation` entry points are
-//! the short-circuit path's (`hook`), dispatching through an already-taken
+//! Dispatch (claimed row to running task) lives here, on the poller itself:
+//! a batched type's claims split into canonical-order batches (sorted by
+//! `queue_id` so concurrent batch transactions lock shared domain rows in
+//! one order), with retries always batched alone. Dispatchers are built
+//! synchronously with the poll loop, since construction claims the type's
+//! tracker slot (which the very next poll's plan reads) and subscribes
+//! shutdown receivers a later broadcast would never reach; each task pairs
+//! the execution future with a monitor that acks shutdown and grants the
+//! drain timeout. The `_from_reservation` entry points are the
+//! short-circuit path's (`hook`), dispatching through an already-taken
 //! reservation.
 
 use chrono::{DateTime, Utc};
@@ -59,8 +54,6 @@ use super::{
     tracker::{JobTracker, UnitReservation},
 };
 
-/// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
-/// Note: Requires both the feature AND tokio_unstable cfg to be set
 #[cfg(all(feature = "tokio-task-names", tokio_unstable))]
 macro_rules! spawn_named_task {
     ($name:expr, $future:expr) => {
@@ -101,9 +94,6 @@ use shutdown::ShutdownCoordinator;
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
-/// The two independently-subscribed shutdown receivers one dispatch task
-/// needs; the short-circuit path must obtain these before its claiming
-/// transaction commits (see `hook`).
 struct ShutdownSubs {
     job: ShutdownRx,
     monitor: ShutdownRx,
@@ -123,19 +113,12 @@ pub(crate) struct JobPoller {
     >,
     clock: ClockHandle,
     internal_pool: PgPool,
-    /// Shared with [`ShutdownCoordinator`]; see `shutdown`.
     shutdown_started: Arc<AtomicBool>,
     budget: PoolBudget,
     recheck: Recheck,
     recovery: Recovery,
 }
 
-/// A small dedicated pool reusing the main pool's connect options, serving
-/// the claim query and `BatchDispatcher`'s terminal writes -- neither may
-/// compete with the shared application pool for a connection. Session GUCs
-/// (`force_generic_plan`, bitmap/seq scans off) make the claim a single
-/// autocommit statement on guaranteed ordered index access; see
-/// PERFORMANCE.md, "Ordered index access is mandatory".
 async fn build_internal_pool(main_pool: &PgPool) -> Result<PgPool, sqlx::Error> {
     let options: PgConnectOptions = (*main_pool.connect_options()).clone();
     PgPoolOptions::new()
@@ -170,16 +153,11 @@ pub(crate) struct JobPollerHandle {
 }
 
 impl JobPollerHandle {
-    /// This process's poller, for populating [`PollerHandle`]s.
     pub(crate) fn poller(&self) -> &Arc<JobPoller> {
         &self.poller
     }
 }
 
-/// A late-bound `Weak` handle to this process's poller, shared by every
-/// [`crate::JobSpawner`]: empty until `Jobs::start_poll` (a spawn before
-/// that falls back to the ordinary insert), never re-set, and never keeps
-/// the poller alive.
 pub(crate) type PollerHandle = Arc<std::sync::OnceLock<std::sync::Weak<JobPoller>>>;
 
 impl JobPoller {
@@ -235,8 +213,6 @@ impl JobPoller {
         self.shutdown_started.load(Ordering::SeqCst)
     }
 
-    /// The dedicated pool backing the claim query and `BatchDispatcher`'s
-    /// terminal writes; see [`build_internal_pool`].
     pub(crate) fn internal_pool(&self) -> &PgPool {
         &self.internal_pool
     }
@@ -293,9 +269,6 @@ impl JobPoller {
         }
     }
 
-    /// Stopping latches via the `watch` (an in-flight poll sees it on its
-    /// next check, and every row it claimed still gets dispatched), then
-    /// flips `poll_exited_tx` for the shutdown sequence to wait on.
     async fn main_loop(
         self: Arc<Self>,
         mut poll_stop_rx: tokio::sync::watch::Receiver<bool>,
@@ -394,7 +367,7 @@ impl JobPoller {
                     window.sleep_for(self.clock.now()),
                     0,
                     window.excluded_due,
-                    plan.n_elastic,
+                    plan.rotation_lap,
                 );
                 span.record("next_poll_in", tracing::field::debug(duration));
                 span.record("n_jobs_to_start", 0);
@@ -405,8 +378,6 @@ impl JobPoller {
         let jobs_len = rows.len();
         span.record("n_jobs_to_start", jobs_len);
 
-        // Full claim -> drain immediately; otherwise the window's honest
-        // sleep, with `recheck` deciding what `excluded_due` may shorten.
         let base = if jobs_len == n_jobs_to_poll {
             Duration::ZERO
         } else {
@@ -414,12 +385,9 @@ impl JobPoller {
         };
         let next_poll_in =
             self.recheck
-                .bounded_sleep(base, jobs_len, window.excluded_due, plan.n_elastic);
+                .bounded_sleep(base, jobs_len, window.excluded_due, plan.rotation_lap);
         span.record("next_poll_in", tracing::field::debug(next_poll_in));
 
-        // Deliberately NOT detached: dispatching claims tracker slots the
-        // very next poll's plan reads, and subscribes shutdown receivers a
-        // broadcast would otherwise never reach (see `dispatch`).
         if !rows.is_empty() {
             self.load_and_dispatch_claimed(rows).await?;
         }
@@ -575,7 +543,6 @@ impl JobPoller {
             tokio::pin!(batch_fut);
 
             tokio::select! {
-                // `execute_batch` emits `batch dispatcher error` itself.
                 res = &mut batch_fut => {
                     let _ = res;
                 }
@@ -857,8 +824,6 @@ impl JobPoller {
         });
     }
 
-    /// Reserve capacity for one due-now unit of `job_type`: the per-process
-    /// cap for a plain type, one batch slot for a batched type.
     fn try_reserve(self: &Arc<Self>, job_type: &JobType) -> Option<UnitReservation> {
         let cap = match self.registry.batch_policy(job_type) {
             Some(policy) => Some(policy.max_concurrent_per_process),
@@ -867,7 +832,6 @@ impl JobPoller {
         self.tracker.try_reserve(job_type, cap)
     }
 
-    /// Claim shape for `job_type`: `(rows_per_unit, fresh_only)`.
     fn claim_shape(&self, job_type: &JobType) -> (i64, bool) {
         match self.registry.batch_policy(job_type) {
             Some(policy) => (policy.max_batch_size as i64, true),
@@ -875,9 +839,6 @@ impl JobPoller {
         }
     }
 
-    /// Claim up to `n_units` units' worth of `job_type`'s due backlog in
-    /// one statement and split it into per-reservation `DispatchTarget`s.
-    /// Can return fewer targets than units; the caller releases the rest.
     async fn claim_after_many(
         self: &Arc<Self>,
         op: &mut impl es_entity::AtomicOperation,
@@ -911,8 +872,6 @@ impl JobPoller {
         }
     }
 
-    /// Register spawn-side claim demand: `n_due` due ROWS of `job_type`
-    /// just landed in this `op` (call AFTER the insert statement).
     pub(crate) fn register_claim_demand(
         self: &Arc<Self>,
         op: &mut impl es_entity::AtomicOperation,
@@ -926,9 +885,6 @@ impl JobPoller {
         Self::register_claim_hook(op, hook);
     }
 
-    /// Register a completion-side recycled unit of `job_type`'s capacity;
-    /// the hook decides at commit time whether to spend it on due backlog
-    /// or let it drop into an ordinary release.
     pub(crate) fn register_claim_recycle(
         self: &Arc<Self>,
         op: &mut impl es_entity::AtomicOperation,
@@ -939,10 +895,6 @@ impl JobPoller {
         Self::register_claim_hook(op, hook);
     }
 
-    /// Never `force_execute_pre_commit` on failure: forcing this hook
-    /// inline would claim rows with no `post_commit` ever dispatching them.
-    /// Dropping it is safe -- nothing is claimed, recycled units release
-    /// via `Drop`, the ordinary poll covers both.
     fn register_claim_hook(op: &mut impl es_entity::AtomicOperation, hook: ClaimHook) {
         if op.add_commit_hook(hook).is_err() {
             tracing::error!(

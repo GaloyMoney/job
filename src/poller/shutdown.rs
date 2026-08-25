@@ -1,13 +1,14 @@
-//! Drain-then-kill, in an order that keeps the drain honest: stop the
-//! poll loop and wait for it to actually exit (the set of live executions
-//! is now final -- a `tokio::sync::broadcast` only reaches receivers
-//! subscribed before the send), then broadcast to every execution's
-//! monitor and collect acks, wait out the shutdown timeout, and finally
-//! force-release whatever is still `running` (`kill_remaining_jobs`,
-//! savepoint per entity append so one lost audit race cannot fail the
-//! whole shutdown -- the row release itself is already durable). The
-//! sequence is idempotent via a CAS on `shutdown_called`, shared with the
-//! poller's `shutdown_started` so completion-time recycle claims stop
+//! Drain-then-kill shutdown: stop the poll loop and wait for it to actually
+//! exit -- since `tokio::sync::broadcast` only reaches receivers subscribed
+//! before the send, this makes the set of live executions final before
+//! broadcasting a shutdown signal to their monitors and collecting acks.
+//! After waiting out the shutdown timeout, `kill_remaining_jobs` force-
+//! releases whatever is still `running`, using a savepoint per entity
+//! append so one lost audit race cannot fail the whole shutdown (the row
+//! release itself is already durable).
+//!
+//! The sequence is idempotent via a CAS on `shutdown_called`, shared with
+//! the poller's `shutdown_started` so completion-time recycle claims stop
 //! re-admitting work mid-drain; dropping the handle runs the same
 //! sequence.
 
@@ -40,7 +41,6 @@ pub(super) struct ShutdownCoordinator {
 }
 
 impl JobPollerHandle {
-    /// Idempotent graceful shutdown; also runs automatically on drop.
     pub async fn shutdown(&self) -> Result<(), JobError> {
         self.shutdown.perform().await
     }
@@ -133,17 +133,12 @@ impl ShutdownCoordinator {
                 tracing::info!("All acknowledged jobs completed");
             }
         } else {
-            // No subscribers left; with the poll loop drained there is no
-            // live execution to wait for.
             tracing::info!("No live job monitors at shutdown, nothing to drain");
         }
 
         kill_remaining_jobs(Arc::clone(&self.repo), self.instance_id, self.clock.clone()).await
     }
 
-    /// Signal `main_loop` to stop and wait for its exit; a wedged poll must
-    /// not wedge shutdown, so this times out and continues (the kill still
-    /// releases whatever the poller left claimed).
     async fn stop_poll_loop(&self) -> bool {
         let _ = self.poll_stop_tx.send(true);
 
@@ -175,10 +170,6 @@ impl ShutdownCoordinator {
     }
 }
 
-/// Release every execution this instance still holds and record the forced
-/// reschedule on each `Job`. The ordered row locks fence out every
-/// execution-path writer; `set_result`-shaped writers (entity append only)
-/// are not fenced, which is what the per-entity savepoint absorbs.
 #[instrument(name = "jobs.kill_remaining_jobs", skip(repo, clock), fields(instance_id = %instance_id, n_killed = tracing::field::Empty, n_conflicts = tracing::field::Empty))]
 async fn kill_remaining_jobs(
     repo: Arc<JobRepo>,
@@ -262,8 +253,6 @@ mod tests {
     use crate::JobType;
     use sqlx::postgres::PgPool;
 
-    /// Seed a real `Job` aggregate plus a `running` execution row owned by
-    /// `instance_id` -- what a live execution looks like to the kill.
     async fn seed_running_entity(
         pool: &PgPool,
         repo: &JobRepo,
@@ -295,8 +284,6 @@ mod tests {
         Ok(id)
     }
 
-    /// Block until some backend on this database waits on a lock: the
-    /// interleaving becomes an observed fact, not a timing assumption.
     async fn wait_for_blocked_backend(pool: &PgPool) -> anyhow::Result<()> {
         for _ in 0..600 {
             let blocked: i64 = sqlx::query_scalar(
@@ -313,9 +300,6 @@ mod tests {
         anyhow::bail!("no backend ever blocked on a lock");
     }
 
-    /// The kill must survive losing a version race on a `Job` it is
-    /// force-rescheduling (a `set_result`-shaped concurrent writer): the
-    /// row release survives, only that one audit append is lost.
     #[tokio::test]
     async fn kill_remaining_jobs_survives_losing_a_concurrent_entity_write() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -326,8 +310,6 @@ mod tests {
 
         let id = seed_running_entity(&pool, &repo, &job_type, instance_id).await?;
 
-        // The competing writer: entity append staged, not yet committed, so
-        // it owns the next event sequence.
         let mut writer_op = repo.begin_op_with_clock(&clock).await?;
         let mut job = repo.find_by_id_in_op(&mut writer_op, id).await?;
         let return_value = crate::outcome::JobReturnValue::try_from(&"progress")?;

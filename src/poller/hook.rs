@@ -1,24 +1,19 @@
-//! Short-circuit ("head-swap") claiming: a spawn or completion can claim
-//! due head rows of its type inside its OWN committing transaction (an
-//! `es_entity` commit hook), skipping the poll loop's latency. It never
-//! dispatches a specific row -- it claims whichever OLDEST due rows exist,
-//! so admission stays oldest-first even on the fast path. `pre_commit`
-//! reserves tracker capacity and claims under the same pool-unit budget as
-//! the ordinary poll (a saturated instance must leave rows `pending` for
-//! healthy peers); it also subscribes the shutdown receivers there,
-//! because a broadcast never reaches late subscribers. `post_commit`
-//! dispatches through the already-held reservations. Demand merges per
-//! `op` (`fresh_demand` row counts from spawns, `recycled` reservations
-//! from completions), and the hook is declared to run after the
-//! insert/promote hooks whose rows it would claim.
+//! Short-circuit ("head-swap") claiming lets a spawn or completion claim due head rows of its
+//! type inside its OWN committing transaction (an `es_entity` commit hook), skipping the poll
+//! loop's latency; it always claims whichever OLDEST due rows exist rather than a specific row,
+//! so admission stays oldest-first even on the fast path. `pre_commit` reserves tracker capacity
+//! and claims under the same pool-unit budget as the ordinary poll (a saturated instance must
+//! leave rows `pending` for healthy peers), and also subscribes the shutdown receivers there
+//! since a broadcast never reaches late subscribers; `post_commit` then dispatches through the
+//! already-held reservations. Demand merges per `op` (`fresh_demand` row counts from spawns,
+//! `recycled` reservations from completions), and the hook runs after the insert/promote hooks
+//! whose rows it would claim.
 //!
-//! `on_rollback` cannot tell "the transaction rolled back, nothing landed"
-//! from "the COMMIT itself errored after landing" -- so `ClaimReconciler`
-//! checks: rows genuinely stranded `running` under this instance are
-//! un-claimed back to their ORIGINAL `execute_at` with no attempt bump
-//! (they provably never dispatched -- dispatch only happens in
-//! `post_commit`, which was skipped), and their queues re-swapped in the
-//! same transaction. `reclaim_lost_jobs` remains the slower backstop.
+//! `on_rollback` cannot tell a genuine rollback from a COMMIT that errored after landing, so
+//! `ClaimReconciler` checks for rows genuinely stranded `running` under this instance and
+//! un-claims them back to their ORIGINAL `execute_at` with no attempt bump (dispatch only
+//! happens in `post_commit`, which was skipped), re-swapping their queues in the same
+//! transaction; `reclaim_lost_jobs` remains the slower backstop.
 
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
@@ -39,9 +34,6 @@ use crate::{
 
 use super::JobPoller;
 
-/// One row claimed by [`claim_due_heads_in_op`]. `execute_at`/`job_type`
-/// exist for [`ClaimReconciler`], which must restore a row's original
-/// position if the claiming COMMIT fails after landing.
 pub(crate) struct ClaimedRow {
     pub id: JobId,
     pub attempt: i32,
@@ -51,12 +43,6 @@ pub(crate) struct ClaimedRow {
     pub job_type: JobType,
 }
 
-/// Claim up to `limit` oldest due `pending` rows of `job_type`,
-/// byte-identical to a poll claim. Always a LATER statement in the SAME
-/// transaction as the caller's write, so it sees those uncommitted rows
-/// with guaranteed ordering; `SKIP LOCKED` races peers harmlessly, and a
-/// short claim (down to zero rows) is fully expected. `fresh_only`
-/// excludes retries for batched claims (retries run alone).
 pub(super) async fn claim_due_heads_in_op(
     op: &mut impl es_entity::AtomicOperation,
     job_type: &JobType,
@@ -103,14 +89,11 @@ pub(super) async fn claim_due_heads_in_op(
     .await
 }
 
-/// One unit of head-swap claimed work, ready to dispatch at commit.
 pub(crate) enum DispatchTarget {
     Single(ClaimedRow),
     Batch(JobType, Vec<ClaimedRow>),
 }
 
-/// See the module doc. Multiple registrations on one `op` merge into one
-/// instance, so registration order across call sites never matters.
 pub(crate) struct ClaimHook {
     poller: std::sync::Weak<JobPoller>,
     fresh_demand: HashMap<JobType, usize>,
@@ -145,10 +128,6 @@ impl ClaimHook {
         }
     }
 
-    /// A claim must never run before the inserts/promotes that create the
-    /// rows it would claim; declared as a dependency rather than relied on
-    /// via registration order. See the hook-DAG note on
-    /// [`crate::execution_hooks`].
     pub(crate) const RUNS_AFTER: [std::any::TypeId; 2] = [
         std::any::TypeId::of::<crate::execution_hooks::ExecutionInsertHook>(),
         std::any::TypeId::of::<PromoteHeadsHook>(),
@@ -168,9 +147,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             return es_entity::operation::hooks::PreCommitRet::ok(self, op);
         }
 
-        // Same pool-aware admission as the ordinary poll: with zero budget
-        // claim nothing -- reservations drop into ordinary releases and the
-        // rows stay `pending` for healthy peers.
         let unit_budget = poller.budget.unit_budget();
         if unit_budget == 0 {
             return es_entity::operation::hooks::PreCommitRet::ok(self, op);
@@ -195,10 +171,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             }
         }
 
-        // Truncate to the unit budget. Excess releases QUIETLY (`release`,
-        // not `Drop`): the budget just ran out, and `Drop`'s poll-loop wake
-        // would re-read headroom that cannot yet see this hook's own
-        // remaining claims and double-spend it.
         let mut remaining_units = unit_budget;
         for reservations in units_by_type.values_mut() {
             if reservations.len() > remaining_units {
@@ -229,10 +201,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             }
         }
 
-        // Report exactly WHICH ids were claimed so the deferred
-        // NotifierHook can skip notifies only for rows this claim actually
-        // carried off -- a count match would be unsound, the claim can take
-        // pre-existing backlog instead of the freshly landed rows.
         let mut claimed_ids: HashMap<JobType, HashSet<JobId>> = HashMap::new();
         for (_, target, _) in &self.claimed {
             match target {
@@ -342,7 +310,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
     }
 }
 
-/// See the module doc, second paragraph.
 struct ClaimReconciler;
 
 impl ClaimReconciler {
@@ -356,7 +323,7 @@ impl ClaimReconciler {
         for (attempt, backoff) in Self::BACKOFF.into_iter().enumerate() {
             match Self::reconcile_unclaimed(poller.repo.pool(), poller.instance_id, &rows).await {
                 Ok((reset_ids, promoted)) if reset_ids.is_empty() && promoted.is_empty() => {
-                    return; // the common case: a real rollback, nothing landed
+                    return;
                 }
                 Ok((reset_ids, promoted)) => {
                     let reset_id_set: HashSet<JobId> = reset_ids.into_iter().collect();
@@ -391,11 +358,6 @@ impl ClaimReconciler {
         );
     }
 
-    /// Un-claims whichever of `rows` genuinely landed `running` under
-    /// `instance_id`, restoring the ORIGINAL `execute_at` with no attempt
-    /// bump, then re-swaps the touched queues in the same transaction
-    /// (a backdated sibling can have parked behind the row while it sat
-    /// `running`, and nothing else will ever revisit it).
     async fn reconcile_unclaimed(
         pool: &PgPool,
         instance_id: uuid::Uuid,
@@ -447,9 +409,6 @@ mod tests {
     use super::*;
     use crate::repo::JobRepo;
 
-    /// Seed a row already `running` under `instance_id`, `execute_at` NULL
-    /// exactly like a real claim leaves it -- what a landed-but-COMMIT-
-    /// errored claim looks like to the reconciler.
     async fn seed_landed_running_row(
         pool: &PgPool,
         repo: &JobRepo,
@@ -481,8 +440,6 @@ mod tests {
         Ok(id)
     }
 
-    /// The landed case: reset to `pending`, ORIGINAL `execute_at`, owner
-    /// cleared, NO attempt bump -- an un-claim, not a retry.
     #[tokio::test]
     async fn reconciler_resets_a_row_that_actually_landed_running() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -524,7 +481,6 @@ mod tests {
         Ok(())
     }
 
-    /// The common case: a genuine rollback -- zero resets, nothing touched.
     #[tokio::test]
     async fn reconciler_is_a_noop_for_a_row_that_never_landed() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -548,8 +504,6 @@ mod tests {
         Ok(())
     }
 
-    /// The guard case: a row `running` under a DIFFERENT instance must be
-    /// left alone.
     #[tokio::test]
     async fn reconciler_does_not_touch_a_different_instances_row() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -577,9 +531,6 @@ mod tests {
         Ok(())
     }
 
-    /// A reset row is not automatically its queue's rightful head: an older
-    /// sibling can have parked behind it while it sat `running`, and the
-    /// reconciler is the only mechanism that will ever revisit this queue.
     #[tokio::test]
     async fn reconciler_swaps_an_older_parked_sibling_ahead_of_the_reset_row() -> anyhow::Result<()>
     {
