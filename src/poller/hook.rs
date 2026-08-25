@@ -1,0 +1,716 @@
+//! Short-circuit ("head-swap") claiming: a spawn or completion can claim
+//! due head rows of its type inside its OWN committing transaction (an
+//! `es_entity` commit hook), skipping the poll loop's latency. It never
+//! dispatches a specific row -- it claims whichever OLDEST due rows exist,
+//! so admission stays oldest-first even on the fast path. `pre_commit`
+//! reserves tracker capacity and claims under the same pool-unit budget as
+//! the ordinary poll (a saturated instance must leave rows `pending` for
+//! healthy peers); it also subscribes the shutdown receivers there,
+//! because a broadcast never reaches late subscribers. `post_commit`
+//! dispatches through the already-held reservations. Demand merges per
+//! `op` (`fresh_demand` row counts from spawns, `recycled` reservations
+//! from completions), and the hook is declared to run after the
+//! insert/promote hooks whose rows it would claim.
+//!
+//! `on_rollback` cannot tell "the transaction rolled back, nothing landed"
+//! from "the COMMIT itself errored after landing" -- so `ClaimReconciler`
+//! checks: rows genuinely stranded `running` under this instance are
+//! un-claimed back to their ORIGINAL `execute_at` with no attempt bump
+//! (they provably never dispatched -- dispatch only happens in
+//! `post_commit`, which was skipped), and their queues re-swapped in the
+//! same transaction. `reclaim_lost_jobs` remains the slower backstop.
+
+use chrono::{DateTime, Utc};
+use es_entity::AtomicOperation;
+use serde_json::Value as JsonValue;
+use sqlx::postgres::PgPool;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::dispatch::ShutdownSubs;
+use crate::{
+    JobId,
+    entity::JobType,
+    execution_hooks::{PromoteHeadsHook, PromotedRow},
+    tracker::UnitReservation,
+};
+
+use super::JobPoller;
+
+impl JobPoller {
+    /// Reserve capacity for one due-now unit of `job_type`: the per-process
+    /// cap for a plain type, one batch slot for a batched type.
+    fn try_reserve(self: &Arc<Self>, job_type: &JobType) -> Option<UnitReservation> {
+        let cap = match self.registry.batch_policy(job_type) {
+            Some(policy) => Some(policy.max_concurrent_per_process),
+            None => self.registry.per_process_cap(job_type),
+        };
+        self.tracker.try_reserve(job_type, cap)
+    }
+
+    /// Claim shape for `job_type`: `(rows_per_unit, fresh_only)`.
+    fn claim_shape(&self, job_type: &JobType) -> (i64, bool) {
+        match self.registry.batch_policy(job_type) {
+            Some(policy) => (policy.max_batch_size as i64, true),
+            None => (1, false),
+        }
+    }
+
+    /// Claim up to `n_units` units' worth of `job_type`'s due backlog in
+    /// one statement and split it into per-reservation `DispatchTarget`s.
+    /// Can return fewer targets than units; the caller releases the rest.
+    async fn claim_after_many(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        job_type: &JobType,
+        now: DateTime<Utc>,
+        n_units: usize,
+    ) -> Result<Vec<DispatchTarget>, sqlx::Error> {
+        if n_units == 0 {
+            return Ok(Vec::new());
+        }
+        let (per_unit_limit, fresh_only) = self.claim_shape(job_type);
+        let limit = per_unit_limit * n_units as i64;
+        let rows =
+            claim_due_heads_in_op(op, job_type, self.instance_id, now, limit, fresh_only).await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.registry.batch_policy(job_type).is_some() {
+            let mut rows = rows.into_iter();
+            let mut targets = Vec::new();
+            loop {
+                let chunk: Vec<ClaimedRow> = (&mut rows).take(per_unit_limit as usize).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                targets.push(DispatchTarget::Batch(job_type.clone(), chunk));
+            }
+            Ok(targets)
+        } else {
+            Ok(rows.into_iter().map(DispatchTarget::Single).collect())
+        }
+    }
+
+    /// Register spawn-side claim demand: `n_due` due ROWS of `job_type`
+    /// just landed in this `op` (call AFTER the insert statement).
+    pub(crate) fn register_claim_demand(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        job_type: &JobType,
+        n_due: usize,
+    ) {
+        if n_due == 0 {
+            return;
+        }
+        let hook = ClaimHook {
+            poller: Arc::downgrade(self),
+            fresh_demand: HashMap::from([(job_type.clone(), n_due)]),
+            recycled: Vec::new(),
+            claimed: Vec::new(),
+        };
+        Self::register_claim_hook(op, hook);
+    }
+
+    /// Register a completion-side recycled unit of `job_type`'s capacity;
+    /// the hook decides at commit time whether to spend it on due backlog
+    /// or let it drop into an ordinary release.
+    pub(crate) fn register_claim_recycle(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        job_type: &JobType,
+        reservation: UnitReservation,
+    ) {
+        let hook = ClaimHook {
+            poller: Arc::downgrade(self),
+            fresh_demand: HashMap::new(),
+            recycled: vec![(job_type.clone(), reservation)],
+            claimed: Vec::new(),
+        };
+        Self::register_claim_hook(op, hook);
+    }
+
+    /// Never `force_execute_pre_commit` on failure: forcing this hook
+    /// inline would claim rows with no `post_commit` ever dispatching them.
+    /// Dropping it is safe -- nothing is claimed, recycled units release
+    /// via `Drop`, the ordinary poll covers both.
+    fn register_claim_hook(op: &mut impl es_entity::AtomicOperation, hook: ClaimHook) {
+        if op.add_commit_hook(hook).is_err() {
+            tracing::error!(
+                "short-circuit claim could not register its commit hook; \
+                 any recycled unit released normally, any fresh demand is simply not claimed \
+                 -- the ordinary poll covers both"
+            );
+        }
+    }
+}
+
+/// One row claimed by [`claim_due_heads_in_op`]. `execute_at`/`job_type`
+/// exist for [`ClaimReconciler`], which must restore a row's original
+/// position if the claiming COMMIT fails after landing.
+pub(crate) struct ClaimedRow {
+    pub id: JobId,
+    pub attempt: i32,
+    pub queue_id: Option<String>,
+    pub data_json: Option<JsonValue>,
+    pub execute_at: DateTime<Utc>,
+    pub job_type: JobType,
+}
+
+/// Claim up to `limit` oldest due `pending` rows of `job_type`,
+/// byte-identical to a poll claim. Always a LATER statement in the SAME
+/// transaction as the caller's write, so it sees those uncommitted rows
+/// with guaranteed ordering; `SKIP LOCKED` races peers harmlessly, and a
+/// short claim (down to zero rows) is fully expected. `fresh_only`
+/// excludes retries for batched claims (retries run alone).
+async fn claim_due_heads_in_op(
+    op: &mut impl es_entity::AtomicOperation,
+    job_type: &JobType,
+    instance_id: uuid::Uuid,
+    now: DateTime<Utc>,
+    limit: i64,
+    fresh_only: bool,
+) -> Result<Vec<ClaimedRow>, sqlx::Error> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let wall_now = chrono::Utc::now();
+    sqlx::query_as!(
+        ClaimedRow,
+        r#"
+        WITH heads AS (
+            SELECT id, execute_at FROM job_executions
+            WHERE job_type = $1 AND state = 'pending' AND execute_at <= $2
+              AND (NOT $6 OR attempt_index = 1)
+            ORDER BY execute_at, id
+            LIMIT $3
+            FOR UPDATE SKIP LOCKED
+        ),
+        updated AS (
+            UPDATE job_executions je
+            SET state = 'running', poller_instance_id = $4, alive_at = $5, execute_at = NULL
+            FROM heads WHERE je.id = heads.id
+            RETURNING je.id, je.queue_id, je.attempt_index, heads.execute_at AS original_execute_at
+        )
+        SELECT u.id AS "id!: JobId", u.attempt_index AS "attempt!", u.queue_id AS "queue_id?",
+               s.execution_state_json AS "data_json?", u.original_execute_at AS "execute_at!",
+               $1 AS "job_type!: JobType"
+        FROM updated u
+        LEFT JOIN job_execution_states s ON s.id = u.id
+        "#,
+        job_type as &JobType,
+        now,
+        limit,
+        instance_id,
+        wall_now,
+        fresh_only,
+    )
+    .fetch_all(op.as_executor())
+    .await
+}
+
+/// One unit of head-swap claimed work, ready to dispatch at commit.
+pub(crate) enum DispatchTarget {
+    Single(ClaimedRow),
+    Batch(JobType, Vec<ClaimedRow>),
+}
+
+/// See the module doc. Multiple registrations on one `op` merge into one
+/// instance, so registration order across call sites never matters.
+pub(crate) struct ClaimHook {
+    poller: std::sync::Weak<JobPoller>,
+    fresh_demand: HashMap<JobType, usize>,
+    recycled: Vec<(JobType, UnitReservation)>,
+    claimed: Vec<(UnitReservation, DispatchTarget, ShutdownSubs)>,
+}
+
+impl ClaimHook {
+    /// A claim must never run before the inserts/promotes that create the
+    /// rows it would claim; declared as a dependency rather than relied on
+    /// via registration order. See the hook-DAG note on
+    /// [`crate::execution_hooks`].
+    pub(crate) const RUNS_AFTER: [std::any::TypeId; 2] = [
+        std::any::TypeId::of::<crate::execution_hooks::ExecutionInsertHook>(),
+        std::any::TypeId::of::<PromoteHeadsHook>(),
+    ];
+}
+
+impl es_entity::operation::hooks::CommitHook for ClaimHook {
+    async fn pre_commit(
+        mut self,
+        mut op: es_entity::operation::hooks::HookOperation<'_>,
+    ) -> Result<es_entity::operation::hooks::PreCommitRet<'_, Self>, sqlx::Error> {
+        let Some(poller) = self.poller.upgrade() else {
+            return es_entity::operation::hooks::PreCommitRet::ok(self, op);
+        };
+
+        if poller.is_shutting_down() {
+            return es_entity::operation::hooks::PreCommitRet::ok(self, op);
+        }
+
+        // Same pool-aware admission as the ordinary poll: with zero budget
+        // claim nothing -- reservations drop into ordinary releases and the
+        // rows stay `pending` for healthy peers.
+        let unit_budget = poller.pool_unit_budget();
+        if unit_budget == 0 {
+            return es_entity::operation::hooks::PreCommitRet::ok(self, op);
+        }
+
+        let mut units_by_type: HashMap<JobType, Vec<UnitReservation>> = HashMap::new();
+        for (job_type, reservation) in self.recycled.drain(..) {
+            units_by_type.entry(job_type).or_default().push(reservation);
+        }
+        for (job_type, n_due) in self.fresh_demand.drain() {
+            if !poller.registry.short_circuit(&job_type) {
+                continue;
+            }
+            let per_reservation = poller.claim_shape(&job_type).0.max(1) as usize;
+            let n_reservations = n_due.div_ceil(per_reservation);
+            let entry = units_by_type.entry(job_type.clone()).or_default();
+            for _ in 0..n_reservations {
+                match poller.try_reserve(&job_type) {
+                    Some(reservation) => entry.push(reservation),
+                    None => break,
+                }
+            }
+        }
+
+        // Truncate to the unit budget. Excess releases QUIETLY (`release`,
+        // not `Drop`): the budget just ran out, and `Drop`'s poll-loop wake
+        // would re-read headroom that cannot yet see this hook's own
+        // remaining claims and double-spend it.
+        let mut remaining_units = unit_budget;
+        for reservations in units_by_type.values_mut() {
+            if reservations.len() > remaining_units {
+                for reservation in reservations.drain(remaining_units..) {
+                    reservation.release();
+                }
+            }
+            remaining_units -= reservations.len();
+        }
+
+        let now = op.maybe_now().unwrap_or_else(|| poller.clock.now());
+        for (job_type, reservations) in units_by_type {
+            if reservations.is_empty() {
+                continue;
+            }
+            if !poller.registry.short_circuit(&job_type) {
+                continue;
+            }
+            let targets = poller
+                .claim_after_many(&mut op, &job_type, now, reservations.len())
+                .await?;
+            for (reservation, target) in reservations.into_iter().zip(targets) {
+                let subs = ShutdownSubs {
+                    job: poller.shutdown_tx.subscribe(),
+                    monitor: poller.shutdown_tx.subscribe(),
+                };
+                self.claimed.push((reservation, target, subs));
+            }
+        }
+
+        // Report exactly WHICH ids were claimed so the deferred
+        // NotifierHook can skip notifies only for rows this claim actually
+        // carried off -- a count match would be unsound, the claim can take
+        // pre-existing backlog instead of the freshly landed rows.
+        let mut claimed_ids: HashMap<JobType, HashSet<JobId>> = HashMap::new();
+        for (_, target, _) in &self.claimed {
+            match target {
+                DispatchTarget::Single(row) => {
+                    claimed_ids
+                        .entry(row.job_type.clone())
+                        .or_default()
+                        .insert(row.id);
+                }
+                DispatchTarget::Batch(job_type, rows) => {
+                    let entry = claimed_ids.entry(job_type.clone()).or_default();
+                    entry.extend(rows.iter().map(|row| row.id));
+                }
+            }
+        }
+        poller.notifier.register_execution_ready_in_op(
+            &mut op,
+            HashMap::new(),
+            claimed_ids,
+            HashSet::new(),
+        );
+
+        es_entity::operation::hooks::PreCommitRet::ok(self, op)
+    }
+
+    fn post_commit(self) {
+        let Some(poller) = self.poller.upgrade() else {
+            return;
+        };
+        for (reservation, target, subs) in self.claimed {
+            let poller = Arc::clone(&poller);
+            tokio::spawn(async move {
+                match target {
+                    DispatchTarget::Single(row) => {
+                        let id = row.id;
+                        if let Err(e) = poller
+                            .dispatch_job_from_reservation(reservation, row, subs)
+                            .await
+                        {
+                            tracing::error!(
+                                job_id = %id,
+                                exception.message = %e,
+                                exception.type = std::any::type_name_of_val(&e),
+                                "failed to dispatch a short-circuit-claimed job"
+                            );
+                        }
+                    }
+                    DispatchTarget::Batch(job_type, rows) => {
+                        let n_items = rows.len();
+                        if let Err(e) = poller
+                            .dispatch_batch_from_reservation(
+                                reservation,
+                                job_type.clone(),
+                                rows,
+                                subs,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                job_type = %job_type,
+                                n_items,
+                                exception.message = %e,
+                                exception.type = std::any::type_name_of_val(&e),
+                                "failed to dispatch a short-circuit-claimed batch"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    fn merge(&mut self, other: &mut Self) -> bool {
+        for (job_type, demand) in other.fresh_demand.drain() {
+            *self.fresh_demand.entry(job_type).or_insert(0) += demand;
+        }
+        self.recycled.append(&mut other.recycled);
+        self.claimed.append(&mut other.claimed);
+        true
+    }
+
+    fn runs_after(&self) -> &[std::any::TypeId] {
+        &Self::RUNS_AFTER
+    }
+
+    fn on_rollback(self) {
+        let Some(poller) = self.poller.upgrade() else {
+            return;
+        };
+        let rows: Vec<(JobId, DateTime<Utc>, JobType)> = self
+            .claimed
+            .iter()
+            .flat_map(|(_, target, _)| match target {
+                DispatchTarget::Single(row) => {
+                    vec![(row.id, row.execute_at, row.job_type.clone())]
+                }
+                DispatchTarget::Batch(_, rows) => rows
+                    .iter()
+                    .map(|row| (row.id, row.execute_at, row.job_type.clone()))
+                    .collect(),
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        tokio::spawn(ClaimReconciler::run(poller, rows));
+    }
+}
+
+/// See the module doc, second paragraph.
+struct ClaimReconciler;
+
+impl ClaimReconciler {
+    const BACKOFF: [Duration; 3] = [
+        Duration::from_millis(250),
+        Duration::from_secs(1),
+        Duration::from_secs(4),
+    ];
+
+    async fn run(poller: Arc<JobPoller>, rows: Vec<(JobId, DateTime<Utc>, JobType)>) {
+        for (attempt, backoff) in Self::BACKOFF.into_iter().enumerate() {
+            match Self::reconcile_unclaimed(poller.repo.pool(), poller.instance_id, &rows).await {
+                Ok((reset_ids, promoted)) if reset_ids.is_empty() && promoted.is_empty() => {
+                    return; // the common case: a real rollback, nothing landed
+                }
+                Ok((reset_ids, promoted)) => {
+                    let reset_id_set: HashSet<JobId> = reset_ids.into_iter().collect();
+                    let mut notify_types: HashSet<JobType> = rows
+                        .iter()
+                        .filter(|(id, _, _)| reset_id_set.contains(id))
+                        .map(|(_, _, job_type)| job_type.clone())
+                        .collect();
+                    notify_types.extend(
+                        promoted
+                            .into_iter()
+                            .map(|row| JobType::from_owned(row.job_type)),
+                    );
+                    for job_type in notify_types {
+                        poller.notifier.execution_ready(&job_type);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        exception.message = %error,
+                        "claim reconciler retrying after a transient error"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+        tracing::error!(
+            n_rows = rows.len(),
+            "claim reconciler exhausted its retries; abandoning to reclaim_lost_jobs' slower backstop"
+        );
+    }
+
+    /// Un-claims whichever of `rows` genuinely landed `running` under
+    /// `instance_id`, restoring the ORIGINAL `execute_at` with no attempt
+    /// bump, then re-swaps the touched queues in the same transaction
+    /// (a backdated sibling can have parked behind the row while it sat
+    /// `running`, and nothing else will ever revisit it).
+    async fn reconcile_unclaimed(
+        pool: &PgPool,
+        instance_id: uuid::Uuid,
+        rows: &[(JobId, DateTime<Utc>, JobType)],
+    ) -> Result<(Vec<JobId>, Vec<PromotedRow>), sqlx::Error> {
+        if rows.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let ids: Vec<uuid::Uuid> = rows
+            .iter()
+            .map(|(id, _, _)| uuid::Uuid::from(*id))
+            .collect();
+        let execute_ats: Vec<DateTime<Utc>> = rows.iter().map(|(_, at, _)| *at).collect();
+
+        let mut tx = pool.begin().await?;
+        let reset = sqlx::query_scalar!(
+            r#"
+            WITH locked AS MATERIALIZED (
+                SELECT je.id, u.execute_at FROM job_executions je
+                JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
+                  ON je.id = u.id
+                WHERE je.state = 'running' AND je.poller_instance_id = $3
+                ORDER BY je.queue_id, je.id
+                FOR NO KEY UPDATE OF je
+            )
+            UPDATE job_executions je
+            SET state = 'pending', poller_instance_id = NULL, execute_at = l.execute_at
+            FROM locked l WHERE je.id = l.id
+            RETURNING je.id AS "id!: JobId"
+            "#,
+            &ids,
+            &execute_ats,
+            instance_id,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let reset_uuids: Vec<uuid::Uuid> = reset.iter().map(|id| uuid::Uuid::from(*id)).collect();
+        let promoted = PromoteHeadsHook::apply(&mut tx, &reset_uuids).await?;
+
+        tx.commit().await?;
+        Ok((reset, promoted))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{init_pool, row_state, seed_queued_job};
+    use super::*;
+    use crate::repo::JobRepo;
+
+    /// Seed a row already `running` under `instance_id`, `execute_at` NULL
+    /// exactly like a real claim leaves it -- what a landed-but-COMMIT-
+    /// errored claim looks like to the reconciler.
+    async fn seed_landed_running_row(
+        pool: &PgPool,
+        repo: &JobRepo,
+        job_type: &str,
+        instance_id: uuid::Uuid,
+    ) -> anyhow::Result<JobId> {
+        let id = JobId::new();
+        let new_job = crate::entity::NewJob::builder()
+            .id(id)
+            .job_type(JobType::from_owned(job_type.to_string()))
+            .config(serde_json::json!({}))?
+            .schedule_at(chrono::Utc::now())
+            .build()
+            .expect("build NewJob");
+        repo.create(new_job).await?;
+
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, state, attempt_index, execute_at, alive_at, poller_instance_id, created_at) \
+             VALUES ($1, $2, 'running', 1, NULL, $3, $4, $3)",
+        )
+        .bind(uuid::Uuid::from(id))
+        .bind(job_type)
+        .bind(now)
+        .bind(instance_id)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// The landed case: reset to `pending`, ORIGINAL `execute_at`, owner
+    /// cleared, NO attempt bump -- an un-claim, not a retry.
+    #[tokio::test]
+    async fn reconciler_resets_a_row_that_actually_landed_running() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = JobRepo::new(&pool);
+        let job_type = format!("reconciler-landed-{}", uuid::Uuid::now_v7());
+        let instance_id = uuid::Uuid::now_v7();
+        let original_execute_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+
+        let id = seed_landed_running_row(&pool, &repo, &job_type, instance_id).await?;
+
+        let (reset, promoted) = ClaimReconciler::reconcile_unclaimed(
+            &pool,
+            instance_id,
+            &[(id, original_execute_at, JobType::from_owned(job_type))],
+        )
+        .await?;
+        assert_eq!(reset, vec![id]);
+        assert!(promoted.is_empty(), "no parked sibling exists in this test");
+
+        let row = sqlx::query!(
+            r#"SELECT state::text AS "state!", poller_instance_id, attempt_index, execute_at
+               FROM job_executions WHERE id = $1"#,
+            uuid::Uuid::from(id),
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.state, "pending");
+        assert!(row.poller_instance_id.is_none());
+        assert_eq!(
+            row.attempt_index, 1,
+            "no attempt bump -- this row never ran"
+        );
+        assert_eq!(
+            row.execute_at.map(|at| at.timestamp_millis()),
+            Some(original_execute_at.timestamp_millis()),
+            "must restore the row's original execute_at, not re-timestamp it to now"
+        );
+
+        Ok(())
+    }
+
+    /// The common case: a genuine rollback -- zero resets, nothing touched.
+    #[tokio::test]
+    async fn reconciler_is_a_noop_for_a_row_that_never_landed() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("reconciler-never-landed-{}", uuid::Uuid::now_v7());
+        let instance_id = uuid::Uuid::now_v7();
+        let phantom_id = JobId::new();
+
+        let (reset, promoted) = ClaimReconciler::reconcile_unclaimed(
+            &pool,
+            instance_id,
+            &[(
+                phantom_id,
+                chrono::Utc::now(),
+                JobType::from_owned(job_type),
+            )],
+        )
+        .await?;
+        assert!(reset.is_empty());
+        assert!(promoted.is_empty());
+
+        Ok(())
+    }
+
+    /// The guard case: a row `running` under a DIFFERENT instance must be
+    /// left alone.
+    #[tokio::test]
+    async fn reconciler_does_not_touch_a_different_instances_row() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = JobRepo::new(&pool);
+        let job_type = format!("reconciler-guard-{}", uuid::Uuid::now_v7());
+        let owner_instance = uuid::Uuid::now_v7();
+        let our_instance = uuid::Uuid::now_v7();
+        let original_execute_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+
+        let id = seed_landed_running_row(&pool, &repo, &job_type, owner_instance).await?;
+
+        let (reset, promoted) = ClaimReconciler::reconcile_unclaimed(
+            &pool,
+            our_instance,
+            &[(id, original_execute_at, JobType::from_owned(job_type))],
+        )
+        .await?;
+        assert!(
+            reset.is_empty(),
+            "must not reset a row owned by a different instance"
+        );
+        assert!(promoted.is_empty());
+        assert_eq!(row_state(&pool, id).await?, "running");
+
+        Ok(())
+    }
+
+    /// A reset row is not automatically its queue's rightful head: an older
+    /// sibling can have parked behind it while it sat `running`, and the
+    /// reconciler is the only mechanism that will ever revisit this queue.
+    #[tokio::test]
+    async fn reconciler_swaps_an_older_parked_sibling_ahead_of_the_reset_row() -> anyhow::Result<()>
+    {
+        let pool = init_pool().await?;
+        let repo = JobRepo::new(&pool);
+        let job_type = format!("reconciler-swap-{}", uuid::Uuid::now_v7());
+        let instance_id = uuid::Uuid::now_v7();
+        let queue = format!("reconciler-swap-queue-{}", uuid::Uuid::now_v7());
+        let younger_execute_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let older_execute_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+        let running_id = seed_landed_running_row(&pool, &repo, &job_type, instance_id).await?;
+        sqlx::query("UPDATE job_executions SET queue_id = $2 WHERE id = $1")
+            .bind(uuid::Uuid::from(running_id))
+            .bind(&queue)
+            .execute(&pool)
+            .await?;
+
+        let older_sibling =
+            seed_queued_job(&pool, &job_type, &queue, older_execute_at, "parked").await?;
+
+        let (reset, promoted) = ClaimReconciler::reconcile_unclaimed(
+            &pool,
+            instance_id,
+            &[(
+                running_id,
+                younger_execute_at,
+                JobType::from_owned(job_type),
+            )],
+        )
+        .await?;
+        assert_eq!(reset, vec![running_id]);
+        assert_eq!(
+            promoted.len(),
+            1,
+            "the older sibling must be promoted in the SAME call"
+        );
+
+        assert_eq!(
+            row_state(&pool, older_sibling).await?,
+            "pending",
+            "the older sibling must now hold the queue's active slot"
+        );
+        assert_eq!(
+            row_state(&pool, running_id).await?,
+            "parked",
+            "the reset row must yield to the genuinely older sibling"
+        );
+
+        Ok(())
+    }
+}
