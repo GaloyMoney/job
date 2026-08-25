@@ -1,3 +1,15 @@
+# [job release v0.13.8](https://github.com/GaloyMoney/job/releases/tag/0.13.8)
+
+
+
+### Bug Fixes
+
+- Honest sleep deadline for rotation-excluded elastic types (#188)
+
+### Refactor
+
+- Decompose poller.rs into poller/ concept modules (#189)
+
 # [job release v0.13.7](https://github.com/GaloyMoney/job/releases/tag/0.13.7)
 
 
