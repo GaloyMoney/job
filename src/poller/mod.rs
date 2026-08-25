@@ -81,6 +81,7 @@ macro_rules! spawn_named_task {
 mod budget;
 mod claim_query;
 mod hook;
+mod plan;
 mod recheck;
 mod recovery;
 mod shutdown;
@@ -93,6 +94,7 @@ pub(crate) use hook::ClaimHook;
 use budget::PoolBudget;
 use claim_query::{CONTENTION_HEADROOM, JobPollResult, poll_jobs};
 use hook::{ClaimedRow, DispatchTarget, claim_due_heads_in_op};
+use plan::ClaimPlanner;
 use recheck::Recheck;
 use recovery::Recovery;
 use shutdown::ShutdownCoordinator;
@@ -110,7 +112,8 @@ struct ShutdownSubs {
 pub(crate) struct JobPoller {
     config: JobPollerConfig,
     repo: Arc<JobRepo>,
-    registry: JobRegistry,
+    registry: Arc<JobRegistry>,
+    planner: ClaimPlanner,
     tracker: Arc<JobTracker>,
     router: Arc<JobNotificationRouter>,
     notifier: Arc<JobEventNotifier>,
@@ -195,7 +198,9 @@ impl JobPoller {
         >(1);
         let internal_pool = build_internal_pool(repo.pool()).await?;
         let instance_id = uuid::Uuid::now_v7();
+        let registry = Arc::new(registry);
         Ok(Self {
+            planner: ClaimPlanner::new(Arc::clone(&registry), Arc::clone(&tracker)),
             recheck: Recheck::new(Arc::clone(&tracker)),
             budget: PoolBudget::new(
                 repo.pool(),
@@ -360,7 +365,7 @@ impl JobPoller {
             return Ok(MAX_WAIT);
         };
         let unit_budget = self.budget.unit_budget();
-        let plan = self.registry.plan_claim(n_jobs_to_poll, unit_budget);
+        let plan = self.planner.plan(n_jobs_to_poll, unit_budget);
         span.record("n_claim_clamped_by_pool", plan.clamped_by_pool);
         if plan.types.is_empty() {
             if plan.clamped_by_pool {

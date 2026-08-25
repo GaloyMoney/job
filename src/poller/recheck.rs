@@ -149,7 +149,7 @@ mod tests {
         // min_jobs must be nonzero: `next_batch_size` returns `None` (poll
         // parks at MAX_WAIT before planning anything) once running >= min.
         let tracker = Arc::new(JobTracker::new(1, 10));
-        let mut registry = JobRegistry::new(Arc::clone(&tracker));
+        let mut registry = JobRegistry::new();
         let run = uuid::Uuid::now_v7();
         let n_elastic = 24usize;
         let mut type_names = Vec::new();
