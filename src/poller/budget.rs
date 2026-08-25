@@ -1,15 +1,15 @@
-//! Pool-aware admission: a poll may claim only as many dispatch units as
-//! the shared pool has headroom for (`connections_per_job` connections per
-//! unit, floor-rounded) -- claiming into a saturated pool strands rows
-//! `running` on an instance that cannot run them while healthy peers are
-//! locked out by `SKIP LOCKED`, so a zero budget claims nothing. Because
-//! `tracker.notified()` cannot observe other users of a shared pool freeing
-//! connections, a clamped-to-zero poll arms a real-time backoff waiter
-//! (10ms doubling to 1s) that wakes the poll loop once the unit BUDGET --
-//! not raw headroom, which can still round down to zero units -- recovers.
-//! The unit is a heuristic priced at the crate's own claim/dispatch cost
-//! (one connection); what a runner does inside its own code is opaque and
-//! deliberately not priced -- congestion reschedules absorb the misses.
+//! Pool-aware admission: a poll may claim only as many dispatch units as the shared pool
+//! has headroom for (`connections_per_job` connections per unit, floor-rounded) --
+//! claiming into a saturated pool strands rows `running` on an instance that cannot run
+//! them while healthy peers are locked out by `SKIP LOCKED`, so a zero budget claims
+//! nothing.
+//!
+//! Because `tracker.notified()` cannot observe other users of a shared pool freeing
+//! connections, a clamped-to-zero poll arms a real-time backoff waiter (10ms doubling to
+//! 1s) that wakes the poll loop once the unit budget -- not raw headroom, which can still
+//! round down to zero units -- recovers. The unit is a heuristic priced at the crate's own
+//! claim/dispatch cost (one connection); what a runner does inside its own code is opaque
+//! and deliberately not priced, with congestion reschedules absorbing the misses.
 
 use sqlx::postgres::PgPool;
 
@@ -24,16 +24,12 @@ use crate::tracker::JobTracker;
 const POOL_WAITER_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const POOL_WAITER_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Live headroom on the shared pool: connections it could still hand out
-/// right now. Instantaneous and racy by design -- a soft budget re-read
-/// every poll, not an invariant.
 pub(crate) fn pool_connection_headroom(main_pool: &PgPool) -> usize {
     let max_connections = main_pool.options().get_max_connections() as usize;
     let in_use = (main_pool.size() as usize).saturating_sub(main_pool.num_idle());
     max_connections.saturating_sub(in_use)
 }
 
-/// Headroom -> dispatch units at `connections_per_job` per unit, floored.
 fn unit_budget(headroom: usize, connections_per_job: f64) -> usize {
     (headroom as f64 / connections_per_job).floor() as usize
 }
@@ -68,9 +64,6 @@ impl PoolBudget {
         )
     }
 
-    /// At most one waiter lives at a time (CAS guard); it disarms itself
-    /// BEFORE waking so the woken poll can re-arm if headroom is gone again,
-    /// and holds only a `Weak` so it can never outlive its poller.
     pub(super) fn arm_waiter(&self) {
         if self.inner.armed.swap(true, Ordering::AcqRel) {
             return;
@@ -104,9 +97,6 @@ impl PoolBudget {
 mod tests {
     use super::*;
 
-    /// `PoolConnection`'s `Drop` returns the connection on a spawned task,
-    /// so `size()`/`num_idle()` lag a `drop()` until it runs. Yields until
-    /// they settle, bounded so a real bug fails an assertion, not hangs.
     async fn settle(pool: &PgPool, expected_idle: u32) {
         for _ in 0..1000 {
             if pool.num_idle() as u32 == expected_idle {

@@ -1,28 +1,25 @@
-//! Why recheck exists: `plan_claim`'s rotation -- the elastic floor window,
-//! and (handoff-0138) the bounded tier's tie-group rotation -- excludes
-//! some types when demand outstrips a tier's budget share, and an excluded
-//! type's due rows are invisible to both that poll's claim and its sleep
-//! deadline. The claim query reports them as `excluded_due` (see
-//! `claim_query`), and this module answers with a zero-sleep re-poll: every
-//! poll advances rotation one slot in whichever tier is scarce, so the
-//! window reaches any excluded type within one lap -- milliseconds.
-//! `Duration::ZERO` fires even under a frozen manual clock (the manual
-//! `ClockSleep` completes when `now >= wake_at`); any positive
+//! `plan_claim`'s rotation -- the elastic floor window, and (handoff-0138) the
+//! bounded tier's tie-group rotation -- excludes some types when demand
+//! outstrips a tier's budget share, leaving an excluded type's due rows
+//! invisible to both that poll's claim and its sleep deadline (reported as
+//! `excluded_due` by `claim_query`). This module closes that blind spot with
+//! a zero-sleep re-poll: every poll advances rotation one slot in whichever
+//! tier is scarce, so the window reaches any excluded type within one lap.
+//! `Duration::ZERO` fires even under a frozen manual clock, since the manual
+//! `ClockSleep` completes once `now >= wake_at`, while any positive
 //! clock-relative duration would not.
 //!
-//! "Due" does not imply "claimable" (a peer's in-flight claim can hold the
-//! row's lock), and two unclaimable due rows further apart in rotation
-//! order than the window is wide keep `excluded_due` set on EVERY poll --
-//! so zero-sleep re-polls are granted only while consecutive claim-nothing
-//! `excluded_due` polls stay within two full rotation laps (`ClaimPlan::
-//! rotation_lap` -- one lap guarantees every excluded type, either tier,
-//! had a turn). Past that, the poll falls back to the honest
-//! window-derived sleep plus a one-shot real-time backoff waiter (10ms
-//! doubling to 1s; lock release emits no notification, and clock-relative
-//! sleeps are inert under manual clocks). Claims reset the streak --
-//! productive spinning is the ordinary drain path, not this pathology.
-//! Design and cost measurements: PR #188; bounded-tier extension:
-//! handoff-0138.
+//! Because "due" doesn't imply "claimable" (a peer's in-flight claim can hold
+//! a row's lock), two unclaimable due rows further apart in rotation order
+//! than the window is wide would otherwise spin forever, so zero-sleep
+//! re-polls are granted only while a streak of consecutive claim-nothing
+//! `excluded_due` polls stays within two full rotation laps
+//! (`ClaimPlan::rotation_lap`; one lap guarantees every excluded type in
+//! either tier gets a turn). Past that bound the poll falls back to the
+//! honest window-derived sleep plus a one-shot real-time backoff waiter
+//! (10ms doubling to 1s, CAS-guarded to at most one live waiter, since lock
+//! release emits no notification and clock-relative sleeps are inert under
+//! manual clocks); any claim resets the streak.
 
 use std::sync::{
     Arc,
@@ -90,9 +87,6 @@ impl Recheck {
         base
     }
 
-    /// At most one waiter lives at a time (CAS guard); it disarms itself
-    /// BEFORE waking so the woken poll can re-arm with a doubled delay if
-    /// the condition still holds.
     pub(super) fn arm(&self, delay: Duration) {
         if self.armed.swap(true, Ordering::AcqRel) {
             return;
@@ -118,9 +112,6 @@ mod tests {
     use crate::JobType;
     use crate::registry::JobRegistry;
 
-    /// The CAS guard must collapse many concurrent/repeated arm calls into
-    /// AT MOST ONE live waiter task -- proven by a counted observation, not
-    /// by re-reading the guard.
     #[tokio::test]
     async fn recheck_waiter_arm_is_idempotent_while_pending() -> anyhow::Result<()> {
         let recheck = Recheck::new(Arc::new(JobTracker::new(0, 10)));
@@ -139,19 +130,9 @@ mod tests {
         Ok(())
     }
 
-    /// The spin bound, against the worst case -- which is NOT a single
-    /// stuck row (that self-terminates: the poll that rotates its type into
-    /// the window sees `excluded_due` clear and sleeps honestly). It takes
-    /// due-but-locked rows of TWO types further apart in rotation order
-    /// than the window is wide; 24 types with rows at sorted positions 0
-    /// and 12 guarantees no window a test pool can produce covers both.
-    /// Deterministic counted observation: each direct `poll_and_dispatch`
-    /// call IS one poll.
     #[tokio::test]
     async fn unclaimable_excluded_due_rows_do_not_spin_unbounded() -> anyhow::Result<()> {
         let pool = init_pool().await?;
-        // min_jobs must be nonzero: `next_batch_size` returns `None` (poll
-        // parks at MAX_WAIT before planning anything) once running >= min.
         let tracker = Arc::new(JobTracker::new(1, 10));
         let mut registry = JobRegistry::new();
         let run = uuid::Uuid::now_v7();
@@ -170,8 +151,6 @@ mod tests {
         let stuck_a = seed_pending_job(&pool, &type_names[0], due).await?;
         let stuck_b = seed_pending_job(&pool, &type_names[12], due).await?;
 
-        // Hold both rows' locks open, exactly what a peer instance's
-        // in-flight claim would: due, pending, unclaimable.
         let mut lock_tx = pool.begin().await?;
         sqlx::query("SELECT id FROM job_executions WHERE id = ANY($1) FOR UPDATE")
             .bind(vec![uuid::Uuid::from(stuck_a), uuid::Uuid::from(stuck_b)])

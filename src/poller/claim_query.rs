@@ -1,25 +1,25 @@
-//! The claim statement, one autocommit round trip on the dedicated pool
-//! (whose session GUCs force ordered index access -- see
-//! `build_internal_pool`): a per-type LATERAL window over
-//! `idx_job_executions_pending_execute_at` bounded by each type's OWN
-//! budget (O(budget), flat in backlog; `state = 'pending'` holds only
-//! claimable rows -- blocked queue backlogs are `parked`), interleaved
-//! round-robin so one backlogged type cannot consume the global LIMIT,
-//! locked `FOR UPDATE SKIP LOCKED` over a small contention overscan, then
-//! budget-enforced and flipped to `running`. Ordering is always
-//! `(execute_at, id)` -- the total order every head-resolving mechanism in
-//! the crate agrees on. Measurements behind the shape: PERFORMANCE.md,
-//! "Claim admission".
+//! The claim statement is one autocommit round trip on the dedicated pool
+//! (session GUCs force ordered index access, see `build_internal_pool`): a
+//! per-type LATERAL window over `idx_job_executions_pending_execute_at`
+//! bounded by each type's own budget (O(budget), flat in backlog;
+//! `state = 'pending'` holds only claimable rows, blocked queue backlogs
+//! are `parked`), interleaved round-robin so one backlogged type cannot
+//! consume the global LIMIT, locked `FOR UPDATE SKIP LOCKED` over a small
+//! contention overscan, then budget-enforced and flipped to `running`.
+//! Ordering is always `(execute_at, id)`, the total order every
+//! head-resolving mechanism in the crate agrees on (see PERFORMANCE.md,
+//! "Claim admission").
 //!
-//! The same statement computes the sleep window the poll loop parks on:
-//! `min_wait` (next FUTURE deadline across planned AND rotation-excluded
-//! types), `excluded_due` (a due-NOW row among the excluded types --
-//! consumed by `recheck`, deliberately separate from `may_have_more` so
-//! the spin bound can tell the causes apart), and `may_have_more`
-//! (claimable work provably left behind, so re-poll immediately). Both
-//! sleep probes are per-type first-row index descents, NOT `ANY(..)`
-//! aggregate/EXISTS forms -- the naive shapes let the planner pick seq
-//! scans or full-range reads that cost orders of magnitude more (PR #188).
+//! The same statement also computes the sleep window the poll loop parks
+//! on: `min_wait` (next FUTURE deadline across planned AND
+//! rotation-excluded types), `excluded_due` (a due-NOW row among the
+//! excluded types, consumed by `recheck` and kept separate from
+//! `may_have_more` so the spin bound can tell the causes apart), and
+//! `may_have_more` (claimable work provably left behind, so re-poll
+//! immediately). Both sleep probes are per-type first-row index descents,
+//! not `ANY(..)` aggregate/EXISTS forms, because the naive shapes let the
+//! planner pick seq scans or full-range reads that cost orders of
+//! magnitude more (PR #188).
 
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
@@ -33,9 +33,6 @@ use super::MAX_WAIT;
 use crate::JobId;
 use crate::dispatcher::PolledJob;
 
-/// Overscan past the admission budget so `SKIP LOCKED` has somewhere to
-/// fall through when a peer holds a targeted row. Sized for contention,
-/// not filtering -- see PERFORMANCE.md, "Contention headroom".
 pub(super) const CONTENTION_HEADROOM: i32 = 4;
 
 #[instrument(
@@ -55,8 +52,6 @@ pub(super) async fn poll_jobs(
     headroom: i32,
     clock: &ClockHandle,
 ) -> Result<JobPollResult, sqlx::Error> {
-    // sim_now drives execute_at scheduling; wall_now drives the alive_at
-    // heartbeat -- liveness is real time, independent of manual clocks.
     let sim_now = clock.now();
     let wall_now = chrono::Utc::now();
     Span::current().record("now", tracing::field::display(sim_now));
@@ -197,13 +192,10 @@ pub(super) async fn poll_jobs(
     Ok(JobPollResult::from_rows(rows))
 }
 
-/// Whether the poller may sleep on `next_due_at`, or must re-poll sooner.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PollWindow {
     next_due_at: Option<DateTime<Utc>>,
     may_have_more: bool,
-    /// NOT consulted by `sleep_for`: unlike `may_have_more`, this one needs
-    /// the spin bound in `recheck`, which is where it is read.
     pub(super) excluded_due: bool,
 }
 
@@ -238,8 +230,6 @@ struct JobPollRow {
 }
 
 impl JobPollResult {
-    /// The min-wait row (`id` NULL) is present in every result set; row
-    /// order is not assumed.
     fn from_rows(rows: Vec<JobPollRow>) -> Self {
         let mut jobs = Vec::with_capacity(rows.len());
         let mut window = PollWindow {
@@ -281,8 +271,6 @@ mod tests {
     use super::*;
     use crate::JobType;
 
-    /// Each type scans under its own budget: one type's older backlog must
-    /// never crowd another type's due row out of the candidate window.
     #[tokio::test]
     async fn capped_type_backlog_does_not_starve_another_type() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -345,8 +333,6 @@ mod tests {
         Ok(())
     }
 
-    /// A blocked queue's backlog is `parked`, never `pending`, so it
-    /// structurally cannot enter the claim window however deep it is.
     #[tokio::test]
     async fn blocked_queue_backlog_does_not_consume_the_budget() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -413,10 +399,6 @@ mod tests {
         Ok(())
     }
 
-    /// Invariant A at the schema level: `idx_job_executions_queue_active`
-    /// is the ONLY enforcement of queue exclusion -- two concurrent raw
-    /// inserts racing for one queue's active slot must leave exactly one
-    /// `pending` row, the loser failing on this exact index.
     #[tokio::test]
     async fn queue_active_unique_index_enforces_exclusion() -> anyhow::Result<()> {
         let pool = init_pool().await?;

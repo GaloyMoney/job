@@ -21,8 +21,6 @@ pub(super) async fn init_pool() -> anyhow::Result<PgPool> {
     Ok(sqlx::PgPool::connect(&pg_con).await?)
 }
 
-/// An uncapped ("elastic") plain type; `init` is unreachable because the
-/// tests using it never let a claimed row reach dispatch.
 pub(super) struct ElasticInitializer {
     pub(super) job_type: JobType,
 }

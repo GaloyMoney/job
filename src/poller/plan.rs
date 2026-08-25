@@ -1,48 +1,27 @@
-//! Turns the registry's static facts (which types exist, their caps and
-//! batch policies) plus the tracker's live in-flight counts into one
-//! poll's per-type claim plan, spending `unit_budget` dispatch units -- a
-//! unit is roughly one shared-pool connection's worth of dispatch: one
-//! row for a plain type, one whole `run_batch` chunk for a batched one.
-//! Bounded types (batched / capped plain, real finite demand) and elastic
-//! types (uncapped plain, priced at the full window since their true
-//! demand is unknowable) first split the budget by tier (`tier_split`,
-//! smaller demand first, alternating by tick at budget one).
+//! Turns the registry's static facts (which types exist, their caps and batch
+//! policies) plus the tracker's live in-flight counts into one poll's
+//! per-type claim plan, spending `unit_budget` dispatch units -- a unit is
+//! roughly one shared-pool connection's worth of dispatch: one row for a
+//! plain type, one whole `run_batch` chunk for a batched one. Bounded types
+//! (batched / capped plain, real finite demand) and elastic types (uncapped
+//! plain, priced at the full window since their true demand is unknowable)
+//! first split the budget by tier (`tier_split`, smaller demand first,
+//! alternating by tick at budget one).
 //!
-//! **Policy: every type gets guaranteed forward progress under a scarce
-//! budget, via rotation that guarantees a turn within a bounded number of
-//! polls -- in both tiers, not just one.** Elastic draws a per-poll floor
-//! from a window that ROTATES by tick over the whole (sorted) type list.
-//! Bounded spends smallest-demand-first -- that ordering is the tier's
-//! whole point, so it is never abandoned -- but ties within it (the common
-//! case: most bounded types cost 1 unit) are broken by rotating each
-//! same-cost group by tick, so a scarce bounded budget cycles through
-//! *which* types in a tie win instead of the same registration-order
-//! prefix winning every single poll. Unspent bounded budget still grows
-//! the picked elastic types past their floor.
-//!
-//! Tie-group rotation only rotates types that share the SAME cost, so a
-//! type whose demand is larger than every tie ahead of it in cost order is
-//! never a tie-group member -- if the cheaper types alone exceed the
-//! tier's budget every poll (the scarce-budget case this module exists
-//! for), that larger type is starved by cost class, not just by identity,
-//! and no amount of tick advancing ever reaches it. `bounded_streak`
-//! tracks, per bounded type, consecutive polls where it had real demand
-//! but lost the budget; once a type's streak reaches the tier's own size,
-//! it is force-included ahead of the normal smallest-first order (ties
-//! among several simultaneously-forced types broken by longest-starved,
-//! then smallest-demand). This is aging, the standard fix for starvation
-//! under a smallest-job-first policy -- it is the fallback that applies
-//! when cost differs; tie-group rotation stays the low-latency path for
-//! the common same-cost case.
-//!
-//! The plan also reports what it could NOT cover: `clamped_by_pool` (due
-//! work exists that a short budget left unclaimed -- arms the headroom
-//! waiter) and `rotation_excluded`/`rotation_lap` (the types EITHER tier's
-//! rotation left out this poll -- fed into the sleep computation and the
-//! recheck spin bound; see `claim_query` and `recheck`). A bounded type
-//! dropped by its tier's budget is pushed into `rotation_excluded` exactly
-//! like an excluded elastic type -- it is not a silent third bucket invisible
-//! to the honest-sleep/recheck machinery (handoff-0138).
+//! Policy: every registered type gets guaranteed forward progress under a
+//! scarce claim budget, via rotation bounded to a known number of polls, in
+//! both tiers. Elastic draws a per-poll floor from a window that rotates by
+//! tick over the whole (sorted) type list. Bounded spends smallest-demand-first
+//! -- that ordering is the tier's whole point and is never abandoned -- with
+//! two layered fairness mechanisms: same-cost ties rotate by tick (the
+//! low-latency path for the common case, since most bounded types cost 1
+//! unit), and a type whose demand exceeds every tie ahead of it is aged in --
+//! force-included once it has lost the budget on as many consecutive polls as
+//! the tier has types -- covering the cross-cost-class starvation tie-rotation
+//! structurally cannot reach (handoff-0138). A type dropped by either
+//! mechanism, or by the elastic floor window, is reported in
+//! `rotation_excluded`/`rotation_lap`, feeding `claim_query`'s sleep
+//! computation and `recheck`'s spin bound.
 
 use std::sync::{
     Arc,
@@ -51,36 +30,18 @@ use std::sync::{
 
 use crate::{entity::JobType, registry::JobRegistry, tracker::JobTracker};
 
-/// One poll's per-type claim plan.
 pub(super) struct ClaimPlan {
     pub types: Vec<JobType>,
     pub row_limits: Vec<i32>,
-    /// The pool's headroom was the limiting factor; an empty-but-clamped
-    /// plan means due work exists that a zero budget kept unclaimed.
     pub clamped_by_pool: bool,
-    /// The types EITHER tier's rotation left out this poll -- elastic types
-    /// outside the floor window, and bounded types dropped by the tier's
-    /// budget; empty whenever nothing was dropped.
     pub rotation_excluded: Vec<JobType>,
-    /// Polls needed to guarantee every excluded type -- either tier -- has
-    /// had a turn at least once: `max(elastic type count, bounded type
-    /// count)` -- the bounded side is sized for the aging fallback's own
-    /// worst case, not just tie-group rotation's. Sizes the recheck spin
-    /// bound.
     pub rotation_lap: usize,
 }
 
 pub(super) struct ClaimPlanner {
     registry: Arc<JobRegistry>,
     tracker: Arc<JobTracker>,
-    /// Advanced once per plan; rotates which elastic types (and, at
-    /// `unit_budget == 1`, which tier) get a scarce claim slot.
     tick: AtomicUsize,
-    /// Consecutive polls each bounded type has had real demand but lost
-    /// the tier's budget; reset to absent (0) the poll it is served. Keyed
-    /// fresh from scratch every poll, so a type with no current demand is
-    /// pruned rather than accumulating a stale streak. See the module doc
-    /// -- this is the aging fallback for cross-cost-class starvation.
     bounded_streak: std::sync::Mutex<std::collections::HashMap<JobType, usize>>,
 }
 
@@ -94,12 +55,6 @@ impl ClaimPlanner {
         }
     }
 
-    /// Row limit for each registered type this poll; a type with no free
-    /// slot is dropped. Units bound DISPATCHES, not rows: a batched type's
-    /// unit is one eventual `dispatch_batches` chunk, and retries (always
-    /// dispatched alone) can nudge a claim slightly past budget -- bounded
-    /// by `RetrySettings`, the same direction of imprecision as the
-    /// clamp's under-claiming elsewhere.
     pub(super) fn plan(&self, n_jobs_to_poll: usize, unit_budget: usize) -> ClaimPlan {
         let natural: Vec<(JobType, usize, usize, bool)> = self
             .registry
@@ -138,15 +93,8 @@ impl ClaimPlanner {
         let tick = self.tick.fetch_add(1, Ordering::Relaxed);
         let (elastic_tier_budget, bounded_tier_budget) =
             tier_split(elastic.len(), bounded_demand, unit_budget, tick);
-        // tier_split caps each tier at its own demand, so unassigned
-        // budget is real headroom that must still reach elastic growth.
         let tier_leftover = unit_budget - bounded_tier_budget - elastic_tier_budget;
 
-        // Smallest-demand-first is the tier's whole point and stays fixed;
-        // but ties (most bounded types cost 1 unit) are broken by rotating
-        // each same-cost run by tick, so a scarce budget cycles through
-        // WHICH types in a tie win instead of the same registration-order
-        // prefix losing every single poll (handoff-0138).
         bounded.sort_by_key(|(_, _, units, _)| *units);
         let mut start = 0;
         while start < bounded.len() {
@@ -160,13 +108,6 @@ impl ClaimPlanner {
             start = end;
         }
 
-        // Tie-group rotation cannot help a type whose demand is larger
-        // than every tie ahead of it in cost order -- it is never a member
-        // of any tie group, so no amount of tick advancing brings it
-        // forward. Age it in instead: once a type has lost the budget on
-        // `starvation_threshold` consecutive polls where it had real
-        // demand, force it to the front of THIS poll's spend, ahead of the
-        // normal smallest-first order (handoff-0138 follow-up).
         let n_bounded = bounded.len();
         let starvation_threshold = n_bounded.max(1);
         let old_streaks = std::mem::take(
@@ -182,8 +123,6 @@ impl ClaimPlanner {
                 (job_type, limit, units, elastic, streak)
             })
             .partition(|(.., streak)| *streak >= starvation_threshold);
-        // Longest-starved wins among several simultaneously-forced types;
-        // smallest-demand stays the secondary key.
         forced.sort_by(|a, b| b.4.cmp(&a.4).then(a.2.cmp(&b.2)));
         rest.sort_by_key(|(_, _, units, ..)| *units);
 
@@ -249,10 +188,6 @@ impl ClaimPlanner {
     }
 }
 
-/// Splits `unit_budget` between the elastic tier (demand = one turn per
-/// elastic type) and the bounded tier (demand = real summed units),
-/// smaller demand first. At `unit_budget == 1` neither tier fits, so
-/// priority alternates by `tick` instead of one tier winning every poll.
 fn tier_split(
     elastic_demand: usize,
     bounded_demand: usize,
@@ -291,8 +226,6 @@ mod tests {
     use super::*;
     use crate::{Job, JobInitializer, JobRunner, JobSpawner};
 
-    /// A capped plain type, keyed by its own job type so several can be
-    /// registered side by side in one registry.
     struct FixedCapInitializer {
         job_type: JobType,
         cap: Option<usize>,
@@ -318,8 +251,6 @@ mod tests {
         }
     }
 
-    /// An uncapped ("elastic") plain type -- `max_concurrent_per_process`
-    /// defaults to `None`.
     struct UncappedInitializer(JobType);
 
     impl JobInitializer for UncappedInitializer {
@@ -342,9 +273,6 @@ mod tests {
         ClaimPlanner::new(Arc::new(registry), Arc::new(JobTracker::new(0, 10)))
     }
 
-    /// Mirrors `capped_type_does_not_starve_others` at the plan level: a
-    /// capped type's small demand must be met in full even with an
-    /// uncapped sibling also competing for the budget.
     #[test]
     fn capped_type_gets_full_demand_despite_uncapped_sibling() {
         let mut registry = JobRegistry::new();
@@ -369,8 +297,6 @@ mod tests {
         );
     }
 
-    /// Bounded demand that sums to the whole budget must not crowd an
-    /// uncapped type out of the plan entirely.
     #[test]
     fn elastic_type_is_not_starved_by_many_bounded_types() {
         let mut registry = JobRegistry::new();
@@ -390,9 +316,6 @@ mod tests {
             "plan-claim-uncapped-starved",
         )));
 
-        // unit_budget equals the four bounded types' combined demand
-        // exactly, so a floor-less algorithm excludes the uncapped type
-        // outright once bounded spends the whole budget.
         let plan = planner(registry).plan(50, 4);
 
         let idx = plan.types.iter().position(|t| t == &uncapped);
@@ -408,9 +331,6 @@ mod tests {
         );
     }
 
-    /// The mirror-image boundary: when elastic types outnumber
-    /// `unit_budget`, a bounded type competing for the same budget must
-    /// still make progress.
     #[test]
     fn bounded_type_is_not_starved_by_many_elastic_types() {
         let mut registry = JobRegistry::new();
@@ -429,8 +349,6 @@ mod tests {
             registry.add_initializer(UncappedInitializer(JobType::new(job_type)));
         }
 
-        // 5 elastic types, unit_budget == 3: a per-type floor would
-        // reserve the whole budget before the capped type is considered.
         let plan = planner(registry).plan(50, 3);
 
         let idx = plan.types.iter().position(|t| t == &capped);
@@ -443,8 +361,6 @@ mod tests {
         assert!(plan.row_limits[idx.unwrap()] >= 1);
     }
 
-    /// Elastic types that lose out on a scarce floor in one poll must win
-    /// it in a later one -- the picked subset rotates.
     #[test]
     fn elastic_types_rotate_through_a_scarce_floor_across_polls() {
         let mut registry = JobRegistry::new();
@@ -457,8 +373,6 @@ mod tests {
             .collect();
         let planner = planner(registry);
 
-        // unit_budget == 2 across 5 elastic types and no bounded
-        // competitor: only 2 can win the floor per poll.
         let mut seen = std::collections::HashSet::new();
         for _ in 0..elastic.len() {
             let plan = planner.plan(50, 2);
@@ -472,9 +386,6 @@ mod tests {
         );
     }
 
-    /// `rotation_excluded` must name exactly the elastic types the floor
-    /// window left out; window picks and excluded set partition the
-    /// elastic types.
     #[test]
     fn rotation_excluded_names_the_elastic_types_the_window_left_out() {
         let mut registry = JobRegistry::new();
@@ -485,8 +396,6 @@ mod tests {
         }
         let planner = planner(registry);
 
-        // budget 2 < 5 elastic types: the window can't cover them all, and
-        // the 3 it left out are exactly the elastic types not in the plan.
         let plan = planner.plan(50, 2);
         assert_eq!(plan.rotation_lap, 5);
         assert_eq!(plan.rotation_excluded.len(), 3);
@@ -497,31 +406,18 @@ mod tests {
             );
         }
 
-        // budget 5 == 5 elastic types: the window covers every one of them.
         let plan = planner.plan(50, 5);
         assert_eq!(plan.rotation_lap, 5);
         assert!(plan.rotation_excluded.is_empty());
         assert_eq!(plan.types.len(), 5);
     }
 
-    /// At `unit_budget == 1` neither tier's demand fits; the single unit
-    /// must alternate by tick instead of one tier winning forever.
     #[test]
     fn tier_split_alternates_at_budget_one() {
         assert_eq!(tier_split(5, 1, 1, 0), (1, 0));
         assert_eq!(tier_split(5, 1, 1, 1), (0, 1));
     }
 
-    /// RED-FIRST regression for handoff-0138: bounded demand that exceeds
-    /// the bounded tier's share must still rotate across polls so every
-    /// bounded type gets served eventually -- mirrors
-    /// `elastic_types_rotate_through_a_scarce_floor_across_polls`, but for
-    /// the bounded tier, which currently has NO rotation at all: `bounded`
-    /// is `sort_by_key(units)` over a fixed pre-order and a type dropped by
-    /// `bounded_remaining == 0` is silently `continue`d, so the SAME losers
-    /// lose on every single poll. Realistic type count (30, per staging's
-    /// ~65 registered / 36 outbox-resident scale) so a 3-type test can't
-    /// hide the bug behind incidental tie-break luck.
     #[test]
     fn bounded_types_rotate_through_a_scarce_floor_across_polls() {
         let mut registry = JobRegistry::new();
@@ -537,9 +433,6 @@ mod tests {
             .collect();
         let planner = planner(registry);
 
-        // unit_budget == 12 against 30 one-unit bounded types and no
-        // elastic competitor: only 12 can win the bounded tier's share per
-        // poll, so the plan must cycle through all 30 over enough polls.
         let mut seen = std::collections::HashSet::new();
         for _ in 0..bounded.len() {
             let plan = planner.plan(50, 12);
@@ -558,19 +451,6 @@ mod tests {
         );
     }
 
-    /// RED-FIRST regression, follow-up finding on handoff-0138: tie-group
-    /// rotation only rotates types that share the SAME cost. A bounded type
-    /// whose demand is strictly larger than every tie ahead of it in
-    /// smallest-first order is never a member of any tie group -- if the
-    /// smaller-cost types alone consume the whole tier budget every poll
-    /// (as they will whenever their combined demand exceeds it, which is
-    /// exactly the scarce-budget case this fix targets), the larger type is
-    /// reached with `bounded_remaining == 0` on EVERY poll, forever, and
-    /// tick never changes that: it is not a tie-group member, so no amount
-    /// of rotation ever brings it forward. Smallest-demand-first is
-    /// deliberately preserved by this fix (see the module doc), so this
-    /// type must still make progress some OTHER way -- across-cost-class
-    /// starvation, not just within-tie starvation.
     #[test]
     fn bounded_type_with_demand_exceeding_every_tie_still_makes_progress() {
         let mut registry = JobRegistry::new();
@@ -588,9 +468,6 @@ mod tests {
         });
         let planner = planner(registry);
 
-        // budget 4 < the 30 one-unit types' combined demand (30): the
-        // budget is exhausted by cost-1 items alone every single poll,
-        // before smallest-first order ever reaches the cost-5 type.
         let mut served = false;
         for _ in 0..60 {
             let plan = planner.plan(50, 4);
@@ -609,13 +486,6 @@ mod tests {
         );
     }
 
-    /// RED-FIRST regression for handoff-0138: a bounded type dropped by the
-    /// tier's budget must be visible in the plan's excluded-types list, the
-    /// same way a rotation-excluded elastic type is -- otherwise its due
-    /// rows are invisible to the honest-sleep/recheck machinery and the
-    /// poller can park past them for `MAX_WAIT`, or forever under a frozen
-    /// clock. Currently a budget-dropped bounded type lands in neither
-    /// `plan.types` nor `plan.rotation_excluded`: a silent third bucket.
     #[test]
     fn budget_dropped_bounded_type_is_visible_in_the_excluded_list() {
         let mut registry = JobRegistry::new();
@@ -629,9 +499,6 @@ mod tests {
         }
         let planner = planner(registry);
 
-        // budget 2 < 5 one-unit bounded types: 3 must be dropped, and every
-        // dropped type must be accounted for somewhere the sleep/recheck
-        // machinery can see it.
         let plan = planner.plan(50, 2);
         assert_eq!(plan.types.len(), 2, "only budget's worth should be planned");
         assert_eq!(
@@ -645,8 +512,6 @@ mod tests {
         );
     }
 
-    /// With no bounded competitor, tier_split caps the elastic tier's
-    /// floor at its type count -- the growth phase must recover the rest.
     #[test]
     fn elastic_type_alone_grows_to_its_full_window_not_just_its_floor() {
         let mut registry = JobRegistry::new();
