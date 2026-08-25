@@ -20,6 +20,15 @@
 //! (10ms doubling to 1s, CAS-guarded to at most one live waiter, since lock
 //! release emits no notification and clock-relative sleeps are inert under
 //! manual clocks); any claim resets the streak.
+//!
+//! The `2 x rotation_lap` threshold is load-bearing, not a tuning knob:
+//! measured, an unbounded zero-sleep spin against unclaimable rows runs at
+//! ~250 polls/s (a full DB core), which the bound caps at ~1 poll/s under the
+//! backoff waiter. `rotation_lap` sizes off the bounded tier's own type
+//! count (not the narrower widest-tie-group figure) specifically so the
+//! `plan()` aging fallback (see `plan`'s doc) always gets to force a starved
+//! type in BEFORE this bound trips and backs off -- reversing that ordering
+//! would stop re-polling exactly when aging was about to rescue the type.
 
 use std::sync::{
     Arc,

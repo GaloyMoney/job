@@ -21,7 +21,10 @@
 //! structurally cannot reach (handoff-0138). A type dropped by either
 //! mechanism, or by the elastic floor window, is reported in
 //! `rotation_excluded`/`rotation_lap`, feeding `claim_query`'s sleep
-//! computation and `recheck`'s spin bound.
+//! computation and `recheck`'s spin bound. `rotation_lap` uses the bounded
+//! tier's own type count, not the narrower widest-tie-group figure, so the
+//! aging threshold above always fires before `recheck`'s spin bound trips
+//! (see that module's doc for why the ordering matters).
 
 use std::sync::{
     Arc,
