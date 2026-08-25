@@ -16,14 +16,27 @@
 //! bounded zero-sleep re-polls. `claim_query`: the claim statement and the
 //! sleep window it computes. `hook`: short-circuit claims on the
 //! spawner's/completer's own commit, plus their rollback reconciler.
-//! `dispatch`: claimed row to running task, batching and shutdown
-//! monitors. `recovery`: real-time heartbeats, lost-job reclaim, orphan
-//! sweep. `shutdown`: drain-then-kill.
+//! `recovery`: real-time heartbeats, lost-job reclaim, orphan sweep.
+//! `shutdown`: drain-then-kill.
+//!
+//! Dispatch (claimed row to running task) lives here, on the poller
+//! itself: a batched type's claims split into canonical-order batches
+//! (sorted by `queue_id` so concurrent batch transactions lock shared
+//! domain rows in one order) with retries always batched alone, and
+//! dispatchers are built synchronously with the poll loop -- construction
+//! claims the type's tracker slot (which the very next poll's plan reads)
+//! and subscribes shutdown receivers a later broadcast would never reach.
+//! Each task pairs the execution future with a monitor that acks shutdown
+//! and grants the drain timeout; the `_from_reservation` entry points are
+//! the short-circuit path's (`hook`), dispatching through an already-taken
+//! reservation.
 
+use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tracing::{Span, instrument};
 
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -31,9 +44,19 @@ use std::sync::{
 use std::time::Duration;
 
 use super::{
-    JobId, config::JobPollerConfig, entity::JobType, error::JobError,
-    notification_router::JobNotificationRouter, notifier::JobEventNotifier, registry::JobRegistry,
-    repo::JobRepo, task::OwnedTaskHandle, tracker::JobTracker,
+    JobId,
+    batch_dispatcher::BatchDispatcher,
+    batched::{RawBatchItem, ShutdownRx},
+    config::JobPollerConfig,
+    dispatcher::*,
+    entity::{Job, JobType},
+    error::JobError,
+    notification_router::JobNotificationRouter,
+    notifier::JobEventNotifier,
+    registry::JobRegistry,
+    repo::JobRepo,
+    task::OwnedTaskHandle,
+    tracker::{JobTracker, UnitReservation},
 };
 
 /// Helper macro to spawn tasks with optional names based on the tokio-task-names feature
@@ -57,7 +80,6 @@ macro_rules! spawn_named_task {
 
 mod budget;
 mod claim_query;
-mod dispatch;
 mod hook;
 mod recheck;
 mod recovery;
@@ -70,11 +92,20 @@ pub(crate) use hook::ClaimHook;
 
 use budget::PoolBudget;
 use claim_query::{CONTENTION_HEADROOM, JobPollResult, poll_jobs};
+use hook::{ClaimedRow, DispatchTarget, claim_due_heads_in_op};
 use recheck::Recheck;
 use recovery::Recovery;
 use shutdown::ShutdownCoordinator;
 
 const MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// The two independently-subscribed shutdown receivers one dispatch task
+/// needs; the short-circuit path must obtain these before its claiming
+/// transaction commits (see `hook`).
+struct ShutdownSubs {
+    job: ShutdownRx,
+    monitor: ShutdownRx,
+}
 
 pub(crate) struct JobPoller {
     config: JobPollerConfig,
@@ -389,5 +420,531 @@ impl JobPoller {
         }
 
         Ok(next_poll_in)
+    }
+
+    async fn load_and_dispatch_claimed(
+        self: &Arc<Self>,
+        rows: Vec<PolledJob>,
+    ) -> Result<(), JobError> {
+        let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
+        let mut entities = self.repo.find_all::<Job>(&ids).await?;
+        let mut batched: HashMap<JobType, Vec<RawBatchItem>> = HashMap::new();
+        for row in rows {
+            let Some(job) = entities.remove(&row.id) else {
+                tracing::error!(
+                    job_id = %row.id,
+                    "claimed job row has no entity; skipping dispatch"
+                );
+                continue;
+            };
+            if self.registry.is_batched(&job.job_type) {
+                batched
+                    .entry(job.job_type.clone())
+                    .or_default()
+                    .push(RawBatchItem {
+                        attempt: row.attempt,
+                        queue_id: row.queue_id,
+                        execution_state_json: row.data_json,
+                        job,
+                    });
+            } else {
+                self.dispatch_job(job, row).await?;
+            }
+        }
+        for (job_type, items) in batched {
+            self.dispatch_batches(job_type, items).await?;
+        }
+        Ok(())
+    }
+
+    #[instrument(
+        name = "job.dispatch_batches",
+        skip(self, items),
+        fields(job_type = %job_type, n_items = items.len(), max_batch_size, n_batches)
+    )]
+    async fn dispatch_batches(
+        self: &Arc<Self>,
+        job_type: JobType,
+        mut items: Vec<RawBatchItem>,
+    ) -> Result<(), JobError> {
+        let span = Span::current();
+        let max_batch_size = self.registry.max_batch_size(&job_type);
+        span.record("max_batch_size", max_batch_size);
+
+        items.sort_by(
+            |a, b| match (a.queue_id.as_deref(), b.queue_id.as_deref()) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => uuid::Uuid::from(a.job.id).cmp(&uuid::Uuid::from(b.job.id)),
+            },
+        );
+
+        let (retries, mut fresh): (Vec<_>, Vec<_>) =
+            items.into_iter().partition(|item| item.attempt > 1);
+
+        let mut n_batches = 0;
+        for retry in retries {
+            n_batches += 1;
+            self.dispatch_batch(job_type.clone(), vec![retry]).await?;
+        }
+        while !fresh.is_empty() {
+            let take = max_batch_size.min(fresh.len());
+            let chunk: Vec<RawBatchItem> = fresh.drain(..take).collect();
+            n_batches += 1;
+            self.dispatch_batch(job_type.clone(), chunk).await?;
+        }
+        span.record("n_batches", n_batches);
+        Ok(())
+    }
+
+    #[instrument(
+        name = "job.dispatch_batch",
+        skip(self, items),
+        fields(job_type = %job_type, n_items = items.len(), poller_id, now)
+    )]
+    async fn dispatch_batch(
+        self: &Arc<Self>,
+        job_type: JobType,
+        items: Vec<RawBatchItem>,
+    ) -> Result<(), JobError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let span = Span::current();
+        let runner = self.registry.init_batch(
+            &job_type,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )?;
+        let retry_settings = self.registry.retry_settings(&job_type).clone();
+        span.record("now", tracing::field::display(self.clock.now()));
+        span.record("poller_id", tracing::field::display(self.instance_id));
+
+        let dispatcher = BatchDispatcher::new(
+            Arc::downgrade(self),
+            Arc::clone(&self.repo),
+            Arc::clone(&self.tracker),
+            Arc::clone(&self.notifier),
+            retry_settings,
+            job_type,
+            runner,
+            self.instance_id,
+            self.clock.clone(),
+            &items,
+        );
+        let subs = ShutdownSubs {
+            job: self.shutdown_tx.subscribe(),
+            monitor: self.shutdown_tx.subscribe(),
+        };
+        self.spawn_batch_dispatch_task(dispatcher, items, subs);
+        Ok(())
+    }
+
+    fn spawn_batch_dispatch_task(
+        &self,
+        dispatcher: BatchDispatcher,
+        items: Vec<RawBatchItem>,
+        subs: ShutdownSubs,
+    ) {
+        let job_type = dispatcher.job_type().clone();
+        let ShutdownSubs {
+            job: shutdown_rx_batch,
+            monitor: mut shutdown_rx_monitor,
+        } = subs;
+        let shutdown_timeout = self.config.shutdown_timeout;
+        let n_items = items.len();
+        let dispatched_type = job_type.clone();
+        #[cfg_attr(
+            not(all(feature = "tokio-task-names", tokio_unstable)),
+            allow(unused_variables)
+        )]
+        let task_name = format!("job-batch-{}-{}", job_type, n_items);
+
+        spawn_named_task!(&task_name, async move {
+            use tracing::Instrument;
+
+            let batch_fut = dispatcher.execute_batch(items, shutdown_rx_batch);
+            tokio::pin!(batch_fut);
+
+            tokio::select! {
+                // `execute_batch` emits `batch dispatcher error` itself.
+                res = &mut batch_fut => {
+                    let _ = res;
+                }
+                Ok(shutdown_notifier) = shutdown_rx_monitor.recv() => {
+                    let (send, recv) = tokio::sync::oneshot::channel();
+
+                    async {
+                        match shutdown_notifier.send(recv).await {
+                            Ok(()) => {
+                                tracing::Span::current().record("ack_sent", true);
+                                tracing::info!("Acknowledgement sent, waiting for batch completion");
+                                drop(shutdown_notifier);
+
+                                match tokio::time::timeout(shutdown_timeout, &mut batch_fut).await {
+                                    Ok(res) => {
+                                        tracing::Span::current().record("job_completed", true);
+                                        tracing::info!("Batch completed gracefully");
+                                        let _ = res;
+                                    }
+                                    Err(_) => {
+                                        tracing::Span::current().record("job_completed", false);
+                                        tracing::warn!("Batch exceeded timeout, aborting");
+                                    }
+                                }
+
+                                let _ = send.send(());
+                                tracing::info!("Final completion signal sent");
+                            }
+                            Err(_) => {
+                                tracing::Span::current().record("ack_sent", false);
+                                tracing::error!("Failed to send acknowledgement - stopped listening");
+                            }
+                        }
+                    }.instrument(tracing::info_span!(
+                            parent: None,
+                            "job.shutdown_coordination",
+                            job_type = %dispatched_type,
+                            n_items,
+                            coordination_path = "shutdown_first",
+                            ack_sent = tracing::field::Empty,
+                            job_completed = tracing::field::Empty,
+                        )
+                    ).await;
+                }
+            }
+        });
+    }
+
+    #[instrument(
+        name = "job.dispatch_job",
+        skip(self, job, polled_job),
+        fields(job_id, job_type, poller_id, attempt, now)
+    )]
+    async fn dispatch_job(
+        self: &Arc<Self>,
+        job: Job,
+        polled_job: PolledJob,
+    ) -> Result<(), JobError> {
+        let span = Span::current();
+        span.record("attempt", polled_job.attempt);
+        span.record("job_id", tracing::field::display(job.id));
+        span.record("job_type", tracing::field::display(&job.job_type));
+        let runner = self.registry.init_job(
+            &job,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )?;
+        let retry_settings = self.registry.retry_settings(&job.job_type).clone();
+        let retains_state = self.registry.retains_state(&job.job_type);
+        span.record("now", tracing::field::display(self.clock.now()));
+        span.record("poller_id", tracing::field::display(self.instance_id));
+
+        let dispatcher = JobDispatcher::new(
+            Arc::downgrade(self),
+            Arc::clone(&self.repo),
+            Arc::clone(&self.tracker),
+            Arc::clone(&self.notifier),
+            retry_settings,
+            job.id,
+            job.job_type.clone(),
+            retains_state,
+            runner,
+            self.instance_id,
+            self.clock.clone(),
+        );
+        let subs = ShutdownSubs {
+            job: self.shutdown_tx.subscribe(),
+            monitor: self.shutdown_tx.subscribe(),
+        };
+        self.spawn_dispatch_task(dispatcher, job, polled_job, subs);
+        Ok(())
+    }
+
+    async fn dispatch_job_from_reservation(
+        self: &Arc<Self>,
+        reservation: UnitReservation,
+        row: ClaimedRow,
+        subs: ShutdownSubs,
+    ) -> Result<(), JobError> {
+        let job = self.repo.find_by_id(row.id).await?;
+        let polled_job = PolledJob {
+            id: row.id,
+            data_json: row.data_json,
+            attempt: row.attempt as u32,
+            queue_id: row.queue_id,
+        };
+        let runner = self.registry.init_job(
+            &job,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )?;
+        let retry_settings = self.registry.retry_settings(&job.job_type).clone();
+        let retains_state = self.registry.retains_state(&job.job_type);
+        let dispatcher = JobDispatcher::from_reservation(
+            reservation,
+            Arc::downgrade(self),
+            Arc::clone(&self.repo),
+            Arc::clone(&self.tracker),
+            Arc::clone(&self.notifier),
+            retry_settings,
+            job.id,
+            job.job_type.clone(),
+            retains_state,
+            runner,
+            self.instance_id,
+            self.clock.clone(),
+        );
+        self.spawn_dispatch_task(dispatcher, job, polled_job, subs);
+        Ok(())
+    }
+
+    async fn dispatch_batch_from_reservation(
+        self: &Arc<Self>,
+        reservation: UnitReservation,
+        job_type: JobType,
+        rows: Vec<ClaimedRow>,
+        subs: ShutdownSubs,
+    ) -> Result<(), JobError> {
+        let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
+        let mut entities = self.repo.find_all::<Job>(&ids).await?;
+        let mut items: Vec<RawBatchItem> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(job) = entities.remove(&row.id) else {
+                tracing::error!(
+                    job_id = %row.id,
+                    "claimed job row has no entity; skipping dispatch"
+                );
+                continue;
+            };
+            items.push(RawBatchItem {
+                attempt: row.attempt as u32,
+                queue_id: row.queue_id,
+                execution_state_json: row.data_json,
+                job,
+            });
+        }
+        if items.is_empty() {
+            reservation.release();
+            return Ok(());
+        }
+        let runner = self.registry.init_batch(
+            &job_type,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+            Arc::clone(&self.notifier),
+        )?;
+        let retry_settings = self.registry.retry_settings(&job_type).clone();
+        let dispatcher = BatchDispatcher::from_reservation(
+            reservation,
+            Arc::downgrade(self),
+            Arc::clone(&self.repo),
+            Arc::clone(&self.tracker),
+            Arc::clone(&self.notifier),
+            retry_settings,
+            job_type,
+            runner,
+            self.instance_id,
+            self.clock.clone(),
+            &items,
+        );
+        self.spawn_batch_dispatch_task(dispatcher, items, subs);
+        Ok(())
+    }
+
+    fn spawn_dispatch_task(
+        &self,
+        dispatcher: JobDispatcher,
+        job: Job,
+        polled_job: PolledJob,
+        subs: ShutdownSubs,
+    ) {
+        let ShutdownSubs {
+            job: shutdown_rx_job,
+            monitor: mut shutdown_rx_monitor,
+        } = subs;
+        let shutdown_timeout = self.config.shutdown_timeout;
+        let job_id = job.id;
+        let job_type = job.job_type.clone();
+        #[cfg_attr(
+            not(all(feature = "tokio-task-names", tokio_unstable)),
+            allow(unused_variables)
+        )]
+        let task_name = format!("job-{}-{}", job_type, job_id);
+
+        spawn_named_task!(&task_name, async move {
+            use tracing::Instrument;
+
+            let attempt = polled_job.attempt;
+            let job_fut = dispatcher.execute_job(job, polled_job, shutdown_rx_job);
+            tokio::pin!(job_fut);
+
+            tokio::select! {
+                res = &mut job_fut => {
+                    if let Err(e) = res {
+                        tracing::error!(
+                            job_id = %job_id,
+                            attempt,
+                            exception.message = %e,
+                            exception.type = std::any::type_name_of_val(&e),
+                            "job dispatcher error"
+                        );
+                    }
+                }
+                Ok(shutdown_notifier) = shutdown_rx_monitor.recv() => {
+                    let (send, recv) = tokio::sync::oneshot::channel();
+
+                    async {
+                        match shutdown_notifier.send(recv).await {
+                            Ok(()) => {
+                                tracing::Span::current().record("ack_sent", true);
+                                tracing::info!("Acknowledgement sent, waiting for job completion");
+                                drop(shutdown_notifier);
+
+                                match tokio::time::timeout(shutdown_timeout, &mut job_fut).await {
+                                    Ok(res) => {
+                                        tracing::Span::current().record("job_completed", true);
+                                        tracing::info!("Job completed gracefully");
+                                        if let Err(e) = res {
+                                            tracing::error!(
+                                                job_id = %job_id,
+                                                attempt,
+                                                exception.message = %e,
+                                                exception.type = std::any::type_name_of_val(&e),
+                                                "job dispatcher error"
+                                            );
+                                        }
+                                    }
+                                    Err(_) => {
+                                        tracing::Span::current().record("job_completed", false);
+                                        tracing::warn!("Job exceeded timeout, aborting");
+                                    }
+                                }
+
+                                let _ = send.send(());
+                                tracing::info!("Final completion signal sent");
+                            }
+                            Err(_) => {
+                                tracing::Span::current().record("ack_sent", false);
+                                tracing::error!("Failed to send acknowledgement - stopped listening");
+                            }
+                        }
+                    }.instrument(tracing::info_span!(
+                            parent: None,
+                            "job.shutdown_coordination",
+                            job_id = %job_id,
+                            job_type = %job_type,
+                            coordination_path = "shutdown_first",
+                            ack_sent = tracing::field::Empty,
+                            job_completed = tracing::field::Empty,
+                        )
+                    ).await;
+                }
+            }
+        });
+    }
+
+    /// Reserve capacity for one due-now unit of `job_type`: the per-process
+    /// cap for a plain type, one batch slot for a batched type.
+    fn try_reserve(self: &Arc<Self>, job_type: &JobType) -> Option<UnitReservation> {
+        let cap = match self.registry.batch_policy(job_type) {
+            Some(policy) => Some(policy.max_concurrent_per_process),
+            None => self.registry.per_process_cap(job_type),
+        };
+        self.tracker.try_reserve(job_type, cap)
+    }
+
+    /// Claim shape for `job_type`: `(rows_per_unit, fresh_only)`.
+    fn claim_shape(&self, job_type: &JobType) -> (i64, bool) {
+        match self.registry.batch_policy(job_type) {
+            Some(policy) => (policy.max_batch_size as i64, true),
+            None => (1, false),
+        }
+    }
+
+    /// Claim up to `n_units` units' worth of `job_type`'s due backlog in
+    /// one statement and split it into per-reservation `DispatchTarget`s.
+    /// Can return fewer targets than units; the caller releases the rest.
+    async fn claim_after_many(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        job_type: &JobType,
+        now: DateTime<Utc>,
+        n_units: usize,
+    ) -> Result<Vec<DispatchTarget>, sqlx::Error> {
+        if n_units == 0 {
+            return Ok(Vec::new());
+        }
+        let (per_unit_limit, fresh_only) = self.claim_shape(job_type);
+        let limit = per_unit_limit * n_units as i64;
+        let rows =
+            claim_due_heads_in_op(op, job_type, self.instance_id, now, limit, fresh_only).await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.registry.batch_policy(job_type).is_some() {
+            let mut rows = rows.into_iter();
+            let mut targets = Vec::new();
+            loop {
+                let chunk: Vec<ClaimedRow> = (&mut rows).take(per_unit_limit as usize).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                targets.push(DispatchTarget::Batch(job_type.clone(), chunk));
+            }
+            Ok(targets)
+        } else {
+            Ok(rows.into_iter().map(DispatchTarget::Single).collect())
+        }
+    }
+
+    /// Register spawn-side claim demand: `n_due` due ROWS of `job_type`
+    /// just landed in this `op` (call AFTER the insert statement).
+    pub(crate) fn register_claim_demand(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        job_type: &JobType,
+        n_due: usize,
+    ) {
+        if n_due == 0 {
+            return;
+        }
+        let hook = ClaimHook::for_demand(Arc::downgrade(self), job_type.clone(), n_due);
+        Self::register_claim_hook(op, hook);
+    }
+
+    /// Register a completion-side recycled unit of `job_type`'s capacity;
+    /// the hook decides at commit time whether to spend it on due backlog
+    /// or let it drop into an ordinary release.
+    pub(crate) fn register_claim_recycle(
+        self: &Arc<Self>,
+        op: &mut impl es_entity::AtomicOperation,
+        job_type: &JobType,
+        reservation: UnitReservation,
+    ) {
+        let hook = ClaimHook::for_recycle(Arc::downgrade(self), job_type.clone(), reservation);
+        Self::register_claim_hook(op, hook);
+    }
+
+    /// Never `force_execute_pre_commit` on failure: forcing this hook
+    /// inline would claim rows with no `post_commit` ever dispatching them.
+    /// Dropping it is safe -- nothing is claimed, recycled units release
+    /// via `Drop`, the ordinary poll covers both.
+    fn register_claim_hook(op: &mut impl es_entity::AtomicOperation, hook: ClaimHook) {
+        if op.add_commit_hook(hook).is_err() {
+            tracing::error!(
+                "short-circuit claim could not register its commit hook; \
+                 any recycled unit released normally, any fresh demand is simply not claimed \
+                 -- the ordinary poll covers both"
+            );
+        }
     }
 }

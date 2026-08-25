@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::dispatch::ShutdownSubs;
+use super::ShutdownSubs;
 use crate::{
     JobId,
     entity::JobType,
@@ -38,114 +38,6 @@ use crate::{
 };
 
 use super::JobPoller;
-
-impl JobPoller {
-    /// Reserve capacity for one due-now unit of `job_type`: the per-process
-    /// cap for a plain type, one batch slot for a batched type.
-    fn try_reserve(self: &Arc<Self>, job_type: &JobType) -> Option<UnitReservation> {
-        let cap = match self.registry.batch_policy(job_type) {
-            Some(policy) => Some(policy.max_concurrent_per_process),
-            None => self.registry.per_process_cap(job_type),
-        };
-        self.tracker.try_reserve(job_type, cap)
-    }
-
-    /// Claim shape for `job_type`: `(rows_per_unit, fresh_only)`.
-    fn claim_shape(&self, job_type: &JobType) -> (i64, bool) {
-        match self.registry.batch_policy(job_type) {
-            Some(policy) => (policy.max_batch_size as i64, true),
-            None => (1, false),
-        }
-    }
-
-    /// Claim up to `n_units` units' worth of `job_type`'s due backlog in
-    /// one statement and split it into per-reservation `DispatchTarget`s.
-    /// Can return fewer targets than units; the caller releases the rest.
-    async fn claim_after_many(
-        self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
-        job_type: &JobType,
-        now: DateTime<Utc>,
-        n_units: usize,
-    ) -> Result<Vec<DispatchTarget>, sqlx::Error> {
-        if n_units == 0 {
-            return Ok(Vec::new());
-        }
-        let (per_unit_limit, fresh_only) = self.claim_shape(job_type);
-        let limit = per_unit_limit * n_units as i64;
-        let rows =
-            claim_due_heads_in_op(op, job_type, self.instance_id, now, limit, fresh_only).await?;
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self.registry.batch_policy(job_type).is_some() {
-            let mut rows = rows.into_iter();
-            let mut targets = Vec::new();
-            loop {
-                let chunk: Vec<ClaimedRow> = (&mut rows).take(per_unit_limit as usize).collect();
-                if chunk.is_empty() {
-                    break;
-                }
-                targets.push(DispatchTarget::Batch(job_type.clone(), chunk));
-            }
-            Ok(targets)
-        } else {
-            Ok(rows.into_iter().map(DispatchTarget::Single).collect())
-        }
-    }
-
-    /// Register spawn-side claim demand: `n_due` due ROWS of `job_type`
-    /// just landed in this `op` (call AFTER the insert statement).
-    pub(crate) fn register_claim_demand(
-        self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
-        job_type: &JobType,
-        n_due: usize,
-    ) {
-        if n_due == 0 {
-            return;
-        }
-        let hook = ClaimHook {
-            poller: Arc::downgrade(self),
-            fresh_demand: HashMap::from([(job_type.clone(), n_due)]),
-            recycled: Vec::new(),
-            claimed: Vec::new(),
-        };
-        Self::register_claim_hook(op, hook);
-    }
-
-    /// Register a completion-side recycled unit of `job_type`'s capacity;
-    /// the hook decides at commit time whether to spend it on due backlog
-    /// or let it drop into an ordinary release.
-    pub(crate) fn register_claim_recycle(
-        self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
-        job_type: &JobType,
-        reservation: UnitReservation,
-    ) {
-        let hook = ClaimHook {
-            poller: Arc::downgrade(self),
-            fresh_demand: HashMap::new(),
-            recycled: vec![(job_type.clone(), reservation)],
-            claimed: Vec::new(),
-        };
-        Self::register_claim_hook(op, hook);
-    }
-
-    /// Never `force_execute_pre_commit` on failure: forcing this hook
-    /// inline would claim rows with no `post_commit` ever dispatching them.
-    /// Dropping it is safe -- nothing is claimed, recycled units release
-    /// via `Drop`, the ordinary poll covers both.
-    fn register_claim_hook(op: &mut impl es_entity::AtomicOperation, hook: ClaimHook) {
-        if op.add_commit_hook(hook).is_err() {
-            tracing::error!(
-                "short-circuit claim could not register its commit hook; \
-                 any recycled unit released normally, any fresh demand is simply not claimed \
-                 -- the ordinary poll covers both"
-            );
-        }
-    }
-}
 
 /// One row claimed by [`claim_due_heads_in_op`]. `execute_at`/`job_type`
 /// exist for [`ClaimReconciler`], which must restore a row's original
@@ -165,7 +57,7 @@ pub(crate) struct ClaimedRow {
 /// with guaranteed ordering; `SKIP LOCKED` races peers harmlessly, and a
 /// short claim (down to zero rows) is fully expected. `fresh_only`
 /// excludes retries for batched claims (retries run alone).
-async fn claim_due_heads_in_op(
+pub(super) async fn claim_due_heads_in_op(
     op: &mut impl es_entity::AtomicOperation,
     job_type: &JobType,
     instance_id: uuid::Uuid,
@@ -227,6 +119,32 @@ pub(crate) struct ClaimHook {
 }
 
 impl ClaimHook {
+    pub(super) fn for_demand(
+        poller: std::sync::Weak<JobPoller>,
+        job_type: JobType,
+        n_due: usize,
+    ) -> Self {
+        Self {
+            poller,
+            fresh_demand: HashMap::from([(job_type, n_due)]),
+            recycled: Vec::new(),
+            claimed: Vec::new(),
+        }
+    }
+
+    pub(super) fn for_recycle(
+        poller: std::sync::Weak<JobPoller>,
+        job_type: JobType,
+        reservation: UnitReservation,
+    ) -> Self {
+        Self {
+            poller,
+            fresh_demand: HashMap::new(),
+            recycled: vec![(job_type, reservation)],
+            claimed: Vec::new(),
+        }
+    }
+
     /// A claim must never run before the inserts/promotes that create the
     /// rows it would claim; declared as a dependency rather than relied on
     /// via registration order. See the hook-DAG note on
