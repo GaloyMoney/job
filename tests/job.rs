@@ -70,6 +70,68 @@ impl JobInitializer for NoShortCircuitJobInitializer {
     }
 }
 
+/// A capped ("bounded") plain type that never gets spawned -- registering
+/// enough of these inflates the bounded tier's demand past its budget share
+/// without needing to seed real work for every distractor.
+struct NoSpawnCappedInitializer {
+    job_type: JobType,
+    cap: usize,
+}
+
+impl JobInitializer for NoSpawnCappedInitializer {
+    type Config = ();
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn max_concurrent_per_process(&self) -> Option<usize> {
+        Some(self.cap)
+    }
+
+    fn init(
+        &self,
+        _job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        unimplemented!("never spawned by these tests")
+    }
+}
+
+/// [`NoShortCircuitJobInitializer`], but also capped (bounded tier) instead
+/// of uncapped (elastic tier) -- needed to exercise `plan_claim`'s bounded
+/// tie-group rotation specifically, the same way `NoShortCircuitJobInitializer`
+/// exercises the elastic floor window's rotation.
+struct NoShortCircuitCappedJobInitializer {
+    job_type: JobType,
+    cap: usize,
+}
+
+impl JobInitializer for NoShortCircuitCappedJobInitializer {
+    type Config = TestJobConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn max_concurrent_per_process(&self) -> Option<usize> {
+        Some(self.cap)
+    }
+
+    fn short_circuit(&self) -> bool {
+        false
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: TestJobConfig = job.config()?;
+        Ok(Box::new(TestJobRunner { config }))
+    }
+}
+
 struct TestJobRunner {
     config: TestJobConfig,
 }
@@ -4035,6 +4097,81 @@ async fn elastic_type_excluded_by_rotation_still_runs_promptly() -> anyhow::Resu
         "a type excluded from the elastic floor's rotation window must still \
          run promptly once due, not park past MAX_WAIT waiting on a wake \
          that never comes under a frozen clock"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Regression for handoff-0138: the bounded tier has the same starvation
+/// hole PR #187/#188 fixed for the elastic tier. `plan_claim`'s bounded
+/// spend is smallest-demand-first over a fixed pre-order; before this fix,
+/// a bounded type dropped once the tier's budget ran out was silently
+/// `continue`d -- landing in neither the plan nor `rotation_excluded` -- so
+/// the same losing types lost on EVERY poll, forever, and their due rows
+/// were invisible to the honest-sleep machinery besides.
+///
+/// Registers 20 capped (bounded), never-spawned distractor types plus ONE
+/// capped target type against `helpers::init_pool`'s 4-unit budget, so at
+/// most 4 of the 21 one-unit bounded types can win a poll's tier share --
+/// the target's position among the tied 21 depends on `JobRegistry`'s
+/// internal (HashMap-derived) registration order, which this test cannot
+/// control, unlike the elastic counterpart's alphabetical sort -- so the
+/// bound below is sized for the worst case (a full 21-type rotation lap,
+/// zero-sleep per poll) rather than for a specific chosen position. The
+/// clock never advances: the due row can only complete because the poller
+/// keeps re-polling and rotating which bounded types win, never because a
+/// deadline it could see arrived.
+///
+/// Before the fix, the target has some fixed probability of landing in the
+/// permanently-dropped remainder every single poll with no rotation ever
+/// reaching it -- this test's bound (well under `MAX_WAIT`) fails
+/// deterministically on the pre-fix behaviour whenever the target draws
+/// that position, which repeated runs do hit.
+#[tokio::test]
+async fn bounded_type_excluded_by_budget_still_runs_promptly() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let (clock, _controller) = ClockHandle::manual();
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .clock(clock)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+
+    // 20 distractors sharing the bounded tier's budget with the target --
+    // never spawned, just registered, so the tier's demand (21 units)
+    // outstrips its ~4-unit share without seeding any DB rows for them.
+    for i in 0..20 {
+        jobs.add_initializer(NoSpawnCappedInitializer {
+            job_type: helpers::job_type(&format!("bounded-rotation-distractor-{i}")),
+            cap: 1,
+        });
+    }
+    // NOT short-circuited: the head-swap fast path bypasses `plan_claim`
+    // entirely, the same reason `elastic_type_excluded_by_rotation_still_runs_promptly`
+    // needs it off.
+    let target_spawner = jobs.add_initializer(NoShortCircuitCappedJobInitializer {
+        job_type: helpers::job_type("bounded-rotation-target"),
+        cap: 1,
+    });
+
+    jobs.start_poll().await?;
+
+    let target_id = JobId::new();
+    target_spawner
+        .spawn(target_id, TestJobConfig { delay_ms: 0 })
+        .await?;
+
+    let outcome = jobs
+        .handle(target_id)
+        .await_completion(Duration::from_secs(15))
+        .await?;
+    assert_eq!(
+        outcome.state(),
+        JobTerminalState::Completed,
+        "a bounded type dropped by the tier's budget must still run promptly \
+         once due, not lose to the same sibling types every poll forever"
     );
 
     jobs.shutdown().await?;

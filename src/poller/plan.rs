@@ -6,18 +6,28 @@
 //! Bounded types (batched / capped plain, real finite demand) and elastic
 //! types (uncapped plain, priced at the full window since their true
 //! demand is unknowable) first split the budget by tier (`tier_split`,
-//! smaller demand first, alternating by tick at budget one), then bounded
-//! spends smallest-demand-first and elastic draws a per-poll floor from a
-//! window that ROTATES by tick -- a scarce budget cycles through every
-//! elastic type instead of the same ones winning each poll -- with
-//! whatever bounded left unspent growing the picked types past their
-//! floor.
+//! smaller demand first, alternating by tick at budget one).
+//!
+//! **Policy: every type gets guaranteed forward progress under a scarce
+//! budget, via rotation that guarantees a turn within a bounded number of
+//! polls -- in both tiers, not just one.** Elastic draws a per-poll floor
+//! from a window that ROTATES by tick over the whole (sorted) type list.
+//! Bounded spends smallest-demand-first -- that ordering is the tier's
+//! whole point, so it is never abandoned -- but ties within it (the common
+//! case: most bounded types cost 1 unit) are broken by rotating each
+//! same-cost group by tick, so a scarce bounded budget cycles through
+//! *which* types in a tie win instead of the same registration-order
+//! prefix winning every single poll. Unspent bounded budget still grows
+//! the picked elastic types past their floor.
 //!
 //! The plan also reports what it could NOT cover: `clamped_by_pool` (due
 //! work exists that a short budget left unclaimed -- arms the headroom
-//! waiter) and `rotation_excluded`/`n_elastic` (the elastic types outside
-//! this poll's window -- fed into the sleep computation and the recheck
-//! spin bound; see `claim_query` and `recheck`).
+//! waiter) and `rotation_excluded`/`rotation_lap` (the types EITHER tier's
+//! rotation left out this poll -- fed into the sleep computation and the
+//! recheck spin bound; see `claim_query` and `recheck`). A bounded type
+//! dropped by its tier's budget is pushed into `rotation_excluded` exactly
+//! like an excluded elastic type -- it is not a silent third bucket invisible
+//! to the honest-sleep/recheck machinery (handoff-0138).
 
 use std::sync::{
     Arc,
@@ -33,12 +43,14 @@ pub(super) struct ClaimPlan {
     /// The pool's headroom was the limiting factor; an empty-but-clamped
     /// plan means due work exists that a zero budget kept unclaimed.
     pub clamped_by_pool: bool,
-    /// The elastic types this poll's rotating floor window did NOT
-    /// include; empty whenever the window covers every elastic type.
+    /// The types EITHER tier's rotation left out this poll -- elastic types
+    /// outside the floor window, and bounded types dropped by the tier's
+    /// budget; empty whenever nothing was dropped.
     pub rotation_excluded: Vec<JobType>,
-    /// Total elastic types this poll: one full rotation lap is exactly
-    /// this many polls, which sizes the recheck spin bound.
-    pub n_elastic: usize,
+    /// Polls needed to guarantee every excluded type -- either tier -- has
+    /// had a turn at least once: `max(elastic type count, largest bounded
+    /// tie-group)`. Sizes the recheck spin bound.
+    pub rotation_lap: usize,
 }
 
 pub(super) struct ClaimPlanner {
@@ -106,12 +118,35 @@ impl ClaimPlanner {
         // budget is real headroom that must still reach elastic growth.
         let tier_leftover = unit_budget - bounded_tier_budget - elastic_tier_budget;
 
+        // Smallest-demand-first is the tier's whole point and stays fixed;
+        // but ties (most bounded types cost 1 unit) are broken by rotating
+        // each same-cost run by tick, so a scarce budget cycles through
+        // WHICH types in a tie win instead of the same registration-order
+        // prefix losing every single poll (handoff-0138). Track the widest
+        // tie group -- its own length is exactly how many polls guarantee
+        // every member of that group has won the rotation at least once.
         bounded.sort_by_key(|(_, _, units, _)| *units);
+        let mut bounded_rotation_lap = 0usize;
+        let mut start = 0;
+        while start < bounded.len() {
+            let units = bounded[start].2;
+            let mut end = start + 1;
+            while end < bounded.len() && bounded[end].2 == units {
+                end += 1;
+            }
+            let group_len = end - start;
+            bounded_rotation_lap = bounded_rotation_lap.max(group_len);
+            bounded[start..end].rotate_left(tick % group_len);
+            start = end;
+        }
+
         let mut types = Vec::new();
         let mut row_limits = Vec::new();
+        let mut rotation_excluded = Vec::new();
         let mut bounded_remaining = bounded_tier_budget;
         for (job_type, limit, units, _) in bounded {
             if bounded_remaining == 0 {
+                rotation_excluded.push(job_type);
                 continue;
             }
             let (limit, units) = if units <= bounded_remaining {
@@ -127,6 +162,7 @@ impl ClaimPlanner {
                 (bounded_remaining, bounded_remaining)
             };
             if limit == 0 {
+                rotation_excluded.push(job_type);
                 continue;
             }
             types.push(job_type);
@@ -147,16 +183,14 @@ impl ClaimPlanner {
             types.push(job_type.clone());
             row_limits.push(units as i32);
         }
-        let rotation_excluded = (take..n)
-            .map(|i| elastic[(offset + i) % n].0.clone())
-            .collect();
+        rotation_excluded.extend((take..n).map(|i| elastic[(offset + i) % n].0.clone()));
 
         ClaimPlan {
             types,
             row_limits,
             clamped_by_pool,
             rotation_excluded,
-            n_elastic: n,
+            rotation_lap: n.max(bounded_rotation_lap),
         }
     }
 }
@@ -400,7 +434,7 @@ mod tests {
         // budget 2 < 5 elastic types: the window can't cover them all, and
         // the 3 it left out are exactly the elastic types not in the plan.
         let plan = planner.plan(50, 2);
-        assert_eq!(plan.n_elastic, 5);
+        assert_eq!(plan.rotation_lap, 5);
         assert_eq!(plan.rotation_excluded.len(), 3);
         for excluded in &plan.rotation_excluded {
             assert!(
@@ -411,7 +445,7 @@ mod tests {
 
         // budget 5 == 5 elastic types: the window covers every one of them.
         let plan = planner.plan(50, 5);
-        assert_eq!(plan.n_elastic, 5);
+        assert_eq!(plan.rotation_lap, 5);
         assert!(plan.rotation_excluded.is_empty());
         assert_eq!(plan.types.len(), 5);
     }
@@ -422,6 +456,88 @@ mod tests {
     fn tier_split_alternates_at_budget_one() {
         assert_eq!(tier_split(5, 1, 1, 0), (1, 0));
         assert_eq!(tier_split(5, 1, 1, 1), (0, 1));
+    }
+
+    /// RED-FIRST regression for handoff-0138: bounded demand that exceeds
+    /// the bounded tier's share must still rotate across polls so every
+    /// bounded type gets served eventually -- mirrors
+    /// `elastic_types_rotate_through_a_scarce_floor_across_polls`, but for
+    /// the bounded tier, which currently has NO rotation at all: `bounded`
+    /// is `sort_by_key(units)` over a fixed pre-order and a type dropped by
+    /// `bounded_remaining == 0` is silently `continue`d, so the SAME losers
+    /// lose on every single poll. Realistic type count (30, per staging's
+    /// ~65 registered / 36 outbox-resident scale) so a 3-type test can't
+    /// hide the bug behind incidental tie-break luck.
+    #[test]
+    fn bounded_types_rotate_through_a_scarce_floor_across_polls() {
+        let mut registry = JobRegistry::new();
+        let bounded: Vec<JobType> = (0..30)
+            .map(|i| {
+                registry.add_initializer(FixedCapInitializer {
+                    job_type: JobType::new(Box::leak(
+                        format!("plan-claim-bounded-rotation-{i:02}").into_boxed_str(),
+                    )),
+                    cap: Some(1),
+                })
+            })
+            .collect();
+        let planner = planner(registry);
+
+        // unit_budget == 12 against 30 one-unit bounded types and no
+        // elastic competitor: only 12 can win the bounded tier's share per
+        // poll, so the plan must cycle through all 30 over enough polls.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..bounded.len() {
+            let plan = planner.plan(50, 12);
+            seen.extend(plan.types);
+        }
+
+        assert_eq!(
+            seen.len(),
+            bounded.len(),
+            "every bounded type must be picked within enough polls to cycle \
+             through them all, not lose to the same smaller-index types every \
+             time -- got {}/{} distinct types served across {} polls",
+            seen.len(),
+            bounded.len(),
+            bounded.len()
+        );
+    }
+
+    /// RED-FIRST regression for handoff-0138: a bounded type dropped by the
+    /// tier's budget must be visible in the plan's excluded-types list, the
+    /// same way a rotation-excluded elastic type is -- otherwise its due
+    /// rows are invisible to the honest-sleep/recheck machinery and the
+    /// poller can park past them for `MAX_WAIT`, or forever under a frozen
+    /// clock. Currently a budget-dropped bounded type lands in neither
+    /// `plan.types` nor `plan.rotation_excluded`: a silent third bucket.
+    #[test]
+    fn budget_dropped_bounded_type_is_visible_in_the_excluded_list() {
+        let mut registry = JobRegistry::new();
+        for i in 0..5 {
+            registry.add_initializer(FixedCapInitializer {
+                job_type: JobType::new(Box::leak(
+                    format!("plan-claim-bounded-excluded-{i}").into_boxed_str(),
+                )),
+                cap: Some(1),
+            });
+        }
+        let planner = planner(registry);
+
+        // budget 2 < 5 one-unit bounded types: 3 must be dropped, and every
+        // dropped type must be accounted for somewhere the sleep/recheck
+        // machinery can see it.
+        let plan = planner.plan(50, 2);
+        assert_eq!(plan.types.len(), 2, "only budget's worth should be planned");
+        assert_eq!(
+            plan.rotation_excluded.len(),
+            3,
+            "the 3 budget-dropped bounded types must be named in the excluded \
+             list, not silently disappear -- got rotation_excluded = {:?} \
+             (plan.types = {:?})",
+            plan.rotation_excluded,
+            plan.types
+        );
     }
 
     /// With no bounded competitor, tier_split caps the elastic tier's

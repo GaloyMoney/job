@@ -1,24 +1,28 @@
-//! Why recheck exists: `plan_claim`'s elastic floor window rotates when
-//! uncapped types outnumber their budget share, and an excluded type's due
-//! rows are invisible to both that poll's claim and its sleep deadline.
-//! The claim query reports them as `excluded_due` (see `claim_query`), and
-//! this module answers with a zero-sleep re-poll: every poll advances the
-//! rotation one slot, so the window reaches any excluded type within one
-//! lap -- milliseconds. `Duration::ZERO` fires even under a frozen manual
-//! clock (the manual `ClockSleep` completes when `now >= wake_at`); any
-//! positive clock-relative duration would not.
+//! Why recheck exists: `plan_claim`'s rotation -- the elastic floor window,
+//! and (handoff-0138) the bounded tier's tie-group rotation -- excludes
+//! some types when demand outstrips a tier's budget share, and an excluded
+//! type's due rows are invisible to both that poll's claim and its sleep
+//! deadline. The claim query reports them as `excluded_due` (see
+//! `claim_query`), and this module answers with a zero-sleep re-poll: every
+//! poll advances rotation one slot in whichever tier is scarce, so the
+//! window reaches any excluded type within one lap -- milliseconds.
+//! `Duration::ZERO` fires even under a frozen manual clock (the manual
+//! `ClockSleep` completes when `now >= wake_at`); any positive
+//! clock-relative duration would not.
 //!
 //! "Due" does not imply "claimable" (a peer's in-flight claim can hold the
 //! row's lock), and two unclaimable due rows further apart in rotation
 //! order than the window is wide keep `excluded_due` set on EVERY poll --
 //! so zero-sleep re-polls are granted only while consecutive claim-nothing
-//! `excluded_due` polls stay within two full rotation laps (one lap
-//! guarantees every elastic type had a window slot). Past that, the poll
-//! falls back to the honest window-derived sleep plus a one-shot real-time
-//! backoff waiter (10ms doubling to 1s; lock release emits no
-//! notification, and clock-relative sleeps are inert under manual clocks).
-//! Claims reset the streak -- productive spinning is the ordinary drain
-//! path, not this pathology. Design and cost measurements: PR #188.
+//! `excluded_due` polls stay within two full rotation laps (`ClaimPlan::
+//! rotation_lap` -- one lap guarantees every excluded type, either tier,
+//! had a turn). Past that, the poll falls back to the honest
+//! window-derived sleep plus a one-shot real-time backoff waiter (10ms
+//! doubling to 1s; lock release emits no notification, and clock-relative
+//! sleeps are inert under manual clocks). Claims reset the streak --
+//! productive spinning is the ordinary drain path, not this pathology.
+//! Design and cost measurements: PR #188; bounded-tier extension:
+//! handoff-0138.
 
 use std::sync::{
     Arc,
@@ -57,7 +61,7 @@ impl Recheck {
         base: Duration,
         jobs_claimed: usize,
         excluded_due: bool,
-        n_elastic: usize,
+        rotation_lap: usize,
     ) -> Duration {
         if !excluded_due {
             self.streak.store(0, Ordering::Relaxed);
@@ -72,7 +76,7 @@ impl Recheck {
             return Duration::ZERO;
         }
         let streak = self.streak.fetch_add(1, Ordering::Relaxed) + 1;
-        if streak <= n_elastic.saturating_mul(2) {
+        if streak <= rotation_lap.saturating_mul(2) {
             return Duration::ZERO;
         }
         let backoff_ms = self.backoff_ms.load(Ordering::Relaxed);

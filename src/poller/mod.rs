@@ -394,7 +394,7 @@ impl JobPoller {
                     window.sleep_for(self.clock.now()),
                     0,
                     window.excluded_due,
-                    plan.n_elastic,
+                    plan.rotation_lap,
                 );
                 span.record("next_poll_in", tracing::field::debug(duration));
                 span.record("n_jobs_to_start", 0);
@@ -414,7 +414,7 @@ impl JobPoller {
         };
         let next_poll_in =
             self.recheck
-                .bounded_sleep(base, jobs_len, window.excluded_due, plan.n_elastic);
+                .bounded_sleep(base, jobs_len, window.excluded_due, plan.rotation_lap);
         span.record("next_poll_in", tracing::field::debug(next_poll_in));
 
         // Deliberately NOT detached: dispatching claims tracker slots the
