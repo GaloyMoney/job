@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "job"
-version = "0.13.10-dev"
+version = "0.13.10"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -1,3 +1,11 @@
+# [job release v0.13.10](https://github.com/GaloyMoney/job/releases/tag/0.13.10)
+
+
+
+### Performance
+
+- Rewrite min_wait back to a single-aggregate scan (#193)
+
 # [job release v0.13.9](https://github.com/GaloyMoney/job/releases/tag/0.13.9)
 
 
