@@ -37,18 +37,38 @@
 //! at 40 types / ~80 future rows, `ANY(..)` wins 5-44 bufs vs LATERAL's
 //! 81-120 (vacuumed vs churned/unvacuumed); at 13 types / ~7.6k future
 //! rows -- PR #188's own bench shape -- LATERAL wins 27-52 bufs vs
-//! `ANY(..)`'s 70-800 (same two conditions). The crossover is roughly
-//! 10-200 future rows per scope-type depending on vacuum/bloat state;
-//! neither a `GROUP BY job_type` rewrite nor any other single-query form
-//! tried closes the gap (Postgres has no loose/skip index scan for a
-//! cross-group `MIN` here, even on PG18), so this is a chosen regime, not
-//! an oversight. `ANY(..)` is primary because lana's real registry
-//! currently sits nowhere near that crossover (production AlloyDB QI:
-//! 190 -> 318 blks/call comparing 0.13.5's `ANY(..)` against 0.13.9's
-//! LATERAL, live traffic; point-sampled backlog ~2 future rows / 57
-//! types). If lana starts scheduling work meaningfully far ahead (bulk
-//! delayed jobs, cron reminders at scale) that ratio moves and this
-//! choice should be revisited with fresh numbers -- see
+//! `ANY(..)`'s 70-800 (same two conditions). That puts the crossover at
+//! roughly **40 future rows per scope-type under churn, ~230 freshly
+//! vacuumed** -- use the churned figure as the actionable floor, since
+//! the scenario below that pushes the ratio up also tends to starve
+//! autovacuum of the CPU/IO it needs. Neither a `GROUP BY job_type`
+//! rewrite nor any other single-query form tried closes the gap
+//! (Postgres has no loose/skip index scan for a cross-group `MIN` here,
+//! even on PG18), so this is a chosen regime, not an oversight.
+//!
+//! `ANY(..)` is primary because lana's real registry currently sits
+//! nowhere near that crossover (production AlloyDB QI: 190 -> 318
+//! blks/call comparing 0.13.5's `ANY(..)` against 0.13.9's LATERAL, live
+//! traffic; point-sampled backlog ~2 future rows / 57 types). **Named
+//! risk, not a hypothetical one:** `entity.rs::RetryPolicy::next_attempt_at`
+//! reschedules a failed job to `state = 'pending'`, `execute_at = now +
+//! backoff` -- squarely inside `min_wait`'s scope -- so a failure storm
+//! (a downstream outage, a bad deploy, a saturated pool) that keeps many
+//! instances of a few types retrying concurrently is exactly the "few
+//! types, deep future backlog" shape this file's `ANY(..)` choice is
+//! worse at, and it lands while the system is already degraded. The
+//! ceiling this trades against is bounded --
+//! `min_wait_any_form_cost_is_bounded_under_a_large_future_backlog` pins
+//! it -- so this does not stall the poller, it just costs more DB work
+//! exactly when DB work is scarcest.
+//!
+//! **Revisit trigger (checkable on a live database, not a vague
+//! "if this changes"):** run
+//! `SELECT job_type, count(*) FROM job_executions WHERE state = 'pending'
+//! AND execute_at > now() GROUP BY job_type ORDER BY 2 DESC;` -- if any
+//! pollable type's count regularly exceeds ~30 (safety margin below the
+//! ~40 churned-crossover above), re-run this file's two `min_wait`
+//! benchmarks against that shape and reconsider the form. See
 //! `job-dev:handoff-claim-deadline-lazy-eval.md` for the full analysis
 //! and PR #193's description for the reproduction.
 //!
