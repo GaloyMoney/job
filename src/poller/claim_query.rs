@@ -16,14 +16,42 @@
 //! excluded types, consumed by `recheck` and kept separate from
 //! `may_have_more` so the spin bound can tell the causes apart), and
 //! `may_have_more` (claimable work provably left behind, so re-poll
-//! immediately). `min_wait` is a single `MIN(..) WHERE job_type =
-//! ANY(..)` aggregate over the same partial index the claim itself uses
-//! (`idx_job_executions_pending_execute_at`): one array-keyed scan sharing
-//! the btree's upper levels beats a per-type LATERAL descent once the
-//! pollable-type count is large (PR #188 introduced the LATERAL form to
-//! widen the scope to rotation-excluded types; #189-era regression
-//! measurement found the form itself, not the widened scope, was the
-//! expensive part -- see `handoff-claim-deadline-lazy-eval.md`).
+//! immediately).
+//!
+//! `min_wait` is a single `MIN(..) WHERE job_type = ANY(..)` aggregate
+//! over the same partial index the claim itself uses
+//! (`idx_job_executions_pending_execute_at`), not the per-type
+//! `CROSS JOIN LATERAL` probe PR #188 introduced when it widened the
+//! scope to `rotation_excluded` types. **This is a real trade-off, not a
+//! strict win -- read before changing either form back:**
+//!
+//! - The `ANY(..)` aggregate has no per-type early-out: Postgres visits
+//!   every *future* `pending` row matching the scope, then aggregates.
+//!   Cost scales with **future rows in scope**, ~flat in type count.
+//! - The LATERAL form's per-type `ORDER BY execute_at LIMIT 1` stops
+//!   after one row per type. Cost scales with **types in scope**
+//!   (~2-4 bufs/type measured), ~flat in backlog depth.
+//!
+//! Measured (this repo, `min_wait_plan_is_a_single_index_scan_not_a_per_type_fanout`
+//! and `min_wait_any_form_cost_is_bounded_under_a_large_future_backlog`):
+//! at 40 types / ~80 future rows, `ANY(..)` wins 5-44 bufs vs LATERAL's
+//! 81-120 (vacuumed vs churned/unvacuumed); at 13 types / ~7.6k future
+//! rows -- PR #188's own bench shape -- LATERAL wins 27-52 bufs vs
+//! `ANY(..)`'s 70-800 (same two conditions). The crossover is roughly
+//! 10-200 future rows per scope-type depending on vacuum/bloat state;
+//! neither a `GROUP BY job_type` rewrite nor any other single-query form
+//! tried closes the gap (Postgres has no loose/skip index scan for a
+//! cross-group `MIN` here, even on PG18), so this is a chosen regime, not
+//! an oversight. `ANY(..)` is primary because lana's real registry
+//! currently sits nowhere near that crossover (production AlloyDB QI:
+//! 190 -> 318 blks/call comparing 0.13.5's `ANY(..)` against 0.13.9's
+//! LATERAL, live traffic; point-sampled backlog ~2 future rows / 57
+//! types). If lana starts scheduling work meaningfully far ahead (bulk
+//! delayed jobs, cron reminders at scale) that ratio moves and this
+//! choice should be revisited with fresh numbers -- see
+//! `job-dev:handoff-claim-deadline-lazy-eval.md` for the full analysis
+//! and PR #193's description for the reproduction.
+//!
 //! `excluded_due` stays a per-type LATERAL EXISTS probe: it only ever
 //! scans `rotation_excluded`, a small set, so the naive shape there still
 //! risks a seq scan / full-range read if flattened to a bare `ANY(..)`
@@ -469,6 +497,112 @@ mod tests {
         assert!(
             plan_text.contains("idx_job_executions_pending_execute_at"),
             "min_wait must still use the shared pending-claim index:\n{plan_text}"
+        );
+
+        Ok(())
+    }
+
+    /// The converse of `min_wait_plan_is_a_single_index_scan_not_a_per_type_fanout`:
+    /// pins the accepted COST of the regime the `ANY(..)` form is worse
+    /// at, rather than pretending it doesn't exist. #188 measured the
+    /// same shape (13 types, ~7.6k future rows -- what lana's registry
+    /// would look like if it started scheduling substantial work ahead of
+    /// time) at 7,737 bufs for a naive `MIN(..) WHERE job_type = ANY(..)`
+    /// aggregate, because that form has no per-type early-out: it visits
+    /// every future row in scope, not one row per type. `ANY(..)` is
+    /// still chosen (see this file's header) because lana's real
+    /// registry sits nowhere near that shape today -- but that choice
+    /// should stay a *chosen, bounded* cost, not an unbounded one. This
+    /// seeds the same shape and asserts the buffer cost stays
+    /// proportional to the future-row count actually in scope (allowing
+    /// generous headroom for vacuum/bloat variance -- this repo's own
+    /// churned-table repro measured up to ~0.1 bufs/row, #188's
+    /// production-churned table ~1.0) and that the plan still uses the
+    /// claim index rather than degrading to a sequential scan. A
+    /// regression that made this unbounded (e.g. losing the
+    /// `execute_at > ..` predicate, or matching outside the intended
+    /// scope) fails this even though it would not touch the other test.
+    #[tokio::test]
+    async fn min_wait_any_form_cost_is_bounded_under_a_large_future_backlog() -> anyhow::Result<()>
+    {
+        let pool = init_pool().await?;
+        let mut conn = pool.acquire().await?;
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("SET enable_bitmapscan = off")
+            .execute(&mut *conn)
+            .await?;
+
+        // #188's own bench shape: a handful of types, each carrying a
+        // deep future-dated backlog -- not a shape lana's registry is in
+        // today (see this file's header), but the one the ANY(..) form
+        // is worse at, so it's the one this test must exercise.
+        const N_TYPES: i64 = 13;
+        const ROWS_PER_TYPE: i64 = 600;
+        let run = format!("min-wait-backlog-{}", uuid::Uuid::now_v7());
+        for t in 0..N_TYPES {
+            let job_type = format!("{run}-{t}");
+            for r in 0..ROWS_PER_TYPE {
+                seed_pending_job(
+                    &pool,
+                    &job_type,
+                    chrono::Utc::now() + chrono::Duration::minutes(r + 1),
+                )
+                .await?;
+            }
+        }
+        sqlx::query("ANALYZE job_executions")
+            .execute(&mut *conn)
+            .await?;
+
+        let scope: Vec<String> = (0..N_TYPES).map(|t| format!("{run}-{t}")).collect();
+        let empty: Vec<String> = Vec::new();
+
+        let plan: JsonValue = sqlx::query_scalar(
+            r#"
+            EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+            SELECT MIN(execute_at) AS next_due_at
+            FROM job_executions
+            WHERE state = 'pending'
+              AND job_type = ANY($1::text[] || $2::text[])
+              AND execute_at > $3::timestamptz
+            "#,
+        )
+        .bind(&scope)
+        .bind(&empty)
+        .bind(chrono::Utc::now())
+        .fetch_one(&mut *conn)
+        .await?;
+
+        let plan_text = plan.to_string();
+        assert!(
+            !plan_text.contains("Seq Scan"),
+            "min_wait must never degrade to a sequential scan, whatever \
+             the backlog shape:\n{plan_text}"
+        );
+        assert!(
+            plan_text.contains("idx_job_executions_pending_execute_at"),
+            "min_wait must still use the shared pending-claim index:\n{plan_text}"
+        );
+
+        let total_future_rows = N_TYPES * ROWS_PER_TYPE;
+        // "Shared Hit Blocks" on the top-level Plan node is cumulative
+        // (self + every child), so this is the whole query's buffer cost.
+        // Generous ceiling: this repo's own churned-table repro measured
+        // ~0.1 bufs/row here, #188's production-churned table ~1.0. 2.0
+        // leaves headroom for CI variance while still catching an
+        // unbounded regression (a lost predicate scanning the whole
+        // table would blow past this by orders of magnitude).
+        let shared_hit = plan[0]["Plan"]["Shared Hit Blocks"]
+            .as_i64()
+            .expect("EXPLAIN (BUFFERS) always reports Shared Hit Blocks on the top plan node");
+        assert!(
+            shared_hit <= total_future_rows * 2,
+            "min_wait's ANY(..) form cost {shared_hit} shared buffers for \
+             {total_future_rows} future rows in scope -- more than the \
+             accepted 2 bufs/row ceiling (see this file's header for the \
+             crossover this trades against):\n{plan_text}"
         );
 
         Ok(())
