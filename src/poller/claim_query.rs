@@ -489,8 +489,8 @@ mod tests {
             .collect();
 
         // Verbatim mirror of the `min_wait` CTE in `poll_jobs` above --
-        // kept as one SELECT so it can be EXPLAINed on its own; update both
-        // together.
+        // kept as one SELECT so EXPLAIN can run on it directly; update
+        // both together.
         let plan: JsonValue = sqlx::query_scalar(
             r#"
             EXPLAIN (FORMAT JSON)
