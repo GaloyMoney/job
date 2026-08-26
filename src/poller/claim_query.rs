@@ -16,10 +16,18 @@
 //! excluded types, consumed by `recheck` and kept separate from
 //! `may_have_more` so the spin bound can tell the causes apart), and
 //! `may_have_more` (claimable work provably left behind, so re-poll
-//! immediately). Both sleep probes are per-type first-row index descents,
-//! not `ANY(..)` aggregate/EXISTS forms, because the naive shapes let the
-//! planner pick seq scans or full-range reads that cost orders of
-//! magnitude more (PR #188).
+//! immediately). `min_wait` is a single `MIN(..) WHERE job_type =
+//! ANY(..)` aggregate over the same partial index the claim itself uses
+//! (`idx_job_executions_pending_execute_at`): one array-keyed scan sharing
+//! the btree's upper levels beats a per-type LATERAL descent once the
+//! pollable-type count is large (PR #188 introduced the LATERAL form to
+//! widen the scope to rotation-excluded types; #189-era regression
+//! measurement found the form itself, not the widened scope, was the
+//! expensive part -- see `handoff-claim-deadline-lazy-eval.md`).
+//! `excluded_due` stays a per-type LATERAL EXISTS probe: it only ever
+//! scans `rotation_excluded`, a small set, so the naive shape there still
+//! risks a seq scan / full-range read if flattened to a bare `ANY(..)`
+//! EXISTS (PR #188).
 
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
@@ -116,17 +124,11 @@ pub(super) async fn poll_jobs(
             RETURNING je.id, selected_jobs.data_json, je.attempt_index, je.queue_id
         ),
         min_wait AS (
-            SELECT MIN(next_due) AS next_due_at
-            FROM UNNEST($4::text[] || $8::text[]) AS mt(job_type)
-            CROSS JOIN LATERAL (
-                SELECT je.execute_at AS next_due
-                FROM job_executions je
-                WHERE je.state = 'pending'
-                  AND je.job_type = mt.job_type
-                  AND je.execute_at > $2::timestamptz
-                ORDER BY je.execute_at
-                LIMIT 1
-            ) probe
+            SELECT MIN(execute_at) AS next_due_at
+            FROM job_executions
+            WHERE state = 'pending'
+              AND job_type = ANY($4::text[] || $8::text[])
+              AND execute_at > $2::timestamptz
         ),
         excluded_due AS (
             SELECT EXISTS (
@@ -395,6 +397,79 @@ mod tests {
             }
             other => panic!("expected a Jobs claim, got {other:?}"),
         }
+
+        Ok(())
+    }
+
+    /// Regression for the 0.13.6-0.13.9 `min_wait` cost blowup
+    /// (job-dev:handoff-claim-deadline-lazy-eval.md): PR #188 widened
+    /// `min_wait`'s type scope to cover `rotation_excluded` (correct, and
+    /// unrelated to this test) but incidentally rewrote it from a single
+    /// `ANY(..)` aggregate into a `CROSS JOIN LATERAL` probe *per type* --
+    /// one index descent per pollable type instead of one array-keyed scan.
+    /// At lana's real registry size (dozens of pollable types, not the
+    /// handful other tests here use) that measured +67% blocks/call in
+    /// production. A three-type EXPLAIN can't distinguish an O(1) scan from
+    /// an O(types) fan-out, so this seeds a realistic count.
+    ///
+    /// Asserts on plan *shape*, not absolute cost, so it's stable across
+    /// environments: the LATERAL form's per-type fan-out is a `Nested Loop`
+    /// over the type array; the single-aggregate form is one `Index Scan`
+    /// (or `Index Only Scan`) directly on the shared claim index. Reverting
+    /// `min_wait` to the LATERAL form fails this deterministically -- the
+    /// plan always contains `Nested Loop`, never intermittently.
+    #[tokio::test]
+    async fn min_wait_plan_is_a_single_index_scan_not_a_per_type_fanout() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let mut conn = pool.acquire().await?;
+        // Mirrors the session GUCs `build_internal_pool` sets on the real
+        // poll pool (see `src/poller/mod.rs`) -- without them a freshly
+        // analyzed, near-empty test table can plan either form as a scan
+        // and hide the shape difference this test exists to catch.
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("SET enable_bitmapscan = off")
+            .execute(&mut *conn)
+            .await?;
+
+        let pollable: Vec<String> = (0..40)
+            .map(|i| format!("min-wait-plan-pollable-{i}-{}", uuid::Uuid::now_v7()))
+            .collect();
+        let excluded: Vec<String> = (0..5)
+            .map(|i| format!("min-wait-plan-excluded-{i}-{}", uuid::Uuid::now_v7()))
+            .collect();
+
+        // Verbatim mirror of the `min_wait` CTE in `poll_jobs` above --
+        // kept as one SELECT so it can be EXPLAINed on its own; update both
+        // together.
+        let plan: JsonValue = sqlx::query_scalar(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT MIN(execute_at) AS next_due_at
+            FROM job_executions
+            WHERE state = 'pending'
+              AND job_type = ANY($1::text[] || $2::text[])
+              AND execute_at > $3::timestamptz
+            "#,
+        )
+        .bind(&pollable)
+        .bind(&excluded)
+        .bind(chrono::Utc::now())
+        .fetch_one(&mut *conn)
+        .await?;
+
+        let plan_text = plan.to_string();
+        assert!(
+            !plan_text.contains("Nested Loop"),
+            "min_wait regressed to a per-type fan-out (a Nested Loop over \
+             the type array) -- this is the 0.13.6-0.13.9 cost regression \
+             job-dev:handoff-claim-deadline-lazy-eval.md fixes:\n{plan_text}"
+        );
+        assert!(
+            plan_text.contains("idx_job_executions_pending_execute_at"),
+            "min_wait must still use the shared pending-claim index:\n{plan_text}"
+        );
 
         Ok(())
     }
