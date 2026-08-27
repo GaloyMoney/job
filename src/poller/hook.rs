@@ -21,22 +21,41 @@
 //! type's claim is guaranteed to find the row it just inserted/promoted, so it always
 //! probes and never touches the hint. A recycle-only reservation set (no fresh demand from
 //! this op, i.e. a completion's `recycle_into_claim`) probes only if
-//! `JobTracker::consume_due_hint` says the type's queue may hold something -- at steady
-//! state a per-completion recycle probe finds an empty queue almost every time, yet paid
-//! the same worst-case claim-probe cost as a hit before this gate. A probe that comes back
-//! full re-arms the hint (`set_due_hint`), since more may remain behind it.
+//! `JobTracker::consume_due_hint` says the type's queue may hold something -- at steady state
+//! a per-completion recycle probe finds an empty queue almost every time, yet paid the same
+//! worst-case claim-probe cost as a hit before this gate. A probe that comes back full
+//! re-arms the hint (`set_due_hint`), since more may remain behind it.
 //!
 //! A due-hint-skipped reservation set is DROPPED, never `.release()`d: it came from
 //! `self.recycled`, whose originating dispatcher already detached from its own
 //! `job_completed`/`batch_completed` release-and-wake, expecting this hook to hand the unit
 //! back -- so `UnitReservation::drop`'s unresolved case is the only wake left for it.
-//! `.release()` stays reserved for the budget-truncation loop just above the due-hint check,
-//! where a wake WOULD over-admit against the surviving (untruncated) reservations' still-
-//! uncommitted headroom. Conflating the two here (job-dev bugbot finding #2 on PR #197) left
-//! a drained type, or one that had just crossed below `min_jobs`, asleep until `MAX_WAIT`
-//! with no other wake pending. See `UnitReservation::drop`'s doc for the general contract
-//! and `reservation_release_is_quiet_but_unresolved_drop_wakes` (tracker.rs) for the two
+//! `.release()` stays reserved for `truncate_to_unit_budget`, where a wake fired mid-loop
+//! WOULD over-admit against the surviving (untruncated) reservations' still-uncommitted
+//! headroom. Conflating the two here (job-dev bugbot finding #2 on PR #197) left a drained
+//! type, or one that had just crossed below `min_jobs`, asleep until `MAX_WAIT` with no
+//! other wake pending. See `UnitReservation::drop`'s doc for the general contract and
+//! `reservation_release_is_quiet_but_unresolved_drop_wakes` (tracker.rs) for the two
 //! release paths side by side.
+//!
+//! **Budget truncation still owes a DEFERRED wake when it reaches a recycled unit**
+//! (job-dev bugbot finding #3 on PR #197). The two release rules above collide when the
+//! pool budget truncates a reservation that came from `self.recycled`: it needs the wake
+//! (nothing else will signal for it) but must not fire one mid-loop (the surviving
+//! reservations are about to claim against headroom a woken poll cannot see yet). So
+//! `truncate_to_unit_budget` keeps the quiet `.release()` and REPORTS that a recycled unit
+//! was released; `pre_commit` then wakes once, after the claim loop, when this hook's own
+//! rows are already `running` inside the uncommitted transaction and `SKIP LOCKED` keeps a
+//! woken poll off them. Fresh-demand truncation stays silent -- the spawn/promote that
+//! created that demand already armed `job_execution_inserted`'s notify, so its row still
+//! has a signal pending and a second wake would only over-admit.
+//!
+//! Reachable whenever one op carries more reservations than `unit_budget` admits AND a
+//! recycled one is among those truncated: a promote/insert hook merging fresh demand onto
+//! a completion's op, under pool pressure, with the HashMap visiting the fresh type first.
+//! Rare per-op today, since a completion contributes exactly one recycled reservation --
+//! but the cost when it does hit is a full `MAX_WAIT` stall of a drainable backlog, and
+//! anything that merges several recycles onto one op would make it ordinary.
 
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
@@ -135,6 +154,35 @@ impl DispatchTarget {
     }
 }
 
+/// Trims `units_by_type` in place so it holds at most `unit_budget`
+/// reservations in total, quietly releasing the excess, and reports whether
+/// any RECYCLED reservation was among the released -- the caller owes a
+/// single deferred wake if so. `n_recycled` gives each type's recycled
+/// count; since [`ClaimHook::pre_commit`] pushes `self.recycled` before any
+/// `try_reserve`d fresh demand, a type's first `n_recycled` entries are its
+/// recycled ones, so the truncation spends fresh demand first and a
+/// recycled unit is only reached once `n_recycled` exceeds what fits.
+fn truncate_to_unit_budget(
+    units_by_type: &mut HashMap<JobType, Vec<UnitReservation>>,
+    n_recycled: &HashMap<JobType, usize>,
+    unit_budget: usize,
+) -> bool {
+    let mut remaining_units = unit_budget;
+    let mut released_a_recycled_unit = false;
+    for (job_type, reservations) in units_by_type.iter_mut() {
+        if reservations.len() > remaining_units {
+            if n_recycled.get(job_type).copied().unwrap_or(0) > remaining_units {
+                released_a_recycled_unit = true;
+            }
+            for reservation in reservations.drain(remaining_units..) {
+                reservation.release();
+            }
+        }
+        remaining_units -= reservations.len();
+    }
+    released_a_recycled_unit
+}
+
 pub(crate) struct ClaimHook {
     poller: std::sync::Weak<JobPoller>,
     fresh_demand: HashMap<JobType, usize>,
@@ -196,7 +244,9 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
         let fresh_types: HashSet<JobType> = self.fresh_demand.keys().cloned().collect();
 
         let mut units_by_type: HashMap<JobType, Vec<UnitReservation>> = HashMap::new();
+        let mut n_recycled: HashMap<JobType, usize> = HashMap::new();
         for (job_type, reservation) in self.recycled.drain(..) {
+            *n_recycled.entry(job_type.clone()).or_insert(0) += 1;
             units_by_type.entry(job_type).or_default().push(reservation);
         }
         for (job_type, n_due) in self.fresh_demand.drain() {
@@ -214,15 +264,8 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             }
         }
 
-        let mut remaining_units = unit_budget;
-        for reservations in units_by_type.values_mut() {
-            if reservations.len() > remaining_units {
-                for reservation in reservations.drain(remaining_units..) {
-                    reservation.release();
-                }
-            }
-            remaining_units -= reservations.len();
-        }
+        let owes_a_truncation_wake =
+            truncate_to_unit_budget(&mut units_by_type, &n_recycled, unit_budget);
 
         let now = op.maybe_now().unwrap_or_else(|| poller.clock.now());
         for (job_type, reservations) in units_by_type {
@@ -252,6 +295,10 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
                 };
                 self.claimed.push((reservation, target, subs));
             }
+        }
+
+        if owes_a_truncation_wake {
+            poller.tracker.wake();
         }
 
         let mut claimed_ids: HashMap<JobType, HashSet<JobId>> = HashMap::new();
@@ -659,10 +706,10 @@ mod tests {
 
     /// P1's due-hint skip must WAKE the poll loop, not quietly `.release()`
     /// the reservation: it came from `self.recycled` (a completing
-    /// dispatcher's `recycle_into_claim`), which
-    /// already detached from its OWN `job_completed`/`batch_completed`
-    /// release-and-wake specifically because it expected this hook to hand
-    /// the unit back. `UnitReservation::drop`'s unresolved case is the only
+    /// dispatcher's `recycle_into_claim`), which already detached from its
+    /// OWN `job_completed`/`batch_completed` release-and-wake specifically
+    /// because it expected this hook to hand the unit back.
+    /// `UnitReservation::drop`'s unresolved case is the only
     /// remaining signal for that unit -- `.release()` is quiet and belongs
     /// only to the budget-truncation case (where a wake would over-admit
     /// against surviving claims' still-uncommitted headroom), a distinction
@@ -718,5 +765,103 @@ mod tests {
                  reservation's drop is the only one left",
             );
         Ok(())
+    }
+
+    /// Budget truncation that reaches a RECYCLED reservation must report a
+    /// wake as owed. The release itself stays quiet (a wake fired mid-loop
+    /// would let the woken poll over-admit against the surviving
+    /// reservations' still-uncommitted claims), so the returned flag is the
+    /// ONLY remaining signal for that freed unit -- its dispatcher already
+    /// detached from `job_completed`'s release-and-wake. Fixes job-dev
+    /// bugbot finding #3 on PR #197; before the fix this returned nothing
+    /// and the quiet release was the last event, stalling a drainable
+    /// backlog until `MAX_WAIT` (60s).
+    #[tokio::test]
+    async fn budget_truncation_of_a_recycled_reservation_reports_a_wake() {
+        let tracker = Arc::new(crate::tracker::JobTracker::new(0, 10));
+        let job_type = JobType::from_owned(format!("truncate-recycled-{}", uuid::Uuid::now_v7()));
+
+        tracker.dispatch_job(JobId::new(), &job_type);
+        tracker.dispatch_job(JobId::new(), &job_type);
+
+        let mut units_by_type = HashMap::from([(
+            job_type.clone(),
+            vec![tracker.recycle(&job_type), tracker.recycle(&job_type)],
+        )]);
+        let n_recycled = HashMap::from([(job_type.clone(), 2)]);
+
+        let notified = tracker.notified();
+        let owed_a_wake = truncate_to_unit_budget(&mut units_by_type, &n_recycled, 1);
+
+        assert_eq!(
+            units_by_type[&job_type].len(),
+            1,
+            "a budget of 1 must keep exactly one reservation"
+        );
+        assert_eq!(
+            tracker.units_in_flight(&job_type),
+            1,
+            "the truncated reservation's unit must still be freed"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notified)
+                .await
+                .is_err(),
+            "the truncating release must stay quiet -- a mid-loop wake would \
+             over-admit against the surviving reservation's claims"
+        );
+        assert!(
+            owed_a_wake,
+            "truncating a recycled reservation must report a wake as owed: \
+             its dispatcher detached from job_completed, so nothing else \
+             will signal that this type's backlog became claimable again"
+        );
+    }
+
+    /// The mirror case: truncation that only reaches FRESH demand owes no
+    /// wake. The spawn/promote that created that demand already ran
+    /// `job_execution_inserted` (notify + due-hint), so the row it would
+    /// have claimed still has a signal pending -- waking again here would
+    /// only over-admit. Also pins the ordering the fix relies on: recycled
+    /// reservations are pushed first, so a mixed type spends its fresh
+    /// demand before any recycled unit is reached.
+    #[tokio::test]
+    async fn budget_truncation_of_fresh_demand_only_stays_quiet() {
+        let tracker = Arc::new(crate::tracker::JobTracker::new(0, 10));
+        let job_type = JobType::from_owned(format!("truncate-fresh-{}", uuid::Uuid::now_v7()));
+
+        let mut units_by_type = HashMap::from([(
+            job_type.clone(),
+            vec![
+                tracker
+                    .try_reserve(&job_type, None)
+                    .expect("under max_jobs"),
+                tracker
+                    .try_reserve(&job_type, None)
+                    .expect("under max_jobs"),
+            ],
+        )]);
+        assert!(
+            !truncate_to_unit_budget(&mut units_by_type, &HashMap::new(), 1),
+            "a truncated fresh-demand reservation owes no wake -- its \
+             spawn/promote already armed job_execution_inserted's notify"
+        );
+        assert_eq!(tracker.units_in_flight(&job_type), 1);
+
+        tracker.dispatch_job(JobId::new(), &job_type);
+        let mut mixed = HashMap::from([(
+            job_type.clone(),
+            vec![
+                tracker.recycle(&job_type),
+                tracker
+                    .try_reserve(&job_type, None)
+                    .expect("under max_jobs"),
+            ],
+        )]);
+        assert!(
+            !truncate_to_unit_budget(&mut mixed, &HashMap::from([(job_type.clone(), 1)]), 1),
+            "a mixed type must spend its fresh demand first, leaving the \
+             recycled unit intact and no wake owed"
+        );
     }
 }
