@@ -402,6 +402,26 @@ impl ClaimReconciler {
         );
     }
 
+    /// The final `UPDATE`'s `AND je.state = 'running' AND je.poller_instance_id
+    /// = $3` re-checks `locked`'s own snapshot-time predicate on the UPDATE
+    /// itself, narrowing the same snapshot-vs-lock race
+    /// `PromoteHeadsHook::apply_freed`'s doc explains in full: this instance
+    /// scopes `locked` to rows it believes it still owns as `running`, but a
+    /// legitimate finalize of the SAME row -- landing between `locked`'s
+    /// snapshot and its lock being granted (this reconciler exists
+    /// precisely for the ambiguous-outcome case where such a race is live)
+    /// -- can complete it (delete, so no row to lock at all -- harmless) or
+    /// reschedule it (`state = 'pending'`, `poller_instance_id = NULL`,
+    /// STILL matching `je.id = l.id` with no re-check). Without the
+    /// re-check, this statement would blindly stomp that legitimate
+    /// disposition back to a stale `pending`/`execute_at`, discarding
+    /// whatever the finalize just wrote. Audited per
+    /// job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md §4's
+    /// "also audit" item; not the originally reported bug (no canary column
+    /// forces a decode error here either way -- the finalize's own
+    /// `poller_instance_id` filter already makes an ambiguous double-apply
+    /// idempotent-safe on the ENTITY side), but the same defensive shape as
+    /// every other multi-row locker of this table now agrees on.
     async fn reconcile_unclaimed(
         pool: &PgPool,
         instance_id: uuid::Uuid,
@@ -429,7 +449,8 @@ impl ClaimReconciler {
             )
             UPDATE job_executions je
             SET state = 'pending', poller_instance_id = NULL, execute_at = l.execute_at
-            FROM locked l WHERE je.id = l.id
+            FROM locked l
+            WHERE je.id = l.id AND je.state = 'running' AND je.poller_instance_id = $3
             RETURNING je.id AS "id!: JobId"
             "#,
             &ids,

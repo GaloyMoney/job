@@ -85,9 +85,19 @@ impl PromoteHeadsHook {
 /// notify) and its own `execute_at`, unchanged by the promote (for callers
 /// that need to know whether it is ACTUALLY due, not merely promoted --
 /// see `super::insert::ExecutionInsertHook::due_now_by_type`).
+///
+/// `execute_at` is `Option` because the row this was read from is not
+/// guaranteed to still be `parked` by the time `RETURNING` reads it back --
+/// see [`Self::apply`]/[`Self::apply_freed`]'s re-checked `state` predicate
+/// doc for the race this guards against. A row a concurrent claimer won the
+/// race on has `execute_at = NULL` (set by the claim itself,
+/// `poller/claim_query.rs` / `poller/hook.rs`) and the re-check makes such a
+/// row match zero rows here anyway, but the column stays honestly nullable
+/// rather than asserted non-null against a predicate a later refactor could
+/// silently weaken (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md).
 pub(crate) struct PromotedRow {
     pub job_type: String,
-    pub execute_at: DateTime<Utc>,
+    pub execute_at: Option<DateTime<Utc>>,
 }
 
 impl PromoteHeadsHook {
@@ -114,6 +124,27 @@ impl PromoteHeadsHook {
     /// lock here, it would acquire in whatever order the `UNNEST` input
     /// happens to iterate, which can deadlock against a concurrent spawn's
     /// pin or swap touching the same rows in the opposite order.
+    ///
+    /// The final `UPDATE`'s `AND je.state = 'parked'` re-checks the SAME
+    /// predicate `heads` established at snapshot time, on the UPDATE itself
+    /// -- not only on `locked`'s lock-acquisition scan. Between `heads`'
+    /// snapshot and `locked`'s `FOR NO KEY UPDATE` actually being granted, a
+    /// concurrent claimer can promote this same row and claim it to
+    /// `running` (nulling `execute_at`); under READ COMMITTED, once this
+    /// statement's blocked lock acquisition unblocks, EvalPlanQual
+    /// re-evaluates `locked`'s qual (an already-fixed `heads` id list, so
+    /// the row still qualifies THERE) but the final `UPDATE`'s own qual is
+    /// re-evaluated too -- and it is the only qual actually checked against
+    /// the LATEST row version. Without `state = 'parked'` here, that
+    /// re-evaluation trivially passes (`je.id = l.id` doesn't care what
+    /// `state` is) and this statement blindly re-applies `state = 'pending'`
+    /// over a row a concurrent claimer already promoted to `running`,
+    /// returning its (`execute_at = NULL`) tuple -- a decode error against
+    /// the old `execute_at!` non-null assertion, and worse, a
+    /// double-dispatch of an already-running row had that assertion not
+    /// existed to abort the transaction. Pinned by
+    /// `tests::apply_freed_yields_to_a_concurrently_claimed_row`.
+    /// (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md)
     async fn apply_freed(
         op: &mut impl AtomicOperation,
         queue_ids: &[String],
@@ -161,8 +192,8 @@ impl PromoteHeadsHook {
                 FOR NO KEY UPDATE
             )
             UPDATE job_executions je SET state = 'pending'
-            FROM locked l WHERE je.id = l.id
-            RETURNING je.job_type, je.execute_at AS "execute_at!"
+            FROM locked l WHERE je.id = l.id AND je.state = 'parked'
+            RETURNING je.job_type, je.execute_at AS "execute_at?"
             "#,
             &deduped,
         )
@@ -199,6 +230,21 @@ impl PromoteHeadsHook {
     /// is set) -- it lets callers gate claim demand on whether a promoted
     /// row is ACTUALLY due, not merely promoted (a promoted row's own
     /// `execute_at` can be in the future).
+    ///
+    /// Both writes re-check `state` on the UPDATE itself (`demote`'s `AND
+    /// state = 'pending'`, the promote UPDATE's `AND je.state = 'parked'`),
+    /// not only on `locked`'s lock-acquisition scan -- the same
+    /// snapshot-vs-lock race [`Self::apply_freed`]'s doc explains in full.
+    /// `demote`'s side is the worse of the two if left unchecked: a
+    /// concurrent claimer that promoted `pending_id` to `running` between
+    /// `candidates`' snapshot and `locked`'s lock leaves a re-check-free
+    /// `demote` free to park an ACTIVELY RUNNING row out from under its
+    /// executor -- no decode error to abort the transaction, just silent
+    /// corruption. The promote UPDATE's own re-check protects the OTHER
+    /// side of the swap (`parked_id`) against the same race landing on the
+    /// sibling being promoted instead. Pinned by
+    /// `tests::apply_demote_yields_to_a_concurrently_claimed_pending_row`.
+    /// (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md)
     pub(crate) async fn apply(
         op: &mut impl AtomicOperation,
         ids: &[uuid::Uuid],
@@ -245,6 +291,7 @@ impl PromoteHeadsHook {
                 WHERE id IN (
                     SELECT s.pending_id FROM swaps s JOIN locked l ON l.id = s.pending_id
                 )
+                AND state = 'pending'
                 RETURNING id
             )
             -- The promote UPDATE reads FROM `demote` (not `swaps`) so Postgres
@@ -257,8 +304,8 @@ impl PromoteHeadsHook {
             UPDATE job_executions je SET state = 'pending'
             FROM swaps s
             JOIN demote d ON d.id = s.pending_id
-            WHERE je.id = s.parked_id
-            RETURNING je.job_type, je.execute_at AS "execute_at!"
+            WHERE je.id = s.parked_id AND je.state = 'parked'
+            RETURNING je.job_type, je.execute_at AS "execute_at?"
             "#,
             ids,
         )
@@ -357,5 +404,195 @@ impl CommitHook for PromoteHeadsHook {
 
     fn runs_after(&self) -> &[std::any::TypeId] {
         &Self::RUNS_AFTER
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
+        let pg_con = std::env::var("PG_CON").unwrap();
+        Ok(sqlx::PgPool::connect(&pg_con).await?)
+    }
+
+    async fn seed_job(
+        pool: &sqlx::PgPool,
+        job_type: &str,
+        queue_id: &str,
+        execute_at: DateTime<Utc>,
+        state: &str,
+    ) -> anyhow::Result<uuid::Uuid> {
+        let id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO jobs (id, job_type, queue_id, created_at) VALUES ($1, $2, $3, NOW())",
+        )
+        .bind(id)
+        .bind(job_type)
+        .bind(queue_id)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, queue_id, state, attempt_index, execute_at, alive_at, created_at) \
+             VALUES ($1, $2, $3, $4::JobExecutionState, 1, \
+                     CASE WHEN $4 = 'running' THEN NULL ELSE $5 END, NOW(), NOW())",
+        )
+        .bind(id)
+        .bind(job_type)
+        .bind(queue_id)
+        .bind(state)
+        .bind(execute_at)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Site 1 (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md):
+    /// `apply_freed`'s promote UPDATE re-locks a parked head without
+    /// re-checking `state` after the lock is granted. Forces the exact
+    /// race: a holder transaction takes the row's lock first (mirroring a
+    /// concurrent claimer that has already started), `apply_freed` blocks
+    /// acquiring `locked`'s `FOR NO KEY UPDATE` on it, then the holder
+    /// promotes-and-runs the row (nulling `execute_at`, exactly like a real
+    /// claim) and commits -- unblocking `apply_freed`. Pre-fix this panics
+    /// the `execute_at!` non-null decode; post-fix the re-checked predicate
+    /// makes the statement affect zero rows for this id.
+    #[tokio::test]
+    async fn apply_freed_yields_to_a_concurrently_claimed_row() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("promote-race-{}", uuid::Uuid::now_v7());
+        let queue = format!("promote-race-queue-{}", uuid::Uuid::now_v7());
+        let claimer_instance = uuid::Uuid::now_v7();
+
+        let head = seed_job(&pool, &job_type, &queue, chrono::Utc::now(), "parked").await?;
+
+        let holder_pool = pool.clone();
+        let holder = tokio::spawn(async move {
+            let mut tx = holder_pool.begin().await?;
+            // Takes the row lock immediately (mirrors a concurrent claimer
+            // already mid-transaction when `apply_freed`'s snapshot runs).
+            sqlx::query("UPDATE job_executions SET state = 'pending' WHERE id = $1")
+                .bind(head)
+                .execute(&mut *tx)
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Claims it to `running`, exactly like a real claim query does.
+            sqlx::query(
+                "UPDATE job_executions SET state = 'running', poller_instance_id = $2, \
+                 execute_at = NULL WHERE id = $1",
+            )
+            .bind(head)
+            .bind(claimer_instance)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        });
+
+        // Gives the holder time to take the lock before `apply_freed` runs,
+        // so its own `locked` CTE is the one left blocked.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut op = pool.begin().await?;
+        let promoted = PromoteHeadsHook::apply_freed(&mut op, std::slice::from_ref(&queue)).await?;
+        op.commit().await?;
+        holder.await??;
+
+        assert!(
+            promoted.is_empty(),
+            "the raced-away row must not be reported as promoted: {}",
+            promoted.len()
+        );
+
+        let (state, poller_instance_id): (String, Option<uuid::Uuid>) = sqlx::query_as(
+            "SELECT state::text, poller_instance_id FROM job_executions WHERE id = $1",
+        )
+        .bind(head)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(state, "running", "the concurrent claim must stand");
+        assert_eq!(
+            poller_instance_id,
+            Some(claimer_instance),
+            "the row must remain owned by the instance that actually claimed it"
+        );
+
+        Ok(())
+    }
+
+    /// Site 3 (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md):
+    /// `apply`'s `demote` CTE re-locks a `pending` swap candidate without
+    /// re-checking `state`. Pre-fix, a concurrent claimer that promoted the
+    /// same candidate to `running` between `candidates`' snapshot and
+    /// `locked`'s lock would get silently demoted back to `parked` --
+    /// worse than site 1's decode error, since nothing surfaces it (the
+    /// candidate is not the RETURNING column that carries `execute_at`).
+    #[tokio::test]
+    async fn apply_demote_yields_to_a_concurrently_claimed_pending_row() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("promote-demote-race-{}", uuid::Uuid::now_v7());
+        let queue = format!("promote-demote-race-queue-{}", uuid::Uuid::now_v7());
+        let claimer_instance = uuid::Uuid::now_v7();
+        let now = chrono::Utc::now();
+
+        // The active (pending) occupant `apply` will try to demote in favor
+        // of the older parked sibling below.
+        let candidate = seed_job(&pool, &job_type, &queue, now, "pending").await?;
+        // An older parked sibling -- older `execute_at` makes it the swap
+        // target ahead of `candidate`.
+        let _sibling = seed_job(
+            &pool,
+            &job_type,
+            &queue,
+            now - chrono::Duration::seconds(60),
+            "parked",
+        )
+        .await?;
+
+        let holder_pool = pool.clone();
+        let holder = tokio::spawn(async move {
+            let mut tx = holder_pool.begin().await?;
+            // Re-takes the already-`pending` candidate's lock (mirrors a
+            // concurrent claimer already mid-transaction).
+            sqlx::query("UPDATE job_executions SET execute_at = execute_at WHERE id = $1")
+                .bind(candidate)
+                .execute(&mut *tx)
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Claims it to `running`, exactly like a real claim query does.
+            sqlx::query(
+                "UPDATE job_executions SET state = 'running', poller_instance_id = $2, \
+                 execute_at = NULL WHERE id = $1",
+            )
+            .bind(candidate)
+            .bind(claimer_instance)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut op = pool.begin().await?;
+        let promoted = PromoteHeadsHook::apply(&mut op, &[candidate]).await?;
+        op.commit().await?;
+        holder.await??;
+
+        assert!(
+            promoted.is_empty(),
+            "no swap must be reported once the candidate raced away to running"
+        );
+
+        let candidate_state: String =
+            sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
+                .bind(candidate)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            candidate_state, "running",
+            "the concurrently claimed row must NOT be demoted back to parked"
+        );
+
+        Ok(())
     }
 }

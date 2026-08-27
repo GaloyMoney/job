@@ -350,6 +350,18 @@ async fn reclaim_lost_jobs(
     ))
 }
 
+/// The `locked` CTE's snapshot-time `state = 'parked'` predicate (baked into
+/// `orphan_queues`/`heads`) is re-checked again on the final `UPDATE` itself
+/// (`AND je.state = 'parked'`) -- without this the race
+/// `PromoteHeadsHook::apply_freed`'s doc explains in full has NO canary here
+/// at all: this statement doesn't select `execute_at`, so a raced-away row
+/// (a concurrent claimer promoted-and-ran it to `running` between this
+/// statement's snapshot and `locked`'s lock being granted) gets silently
+/// reset back to `pending` by the bare pre-fix `UPDATE ... FROM locked` --
+/// becoming claimable again while its original executor is still running
+/// it, i.e. a silent double-dispatch with no error to surface it. Pinned by
+/// `tests::sweep_yields_to_a_concurrently_claimed_row`.
+/// (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md)
 async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar!(
         r#"
@@ -376,7 +388,7 @@ async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::
             FOR NO KEY UPDATE
         )
         UPDATE job_executions je SET state = 'pending'
-        FROM locked l WHERE je.id = l.id
+        FROM locked l WHERE je.id = l.id AND je.state = 'parked'
         RETURNING je.job_type
         "#,
     )
@@ -388,6 +400,64 @@ async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::
 mod tests {
     use super::super::test_support::{init_pool, row_state, seed_queued_job, seed_running_job};
     use super::*;
+
+    /// Site 4 (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md):
+    /// unlike `apply_freed`, this statement selects no `execute_at`, so
+    /// pre-fix a raced-away row (a concurrent claimer promoted-and-ran it
+    /// between this call's snapshot and `locked`'s lock being granted)
+    /// silently resets back to `pending` -- no decode error to surface it,
+    /// just a `running` row made claimable again while its original
+    /// executor is still working it. Forces the race with the same
+    /// holder-transaction shape as `promote::tests::
+    /// apply_freed_yields_to_a_concurrently_claimed_row`.
+    #[tokio::test]
+    async fn sweep_yields_to_a_concurrently_claimed_row() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("orphan-race-{}", uuid::Uuid::now_v7());
+        let queue = format!("orphan-race-queue-{}", uuid::Uuid::now_v7());
+        let claimer_instance = uuid::Uuid::now_v7();
+        let base = chrono::Utc::now() - chrono::Duration::seconds(600);
+
+        let head = seed_queued_job(&pool, &job_type, &queue, base, "parked").await?;
+        let head_uuid = uuid::Uuid::from(head);
+
+        let holder_pool = pool.clone();
+        let holder = tokio::spawn(async move {
+            let mut tx = holder_pool.begin().await?;
+            sqlx::query("UPDATE job_executions SET state = 'pending' WHERE id = $1")
+                .bind(head_uuid)
+                .execute(&mut *tx)
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            sqlx::query(
+                "UPDATE job_executions SET state = 'running', poller_instance_id = $2, \
+                 execute_at = NULL WHERE id = $1",
+            )
+            .bind(head_uuid)
+            .bind(claimer_instance)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let promoted = sweep_orphaned_parked_rows(&pool).await?;
+        holder.await??;
+
+        assert!(
+            !promoted.contains(&job_type),
+            "the raced-away row must not be reported as swept: {promoted:?}"
+        );
+        assert_eq!(
+            row_state(&pool, head).await?,
+            "running",
+            "the concurrent claim must stand -- the sweep must not silently \
+             reset a running row back to pending"
+        );
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn self_reclaim_skips_live_jobs() -> anyhow::Result<()> {
