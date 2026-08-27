@@ -14,6 +14,29 @@
 //! un-claims them back to their ORIGINAL `execute_at` with no attempt bump (dispatch only
 //! happens in `post_commit`, which was skipped), re-swapping their queues in the same
 //! transaction; `reclaim_lost_jobs` remains the slower backstop.
+//!
+//! **The due-hint gate (P1, job-dev:handoff-write-path-efficiency-sb-max13.md).**
+//! `pre_commit` snapshots `fresh_types` -- the job types THIS op's own spawn/promote
+//! contributed `fresh_demand` for -- before draining it into reservations: a fresh-demand
+//! type's claim is guaranteed to find the row it just inserted/promoted, so it always
+//! probes and never touches the hint. A recycle-only reservation set (no fresh demand from
+//! this op, i.e. a completion's `recycle_into_claim`) probes only if
+//! `JobTracker::consume_due_hint` says the type's queue may hold something -- at steady
+//! state a per-completion recycle probe finds an empty queue almost every time, yet paid
+//! the same worst-case claim-probe cost as a hit before this gate. A probe that comes back
+//! full re-arms the hint (`set_due_hint`), since more may remain behind it.
+//!
+//! A due-hint-skipped reservation set is DROPPED, never `.release()`d: it came from
+//! `self.recycled`, whose originating dispatcher already detached from its own
+//! `job_completed`/`batch_completed` release-and-wake, expecting this hook to hand the unit
+//! back -- so `UnitReservation::drop`'s unresolved case is the only wake left for it.
+//! `.release()` stays reserved for the budget-truncation loop just above the due-hint check,
+//! where a wake WOULD over-admit against the surviving (untruncated) reservations' still-
+//! uncommitted headroom. Conflating the two here (job-dev bugbot finding #2 on PR #197) left
+//! a drained type, or one that had just crossed below `min_jobs`, asleep until `MAX_WAIT`
+//! with no other wake pending. See `UnitReservation::drop`'s doc for the general contract
+//! and `reservation_release_is_quiet_but_unresolved_drop_wakes` (tracker.rs) for the two
+//! release paths side by side.
 
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
@@ -43,6 +66,10 @@ pub(crate) struct ClaimedRow {
     pub job_type: JobType,
 }
 
+#[cfg(test)]
+pub(crate) static PROBE_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(super) async fn claim_due_heads_in_op(
     op: &mut impl es_entity::AtomicOperation,
     job_type: &JobType,
@@ -54,6 +81,8 @@ pub(super) async fn claim_due_heads_in_op(
     if limit <= 0 {
         return Ok(Vec::new());
     }
+    #[cfg(test)]
+    PROBE_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let wall_now = chrono::Utc::now();
     sqlx::query_as!(
         ClaimedRow,
@@ -164,11 +193,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             return es_entity::operation::hooks::PreCommitRet::ok(self, op);
         }
 
-        // Snapshot which types this pass's OWN spawn/promote inserted due
-        // rows for -- their claim is guaranteed to find work and must always
-        // probe. Taken before draining `fresh_demand` below; merges from
-        // other registrations on this op have already folded in by the time
-        // `pre_commit` runs (`Self::merge`), so this is the final set.
         let fresh_types: HashSet<JobType> = self.fresh_demand.keys().cloned().collect();
 
         let mut units_by_type: HashMap<JobType, Vec<UnitReservation>> = HashMap::new();
@@ -208,20 +232,8 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             if !poller.registry.short_circuit(&job_type) {
                 continue;
             }
-            // P1 (job-dev:handoff-write-path-efficiency-sb-max13.md): a
-            // recycle-only reservation set -- no fresh demand contributed by
-            // THIS op -- probes only if the type's due-hint says work may be
-            // waiting. At steady state a type's per-completion recycle probe
-            // finds an empty queue almost every time (F5), yet pays the same
-            // claim-probe cost as a hit (F2's churned-head amplification).
-            // Fresh-demand types always probe below -- this op's own spawn/
-            // promote guarantees a due row exists -- and never consume the
-            // hint, so they can't starve a genuinely idle recycle probe of
-            // its own signal.
             if !fresh_types.contains(&job_type) && !poller.tracker.consume_due_hint(&job_type) {
-                for reservation in reservations {
-                    reservation.release();
-                }
+                drop(reservations);
                 continue;
             }
             let (per_unit_limit, _) = poller.claim_shape(&job_type);
@@ -231,9 +243,6 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
                 .await?;
             let n_claimed: i64 = targets.iter().map(DispatchTarget::row_count).sum();
             if n_claimed >= limit {
-                // The probe came back full -- more due rows may remain
-                // behind it -- so re-arm the hint rather than requiring a
-                // fresh external signal before the next recycle probe looks.
                 poller.tracker.set_due_hint(&job_type);
             }
             for (reservation, target) in reservations.into_iter().zip(targets) {
@@ -645,6 +654,69 @@ mod tests {
             "the reset row must yield to the genuinely older sibling"
         );
 
+        Ok(())
+    }
+
+    /// P1's due-hint skip must WAKE the poll loop, not quietly `.release()`
+    /// the reservation: it came from `self.recycled` (a completing
+    /// dispatcher's `recycle_into_claim`), which
+    /// already detached from its OWN `job_completed`/`batch_completed`
+    /// release-and-wake specifically because it expected this hook to hand
+    /// the unit back. `UnitReservation::drop`'s unresolved case is the only
+    /// remaining signal for that unit -- `.release()` is quiet and belongs
+    /// only to the budget-truncation case (where a wake would over-admit
+    /// against surviving claims' still-uncommitted headroom), a distinction
+    /// `reservation_release_is_quiet_but_unresolved_drop_wakes` (tracker.rs)
+    /// pins directly. Fixes job-dev bugbot finding #2 on PR #197 -- before
+    /// the fix, this due-hint-skip branch used `.release()` too, leaving a
+    /// drained (or just-below-`min_jobs`) type asleep until `MAX_WAIT`
+    /// (60s) with no other wake pending.
+    ///
+    /// No sleep-based sync: the probe-skip is asserted via `PROBE_CALL_
+    /// COUNT` (so the test cannot pass vacuously if the gate stopped
+    /// skipping), and the wake via a `tokio::time::timeout`-bounded await
+    /// on the tracker's own `Notify`, the same pattern
+    /// `reservation_release_is_quiet_but_unresolved_drop_wakes` already
+    /// uses.
+    #[tokio::test]
+    async fn due_hint_skip_wakes_the_poll_loop_instead_of_a_quiet_release() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = JobType::from_owned(format!("due-hint-wake-{}", uuid::Uuid::now_v7()));
+
+        let mut registry = crate::registry::JobRegistry::new();
+        registry.add_initializer(super::super::test_support::ElasticInitializer {
+            job_type: job_type.clone(),
+        });
+
+        let tracker = std::sync::Arc::new(crate::tracker::JobTracker::new(0, 10));
+        tracker.set_job_types(vec![job_type.clone()]);
+        let poller =
+            super::super::test_support::build_poller(&pool, registry, Arc::clone(&tracker)).await?;
+
+        tracker.dispatch_job(JobId::new(), &job_type);
+        let reservation = tracker.recycle(&job_type);
+
+        PROBE_CALL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let notified = tracker.notified();
+
+        let repo = JobRepo::new(&pool);
+        let mut op = repo.begin_op_with_clock(&poller.clock).await?;
+        poller.register_claim_recycle(&mut op, &job_type, reservation);
+        op.commit().await?;
+
+        assert_eq!(
+            PROBE_CALL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the due-hint gate must actually skip the probe here, or this \
+             test's wake assertion below would be vacuous"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(200), notified)
+            .await
+            .expect(
+                "a due-hint-skipped recycle must wake the poll loop -- its \
+                 dispatcher already suppressed its own wake, so this \
+                 reservation's drop is the only one left",
+            );
         Ok(())
     }
 }
