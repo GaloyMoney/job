@@ -442,12 +442,28 @@ where
     /// final state into it and drop every older generation's row — all in a
     /// single statement.
     ///
-    /// Both halves read the same snapshot, so the seeding SELECT still sees
-    /// the predecessor rows that the DELETE removes, and the DELETE cannot
-    /// see the rows the INSERT writes (they are disjoint anyway: `j.id =
-    /// i.id` vs `j.id != i.id`). The result is that a key's state never grows
-    /// past one row. `ids[n]` pairs with `keys[n]`, and a key appears at most
-    /// once, so the per-key `LATERAL` picks exactly one predecessor.
+    /// The per-key predecessor lookup starts from `jobs` (riding
+    /// `idx_jobs_job_type_unique_key_created_at`) rather than from
+    /// `job_execution_states` joined to `jobs`: `jobs` rows are never
+    /// deleted, so at scale (a long-running key with thousands of terminal
+    /// generations) joining `job_execution_states` to `jobs` over EVERY
+    /// matching generation before sorting made that join dominate the
+    /// statement's cost — even though, by the compaction invariant this very
+    /// statement maintains, only ever one generation can actually have a
+    /// state row to find. Picking the predecessor id from `jobs` first costs
+    /// a two-row backward index scan per key (`id != i.id` skips at most the
+    /// current row) regardless of how many terminal generations the key has
+    /// accumulated, and `job_execution_states` is then probed only for that
+    /// one winning id per key
+    /// (job-dev:handoff-write-path-efficiency-sb-max13.md, F6).
+    ///
+    /// Both halves read the same `pred` snapshot, so the seeding SELECT still
+    /// sees the predecessor rows that the DELETE removes, and the DELETE
+    /// cannot see the rows the INSERT writes (they are disjoint anyway:
+    /// `pred.new_id` vs `pred.pred_id`). The result is that a key's state
+    /// never grows past one row. `ids[n]` pairs with `keys[n]`, and a key
+    /// appears at most once, so the per-key `LATERAL` picks exactly one
+    /// predecessor.
     ///
     /// Race-free with respect to the outgoing generation: this `op` already
     /// observed each key as free in
@@ -455,8 +471,9 @@ where
     /// atomically with its holder's final state write — so the predecessor's
     /// last write, if any, is committed and visible here.
     ///
-    /// `$4` is [`KeyedJobInitializer::inherits_state`]: when false the seeding
-    /// half is a no-op and only compaction runs.
+    /// `$4` is [`KeyedJobInitializer::inherits_state`] (read from
+    /// `self.inherits_state`): when false the seeding half is a no-op and
+    /// only compaction runs.
     async fn carry_state_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
@@ -467,26 +484,28 @@ where
             r#"
             WITH input AS (
                 SELECT * FROM UNNEST($1::uuid[], $3::text[]) AS t(id, unique_key)
-            ), seeded AS (
-                INSERT INTO job_execution_states (id, execution_state_json)
-                SELECT i.id, prev.execution_state_json
+            ), pred AS (
+                SELECT i.id AS new_id, p.pred_id
                 FROM input i
                 JOIN LATERAL (
-                    SELECT s.execution_state_json
-                    FROM job_execution_states s
-                    JOIN jobs j ON j.id = s.id
+                    SELECT j.id AS pred_id
+                    FROM jobs j
                     WHERE j.job_type = $2 AND j.unique_key = i.unique_key
                       AND j.id != i.id
                     ORDER BY j.created_at DESC, j.id DESC
                     LIMIT 1
-                ) prev ON TRUE
+                ) p ON TRUE
+            ), seeded AS (
+                INSERT INTO job_execution_states (id, execution_state_json)
+                SELECT pred.new_id, s.execution_state_json
+                FROM pred
+                JOIN job_execution_states s ON s.id = pred.pred_id
                 WHERE $4::boolean
                 RETURNING id
             )
             DELETE FROM job_execution_states s
-            USING jobs j, input i
-            WHERE s.id = j.id AND j.job_type = $2 AND j.unique_key = i.unique_key
-              AND j.id != i.id
+            USING pred
+            WHERE s.id = pred.pred_id
             "#,
             ids as &[JobId],
             &self.job_type as &JobType,
@@ -505,5 +524,223 @@ where
             Arc::clone(&self.router),
             self.clock.clone(),
         )
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{notification_router::JobNotificationRouter, notifier::JobEventNotifier, tracker::JobTracker};
+    use std::time::Duration;
+
+    async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
+        let pg_con = std::env::var("PG_CON").unwrap();
+        Ok(sqlx::PgPool::connect(&pg_con).await?)
+    }
+
+    /// Wires a real `KeyedJobSpawner<()>` against `pool` so
+    /// `carry_state_in_op` can be exercised directly. No poller is
+    /// registered -- `carry_state_in_op` never consults it -- so an empty
+    /// `PollerHandle` (the same stand-in `ResidentJobSpawner` uses in
+    /// production before a poller attaches) is enough.
+    async fn test_spawner(pool: &sqlx::PgPool, job_type: JobType, inherits_state: bool) -> KeyedJobSpawner<()> {
+        let repo = Arc::new(JobRepo::new(pool));
+        let router = Arc::new(JobNotificationRouter::new(
+            pool,
+            Arc::clone(&repo),
+            16,
+            Duration::from_secs(60),
+        ));
+        let tracker = Arc::new(JobTracker::new(0, 1));
+        let notifier = JobEventNotifier::spawn(pool, tracker, router.terminal_sender());
+        let poller_ref: PollerHandle = Arc::new(std::sync::OnceLock::new());
+        KeyedJobSpawner::new(
+            repo,
+            job_type,
+            router,
+            ClockHandle::realtime(),
+            notifier,
+            inherits_state,
+            poller_ref,
+        )
+    }
+
+    /// Seeds a terminal `jobs` row (no execution row -- the generation has
+    /// already gone terminal) at `created_at`, optionally with its own
+    /// `job_execution_states` row.
+    async fn seed_generation(
+        pool: &sqlx::PgPool,
+        job_type: &JobType,
+        key: &str,
+        created_at: DateTime<Utc>,
+        state_json: Option<serde_json::Value>,
+    ) -> anyhow::Result<JobId> {
+        let id = JobId::new();
+        sqlx::query(
+            "INSERT INTO jobs (id, job_type, unique_key, created_at) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(uuid::Uuid::from(id))
+        .bind(job_type.as_str())
+        .bind(key)
+        .bind(created_at)
+        .execute(pool)
+        .await?;
+        if let Some(state_json) = state_json {
+            sqlx::query(
+                "INSERT INTO job_execution_states (id, execution_state_json) VALUES ($1, $2)",
+            )
+            .bind(uuid::Uuid::from(id))
+            .bind(state_json)
+            .execute(pool)
+            .await?;
+        }
+        Ok(id)
+    }
+
+    /// P2 (job-dev:handoff-write-path-efficiency-sb-max13.md, F6): three
+    /// terminal predecessor generations exist for the key -- the compaction
+    /// invariant means only the NEWEST of them (`gen3`) can still carry a
+    /// `job_execution_states` row (as if every earlier `carry_state_in_op`
+    /// call had already compacted `gen1`/`gen2` away). The rewritten `pred`
+    /// CTE must pick exactly `gen3` -- not scan/require all three -- seed the
+    /// new generation from it, and delete exactly its row.
+    #[tokio::test]
+    async fn carry_state_seeds_from_and_deletes_only_the_newest_predecessor() -> anyhow::Result<()>
+    {
+        let pool = init_pool().await?;
+        let job_type = JobType::from_owned(format!("carry-state-{}", uuid::Uuid::now_v7()));
+        let key = "k";
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let gen1 = seed_generation(
+            &pool,
+            &job_type,
+            key,
+            base,
+            Some(serde_json::json!({"processed": 1})),
+        )
+        .await?;
+        let gen2 = seed_generation(
+            &pool,
+            &job_type,
+            key,
+            base + chrono::Duration::minutes(1),
+            None,
+        )
+        .await?;
+        let gen3 = seed_generation(
+            &pool,
+            &job_type,
+            key,
+            base + chrono::Duration::minutes(2),
+            Some(serde_json::json!({"processed": 3})),
+        )
+        .await?;
+        // gen1's row is stale leftover from before compaction existed (or a
+        // bug) -- it must never be read even though it's a real match for
+        // `job_type`/`unique_key`/`id != $1`.
+        let _ = gen1;
+        let _ = gen2;
+
+        let new_id = JobId::new();
+        sqlx::query(
+            "INSERT INTO jobs (id, job_type, unique_key, created_at) VALUES ($1, $2, $3, NOW())",
+        )
+        .bind(uuid::Uuid::from(new_id))
+        .bind(job_type.as_str())
+        .bind(key)
+        .execute(&pool)
+        .await?;
+
+        let spawner = test_spawner(&pool, job_type.clone(), true).await;
+        let mut op = es_entity::DbOp::init(&pool).await?;
+        spawner
+            .carry_state_in_op(&mut op, &[new_id], &[key.to_string()])
+            .await?;
+        op.commit().await?;
+
+        let new_state: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT execution_state_json FROM job_execution_states WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(new_id))
+        .fetch_optional(&pool)
+        .await?;
+        assert_eq!(
+            new_state,
+            Some(serde_json::json!({"processed": 3})),
+            "the new generation must seed from the NEWEST predecessor (gen3), not gen1"
+        );
+
+        let gen3_state_gone: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT execution_state_json FROM job_execution_states WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(gen3))
+        .fetch_optional(&pool)
+        .await?;
+        assert_eq!(
+            gen3_state_gone, None,
+            "gen3's state row must be deleted -- compacted into the new generation"
+        );
+
+        Ok(())
+    }
+
+    /// With `inherits_state = false` the seeding half is a no-op, but
+    /// compaction (the DELETE) still runs -- the predecessor's state row
+    /// must not be left behind to be picked up by some later carry.
+    #[tokio::test]
+    async fn carry_state_without_inherits_state_still_compacts_the_predecessor()
+    -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type =
+            JobType::from_owned(format!("carry-state-no-inherit-{}", uuid::Uuid::now_v7()));
+        let key = "k";
+        let base = chrono::Utc::now() - chrono::Duration::minutes(1);
+
+        let pred = seed_generation(
+            &pool,
+            &job_type,
+            key,
+            base,
+            Some(serde_json::json!({"processed": 1})),
+        )
+        .await?;
+
+        let new_id = JobId::new();
+        sqlx::query(
+            "INSERT INTO jobs (id, job_type, unique_key, created_at) VALUES ($1, $2, $3, NOW())",
+        )
+        .bind(uuid::Uuid::from(new_id))
+        .bind(job_type.as_str())
+        .bind(key)
+        .execute(&pool)
+        .await?;
+
+        let spawner = test_spawner(&pool, job_type.clone(), false).await;
+        let mut op = es_entity::DbOp::init(&pool).await?;
+        spawner
+            .carry_state_in_op(&mut op, &[new_id], &[key.to_string()])
+            .await?;
+        op.commit().await?;
+
+        let new_state: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT execution_state_json FROM job_execution_states WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(new_id))
+        .fetch_optional(&pool)
+        .await?;
+        assert_eq!(new_state, None, "inherits_state = false must not seed");
+
+        let pred_state_gone: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT execution_state_json FROM job_execution_states WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(pred))
+        .fetch_optional(&pool)
+        .await?;
+        assert_eq!(
+            pred_state_gone, None,
+            "the predecessor's row must still be compacted away even when not inherited"
+        );
+
+        Ok(())
     }
 }
