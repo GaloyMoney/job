@@ -94,6 +94,18 @@ pub(crate) enum DispatchTarget {
     Batch(JobType, Vec<ClaimedRow>),
 }
 
+impl DispatchTarget {
+    /// Rows actually claimed -- 1 for a single dispatch, the batch's length
+    /// otherwise. Used by [`ClaimHook::pre_commit`]'s due-hint re-arm: a
+    /// probe that came back full may have left more behind it.
+    fn row_count(&self) -> i64 {
+        match self {
+            DispatchTarget::Single(_) => 1,
+            DispatchTarget::Batch(_, rows) => rows.len() as i64,
+        }
+    }
+}
+
 pub(crate) struct ClaimHook {
     poller: std::sync::Weak<JobPoller>,
     fresh_demand: HashMap<JobType, usize>,
@@ -152,6 +164,13 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             return es_entity::operation::hooks::PreCommitRet::ok(self, op);
         }
 
+        // Snapshot which types this pass's OWN spawn/promote inserted due
+        // rows for -- their claim is guaranteed to find work and must always
+        // probe. Taken before draining `fresh_demand` below; merges from
+        // other registrations on this op have already folded in by the time
+        // `pre_commit` runs (`Self::merge`), so this is the final set.
+        let fresh_types: HashSet<JobType> = self.fresh_demand.keys().cloned().collect();
+
         let mut units_by_type: HashMap<JobType, Vec<UnitReservation>> = HashMap::new();
         for (job_type, reservation) in self.recycled.drain(..) {
             units_by_type.entry(job_type).or_default().push(reservation);
@@ -189,9 +208,34 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             if !poller.registry.short_circuit(&job_type) {
                 continue;
             }
+            // P1 (job-dev:handoff-write-path-efficiency-sb-max13.md): a
+            // recycle-only reservation set -- no fresh demand contributed by
+            // THIS op -- probes only if the type's due-hint says work may be
+            // waiting. At steady state a type's per-completion recycle probe
+            // finds an empty queue almost every time (F5), yet pays the same
+            // claim-probe cost as a hit (F2's churned-head amplification).
+            // Fresh-demand types always probe below -- this op's own spawn/
+            // promote guarantees a due row exists -- and never consume the
+            // hint, so they can't starve a genuinely idle recycle probe of
+            // its own signal.
+            if !fresh_types.contains(&job_type) && !poller.tracker.consume_due_hint(&job_type) {
+                for reservation in reservations {
+                    reservation.release();
+                }
+                continue;
+            }
+            let (per_unit_limit, _) = poller.claim_shape(&job_type);
+            let limit = per_unit_limit.max(1) * reservations.len() as i64;
             let targets = poller
                 .claim_after_many(&mut op, &job_type, now, reservations.len())
                 .await?;
+            let n_claimed: i64 = targets.iter().map(DispatchTarget::row_count).sum();
+            if n_claimed >= limit {
+                // The probe came back full -- more due rows may remain
+                // behind it -- so re-arm the hint rather than requiring a
+                // fresh external signal before the next recycle probe looks.
+                poller.tracker.set_due_hint(&job_type);
+            }
             for (reservation, target) in reservations.into_iter().zip(targets) {
                 let subs = ShutdownSubs {
                     job: poller.shutdown_tx.subscribe(),
