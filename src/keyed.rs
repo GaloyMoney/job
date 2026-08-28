@@ -445,17 +445,14 @@ where
     /// The per-key predecessor lookup starts from `jobs` (riding
     /// `idx_jobs_job_type_unique_key_created_at`) rather than from
     /// `job_execution_states` joined to `jobs`: `jobs` rows are never
-    /// deleted, so at scale (a long-running key with thousands of terminal
-    /// generations) joining `job_execution_states` to `jobs` over EVERY
-    /// matching generation before sorting made that join dominate the
-    /// statement's cost — even though, by the compaction invariant this very
-    /// statement maintains, only ever one generation can actually have a
-    /// state row to find. Picking the predecessor id from `jobs` first costs
-    /// a two-row backward index scan per key (`id != i.id` skips at most the
+    /// deleted, so picking the predecessor id from `jobs` first costs a
+    /// two-row backward index scan per key (`id != i.id` skips at most the
     /// current row) regardless of how many terminal generations the key has
-    /// accumulated, and `job_execution_states` is then probed only for that
-    /// one winning id per key
-    /// (job-dev:handoff-write-path-efficiency-sb-max13.md, F6).
+    /// accumulated. That bound is the point: a long-running key accumulates
+    /// thousands of terminal generations, and any form that examines them
+    /// all before narrowing to one row pays for the whole history to find
+    /// the one row that can exist. `job_execution_states` is then probed
+    /// only for that one winning id per key.
     ///
     /// Both halves read the same `pred` snapshot, so the seeding SELECT still
     /// sees the predecessor rows that the DELETE removes, and the DELETE
@@ -526,6 +523,7 @@ where
         )
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,13 +594,12 @@ mod tests {
         Ok(id)
     }
 
-    /// P2 (job-dev:handoff-write-path-efficiency-sb-max13.md, F6): three
-    /// terminal predecessor generations exist for the key -- the compaction
-    /// invariant means only the NEWEST of them (`gen3`) can still carry a
-    /// `job_execution_states` row (as if every earlier `carry_state_in_op`
-    /// call had already compacted `gen1`/`gen2` away). The rewritten `pred`
-    /// CTE must pick exactly `gen3` -- not scan/require all three -- seed the
-    /// new generation from it, and delete exactly its row.
+    /// Three terminal predecessor generations exist for the key. The
+    /// compaction invariant means only the NEWEST of them (`gen3`) can still
+    /// carry a `job_execution_states` row, since every earlier
+    /// `carry_state_in_op` call already compacted `gen1`/`gen2` away. The
+    /// `pred` CTE must pick exactly `gen3` -- not scan or require all three
+    /// -- seed the new generation from it, and delete exactly its row.
     #[tokio::test]
     async fn carry_state_seeds_from_and_deletes_only_the_newest_predecessor() -> anyhow::Result<()>
     {

@@ -356,12 +356,11 @@ async fn reclaim_lost_jobs(
 /// `PromoteHeadsHook::apply_freed`'s doc explains in full has NO canary here
 /// at all: this statement doesn't select `execute_at`, so a raced-away row
 /// (a concurrent claimer promoted-and-ran it to `running` between this
-/// statement's snapshot and `locked`'s lock being granted) gets silently
-/// reset back to `pending` by the bare pre-fix `UPDATE ... FROM locked` --
-/// becoming claimable again while its original executor is still running
-/// it, i.e. a silent double-dispatch with no error to surface it. Pinned by
+/// statement's snapshot and `locked`'s lock being granted) would be silently
+/// reset back to `pending` by a bare `UPDATE ... FROM locked` -- becoming
+/// claimable again while its original executor is still running it, i.e. a
+/// silent double-dispatch with no error to surface it. Pinned by
 /// `tests::sweep_yields_to_a_concurrently_claimed_row`.
-/// (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md)
 async fn sweep_orphaned_parked_rows(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar!(
         r#"
@@ -401,14 +400,13 @@ mod tests {
     use super::super::test_support::{init_pool, row_state, seed_queued_job, seed_running_job};
     use super::*;
 
-    /// Site 4 (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md):
-    /// unlike `apply_freed`, this statement selects no `execute_at`, so
-    /// pre-fix a raced-away row (a concurrent claimer promoted-and-ran it
-    /// between this call's snapshot and `locked`'s lock being granted)
-    /// silently resets back to `pending` -- no decode error to surface it,
-    /// just a `running` row made claimable again while its original
-    /// executor is still working it. Forces the race with the same
-    /// holder-transaction shape as `promote::tests::
+    /// Unlike `apply_freed`, this statement selects no `execute_at`, so a
+    /// raced-away row (a concurrent claimer promoted-and-ran it between this
+    /// call's snapshot and `locked`'s lock being granted) has no decode
+    /// error to surface it: without the re-checked predicate it silently
+    /// resets back to `pending`, making a `running` row claimable again
+    /// while its original executor is still working it. Forces the race with
+    /// the same holder-transaction shape as `promote::tests::
     /// apply_freed_yields_to_a_concurrently_claimed_row`.
     #[tokio::test]
     async fn sweep_yields_to_a_concurrently_claimed_row() -> anyhow::Result<()> {

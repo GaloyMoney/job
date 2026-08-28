@@ -15,16 +15,16 @@
 //! happens in `post_commit`, which was skipped), re-swapping their queues in the same
 //! transaction; `reclaim_lost_jobs` remains the slower backstop.
 //!
-//! **The due-hint gate (P1, job-dev:handoff-write-path-efficiency-sb-max13.md).**
-//! `pre_commit` snapshots `fresh_types` -- the job types THIS op's own spawn/promote
-//! contributed `fresh_demand` for -- before draining it into reservations: a fresh-demand
-//! type's claim is guaranteed to find the row it just inserted/promoted, so it always
-//! probes and never touches the hint. A recycle-only reservation set (no fresh demand from
-//! this op, i.e. a completion's `recycle_into_claim`) probes only if
-//! `JobTracker::consume_due_hint` says the type's queue may hold something -- at steady state
-//! a per-completion recycle probe finds an empty queue almost every time, yet paid the same
-//! worst-case claim-probe cost as a hit before this gate. A probe that comes back full
-//! re-arms the hint (`set_due_hint`), since more may remain behind it.
+//! **The due-hint gate.** `pre_commit` snapshots `fresh_types` -- the job types THIS op's
+//! own spawn/promote contributed `fresh_demand` for -- before draining it into
+//! reservations: a fresh-demand type's claim is guaranteed to find the row it just
+//! inserted/promoted, so it always probes and never touches the hint. A recycle-only
+//! reservation set (no fresh demand from this op, i.e. a completion's
+//! `recycle_into_claim`) probes only if `JobTracker::consume_due_hint` says the type's
+//! queue may hold something -- at steady state a per-completion recycle probe finds an
+//! empty queue almost every time, yet an ungated one pays the same worst-case claim-probe
+//! cost as a hit. A probe that comes back full re-arms the hint (`set_due_hint`), since
+//! more may remain behind it.
 //!
 //! **Handing a recycled unit back owes a wake, and that wake is DEFERRED.** Two sites give
 //! a reservation back without claiming: the due-hint skip, and `truncate_to_unit_budget`.
@@ -32,8 +32,7 @@
 //! detached from its own `job_completed`/`batch_completed` release-and-wake, expecting this
 //! hook to hand the unit back -- so nothing else will ever signal that the type's backlog
 //! became claimable again, and omitting the wake leaves a drained type (or one that just
-//! crossed below `min_jobs`) asleep until `MAX_WAIT`. That was job-dev bugbot finding #2 on
-//! PR #197 at the skip site, and finding #3 at the truncation site.
+//! crossed below `min_jobs`) asleep until `MAX_WAIT`.
 //!
 //! But the wake cannot fire where the debt is incurred. Both sites sit inside the per-type
 //! claim loop, and the reservations that SURVIVE are about to claim rows whose connections
@@ -41,20 +40,19 @@
 //! and over-admits on top. So both sites release QUIETLY (`UnitReservation::release`) and
 //! arm a single [`DeferredWake`], which fires on scope exit: after the claim loop, when
 //! this hook's own rows are already `running` inside the uncommitted transaction and
-//! `SKIP LOCKED` keeps a woken poll off them. Splitting these two sites -- deferring one
-//! and leaving the other's mid-loop `drop` -- was finding #4. Fresh-demand truncation arms
-//! nothing: the spawn/promote that created that demand already armed
-//! `job_execution_inserted`'s notify, so its row still has a signal pending and a second
-//! wake would only over-admit.
+//! `SKIP LOCKED` keeps a woken poll off them. Both sites must stay on that discipline --
+//! deferring one while the other wakes mid-loop reintroduces the over-admission. And
+//! fresh-demand truncation arms nothing: the spawn/promote that created that demand already
+//! armed `job_execution_inserted`'s notify, so its row still has a signal pending and a
+//! second wake would only over-admit.
 //!
 //! See `UnitReservation::drop`'s doc for the general release contract and
 //! `reservation_release_is_quiet_but_unresolved_drop_wakes` (tracker.rs) for the quiet and
 //! waking paths side by side. Truncation reaches a recycled unit whenever one op carries
 //! more reservations than `unit_budget` admits -- a promote/insert hook merging fresh
 //! demand onto a completion's op, under pool pressure, with the HashMap visiting the fresh
-//! type first. Rare per-op today, since a completion contributes exactly one recycled
-//! reservation, but anything that merges several recycles onto one op would make it
-//! ordinary.
+//! type first. Rare per-op while a completion contributes exactly one recycled reservation,
+//! but anything that merges several recycles onto one op makes it ordinary.
 
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
@@ -523,13 +521,11 @@ impl ClaimReconciler {
     /// STILL matching `je.id = l.id` with no re-check). Without the
     /// re-check, this statement would blindly stomp that legitimate
     /// disposition back to a stale `pending`/`execute_at`, discarding
-    /// whatever the finalize just wrote. Audited per
-    /// job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md §4's
-    /// "also audit" item; not the originally reported bug (no canary column
-    /// forces a decode error here either way -- the finalize's own
-    /// `poller_instance_id` filter already makes an ambiguous double-apply
-    /// idempotent-safe on the ENTITY side), but the same defensive shape as
-    /// every other multi-row locker of this table now agrees on.
+    /// whatever the finalize just wrote. No canary column forces a decode
+    /// error here either way -- the finalize's own `poller_instance_id`
+    /// filter already makes an ambiguous double-apply idempotent-safe on the
+    /// ENTITY side -- but this is the same defensive shape every other
+    /// multi-row locker of this table holds to.
     async fn reconcile_unclaimed(
         pool: &PgPool,
         instance_id: uuid::Uuid,
@@ -756,20 +752,16 @@ mod tests {
         Ok(())
     }
 
-    /// P1's due-hint skip must WAKE the poll loop, not quietly `.release()`
-    /// the reservation: it came from `self.recycled` (a completing
-    /// dispatcher's `recycle_into_claim`), which already detached from its
-    /// OWN `job_completed`/`batch_completed` release-and-wake specifically
-    /// because it expected this hook to hand the unit back.
-    /// `UnitReservation::drop`'s unresolved case is the only
-    /// remaining signal for that unit -- `.release()` is quiet and belongs
-    /// only to the budget-truncation case (where a wake would over-admit
-    /// against surviving claims' still-uncommitted headroom), a distinction
-    /// `reservation_release_is_quiet_but_unresolved_drop_wakes` (tracker.rs)
-    /// pins directly. Fixes job-dev bugbot finding #2 on PR #197 -- before
-    /// the fix, this due-hint-skip branch used `.release()` too, leaving a
-    /// drained (or just-below-`min_jobs`) type asleep until `MAX_WAIT`
-    /// (60s) with no other wake pending.
+    /// A due-hint skip must WAKE the poll loop by the time the op commits.
+    /// The reservation came from `self.recycled` (a completing dispatcher's
+    /// `recycle_into_claim`), which already detached from its OWN
+    /// `job_completed`/`batch_completed` release-and-wake specifically
+    /// because it expected this hook to hand the unit back, so this wake is
+    /// the only remaining signal for that unit. Without it a drained (or
+    /// just-below-`min_jobs`) type sleeps until `MAX_WAIT` (60s) with
+    /// nothing else pending. `reservation_release_is_quiet_but_unresolved_
+    /// drop_wakes` (tracker.rs) pins the quiet-vs-waking distinction the
+    /// release paths rest on.
     ///
     /// No sleep-based sync: the probe-skip is asserted via `PROBE_CALL_
     /// COUNT` (so the test cannot pass vacuously if the gate stopped
@@ -820,23 +812,22 @@ mod tests {
     }
 
     /// A due-hint skip on one type must not wake while a LATER type in the
-    /// same `pre_commit` has yet to claim. Both hand-back sites now release
-    /// quietly and arm one `DeferredWake` that fires on scope exit; before
-    /// this fix (job-dev bugbot finding #4 on PR #197) the skip site used a
-    /// bare `drop(reservations)`, whose `UnitReservation::drop` wake landed
-    /// mid-loop -- letting a woken poll re-read pool headroom that could not
-    /// yet see the surviving reservations' claims, the exact over-admission
-    /// the truncation site had just been changed to avoid.
+    /// same `pre_commit` has yet to claim. Both hand-back sites release
+    /// quietly and arm one `DeferredWake` that fires on scope exit; a bare
+    /// `drop(reservations)` at the skip site would instead land
+    /// `UnitReservation::drop`'s wake mid-loop, letting a woken poll re-read
+    /// pool headroom that cannot yet see the surviving reservations' claims
+    /// and over-admit on top of them.
     ///
     /// Ordering is asserted via `PROBE_COUNT_AT_WAKE`, which records
     /// `PROBE_CALL_COUNT` at the instant the deferred wake fires: the probing
     /// type's claim must already have run. This holds whichever order the
     /// HashMap visits the two types in -- if the skipped type comes first the
     /// wake is deferred past the other's probe, and if it comes second the
-    /// probe has already happened. Pre-fix the value stays at its `-1`
-    /// sentinel, since the mid-loop wake came from the reservation's own
-    /// `Drop` and no deferred wake was ever armed. No sleep-based sync: every
-    /// assertion reads an atomic settled during `pre_commit`.
+    /// probe has already happened. A mid-loop wake leaves the value at its
+    /// `-1` sentinel instead, since that wake comes from the reservation's
+    /// own `Drop` with no deferred wake armed at all. No sleep-based sync:
+    /// every assertion reads an atomic settled during `pre_commit`.
     #[tokio::test]
     async fn due_hint_skip_defers_its_wake_past_another_types_claim() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -891,10 +882,9 @@ mod tests {
     /// would let the woken poll over-admit against the surviving
     /// reservations' still-uncommitted claims), so the returned flag is the
     /// ONLY remaining signal for that freed unit -- its dispatcher already
-    /// detached from `job_completed`'s release-and-wake. Fixes job-dev
-    /// bugbot finding #3 on PR #197; before the fix this returned nothing
-    /// and the quiet release was the last event, stalling a drainable
-    /// backlog until `MAX_WAIT` (60s).
+    /// detached from `job_completed`'s release-and-wake. A quiet release
+    /// that reported nothing would leave that release as the last event,
+    /// stalling a drainable backlog until `MAX_WAIT` (60s).
     #[tokio::test]
     async fn budget_truncation_of_a_recycled_reservation_reports_a_wake() {
         let tracker = Arc::new(crate::tracker::JobTracker::new(0, 10));

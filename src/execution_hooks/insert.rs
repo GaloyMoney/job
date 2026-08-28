@@ -505,7 +505,6 @@ impl ExecutionInsertHook {
             // `PromoteHeadsHook::apply`'s doc) must not count as due-now
             // demand either: there is no due `execute_at` to have been
             // reached at all.
-            // (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md)
             if row.execute_at.is_some_and(|at| at <= now) {
                 *due.entry(JobType::from_owned(row.job_type.clone()))
                     .or_insert(0) += 1;
@@ -857,7 +856,6 @@ mod tests {
     /// A promoted row a concurrent claimer already raced away (`execute_at
     /// = None` -- see `PromoteHeadsHook::apply`'s doc) must not contribute
     /// claim demand: there is no due `execute_at` to have been reached.
-    /// (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md)
     #[test]
     fn due_now_excludes_a_promoted_row_raced_away_by_a_concurrent_claim() {
         let now = chrono::Utc::now();

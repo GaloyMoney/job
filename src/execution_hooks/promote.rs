@@ -94,7 +94,7 @@ impl PromoteHeadsHook {
 /// `poller/claim_query.rs` / `poller/hook.rs`) and the re-check makes such a
 /// row match zero rows here anyway, but the column stays honestly nullable
 /// rather than asserted non-null against a predicate a later refactor could
-/// silently weaken (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md).
+/// silently weaken.
 pub(crate) struct PromotedRow {
     pub job_type: String,
     pub execute_at: Option<DateTime<Utc>>,
@@ -139,12 +139,10 @@ impl PromoteHeadsHook {
     /// re-evaluation trivially passes (`je.id = l.id` doesn't care what
     /// `state` is) and this statement blindly re-applies `state = 'pending'`
     /// over a row a concurrent claimer already promoted to `running`,
-    /// returning its (`execute_at = NULL`) tuple -- a decode error against
-    /// the old `execute_at!` non-null assertion, and worse, a
-    /// double-dispatch of an already-running row had that assertion not
-    /// existed to abort the transaction. Pinned by
+    /// returning its (`execute_at = NULL`) tuple -- which, absent a non-null
+    /// decode assertion to abort the transaction, is a double-dispatch of an
+    /// already-running row. Pinned by
     /// `tests::apply_freed_yields_to_a_concurrently_claimed_row`.
-    /// (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md)
     async fn apply_freed(
         op: &mut impl AtomicOperation,
         queue_ids: &[String],
@@ -244,7 +242,6 @@ impl PromoteHeadsHook {
     /// side of the swap (`parked_id`) against the same race landing on the
     /// sibling being promoted instead. Pinned by
     /// `tests::apply_demote_yields_to_a_concurrently_claimed_pending_row`.
-    /// (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md)
     pub(crate) async fn apply(
         op: &mut impl AtomicOperation,
         ids: &[uuid::Uuid],
@@ -448,16 +445,16 @@ mod tests {
         Ok(id)
     }
 
-    /// Site 1 (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md):
-    /// `apply_freed`'s promote UPDATE re-locks a parked head without
-    /// re-checking `state` after the lock is granted. Forces the exact
-    /// race: a holder transaction takes the row's lock first (mirroring a
-    /// concurrent claimer that has already started), `apply_freed` blocks
-    /// acquiring `locked`'s `FOR NO KEY UPDATE` on it, then the holder
-    /// promotes-and-runs the row (nulling `execute_at`, exactly like a real
-    /// claim) and commits -- unblocking `apply_freed`. Pre-fix this panics
-    /// the `execute_at!` non-null decode; post-fix the re-checked predicate
-    /// makes the statement affect zero rows for this id.
+    /// `apply_freed`'s promote UPDATE must re-check `state` after its lock
+    /// is granted. Forces the exact race: a holder transaction takes the
+    /// row's lock first (mirroring a concurrent claimer that has already
+    /// started), `apply_freed` blocks acquiring `locked`'s
+    /// `FOR NO KEY UPDATE` on it, then the holder promotes-and-runs the row
+    /// (nulling `execute_at`, exactly like a real claim) and commits --
+    /// unblocking `apply_freed`. The re-checked predicate must make the
+    /// statement affect zero rows for this id; without it the statement
+    /// re-applies over the running row and panics the `execute_at!`
+    /// non-null decode.
     #[tokio::test]
     async fn apply_freed_yields_to_a_concurrently_claimed_row() -> anyhow::Result<()> {
         let pool = init_pool().await?;
@@ -520,13 +517,13 @@ mod tests {
         Ok(())
     }
 
-    /// Site 3 (job-dev:handoff-promote-missing-state-recheck-race-sb-max13.md):
-    /// `apply`'s `demote` CTE re-locks a `pending` swap candidate without
-    /// re-checking `state`. Pre-fix, a concurrent claimer that promoted the
-    /// same candidate to `running` between `candidates`' snapshot and
-    /// `locked`'s lock would get silently demoted back to `parked` --
-    /// worse than site 1's decode error, since nothing surfaces it (the
-    /// candidate is not the RETURNING column that carries `execute_at`).
+    /// `apply`'s `demote` CTE must re-check `state` when it re-locks a
+    /// `pending` swap candidate. Without that, a concurrent claimer that
+    /// promoted the same candidate to `running` between `candidates`'
+    /// snapshot and `locked`'s lock gets silently demoted back to `parked`
+    /// -- worse than `apply_freed`'s decode error, since nothing surfaces
+    /// it: the candidate is not the RETURNING column that carries
+    /// `execute_at`.
     #[tokio::test]
     async fn apply_demote_yields_to_a_concurrently_claimed_pending_row() -> anyhow::Result<()> {
         let pool = init_pool().await?;

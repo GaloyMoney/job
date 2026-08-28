@@ -59,9 +59,9 @@ pub(crate) struct JobTracker {
     /// funnel through it already) and by `ClaimHook::pre_commit` whenever a
     /// probe comes back full (more may remain behind it). Consumed by
     /// [`Self::consume_due_hint`] -- the completion-recycle claim probe's
-    /// gate (P1, `job-dev:handoff-write-path-efficiency-sb-max13.md`): at
-    /// steady state a type's queue is usually empty, so an unconditional
-    /// post-completion probe pays full claim-probe cost to find nothing.
+    /// gate: at steady state a type's queue is usually empty, so an
+    /// unconditional post-completion probe pays full claim-probe cost to
+    /// find nothing.
     /// Fresh-demand probes (this op's own spawn/promote) never consult this
     /// -- their due rows are guaranteed by construction.
     maybe_due: Mutex<HashSet<JobType>>,
