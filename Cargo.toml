@@ -45,7 +45,7 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.12.10"
+es-entity = "0.12.16"
 
 anyhow = "1.0"
 async-trait = "0.1"

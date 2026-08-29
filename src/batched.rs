@@ -452,12 +452,17 @@ impl<C> BatchedJobItem<C> {
 /// Context handed to a [`BatchedJobRunner`] for one batch.
 pub struct CurrentBatchedJob<C> {
     items: Vec<BatchedJobItem<C>>,
+    job_type: JobType,
     pool: PgPool,
     clock: ClockHandle,
     shutdown_rx: ShutdownRx,
 }
 
 impl<C> CurrentBatchedJob<C> {
+    pub fn job_type(&self) -> &JobType {
+        &self.job_type
+    }
+
     /// The jobs in this batch, ordered by `queue_id` (job id when unqueued) so
     /// concurrent batches take domain locks in a consistent order.
     ///
@@ -550,7 +555,7 @@ impl<C> CurrentBatchedJob<C> {
     #[cfg(feature = "es-entity")]
     pub async fn run_isolated<E>(
         &self,
-        op: &mut es_entity::DbOp<'static>,
+        op: &mut impl es_entity::SavepointOperation,
         f: impl AsyncFn(
             &mut es_entity::SavepointOp<'_>,
             &BatchedJobItem<C>,
@@ -659,7 +664,7 @@ impl<C> CurrentBatchedJob<C> {
     #[cfg(feature = "es-entity")]
     pub async fn run_bisected<E>(
         &self,
-        op: &mut es_entity::DbOp<'static>,
+        op: &mut impl es_entity::SavepointOperation,
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>,
     ) -> Result<BatchOutcomes, sqlx::Error>
     where
@@ -675,7 +680,7 @@ impl<C> CurrentBatchedJob<C> {
     #[cfg(feature = "es-entity")]
     pub async fn run_bisected_with<E>(
         &self,
-        op: &mut es_entity::DbOp<'static>,
+        op: &mut impl es_entity::SavepointOperation,
         budget: BisectBudget,
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>,
     ) -> Result<BatchOutcomes, sqlx::Error>
@@ -857,6 +862,7 @@ pub(crate) struct BatchRunCtx {
     pub pool: PgPool,
     pub clock: ClockHandle,
     pub repo: Arc<JobRepo>,
+    pub job_type: JobType,
     pub shutdown_rx: ShutdownRx,
 }
 
@@ -894,6 +900,7 @@ where
             pool,
             clock,
             repo,
+            job_type,
             shutdown_rx,
         } = ctx;
 
@@ -914,6 +921,7 @@ where
         self.inner
             .run_batch(CurrentBatchedJob {
                 items: typed,
+                job_type,
                 pool,
                 clock,
                 shutdown_rx,

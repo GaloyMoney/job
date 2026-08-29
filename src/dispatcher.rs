@@ -198,6 +198,7 @@ impl JobDispatcher {
         }
         let current_job = CurrentJob::new(
             polled_job.id,
+            job.job_type.clone(),
             polled_job.attempt,
             self.repo.pool().clone(),
             polled_job.data_json,

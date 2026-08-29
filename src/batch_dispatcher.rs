@@ -268,6 +268,7 @@ impl BatchDispatcher {
             pool: self.repo.pool().clone(),
             clock: self.clock.clone(),
             repo: Arc::clone(&self.repo),
+            job_type: self.job_type.clone(),
             shutdown_rx,
         };
 
