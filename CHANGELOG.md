@@ -1,3 +1,11 @@
+# [job release v0.13.11](https://github.com/GaloyMoney/job/releases/tag/0.13.11)
+
+
+
+### Features
+
+- Expose job_type on Current{Job,BatchedJob}, widen savepoint ops (#201)
+
 # [job release v0.13.10](https://github.com/GaloyMoney/job/releases/tag/0.13.10)
 
 
