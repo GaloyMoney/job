@@ -6,11 +6,12 @@ use sqlx::PgPool;
 
 use std::sync::Arc;
 
-use super::{JobId, error::JobError, outcome::JobReturnValue, repo::JobRepo};
+use super::{JobId, entity::JobType, error::JobError, outcome::JobReturnValue, repo::JobRepo};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
     id: JobId,
+    job_type: JobType,
     attempt: u32,
     pool: PgPool,
     execution_state_json: Option<serde_json::Value>,
@@ -22,8 +23,10 @@ pub struct CurrentJob {
 }
 
 impl CurrentJob {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         id: JobId,
+        job_type: JobType,
         attempt: u32,
         pool: PgPool,
         execution_state: Option<serde_json::Value>,
@@ -35,6 +38,7 @@ impl CurrentJob {
     ) -> Self {
         Self {
             id,
+            job_type,
             attempt,
             pool,
             execution_state_json: execution_state,
@@ -103,6 +107,10 @@ impl CurrentJob {
 
     pub fn id(&self) -> &JobId {
         &self.id
+    }
+
+    pub fn job_type(&self) -> &JobType {
+        &self.job_type
     }
 
     pub fn pool(&self) -> &PgPool {
