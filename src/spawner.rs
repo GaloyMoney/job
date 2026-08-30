@@ -209,7 +209,7 @@ where
                 .repo
                 .lock_and_check_live_keys_in_op(op, &self.job_type, std::slice::from_ref(key))
                 .await?;
-            if live_keys.contains(key) {
+            if live_keys.contains_key(key) {
                 return Ok(None);
             }
         }
@@ -475,7 +475,7 @@ where
         let mut surviving = Vec::with_capacity(specs.len());
         for spec in specs {
             if let Some(key) = &spec.dedup_key
-                && (live_keys.contains(key) || !seen_keys.insert(key.clone()))
+                && (live_keys.contains_key(key) || !seen_keys.insert(key.clone()))
             {
                 deduped.push(spec.id);
                 continue;

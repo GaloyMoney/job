@@ -18,10 +18,13 @@ use super::promote::{PromoteHeadsHook, PromotedRow};
 /// `unique_key` is `Some` only for a [`crate::JobSpec::dedup_key`]-bearing
 /// bulk-spawn row; `spawn_in_op`/`spawn_at_in_op`/`spawn_with_queue_id_in_op`
 /// (the single-item convenience methods) never set it. Keyed spawn's own
-/// insert stays entirely separate and inline (`keyed.rs::KeyedJobSpawner::spawn`)
-/// rather than going through this hook -- it needs the live-holder's id back
-/// in the SAME round trip to resolve a conflict, which a deferred, merged,
-/// multi-row batch insert cannot give it. `spawn_all_in_op` resolves a
+/// inserts stay entirely separate and inline
+/// (`keyed.rs::KeyedJobSpawner::spawn_all_in_op`) rather than going through
+/// this hook -- deferring them to commit time is exactly what would stop a
+/// second keyed spawn on the SAME `op` from seeing the first's row in its
+/// live-check, and that live-check is the single mechanism keyed spawn uses
+/// to resolve same-op and cross-transaction collisions alike. See there.
+/// `spawn_all_in_op` resolves a
 /// dedup-key row's liveness BEFORE registering it here (see
 /// `JobRepo::lock_and_check_live_keys_in_op`), so by the time a row reaches
 /// this hook its key (if any) is either free or a cross-call collision
