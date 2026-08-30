@@ -1,3 +1,15 @@
+# [job release v0.13.12](https://github.com/GaloyMoney/job/releases/tag/0.13.12)
+
+
+
+### Bug Fixes
+
+- Make pool-headroom settle wait for the connection return
+
+### Features
+
+- Add KeyedJobSpawner::spawn_in_op and bulk keyed spawn (#202)
+
 # [job release v0.13.11](https://github.com/GaloyMoney/job/releases/tag/0.13.11)
 
 
