@@ -97,12 +97,36 @@ impl PoolBudget {
 mod tests {
     use super::*;
 
+    /// Wait for sqlx to finish returning dropped connections to `pool`.
+    ///
+    /// Dropping a `PoolConnection` does not make it idle synchronously: sqlx
+    /// resets the connection -- a round trip to Postgres -- before returning
+    /// it. This has to wait on real time, not just reschedule.
+    /// `tokio::task::yield_now()` does the latter, so an earlier
+    /// spin of 1000 yields elapsed in microseconds without ever waiting for
+    /// that round trip. It settled on a quiet loopback Postgres and gave up
+    /// on a loaded one, then fell through silently into the caller's
+    /// `assert_eq!`, which compared stale numbers -- surfacing as an
+    /// off-by-one headroom assertion in CI (`left: 0, right: 1`) while
+    /// passing locally every time.
+    ///
+    /// Sleeping on a timer lets the round trip actually complete, and a
+    /// deadline that panics beats falling through into a confusing
+    /// assertion several lines later.
     async fn settle(pool: &PgPool, expected_idle: u32) {
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
             if pool.num_idle() as u32 == expected_idle {
                 return;
             }
-            tokio::task::yield_now().await;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pool did not settle to {expected_idle} idle connection(s) within 30s \
+                 (num_idle = {}, size = {})",
+                pool.num_idle(),
+                pool.size(),
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
