@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use sqlx::PgPool;
 
@@ -34,11 +34,17 @@ impl JobRepo {
         Self { pool: pool.clone() }
     }
 
-    /// [`crate::JobSpec::dedup_key`]'s enforcement point: acquire a
-    /// transaction-scoped advisory lock per distinct `keys` entry, THEN
-    /// report which are currently LIVE (any state -- the same live-window
-    /// definition `idx_job_executions_job_type_unique_key` already enforces
-    /// for keyed jobs) for `job_type`.
+    /// The shared enforcement point of [`crate::JobSpec::dedup_key`] AND
+    /// keyed spawn ([`crate::KeyedJobSpawner`]): acquire a transaction-scoped
+    /// advisory lock per distinct `keys` entry, THEN report which are
+    /// currently LIVE (any state -- the same live-window definition
+    /// `idx_job_executions_job_type_unique_key` enforces) for `job_type`,
+    /// each mapped to the id of the job holding it.
+    ///
+    /// The holder's id is what lets keyed spawn resolve a collision to a
+    /// [`crate::JobHandle`] for the live job (its documented semantic) rather
+    /// than dropping the spec the way `dedup_key` does; `dedup_key`'s callers
+    /// just ignore the values.
     ///
     /// Locking BEFORE checking, rather than checking then locking, is what
     /// closes the race: a concurrent call for an overlapping key blocks at
@@ -66,13 +72,24 @@ impl JobRepo {
     /// `lock_queue_occupants` already use for row locks, applied here to
     /// advisory locks instead.
     ///
-    /// Does NOT catch two calls sharing one `op` (e.g. two `spawn_all_in_op`
-    /// calls, or `spawn_in_op` + `spawn_all_in_op`, merged by
-    /// `ExecutionInsertHook::merge`) that both target the same key: each
-    /// call's live-check only sees the durable table, not a sibling call's
-    /// still-uncommitted, not-yet-inserted row. `insert_many`'s own
-    /// `DISTINCT ON` collapse is the backstop for that narrower, same-op
-    /// case.
+    /// Whether this catches two calls sharing one `op` that both target the
+    /// same key depends on WHEN the caller inserts its execution rows, and
+    /// the two callers differ:
+    ///
+    /// - `dedup_key` (`spawner.rs`) defers its insert to
+    ///   `ExecutionInsertHook`'s commit-time batch, so a sibling call's row
+    ///   does not exist yet at live-check time and is not seen (e.g. two
+    ///   `spawn_all_in_op` calls, or `spawn_in_op` + `spawn_all_in_op`,
+    ///   merged by `ExecutionInsertHook::merge`). `insert_many`'s own
+    ///   `DISTINCT ON` collapse is the backstop for that narrower case.
+    /// - Keyed spawn (`keyed.rs`) inserts its execution rows INLINE, before
+    ///   returning. A transaction sees its own uncommitted writes, so a
+    ///   second `spawn_in_op`/`spawn_all_in_op` on the same `op` finds the
+    ///   first call's row right here in the live-check and resolves to its
+    ///   holder -- the same answer it would give across transactions, from
+    ///   the same statement. That is precisely why keyed spawn does not use
+    ///   the deferred hook; see `keyed.rs::KeyedJobSpawner::spawn_all_in_op`.
+    ///
     /// Deliberately TWO statements, not one -- two single-statement designs
     /// were tried and both are unsafe:
     ///
@@ -107,9 +124,9 @@ impl JobRepo {
         op: &mut impl es_entity::AtomicOperation,
         job_type: &JobType,
         keys: &[String],
-    ) -> Result<HashSet<String>, JobError> {
+    ) -> Result<HashMap<String, JobId>, JobError> {
         if keys.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(HashMap::new());
         }
         sqlx::query!(
             r#"
@@ -126,15 +143,15 @@ impl JobRepo {
         .execute(op.as_executor())
         .await?;
 
-        let live = sqlx::query_scalar!(
-            r#"SELECT unique_key AS "unique_key!" FROM job_executions
+        let live = sqlx::query!(
+            r#"SELECT unique_key AS "unique_key!", id AS "id: JobId" FROM job_executions
                WHERE job_type = $1 AND unique_key = ANY($2)"#,
             job_type as &JobType,
             keys,
         )
         .fetch_all(op.as_executor())
         .await?;
-        Ok(live.into_iter().collect())
+        Ok(live.into_iter().map(|r| (r.unique_key, r.id)).collect())
     }
 
     /// Resolve the keyed singleton of `(job_type, key)`: the LIVE job if one

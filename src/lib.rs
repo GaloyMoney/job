@@ -273,6 +273,26 @@
 //! shard_spawner.spawn(format!("shard-{shard_id}"), ShardConfig { shard_id }).await?;
 //! ```
 //!
+//! [`KeyedJobSpawner::spawn_in_op`] does the same inside a transaction you
+//! already have open, and [`KeyedJobSpawner::spawn_all`] /
+//! [`KeyedJobSpawner::spawn_all_in_op`] do it for many keys at once.
+//! Both report per key whether they created the job or resolved to one that
+//! already held the key ([`KeyedSpawn::created`]) — the collision is never
+//! silently dropped, unlike [`JobSpec::dedup_key`] on the regular spawn path:
+//!
+//! ```ignore
+//! let spawned = shard_spawner
+//!     .spawn_all_in_op(&mut op, shards.iter().map(|s| {
+//!         KeyedJobSpec::new(format!("shard-{s}"), ShardConfig { shard_id: *s })
+//!     }).collect())
+//!     .await?;
+//! for s in &spawned {
+//!     if s.created {
+//!         // ... first-time setup for this shard, in the same transaction
+//!     }
+//! }
+//! ```
+//!
 //! By default a keyed generation's execution state (see
 //! [`CurrentJob::update_execution_state`]) is deleted when it terminates, just
 //! like a regular job's. Set [`KeyedJobInitializer::inherits_state`] to make it
@@ -401,7 +421,7 @@ pub use error::JobError;
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use handle::{JobHandle, JobHandles};
 pub use job_execution::JobStatus;
-pub use keyed::{KeyedJobInitializer, KeyedJobSpawner};
+pub use keyed::{KeyedJobInitializer, KeyedJobSpawner, KeyedJobSpec, KeyedSpawn};
 pub use migrate::*;
 pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;

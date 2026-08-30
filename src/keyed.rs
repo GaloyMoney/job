@@ -15,7 +15,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Serialize, de::DeserializeOwned};
-use std::{fmt::Debug, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use es_entity::clock::ClockHandle;
 use tracing::instrument;
@@ -88,6 +88,60 @@ pub trait KeyedJobInitializer: Send + Sync + 'static {
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
+/// Describes one keyed job to create as part of a bulk
+/// [`KeyedJobSpawner::spawn_all`] / [`KeyedJobSpawner::spawn_all_in_op`]
+/// call.
+///
+/// There is deliberately no `id`: a keyed job is identified by its
+/// `(job_type, key)`, and its id is generated internally. See
+/// [`KeyedJobSpawner::spawn`].
+pub struct KeyedJobSpec<Config> {
+    pub key: String,
+    pub config: Config,
+    pub schedule_at: Option<DateTime<Utc>>,
+}
+
+impl<Config> KeyedJobSpec<Config> {
+    pub fn new(key: impl Into<String>, config: Config) -> Self {
+        Self {
+            key: key.into(),
+            config,
+            schedule_at: None,
+        }
+    }
+
+    /// Schedule this job for a specific time instead of immediately.
+    pub fn schedule_at(mut self, schedule_at: DateTime<Utc>) -> Self {
+        self.schedule_at = Some(schedule_at);
+        self
+    }
+}
+
+/// The outcome of spawning one key.
+///
+/// Unlike [`crate::BulkSpawnResult`], there is no "dropped" case: keyed spawn
+/// resolves a collision to the LIVE holder rather than discarding the spec,
+/// so every requested key yields a usable [`JobHandle`] and `created` says
+/// which generation it refers to.
+pub struct KeyedSpawn {
+    /// The key that was requested.
+    pub key: String,
+    /// Handle to the job now holding `key` — the one just created, or the
+    /// LIVE one that already held it.
+    pub handle: JobHandle,
+    /// `true` if this call created the job, `false` if it resolved to a job
+    /// that already held the key. Use it to decide whether to perform
+    /// first-time side effects alongside the spawn, in the same `op`.
+    pub created: bool,
+}
+
+impl KeyedSpawn {
+    /// Discard the key/`created` context and keep just the handle.
+    pub fn into_handle(self) -> JobHandle {
+        self.handle
+    }
+}
+
 /// A handle for spawning keyed jobs of a specific type.
 ///
 /// Returned by [`crate::Jobs::add_keyed_initializer`].
@@ -158,11 +212,8 @@ where
     /// # Errors
     ///
     /// Spawning against a held key is not an error — it resolves to the
-    /// holder. The one failure mode of its own is
-    /// [`JobError::KeyedSpawnRace`], and it is practically unreachable: each
-    /// attempt that loses the key re-reads the holder, and only a holder that
-    /// went terminal in the instant between those two steps forces a retry.
-    /// The error means that happened on three consecutive attempts.
+    /// holder. This has no failure mode of its own beyond the underlying
+    /// database errors.
     #[instrument(
         name = "keyed_job_spawner.spawn",
         skip(self, config),
@@ -173,98 +224,273 @@ where
         key: impl Into<String> + Send + Debug,
         config: Config,
     ) -> Result<JobHandle, JobError> {
-        let key = key.into();
-        // Serialized once so a retry (see below) doesn't need `Config: Clone`.
-        let config = serde_json::to_value(config).map_err(JobError::CouldNotSerializeConfig)?;
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let spawned = self.spawn_in_op(&mut op, key, config).await?;
+        op.commit().await?;
+        Ok(spawned.handle)
+    }
 
-        for _attempt in 0..3 {
-            let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-            let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
-            let new_job = NewJob::builder()
-                .id(JobId::new())
-                .unique_key(key.clone())
-                .job_type(self.job_type.clone())
-                .config(config.clone())?
-                .tracing_context(es_entity::context::TracingContext::current())
-                .schedule_at(schedule_at)
-                .build()
-                .expect("Could not build new job");
+    /// [`Self::spawn`] as part of an existing atomic operation, so a keyed
+    /// job is created in the same transaction as whatever prompted it.
+    ///
+    /// Same semantics as [`Self::spawn`] — create, or resolve to the LIVE
+    /// holder — but returns [`KeyedSpawn`] rather than a bare handle, since
+    /// in-op callers usually need to know whether they are the ones who
+    /// created it before writing their own side of the transaction. Use
+    /// [`KeyedSpawn::into_handle`] when they don't.
+    ///
+    /// Two calls on the SAME `op` for the same key are safe and resolve the
+    /// second to the first's job: the execution row is inserted before this
+    /// returns, and a transaction sees its own uncommitted writes, so the
+    /// second call's live-check finds it. See [`Self::spawn_all_in_op`].
+    #[instrument(
+        name = "keyed_job_spawner.spawn_in_op",
+        skip(self, op, config),
+        fields(job_type = %self.job_type)
+    )]
+    pub async fn spawn_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        key: impl Into<String> + Send + Debug,
+        config: Config,
+    ) -> Result<KeyedSpawn, JobError> {
+        let mut spawned = self
+            .spawn_all_in_op(op, vec![KeyedJobSpec::new(key, config)])
+            .await?;
+        Ok(spawned.pop().expect("one spec in, exactly one outcome out"))
+    }
+
+    /// Create or resolve many keys of this type in a single atomic operation.
+    ///
+    /// Outcomes are returned in the order of `specs`, one per spec. Every key
+    /// yields a [`KeyedSpawn`] — none are silently dropped — so this can be
+    /// zipped straight back against the inputs.
+    #[instrument(
+        name = "keyed_job_spawner.spawn_all",
+        skip(self, specs),
+        fields(job_type = %self.job_type)
+    )]
+    pub async fn spawn_all(
+        &self,
+        specs: Vec<KeyedJobSpec<Config>>,
+    ) -> Result<Vec<KeyedSpawn>, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        let spawned = self.spawn_all_in_op(&mut op, specs).await?;
+        op.commit().await?;
+        Ok(spawned)
+    }
+
+    /// [`Self::spawn_all`] as part of an existing atomic operation. The core
+    /// every other `spawn*` method on this spawner delegates to.
+    ///
+    /// # How a key is claimed
+    ///
+    /// `JobRepo::lock_and_check_live_keys_in_op` takes a transaction-scoped
+    /// advisory lock per key and THEN reports each key's live holder. Every
+    /// writer of a keyed key goes through it, so once the check reports a key
+    /// free, no other transaction can claim it before this one ends — the
+    /// subsequent insert cannot conflict, and needs no `ON CONFLICT` clause.
+    /// A unique violation on `idx_job_executions_job_type_unique_key` from
+    /// here would mean a writer bypassed the lock, which is a bug worth
+    /// failing loudly on rather than absorbing.
+    ///
+    /// Resolving liveness BEFORE creating any `jobs` row is what keeps a
+    /// resolved-to-holder spec from leaving an orphan `jobs` row behind (see
+    /// `JobRepo::lock_and_check_live_keys_in_op`).
+    ///
+    /// # Why the insert is inline rather than deferred to `ExecutionInsertHook`
+    ///
+    /// Because it makes duplicate keys within one `op` self-checking. The
+    /// hook batches inserts to commit time, so a sibling call's row would not
+    /// exist yet when the next call runs its live-check; inserting here means
+    /// the live-check — which reads inside this transaction, and so sees this
+    /// transaction's own uncommitted writes — is the single mechanism
+    /// resolving same-op, same-transaction and cross-transaction collisions
+    /// alike. The batching that would buy is small in exchange: keyed rows
+    /// always have `queue_id = NULL`, so the hook's queue parking/promotion
+    /// machinery is inert for them, and bulk callers already get one
+    /// statement per call from here.
+    ///
+    /// `seen` covers the remaining case the live-check cannot: two specs
+    /// sharing a key WITHIN this call, neither inserted yet.
+    #[instrument(
+        name = "keyed_job_spawner.spawn_all_in_op",
+        skip(self, op, specs),
+        fields(job_type = %self.job_type, count)
+    )]
+    pub async fn spawn_all_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        specs: Vec<KeyedJobSpec<Config>>,
+    ) -> Result<Vec<KeyedSpawn>, JobError> {
+        tracing::Span::current().record("count", specs.len());
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let default_schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        let keys: Vec<String> = specs.iter().map(|s| s.key.clone()).collect();
+        let live = self
+            .repo
+            .lock_and_check_live_keys_in_op(op, &self.job_type, &keys)
+            .await?;
+
+        let mut seen: HashMap<String, JobId> = HashMap::new();
+        let mut new_jobs = Vec::new();
+        let mut new_ids: Vec<JobId> = Vec::new();
+        let mut new_keys: Vec<String> = Vec::new();
+        let mut new_schedule_times: Vec<DateTime<Utc>> = Vec::new();
+        let mut outcomes = Vec::with_capacity(specs.len());
+
+        for spec in specs {
+            if let Some(id) = live.get(&spec.key).or_else(|| seen.get(&spec.key)) {
+                outcomes.push(KeyedSpawn {
+                    key: spec.key,
+                    handle: self.handle(*id),
+                    created: false,
+                });
+                continue;
+            }
+
+            let id = JobId::new();
+            let schedule_at = spec.schedule_at.unwrap_or(default_schedule_at);
             // The id is an internally generated v7 uuid, `resident` defaults
             // to false here (this path never sets it), and `jobs` carries no
             // unique-key-string constraint (liveness enforcement is on
-            // `job_executions`, see below) — this can no longer conflict.
-            let job = self.repo.create_in_op(&mut op, new_job).await?;
-            match insert_keyed_execution(&self.notifier, &mut op, &job, schedule_at, &key).await? {
-                KeyedInsert::Inserted => {
-                    self.carry_state_in_op(&mut op, job.id, &key).await?;
-
-                    if schedule_at <= self.clock.now()
-                        && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
-                    {
-                        poller.register_claim_demand(&mut op, &self.job_type, 1);
-                    }
-
-                    op.commit().await?;
-                    return Ok(self.handle(job.id));
-                }
-                KeyedInsert::Live(live) => {
-                    // Rolls back the job row too — nothing leaks.
-                    drop(op);
-                    return Ok(self.handle(live));
-                }
-                KeyedInsert::Contended => {
-                    // The holder went terminal between the conflict and the
-                    // read — retry the whole spawn.
-                    drop(op);
-                }
-            }
+            // `job_executions`) — this cannot conflict.
+            new_jobs.push(
+                NewJob::builder()
+                    .id(id)
+                    .unique_key(spec.key.clone())
+                    .job_type(self.job_type.clone())
+                    .config(spec.config)?
+                    .tracing_context(es_entity::context::TracingContext::current())
+                    .schedule_at(schedule_at)
+                    .build()
+                    .expect("Could not build new job"),
+            );
+            seen.insert(spec.key.clone(), id);
+            new_ids.push(id);
+            new_keys.push(spec.key.clone());
+            new_schedule_times.push(schedule_at);
+            outcomes.push(KeyedSpawn {
+                key: spec.key,
+                handle: self.handle(id),
+                created: true,
+            });
         }
-        Err(JobError::KeyedSpawnRace(self.job_type.clone(), key))
+
+        if new_jobs.is_empty() {
+            return Ok(outcomes);
+        }
+
+        self.repo.create_all_in_op(op, new_jobs).await?;
+        self.insert_executions_in_op(op, &new_ids, &new_keys, &new_schedule_times)
+            .await?;
+        self.carry_state_in_op(op, &new_ids, &new_keys).await?;
+
+        self.notifier
+            .execution_ready_in_op(op, &self.job_type)
+            .await?;
+
+        let now = self.clock.now();
+        let n_due = new_schedule_times.iter().filter(|at| **at <= now).count();
+        if n_due > 0
+            && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
+        {
+            poller.register_claim_demand(op, &self.job_type, n_due);
+        }
+
+        Ok(outcomes)
     }
 
-    /// Carry the previous generation's final state into the new one and drop
-    /// every older generation's row, in a single statement.
+    /// Insert the `job_executions` row claiming each key.
+    ///
+    /// No `ON CONFLICT`: every caller holds the key's advisory lock and has
+    /// already seen it free. `state`/`attempt_index` come from the column
+    /// defaults ('pending', 1), and `queue_id` is always NULL — a keyed job's
+    /// singleton-ness comes from its key, not from a queue.
+    #[instrument(name = "job.insert_keyed_executions", skip_all)]
+    async fn insert_executions_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        ids: &[JobId],
+        keys: &[String],
+        schedule_times: &[DateTime<Utc>],
+    ) -> Result<(), JobError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO job_executions
+                (id, job_type, queue_id, unique_key, execute_at, alive_at, created_at)
+            SELECT t.id, $2, NULL, t.unique_key, t.execute_at,
+                   COALESCE($5, NOW()), COALESCE($5, NOW())
+            FROM UNNEST($1::uuid[], $3::text[], $4::timestamptz[])
+                AS t(id, unique_key, execute_at)
+            "#,
+            ids as &[JobId],
+            &self.job_type as &JobType,
+            keys,
+            schedule_times,
+            op.maybe_now(),
+        )
+        .execute(op.as_executor())
+        .await?;
+        Ok(())
+    }
+
+    /// For each newly created generation, carry the previous generation's
+    /// final state into it and drop every older generation's row — all in a
+    /// single statement.
     ///
     /// Both halves read the same snapshot, so the seeding SELECT still sees
-    /// the predecessor's row that the DELETE removes, and the DELETE cannot
-    /// see the row the INSERT writes (they are disjoint anyway: `id = $1` vs
-    /// `id != $1`). The result is that a key's state never grows past one
-    /// row.
+    /// the predecessor rows that the DELETE removes, and the DELETE cannot
+    /// see the rows the INSERT writes (they are disjoint anyway: `j.id =
+    /// i.id` vs `j.id != i.id`). The result is that a key's state never grows
+    /// past one row. `ids[n]` pairs with `keys[n]`, and a key appears at most
+    /// once, so the per-key `LATERAL` picks exactly one predecessor.
     ///
-    /// Race-free without extra locking: the new generation's execution insert
-    /// (earlier in this same `op`) can only have succeeded once the previous
-    /// LIVE holder released the key, which happens atomically with that
-    /// holder's final state write — so the predecessor's last write, if any,
-    /// is already visible here.
+    /// Race-free with respect to the outgoing generation: this `op` already
+    /// observed each key as free in
+    /// `JobRepo::lock_and_check_live_keys_in_op`, and a key is released
+    /// atomically with its holder's final state write — so the predecessor's
+    /// last write, if any, is committed and visible here.
     ///
     /// `$4` is [`KeyedJobInitializer::inherits_state`]: when false the seeding
     /// half is a no-op and only compaction runs.
     async fn carry_state_in_op(
         &self,
         op: &mut impl es_entity::AtomicOperation,
-        id: JobId,
-        key: &str,
+        ids: &[JobId],
+        keys: &[String],
     ) -> Result<(), JobError> {
         sqlx::query!(
             r#"
-            WITH seeded AS (
+            WITH input AS (
+                SELECT * FROM UNNEST($1::uuid[], $3::text[]) AS t(id, unique_key)
+            ), seeded AS (
                 INSERT INTO job_execution_states (id, execution_state_json)
-                SELECT $1, s.execution_state_json
-                FROM job_execution_states s
-                JOIN jobs j ON j.id = s.id
-                WHERE j.job_type = $2 AND j.unique_key = $3 AND j.id != $1
-                  AND $4::boolean
-                ORDER BY j.created_at DESC, j.id DESC
-                LIMIT 1
+                SELECT i.id, prev.execution_state_json
+                FROM input i
+                JOIN LATERAL (
+                    SELECT s.execution_state_json
+                    FROM job_execution_states s
+                    JOIN jobs j ON j.id = s.id
+                    WHERE j.job_type = $2 AND j.unique_key = i.unique_key
+                      AND j.id != i.id
+                    ORDER BY j.created_at DESC, j.id DESC
+                    LIMIT 1
+                ) prev ON TRUE
+                WHERE $4::boolean
                 RETURNING id
             )
             DELETE FROM job_execution_states s
-            USING jobs j
-            WHERE s.id = j.id AND j.job_type = $2 AND j.unique_key = $3 AND j.id != $1
+            USING jobs j, input i
+            WHERE s.id = j.id AND j.job_type = $2 AND j.unique_key = i.unique_key
+              AND j.id != i.id
             "#,
-            id as JobId,
+            ids as &[JobId],
             &self.job_type as &JobType,
-            key,
+            keys,
             self.inherits_state,
         )
         .execute(op.as_executor())
@@ -280,65 +506,4 @@ where
             self.clock.clone(),
         )
     }
-}
-
-/// Outcome of a keyed execution insert.
-pub(crate) enum KeyedInsert {
-    /// The key was free; this job now holds it.
-    Inserted,
-    /// The key is already held by this LIVE job.
-    Live(JobId),
-    /// The key was taken, but its holder is no longer visible — it went
-    /// terminal between the conflict and the read. The caller should retry.
-    Contended,
-}
-
-/// Insert a keyed execution row, resolving a live-key conflict in the SAME
-/// round trip rather than following up with a separate lookup.
-///
-/// `ON CONFLICT DO NOTHING` (inferring the partial live-key index) turns the
-/// conflict into data instead of an error, so the holder's id comes back
-/// alongside it and there is no constraint-name string matching to keep in
-/// sync with the schema. The holder is read at this statement's snapshot, so a
-/// key claimed by a transaction that committed after it reports
-/// [`KeyedInsert::Contended`] rather than a stale id.
-#[instrument(name = "job.insert_keyed_execution", skip_all)]
-async fn insert_keyed_execution(
-    notifier: &Arc<JobEventNotifier>,
-    op: &mut impl es_entity::AtomicOperation,
-    job: &Job,
-    schedule_at: DateTime<Utc>,
-    unique_key: &str,
-) -> Result<KeyedInsert, JobError> {
-    let row = sqlx::query!(
-        r#"
-        WITH ins AS (
-            INSERT INTO job_executions
-                (id, job_type, queue_id, unique_key, execute_at, alive_at, created_at)
-            VALUES ($1, $2, NULL, $3, $4, COALESCE($5, NOW()), COALESCE($5, NOW()))
-            ON CONFLICT (job_type, unique_key) WHERE unique_key IS NOT NULL
-            DO NOTHING
-            RETURNING id
-        )
-        SELECT (SELECT id FROM ins) AS "inserted?: JobId",
-               (SELECT id FROM job_executions
-                WHERE job_type = $2 AND unique_key = $3) AS "live?: JobId"
-        "#,
-        job.id as JobId,
-        &job.job_type as &JobType,
-        unique_key,
-        schedule_at,
-        op.maybe_now(),
-    )
-    .fetch_one(op.as_executor())
-    .await?;
-
-    if row.inserted.is_some() {
-        notifier.execution_ready_in_op(op, &job.job_type).await?;
-        return Ok(KeyedInsert::Inserted);
-    }
-    Ok(match row.live {
-        Some(id) => KeyedInsert::Live(id),
-        None => KeyedInsert::Contended,
-    })
 }

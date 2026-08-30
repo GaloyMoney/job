@@ -65,13 +65,6 @@ pub enum JobError {
     TimedOut(JobId),
     #[error("JobError - RouterNotStarted: await called before Jobs::start_poll")]
     RouterNotStarted,
-    /// Practically unreachable; raised by
-    /// [`KeyedJobSpawner::spawn`](crate::KeyedJobSpawner::spawn), which
-    /// documents the race it exhausts.
-    #[error(
-        "JobError - KeyedSpawnRace: exhausted retries resolving a live-keyed conflict for job_type '{0}' key '{1}'"
-    )]
-    KeyedSpawnRace(JobType, String),
 }
 
 /// The SQLSTATE, if this error (or anything it wraps) is a Postgres abort that
