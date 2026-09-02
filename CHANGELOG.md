@@ -1,3 +1,11 @@
+# [job release v0.13.13](https://github.com/GaloyMoney/job/releases/tag/0.13.13)
+
+
+
+### Performance
+
+- Write-path efficiency pass (P1-P2) + promote/demote race fix (#197)
+
 # [job release v0.13.12](https://github.com/GaloyMoney/job/releases/tag/0.13.12)
 
 
