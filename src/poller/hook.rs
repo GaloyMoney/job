@@ -14,6 +14,45 @@
 //! un-claims them back to their ORIGINAL `execute_at` with no attempt bump (dispatch only
 //! happens in `post_commit`, which was skipped), re-swapping their queues in the same
 //! transaction; `reclaim_lost_jobs` remains the slower backstop.
+//!
+//! **The due-hint gate.** `pre_commit` snapshots `fresh_types` -- the job types THIS op's
+//! own spawn/promote contributed `fresh_demand` for -- before draining it into
+//! reservations: a fresh-demand type's claim is guaranteed to find the row it just
+//! inserted/promoted, so it always probes and never touches the hint. A recycle-only
+//! reservation set (no fresh demand from this op, i.e. a completion's
+//! `recycle_into_claim`) probes only if `JobTracker::consume_due_hint` says the type's
+//! queue may hold something -- at steady state a per-completion recycle probe finds an
+//! empty queue almost every time, yet an ungated one pays the same worst-case claim-probe
+//! cost as a hit. A probe that comes back full re-arms the hint (`set_due_hint`), since
+//! more may remain behind it.
+//!
+//! **Handing a recycled unit back owes a wake, and that wake is DEFERRED.** Two sites give
+//! a reservation back without claiming: the due-hint skip, and `truncate_to_unit_budget`.
+//! When the reservation came from `self.recycled`, its originating dispatcher has already
+//! detached from its own `job_completed`/`batch_completed` release-and-wake, expecting this
+//! hook to hand the unit back -- so nothing else will ever signal that the type's backlog
+//! became claimable again, and omitting the wake leaves a drained type (or one that just
+//! crossed below `min_jobs`) asleep until `MAX_WAIT`.
+//!
+//! But the wake cannot fire where the debt is incurred. Both sites sit inside the per-type
+//! claim loop, and the reservations that SURVIVE are about to claim rows whose connections
+//! are not taken yet -- a poll woken mid-loop re-reads pool headroom that cannot see them
+//! and over-admits on top. So both sites release QUIETLY (`UnitReservation::release`) and
+//! arm a single [`DeferredWake`], which fires on scope exit: after the claim loop, when
+//! this hook's own rows are already `running` inside the uncommitted transaction and
+//! `SKIP LOCKED` keeps a woken poll off them. Both sites must stay on that discipline --
+//! deferring one while the other wakes mid-loop reintroduces the over-admission. And
+//! fresh-demand truncation arms nothing: the spawn/promote that created that demand already
+//! armed `job_execution_inserted`'s notify, so its row still has a signal pending and a
+//! second wake would only over-admit.
+//!
+//! See `UnitReservation::drop`'s doc for the general release contract and
+//! `reservation_release_is_quiet_but_unresolved_drop_wakes` (tracker.rs) for the quiet and
+//! waking paths side by side. Truncation reaches a recycled unit whenever one op carries
+//! more reservations than `unit_budget` admits -- a promote/insert hook merging fresh
+//! demand onto a completion's op, under pool pressure, with the HashMap visiting the fresh
+//! type first. Rare per-op while a completion contributes exactly one recycled reservation,
+//! but anything that merges several recycles onto one op makes it ordinary.
 
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
@@ -43,6 +82,10 @@ pub(crate) struct ClaimedRow {
     pub job_type: JobType,
 }
 
+#[cfg(test)]
+pub(crate) static PROBE_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(super) async fn claim_due_heads_in_op(
     op: &mut impl es_entity::AtomicOperation,
     job_type: &JobType,
@@ -54,6 +97,8 @@ pub(super) async fn claim_due_heads_in_op(
     if limit <= 0 {
         return Ok(Vec::new());
     }
+    #[cfg(test)]
+    PROBE_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let wall_now = chrono::Utc::now();
     sqlx::query_as!(
         ClaimedRow,
@@ -92,6 +137,99 @@ pub(super) async fn claim_due_heads_in_op(
 pub(crate) enum DispatchTarget {
     Single(ClaimedRow),
     Batch(JobType, Vec<ClaimedRow>),
+}
+
+impl DispatchTarget {
+    /// Rows actually claimed -- 1 for a single dispatch, the batch's length
+    /// otherwise. Used by [`ClaimHook::pre_commit`]'s due-hint re-arm: a
+    /// probe that came back full may have left more behind it.
+    fn row_count(&self) -> i64 {
+        match self {
+            DispatchTarget::Single(_) => 1,
+            DispatchTarget::Batch(_, rows) => rows.len() as i64,
+        }
+    }
+}
+
+/// Trims `units_by_type` in place so it holds at most `unit_budget`
+/// reservations in total, quietly releasing the excess, and reports whether
+/// any RECYCLED reservation was among the released -- the caller owes a
+/// single deferred wake if so. `n_recycled` gives each type's recycled
+/// count; since [`ClaimHook::pre_commit`] pushes `self.recycled` before any
+/// `try_reserve`d fresh demand, a type's first `n_recycled` entries are its
+/// recycled ones, so the truncation spends fresh demand first and a
+/// recycled unit is only reached once `n_recycled` exceeds what fits.
+fn truncate_to_unit_budget(
+    units_by_type: &mut HashMap<JobType, Vec<UnitReservation>>,
+    n_recycled: &HashMap<JobType, usize>,
+    unit_budget: usize,
+) -> bool {
+    let mut remaining_units = unit_budget;
+    let mut released_a_recycled_unit = false;
+    for (job_type, reservations) in units_by_type.iter_mut() {
+        if reservations.len() > remaining_units {
+            if n_recycled.get(job_type).copied().unwrap_or(0) > remaining_units {
+                released_a_recycled_unit = true;
+            }
+            for reservation in reservations.drain(remaining_units..) {
+                reservation.release();
+            }
+        }
+        remaining_units -= reservations.len();
+    }
+    released_a_recycled_unit
+}
+
+/// Records `PROBE_CALL_COUNT` at the instant [`DeferredWake`] fires, so
+/// tests can prove the wake landed AFTER the claim loop rather than inside
+/// it. `-1` means no deferred wake fired at all.
+#[cfg(test)]
+pub(crate) static PROBE_COUNT_AT_WAKE: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(-1);
+
+/// One `JobTracker::wake()` owed by [`ClaimHook::pre_commit`], fired on
+/// scope exit instead of at the point the debt is incurred.
+///
+/// Both sites that hand a RECYCLED reservation back without claiming --
+/// the due-hint skip and `truncate_to_unit_budget` -- owe a wake (nothing
+/// else signals for that unit) but must not fire it mid-loop, where a woken
+/// poll re-reads pool headroom that cannot yet see the claims the surviving
+/// reservations are about to make, and over-admits on top of them. Arming
+/// is idempotent and `notify_one` holds at most one permit, so any number
+/// of debts collapse into the single wake a freed unit warrants.
+///
+/// A `Drop` guard rather than a bool checked after the loop: the claim loop
+/// can exit early via `?`, and a wake dropped on that path would re-open
+/// the very stall this exists to prevent.
+struct DeferredWake {
+    tracker: Arc<crate::tracker::JobTracker>,
+    armed: bool,
+}
+
+impl DeferredWake {
+    fn new(tracker: Arc<crate::tracker::JobTracker>) -> Self {
+        Self {
+            tracker,
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+}
+
+impl Drop for DeferredWake {
+    fn drop(&mut self) {
+        if self.armed {
+            #[cfg(test)]
+            PROBE_COUNT_AT_WAKE.store(
+                PROBE_CALL_COUNT.load(std::sync::atomic::Ordering::SeqCst) as isize,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.tracker.wake();
+        }
+    }
 }
 
 pub(crate) struct ClaimHook {
@@ -152,8 +290,12 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             return es_entity::operation::hooks::PreCommitRet::ok(self, op);
         }
 
+        let fresh_types: HashSet<JobType> = self.fresh_demand.keys().cloned().collect();
+
         let mut units_by_type: HashMap<JobType, Vec<UnitReservation>> = HashMap::new();
+        let mut n_recycled: HashMap<JobType, usize> = HashMap::new();
         for (job_type, reservation) in self.recycled.drain(..) {
+            *n_recycled.entry(job_type.clone()).or_insert(0) += 1;
             units_by_type.entry(job_type).or_default().push(reservation);
         }
         for (job_type, n_due) in self.fresh_demand.drain() {
@@ -171,14 +313,9 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             }
         }
 
-        let mut remaining_units = unit_budget;
-        for reservations in units_by_type.values_mut() {
-            if reservations.len() > remaining_units {
-                for reservation in reservations.drain(remaining_units..) {
-                    reservation.release();
-                }
-            }
-            remaining_units -= reservations.len();
+        let mut deferred_wake = DeferredWake::new(Arc::clone(&poller.tracker));
+        if truncate_to_unit_budget(&mut units_by_type, &n_recycled, unit_budget) {
+            deferred_wake.arm();
         }
 
         let now = op.maybe_now().unwrap_or_else(|| poller.clock.now());
@@ -189,9 +326,22 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             if !poller.registry.short_circuit(&job_type) {
                 continue;
             }
+            if !fresh_types.contains(&job_type) && !poller.tracker.consume_due_hint(&job_type) {
+                for reservation in reservations {
+                    reservation.release();
+                }
+                deferred_wake.arm();
+                continue;
+            }
+            let (per_unit_limit, _) = poller.claim_shape(&job_type);
+            let limit = per_unit_limit.max(1) * reservations.len() as i64;
             let targets = poller
                 .claim_after_many(&mut op, &job_type, now, reservations.len())
                 .await?;
+            let n_claimed: i64 = targets.iter().map(DispatchTarget::row_count).sum();
+            if n_claimed >= limit {
+                poller.tracker.set_due_hint(&job_type);
+            }
             for (reservation, target) in reservations.into_iter().zip(targets) {
                 let subs = ShutdownSubs {
                     job: poller.shutdown_tx.subscribe(),
@@ -358,6 +508,24 @@ impl ClaimReconciler {
         );
     }
 
+    /// The final `UPDATE`'s `AND je.state = 'running' AND je.poller_instance_id
+    /// = $3` re-checks `locked`'s own snapshot-time predicate on the UPDATE
+    /// itself, narrowing the same snapshot-vs-lock race
+    /// `PromoteHeadsHook::apply_freed`'s doc explains in full: this instance
+    /// scopes `locked` to rows it believes it still owns as `running`, but a
+    /// legitimate finalize of the SAME row -- landing between `locked`'s
+    /// snapshot and its lock being granted (this reconciler exists
+    /// precisely for the ambiguous-outcome case where such a race is live)
+    /// -- can complete it (delete, so no row to lock at all -- harmless) or
+    /// reschedule it (`state = 'pending'`, `poller_instance_id = NULL`,
+    /// STILL matching `je.id = l.id` with no re-check). Without the
+    /// re-check, this statement would blindly stomp that legitimate
+    /// disposition back to a stale `pending`/`execute_at`, discarding
+    /// whatever the finalize just wrote. No canary column forces a decode
+    /// error here either way -- the finalize's own `poller_instance_id`
+    /// filter already makes an ambiguous double-apply idempotent-safe on the
+    /// ENTITY side -- but this is the same defensive shape every other
+    /// multi-row locker of this table holds to.
     async fn reconcile_unclaimed(
         pool: &PgPool,
         instance_id: uuid::Uuid,
@@ -385,7 +553,8 @@ impl ClaimReconciler {
             )
             UPDATE job_executions je
             SET state = 'pending', poller_instance_id = NULL, execute_at = l.execute_at
-            FROM locked l WHERE je.id = l.id
+            FROM locked l
+            WHERE je.id = l.id AND je.state = 'running' AND je.poller_instance_id = $3
             RETURNING je.id AS "id!: JobId"
             "#,
             &ids,
@@ -581,5 +750,227 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// A due-hint skip must WAKE the poll loop by the time the op commits.
+    /// The reservation came from `self.recycled` (a completing dispatcher's
+    /// `recycle_into_claim`), which already detached from its OWN
+    /// `job_completed`/`batch_completed` release-and-wake specifically
+    /// because it expected this hook to hand the unit back, so this wake is
+    /// the only remaining signal for that unit. Without it a drained (or
+    /// just-below-`min_jobs`) type sleeps until `MAX_WAIT` (60s) with
+    /// nothing else pending. `reservation_release_is_quiet_but_unresolved_
+    /// drop_wakes` (tracker.rs) pins the quiet-vs-waking distinction the
+    /// release paths rest on.
+    ///
+    /// No sleep-based sync: the probe-skip is asserted via `PROBE_CALL_
+    /// COUNT` (so the test cannot pass vacuously if the gate stopped
+    /// skipping), and the wake via a `tokio::time::timeout`-bounded await
+    /// on the tracker's own `Notify`, the same pattern
+    /// `reservation_release_is_quiet_but_unresolved_drop_wakes` already
+    /// uses.
+    #[tokio::test]
+    async fn due_hint_skip_wakes_the_poll_loop_instead_of_a_quiet_release() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = JobType::from_owned(format!("due-hint-wake-{}", uuid::Uuid::now_v7()));
+
+        let mut registry = crate::registry::JobRegistry::new();
+        registry.add_initializer(super::super::test_support::ElasticInitializer {
+            job_type: job_type.clone(),
+        });
+
+        let tracker = std::sync::Arc::new(crate::tracker::JobTracker::new(0, 10));
+        tracker.set_job_types(vec![job_type.clone()]);
+        let poller =
+            super::super::test_support::build_poller(&pool, registry, Arc::clone(&tracker)).await?;
+
+        tracker.dispatch_job(JobId::new(), &job_type);
+        let reservation = tracker.recycle(&job_type);
+
+        PROBE_CALL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let notified = tracker.notified();
+
+        let repo = JobRepo::new(&pool);
+        let mut op = repo.begin_op_with_clock(&poller.clock).await?;
+        poller.register_claim_recycle(&mut op, &job_type, reservation);
+        op.commit().await?;
+
+        assert_eq!(
+            PROBE_CALL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the due-hint gate must actually skip the probe here, or this \
+             test's wake assertion below would be vacuous"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(200), notified)
+            .await
+            .expect(
+                "a due-hint-skipped recycle must wake the poll loop -- its \
+                 dispatcher already suppressed its own wake, so this \
+                 reservation's drop is the only one left",
+            );
+        Ok(())
+    }
+
+    /// A due-hint skip on one type must not wake while a LATER type in the
+    /// same `pre_commit` has yet to claim. Both hand-back sites release
+    /// quietly and arm one `DeferredWake` that fires on scope exit; a bare
+    /// `drop(reservations)` at the skip site would instead land
+    /// `UnitReservation::drop`'s wake mid-loop, letting a woken poll re-read
+    /// pool headroom that cannot yet see the surviving reservations' claims
+    /// and over-admit on top of them.
+    ///
+    /// Ordering is asserted via `PROBE_COUNT_AT_WAKE`, which records
+    /// `PROBE_CALL_COUNT` at the instant the deferred wake fires: the probing
+    /// type's claim must already have run. This holds whichever order the
+    /// HashMap visits the two types in -- if the skipped type comes first the
+    /// wake is deferred past the other's probe, and if it comes second the
+    /// probe has already happened. A mid-loop wake leaves the value at its
+    /// `-1` sentinel instead, since that wake comes from the reservation's
+    /// own `Drop` with no deferred wake armed at all. No sleep-based sync:
+    /// every assertion reads an atomic settled during `pre_commit`.
+    #[tokio::test]
+    async fn due_hint_skip_defers_its_wake_past_another_types_claim() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let skipped = JobType::from_owned(format!("skip-defer-a-{}", uuid::Uuid::now_v7()));
+        let probing = JobType::from_owned(format!("skip-defer-b-{}", uuid::Uuid::now_v7()));
+
+        let mut registry = crate::registry::JobRegistry::new();
+        registry.add_initializer(super::super::test_support::ElasticInitializer {
+            job_type: skipped.clone(),
+        });
+        registry.add_initializer(super::super::test_support::ElasticInitializer {
+            job_type: probing.clone(),
+        });
+
+        let tracker = Arc::new(crate::tracker::JobTracker::new(0, 10));
+        tracker.set_job_types(vec![skipped.clone(), probing.clone()]);
+        let poller =
+            super::super::test_support::build_poller(&pool, registry, Arc::clone(&tracker)).await?;
+
+        tracker.dispatch_job(JobId::new(), &skipped);
+        tracker.dispatch_job(JobId::new(), &probing);
+        tracker.set_due_hint(&probing);
+
+        PROBE_CALL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        PROBE_COUNT_AT_WAKE.store(-1, std::sync::atomic::Ordering::SeqCst);
+
+        let repo = JobRepo::new(&pool);
+        let mut op = repo.begin_op_with_clock(&poller.clock).await?;
+        poller.register_claim_recycle(&mut op, &skipped, tracker.recycle(&skipped));
+        poller.register_claim_recycle(&mut op, &probing, tracker.recycle(&probing));
+        op.commit().await?;
+
+        assert_eq!(
+            PROBE_CALL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one type should have probed -- the hinted one; if this \
+             is 0 or 2 the test is no longer exercising a skip alongside a \
+             claim and the ordering assertion below is meaningless"
+        );
+        assert_eq!(
+            PROBE_COUNT_AT_WAKE.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the skipped type's wake must be DEFERRED past the other type's \
+             claim (-1 means it fired mid-loop from UnitReservation::drop \
+             with no deferred wake armed at all)"
+        );
+        Ok(())
+    }
+
+    /// Budget truncation that reaches a RECYCLED reservation must report a
+    /// wake as owed. The release itself stays quiet (a wake fired mid-loop
+    /// would let the woken poll over-admit against the surviving
+    /// reservations' still-uncommitted claims), so the returned flag is the
+    /// ONLY remaining signal for that freed unit -- its dispatcher already
+    /// detached from `job_completed`'s release-and-wake. A quiet release
+    /// that reported nothing would leave that release as the last event,
+    /// stalling a drainable backlog until `MAX_WAIT` (60s).
+    #[tokio::test]
+    async fn budget_truncation_of_a_recycled_reservation_reports_a_wake() {
+        let tracker = Arc::new(crate::tracker::JobTracker::new(0, 10));
+        let job_type = JobType::from_owned(format!("truncate-recycled-{}", uuid::Uuid::now_v7()));
+
+        tracker.dispatch_job(JobId::new(), &job_type);
+        tracker.dispatch_job(JobId::new(), &job_type);
+
+        let mut units_by_type = HashMap::from([(
+            job_type.clone(),
+            vec![tracker.recycle(&job_type), tracker.recycle(&job_type)],
+        )]);
+        let n_recycled = HashMap::from([(job_type.clone(), 2)]);
+
+        let notified = tracker.notified();
+        let owed_a_wake = truncate_to_unit_budget(&mut units_by_type, &n_recycled, 1);
+
+        assert_eq!(
+            units_by_type[&job_type].len(),
+            1,
+            "a budget of 1 must keep exactly one reservation"
+        );
+        assert_eq!(
+            tracker.units_in_flight(&job_type),
+            1,
+            "the truncated reservation's unit must still be freed"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notified)
+                .await
+                .is_err(),
+            "the truncating release must stay quiet -- a mid-loop wake would \
+             over-admit against the surviving reservation's claims"
+        );
+        assert!(
+            owed_a_wake,
+            "truncating a recycled reservation must report a wake as owed: \
+             its dispatcher detached from job_completed, so nothing else \
+             will signal that this type's backlog became claimable again"
+        );
+    }
+
+    /// The mirror case: truncation that only reaches FRESH demand owes no
+    /// wake. The spawn/promote that created that demand already ran
+    /// `job_execution_inserted` (notify + due-hint), so the row it would
+    /// have claimed still has a signal pending -- waking again here would
+    /// only over-admit. Also pins the ordering the fix relies on: recycled
+    /// reservations are pushed first, so a mixed type spends its fresh
+    /// demand before any recycled unit is reached.
+    #[tokio::test]
+    async fn budget_truncation_of_fresh_demand_only_stays_quiet() {
+        let tracker = Arc::new(crate::tracker::JobTracker::new(0, 10));
+        let job_type = JobType::from_owned(format!("truncate-fresh-{}", uuid::Uuid::now_v7()));
+
+        let mut units_by_type = HashMap::from([(
+            job_type.clone(),
+            vec![
+                tracker
+                    .try_reserve(&job_type, None)
+                    .expect("under max_jobs"),
+                tracker
+                    .try_reserve(&job_type, None)
+                    .expect("under max_jobs"),
+            ],
+        )]);
+        assert!(
+            !truncate_to_unit_budget(&mut units_by_type, &HashMap::new(), 1),
+            "a truncated fresh-demand reservation owes no wake -- its \
+             spawn/promote already armed job_execution_inserted's notify"
+        );
+        assert_eq!(tracker.units_in_flight(&job_type), 1);
+
+        tracker.dispatch_job(JobId::new(), &job_type);
+        let mut mixed = HashMap::from([(
+            job_type.clone(),
+            vec![
+                tracker.recycle(&job_type),
+                tracker
+                    .try_reserve(&job_type, None)
+                    .expect("under max_jobs"),
+            ],
+        )]);
+        assert!(
+            !truncate_to_unit_budget(&mut mixed, &HashMap::from([(job_type.clone(), 1)]), 1),
+            "a mixed type must spend its fresh demand first, leaving the \
+             recycled unit intact and no wake owed"
+        );
     }
 }

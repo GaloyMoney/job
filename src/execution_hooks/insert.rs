@@ -500,7 +500,7 @@ impl ExecutionInsertHook {
             }
         }
         for row in promoted {
-            if row.execute_at <= now {
+            if row.execute_at.is_some_and(|at| at <= now) {
                 *due.entry(JobType::from_owned(row.job_type.clone()))
                     .or_insert(0) += 1;
             }
@@ -639,8 +639,7 @@ impl CommitHook for ExecutionInsertHook {
         // poll had to SKIP LOCKED past (see `lock_queue_occupants`) needs a
         // wake regardless of self-claim. Due-now LANDED rows are handled
         // separately below, by exact id, netted against `ClaimHook`'s
-        // `claimed` ids by `NotifierHook` -- see `due_now_landed_ids_by_type`
-        // for why ids and not counts.
+        // `claimed` ids by `NotifierHook`
         let mut forces = Self::not_yet_due_landed_types(&inserted, &self.rows, now);
         forces.extend(Self::promoted_types(&promoted));
         forces.extend(wake_types);
@@ -699,7 +698,18 @@ mod tests {
     fn promoted_row(job_type: JobType, execute_at: DateTime<Utc>) -> PromotedRow {
         PromotedRow {
             job_type: job_type.to_string(),
-            execute_at,
+            execute_at: Some(execute_at),
+        }
+    }
+
+    /// A raced-away promoted row -- a concurrent claimer already took it to
+    /// `running` between snapshot and lock, nulling its `execute_at` (see
+    /// `PromoteHeadsHook::apply`'s doc). It must never count as due-now
+    /// demand.
+    fn promoted_row_raced_away(job_type: JobType) -> PromotedRow {
+        PromotedRow {
+            job_type: job_type.to_string(),
+            execute_at: None,
         }
     }
 
@@ -834,6 +844,21 @@ mod tests {
         assert!(
             due_counts.is_empty(),
             "a not-yet-due promotion must not contribute claim demand"
+        );
+    }
+
+    /// A promoted row a concurrent claimer already raced away (`execute_at
+    /// = None` -- see `PromoteHeadsHook::apply`'s doc) must not contribute
+    /// claim demand: there is no due `execute_at` to have been reached.
+    #[test]
+    fn due_now_excludes_a_promoted_row_raced_away_by_a_concurrent_claim() {
+        let now = chrono::Utc::now();
+        let promoted = vec![promoted_row_raced_away(TYPE_A.clone())];
+
+        let due_counts = ExecutionInsertHook::due_now_by_type(&[], &[], &promoted, now);
+        assert!(
+            due_counts.is_empty(),
+            "a raced-away promotion (execute_at = None) must not contribute claim demand"
         );
     }
 

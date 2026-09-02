@@ -54,6 +54,17 @@ pub(crate) struct JobTracker {
     /// `job_completed` notifies the poll loop for them even when the
     /// process-wide min/max thresholds wouldn't otherwise trigger a wake.
     capped_types: OnceLock<HashSet<JobType>>,
+    /// Per-type "claimable work may exist" hint, set by
+    /// [`Self::job_execution_inserted`] (spawns, promotes, and retries all
+    /// funnel through it already) and by `ClaimHook::pre_commit` whenever a
+    /// probe comes back full (more may remain behind it). Consumed by
+    /// [`Self::consume_due_hint`] -- the completion-recycle claim probe's
+    /// gate: at steady state a type's queue is usually empty, so an
+    /// unconditional post-completion probe pays full claim-probe cost to
+    /// find nothing.
+    /// Fresh-demand probes (this op's own spawn/promote) never consult this
+    /// -- their due rows are guaranteed by construction.
+    maybe_due: Mutex<HashSet<JobType>>,
 }
 
 impl JobTracker {
@@ -67,6 +78,7 @@ impl JobTracker {
             units_in_flight: Mutex::new(HashMap::new()),
             job_types: OnceLock::new(),
             capped_types: OnceLock::new(),
+            maybe_due: Mutex::new(HashSet::new()),
         }
     }
 
@@ -159,13 +171,38 @@ impl JobTracker {
 
     /// Wake the poll loop if this process polls `job_type`. `notify_one` holds
     /// at most one permit, so repeated reports collapse into one wake-up.
+    /// Also arms [`Self::consume_due_hint`]'s hint for the type, so a
+    /// completion's recycle probe that runs after this report finds it.
     pub fn job_execution_inserted(&self, job_type: &str) {
         let Some(job_types) = self.job_types.get() else {
             return;
         };
-        if job_types.iter().any(|jt| jt.as_str() == job_type) {
+        if let Some(job_type) = job_types.iter().find(|jt| jt.as_str() == job_type) {
+            self.set_due_hint(job_type);
             self.notify.notify_one();
         }
+    }
+
+    /// Records that `job_type` may have claimable work waiting. See the
+    /// `maybe_due` field doc for the two call sites that set it.
+    pub(crate) fn set_due_hint(&self, job_type: &JobType) {
+        self.maybe_due
+            .lock()
+            .expect("maybe_due poisoned")
+            .insert(job_type.clone());
+    }
+
+    /// Consumes (removes) `job_type`'s due-hint, returning whether it was
+    /// set. Consume-before-probe: a concurrent spawn's hint that lands AFTER
+    /// this read is not lost -- it survives for the next completion's probe.
+    /// A hint consumed with nothing actually due just costs one empty probe,
+    /// same as today's unconditional behavior; a skipped claim is always
+    /// backstopped by the ordinary poll.
+    pub(crate) fn consume_due_hint(&self, job_type: &JobType) -> bool {
+        self.maybe_due
+            .lock()
+            .expect("maybe_due poisoned")
+            .remove(job_type)
     }
 
     /// Release the unit [`dispatch_job`](Self::dispatch_job) took for
@@ -444,6 +481,48 @@ mod tests {
         let mut live = LiveJobs::default();
         live.finished(id);
         assert!(live.ids().is_empty());
+    }
+
+    /// `consume_due_hint` is a one-shot read: unset until something reports
+    /// the type, then cleared by the read itself.
+    #[test]
+    fn due_hint_is_consumed_exactly_once() {
+        let tracker = JobTracker::new(0, 10);
+        let job_type = JobType::from_owned("due-hint-consume".to_string());
+
+        assert!(
+            !tracker.consume_due_hint(&job_type),
+            "unset until something reports it"
+        );
+
+        tracker.set_due_hint(&job_type);
+        assert!(tracker.consume_due_hint(&job_type), "reports once set");
+        assert!(
+            !tracker.consume_due_hint(&job_type),
+            "consuming clears it -- a second read finds nothing"
+        );
+    }
+
+    /// `job_execution_inserted` only arms the hint for a type this process
+    /// actually polls -- an unpolled type's report must not linger.
+    #[tokio::test]
+    async fn job_execution_inserted_arms_the_due_hint_for_polled_types_only() {
+        let tracker = JobTracker::new(0, 10);
+        let polled = JobType::from_owned("due-hint-polled".to_string());
+        let unpolled = JobType::from_owned("due-hint-unpolled".to_string());
+        tracker.set_job_types(vec![polled.clone()]);
+
+        tracker.job_execution_inserted(unpolled.as_str());
+        assert!(
+            !tracker.consume_due_hint(&unpolled),
+            "an unpolled type's report must not arm the hint"
+        );
+
+        tracker.job_execution_inserted(polled.as_str());
+        assert!(
+            tracker.consume_due_hint(&polled),
+            "a polled type's report must arm the hint"
+        );
     }
 
     #[tokio::test]
