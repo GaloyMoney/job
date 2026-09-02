@@ -527,7 +527,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{notification_router::JobNotificationRouter, notifier::JobEventNotifier, tracker::JobTracker};
+    use crate::{
+        notification_router::JobNotificationRouter, notifier::JobEventNotifier, tracker::JobTracker,
+    };
     use std::time::Duration;
 
     async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
@@ -540,7 +542,11 @@ mod tests {
     /// registered -- `carry_state_in_op` never consults it -- so an empty
     /// `PollerHandle` (the same stand-in `ResidentJobSpawner` uses in
     /// production before a poller attaches) is enough.
-    async fn test_spawner(pool: &sqlx::PgPool, job_type: JobType, inherits_state: bool) -> KeyedJobSpawner<()> {
+    async fn test_spawner(
+        pool: &sqlx::PgPool,
+        job_type: JobType,
+        inherits_state: bool,
+    ) -> KeyedJobSpawner<()> {
         let repo = Arc::new(JobRepo::new(pool));
         let router = Arc::new(JobNotificationRouter::new(
             pool,
