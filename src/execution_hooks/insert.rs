@@ -500,11 +500,6 @@ impl ExecutionInsertHook {
             }
         }
         for row in promoted {
-            // `None` (the raced-away row a concurrent claimer already took
-            // to `running`, nulling its `execute_at` -- see
-            // `PromoteHeadsHook::apply`'s doc) must not count as due-now
-            // demand either: there is no due `execute_at` to have been
-            // reached at all.
             if row.execute_at.is_some_and(|at| at <= now) {
                 *due.entry(JobType::from_owned(row.job_type.clone()))
                     .or_insert(0) += 1;
@@ -644,8 +639,7 @@ impl CommitHook for ExecutionInsertHook {
         // poll had to SKIP LOCKED past (see `lock_queue_occupants`) needs a
         // wake regardless of self-claim. Due-now LANDED rows are handled
         // separately below, by exact id, netted against `ClaimHook`'s
-        // `claimed` ids by `NotifierHook` -- see `due_now_landed_ids_by_type`
-        // for why ids and not counts.
+        // `claimed` ids by `NotifierHook`
         let mut forces = Self::not_yet_due_landed_types(&inserted, &self.rows, now);
         forces.extend(Self::promoted_types(&promoted));
         forces.extend(wake_types);

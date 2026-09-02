@@ -81,20 +81,6 @@ impl PromoteHeadsHook {
         [std::any::TypeId::of::<super::insert::ExecutionInsertHook>()];
 }
 
-/// One sibling promoted by [`PromoteHeadsHook::apply`]: its type (for
-/// notify) and its own `execute_at`, unchanged by the promote (for callers
-/// that need to know whether it is ACTUALLY due, not merely promoted --
-/// see `super::insert::ExecutionInsertHook::due_now_by_type`).
-///
-/// `execute_at` is `Option` because the row this was read from is not
-/// guaranteed to still be `parked` by the time `RETURNING` reads it back --
-/// see [`Self::apply`]/[`Self::apply_freed`]'s re-checked `state` predicate
-/// doc for the race this guards against. A row a concurrent claimer won the
-/// race on has `execute_at = NULL` (set by the claim itself,
-/// `poller/claim_query.rs` / `poller/hook.rs`) and the re-check makes such a
-/// row match zero rows here anyway, but the column stays honestly nullable
-/// rather than asserted non-null against a predicate a later refactor could
-/// silently weaken.
 pub(crate) struct PromotedRow {
     pub job_type: String,
     pub execute_at: Option<DateTime<Utc>>,
@@ -103,11 +89,7 @@ pub(crate) struct PromotedRow {
 impl PromoteHeadsHook {
     /// The freed-queue promote statement: each freed queue's oldest parked
     /// sibling goes to `pending`, by the same (execute_at, id) tiebreak the
-    /// claim query and [`Self::apply`] use -- ordering by execute_at alone
-    /// would let this promote a different row, and so a different TYPE, than
-    /// every peer would independently agree is the head. See the type-level
-    /// docs for why this is its own statement, never a CTE of the completer's
-    /// `DELETE`.
+    /// claim query and [`Self::apply`] use
     ///
     /// The `NOT EXISTS` active-row guard makes the promote self-verifying
     /// rather than trusting the registrant's "I just deleted the queue's
@@ -115,15 +97,6 @@ impl PromoteHeadsHook {
     /// promoting a sibling would fail `idx_job_executions_queue_active`
     /// outright, so the guard skips a queue that needs no promotion instead
     /// of erroring.
-    ///
-    /// Locks every head in `(queue_id, id)` order before updating any of
-    /// them -- the same global order every other multi-row locker of this
-    /// table agrees on (`lock_queue_occupants`, `Self::apply`'s own swap
-    /// lock, `ExecutionInsertHook::insert_many`'s `input` CTE). A batch
-    /// completion can free several queues in one call; without an ordered
-    /// lock here, it would acquire in whatever order the `UNNEST` input
-    /// happens to iterate, which can deadlock against a concurrent spawn's
-    /// pin or swap touching the same rows in the opposite order.
     ///
     /// The final `UPDATE`'s `AND je.state = 'parked'` re-checks the SAME
     /// predicate `heads` established at snapshot time, on the UPDATE itself
@@ -199,49 +172,6 @@ impl PromoteHeadsHook {
         .await
     }
 
-    /// The swap statement itself. Set-based so one statement covers
-    /// everything from a single-row retry to a bulk batch reschedule or
-    /// reclaim sweep. Callers pass only the ids they just moved to
-    /// `pending` -- a row this didn't touch is left alone even if it
-    /// happens to belong to a queue with parked siblings (nothing changed
-    /// for it, so there is nothing to fix).
-    ///
-    /// Every row this touches is locked up front by the `locked` CTE, in
-    /// `(queue_id, id)` order -- the same global order
-    /// `execution_hooks::insert`'s `lock_queue_occupants` (the spawn-side
-    /// pin) and `ExecutionInsertHook::insert_many`'s `input` CTE agree on.
-    /// Without it the `demote` and promote `UPDATE`s acquire in
-    /// planner-determined scan order, so two concurrent multi-row callers --
-    /// two overlapping `reclaim_lost_jobs` sweeps, a batch reschedule racing
-    /// a reclaim, or a spawn's pin racing this swap -- could each hold a row
-    /// the other wants. `FOR NO KEY UPDATE` rather than `FOR UPDATE` because
-    /// it is what these `state`-only `UPDATE`s already take, and because it
-    /// leaves a spawn's `FOR KEY SHARE` on the same row unblocked; `FOR
-    /// UPDATE` would make this statement serialize concurrent spawns into the
-    /// queue for no benefit.
-    ///
-    /// Returns the job type AND `execute_at` of every promoted sibling, so
-    /// callers can wake the pollers that actually cover it -- a sibling can
-    /// be a different type than the row it displaced (one `queue_id` can be
-    /// shared across types), so notifying only the caller's own type would
-    /// miss it. `execute_at` is unchanged by this statement (only `state`
-    /// is set) -- it lets callers gate claim demand on whether a promoted
-    /// row is ACTUALLY due, not merely promoted (a promoted row's own
-    /// `execute_at` can be in the future).
-    ///
-    /// Both writes re-check `state` on the UPDATE itself (`demote`'s `AND
-    /// state = 'pending'`, the promote UPDATE's `AND je.state = 'parked'`),
-    /// not only on `locked`'s lock-acquisition scan -- the same
-    /// snapshot-vs-lock race [`Self::apply_freed`]'s doc explains in full.
-    /// `demote`'s side is the worse of the two if left unchecked: a
-    /// concurrent claimer that promoted `pending_id` to `running` between
-    /// `candidates`' snapshot and `locked`'s lock leaves a re-check-free
-    /// `demote` free to park an ACTIVELY RUNNING row out from under its
-    /// executor -- no decode error to abort the transaction, just silent
-    /// corruption. The promote UPDATE's own re-check protects the OTHER
-    /// side of the swap (`parked_id`) against the same race landing on the
-    /// sibling being promoted instead. Pinned by
-    /// `tests::apply_demote_yields_to_a_concurrently_claimed_pending_row`.
     pub(crate) async fn apply(
         op: &mut impl AtomicOperation,
         ids: &[uuid::Uuid],
