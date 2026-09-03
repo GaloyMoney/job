@@ -26,25 +26,14 @@
 //! cost as a hit. A probe that comes back full re-arms the hint (`set_due_hint`), since
 //! more may remain behind it.
 //!
-//! **Handing a recycled unit back owes a wake, and that wake is DEFERRED.** Two sites give
-//! a reservation back without claiming: the due-hint skip, and `truncate_to_unit_budget`.
-//! When the reservation came from `self.recycled`, its originating dispatcher has already
-//! detached from its own `job_completed`/`batch_completed` release-and-wake, expecting this
-//! hook to hand the unit back -- so nothing else will ever signal that the type's backlog
-//! became claimable again, and omitting the wake leaves a drained type (or one that just
-//! crossed below `min_jobs`) asleep until `MAX_WAIT`.
-//!
-//! But the wake cannot fire where the debt is incurred. Both sites sit inside the per-type
-//! claim loop, and the reservations that SURVIVE are about to claim rows whose connections
-//! are not taken yet -- a poll woken mid-loop re-reads pool headroom that cannot see them
-//! and over-admits on top. So both sites release QUIETLY (`UnitReservation::release`) and
-//! arm a single [`DeferredWake`], which fires on scope exit: after the claim loop, when
-//! this hook's own rows are already `running` inside the uncommitted transaction and
-//! `SKIP LOCKED` keeps a woken poll off them. Both sites must stay on that discipline --
-//! deferring one while the other wakes mid-loop reintroduces the over-admission. And
-//! fresh-demand truncation arms nothing: the spawn/promote that created that demand already
-//! armed `job_execution_inserted`'s notify, so its row still has a signal pending and a
-//! second wake would only over-admit.
+//! **Handing a unit back.** The due-hint skip, a short probe and budget truncation give
+//! reservations back without claiming. A recycled reservation's dispatcher has already
+//! detached from its own release-and-wake, so the wake decision is made here, under
+//! `job_completed`'s rule (`UnitReservation::hand_back`: the `min_jobs` crossing or a capped
+//! type) -- waking on every hand-back turned each steady-state completion into an empty
+//! poll. Any wake is deferred to scope exit via [`DeferredWake`]: a poll woken mid-loop
+//! re-reads pool headroom that cannot see the surviving reservations' claims and
+//! over-admits. Fresh-demand truncation arms nothing; its spawn already notified.
 //!
 //! See `UnitReservation::drop`'s doc for the general release contract and
 //! `reservation_release_is_quiet_but_unresolved_drop_wakes` (tracker.rs) for the quiet and
@@ -328,9 +317,10 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             }
             if !fresh_types.contains(&job_type) && !poller.tracker.consume_due_hint(&job_type) {
                 for reservation in reservations {
-                    reservation.release();
+                    if reservation.hand_back() {
+                        deferred_wake.arm();
+                    }
                 }
-                deferred_wake.arm();
                 continue;
             }
             let (per_unit_limit, _) = poller.claim_shape(&job_type);
@@ -342,7 +332,14 @@ impl es_entity::operation::hooks::CommitHook for ClaimHook {
             if n_claimed >= limit {
                 poller.tracker.set_due_hint(&job_type);
             }
-            for (reservation, target) in reservations.into_iter().zip(targets) {
+            let mut targets = targets.into_iter();
+            for reservation in reservations {
+                let Some(target) = targets.next() else {
+                    if reservation.hand_back() {
+                        deferred_wake.arm();
+                    }
+                    continue;
+                };
                 let subs = ShutdownSubs {
                     job: poller.shutdown_tx.subscribe(),
                     monitor: poller.shutdown_tx.subscribe(),
@@ -576,6 +573,9 @@ impl ClaimReconciler {
 mod tests {
     use super::super::test_support::{init_pool, row_state, seed_queued_job};
     use super::*;
+
+    /// Serialises the tests that read the process-wide probe counters.
+    static PROBE_COUNTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use crate::repo::JobRepo;
 
     async fn seed_landed_running_row(
@@ -771,6 +771,7 @@ mod tests {
     /// uses.
     #[tokio::test]
     async fn due_hint_skip_wakes_the_poll_loop_instead_of_a_quiet_release() -> anyhow::Result<()> {
+        let _serial = PROBE_COUNTER_TESTS.lock().await;
         let pool = init_pool().await?;
         let job_type = JobType::from_owned(format!("due-hint-wake-{}", uuid::Uuid::now_v7()));
 
@@ -779,7 +780,7 @@ mod tests {
             job_type: job_type.clone(),
         });
 
-        let tracker = std::sync::Arc::new(crate::tracker::JobTracker::new(0, 10));
+        let tracker = std::sync::Arc::new(crate::tracker::JobTracker::new(1, 10));
         tracker.set_job_types(vec![job_type.clone()]);
         let poller =
             super::super::test_support::build_poller(&pool, registry, Arc::clone(&tracker)).await?;
@@ -830,6 +831,7 @@ mod tests {
     /// every assertion reads an atomic settled during `pre_commit`.
     #[tokio::test]
     async fn due_hint_skip_defers_its_wake_past_another_types_claim() -> anyhow::Result<()> {
+        let _serial = PROBE_COUNTER_TESTS.lock().await;
         let pool = init_pool().await?;
         let skipped = JobType::from_owned(format!("skip-defer-a-{}", uuid::Uuid::now_v7()));
         let probing = JobType::from_owned(format!("skip-defer-b-{}", uuid::Uuid::now_v7()));
@@ -842,7 +844,7 @@ mod tests {
             job_type: probing.clone(),
         });
 
-        let tracker = Arc::new(crate::tracker::JobTracker::new(0, 10));
+        let tracker = Arc::new(crate::tracker::JobTracker::new(2, 10));
         tracker.set_job_types(vec![skipped.clone(), probing.clone()]);
         let poller =
             super::super::test_support::build_poller(&pool, registry, Arc::clone(&tracker)).await?;
@@ -874,6 +876,68 @@ mod tests {
              claim (-1 means it fired mid-loop from UnitReservation::drop \
              with no deferred wake armed at all)"
         );
+        Ok(())
+    }
+
+    /// A handed-back unit wakes the poll loop only on the `min_jobs` crossing,
+    /// on both hand-back paths.
+    #[tokio::test]
+    async fn hand_back_wakes_only_on_the_min_jobs_crossing() -> anyhow::Result<()> {
+        let _serial = PROBE_COUNTER_TESTS.lock().await;
+        let pool = init_pool().await?;
+        let job_type = JobType::from_owned(format!("hand-back-rule-{}", uuid::Uuid::now_v7()));
+
+        let mut registry = crate::registry::JobRegistry::new();
+        registry.add_initializer(super::super::test_support::ElasticInitializer {
+            job_type: job_type.clone(),
+        });
+
+        let tracker = Arc::new(crate::tracker::JobTracker::new(1, 10));
+        tracker.set_job_types(vec![job_type.clone()]);
+        let poller =
+            super::super::test_support::build_poller(&pool, registry, Arc::clone(&tracker)).await?;
+        let repo = JobRepo::new(&pool);
+
+        for _ in 0..3 {
+            tracker.dispatch_job(JobId::new(), &job_type);
+        }
+
+        tracker.set_due_hint(&job_type);
+        PROBE_CALL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let notified = tracker.notified();
+        let mut op = repo.begin_op_with_clock(&poller.clock).await?;
+        poller.register_claim_recycle(&mut op, &job_type, tracker.recycle(&job_type));
+        op.commit().await?;
+        assert_eq!(
+            PROBE_CALL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the hinted recycle must actually probe"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), notified)
+                .await
+                .is_err(),
+            "an empty probe above min_jobs must NOT wake the poll loop"
+        );
+
+        let notified = tracker.notified();
+        let mut op = repo.begin_op_with_clock(&poller.clock).await?;
+        poller.register_claim_recycle(&mut op, &job_type, tracker.recycle(&job_type));
+        op.commit().await?;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), notified)
+                .await
+                .is_err(),
+            "a due-hint skip above min_jobs must NOT wake the poll loop"
+        );
+
+        let notified = tracker.notified();
+        let mut op = repo.begin_op_with_clock(&poller.clock).await?;
+        poller.register_claim_recycle(&mut op, &job_type, tracker.recycle(&job_type));
+        op.commit().await?;
+        tokio::time::timeout(std::time::Duration::from_millis(200), notified)
+            .await
+            .expect("the hand-back that crosses min_jobs must wake the poll loop");
         Ok(())
     }
 
