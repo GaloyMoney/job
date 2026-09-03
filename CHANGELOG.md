@@ -1,3 +1,11 @@
+# [job release v0.13.15](https://github.com/GaloyMoney/job/releases/tag/0.13.15)
+
+
+
+### Refactor
+
+- Delegate run_isolated/run_bisected to es-entity 0.12.17 (#208)
+
 # [job release v0.13.14](https://github.com/GaloyMoney/job/releases/tag/0.13.14)
 
 
