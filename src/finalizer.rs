@@ -474,7 +474,12 @@ impl Finalizer {
         let retry_policy = RetryPolicy::from(&self.retry_settings);
 
         let ids: Vec<JobId> = items.iter().map(|(id, _)| *id).collect();
-        let mut entities = self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?;
+        let mut entities: HashMap<JobId, Job> = if let [id] = ids.as_slice() {
+            let job = self.repo.find_by_id_in_op(&mut *op, id).await?;
+            HashMap::from([(*id, job)])
+        } else {
+            self.repo.find_all_in_op::<Job>(&mut *op, &ids).await?
+        };
 
         // Decision phase: push events on the IN-MEMORY entities and bucket
         // the row transitions. Nothing staged here persists on its own --
@@ -664,42 +669,70 @@ impl Finalizer {
             // promote runs as the hook's OWN later statement, never a CTE
             // of this DELETE -- see `PromoteHeadsHook` for why folding it
             // in silently orphans a freshly parked row.
-            let rows = sqlx::query!(
-                r#"
-                WITH to_delete AS MATERIALIZED (
-                    SELECT id FROM job_executions
-                    WHERE id = ANY($1) AND poller_instance_id = $2
-                    ORDER BY queue_id, id
-                    FOR UPDATE
-                ), deleted AS (
-                    DELETE FROM job_executions je USING to_delete t WHERE je.id = t.id
-                    RETURNING je.id, je.queue_id
-                ), cleanup AS (
-                    DELETE FROM job_execution_states s USING deleted d
-                    WHERE s.id = d.id AND NOT $3::boolean
+            let rows: Vec<(JobId, Option<String>)> = if let [id] = delete_uuids.as_slice() {
+                sqlx::query!(
+                    r#"
+                    WITH deleted AS (
+                        DELETE FROM job_executions
+                        WHERE id = $1 AND poller_instance_id = $2
+                        RETURNING id, queue_id
+                    ), cleanup AS (
+                        DELETE FROM job_execution_states s USING deleted d
+                        WHERE s.id = d.id AND NOT $3::boolean
+                    )
+                    SELECT id AS "id!: JobId", queue_id AS "queue_id?"
+                    FROM deleted
+                    "#,
+                    *id,
+                    self.instance_id,
+                    self.retains_state,
                 )
-                SELECT id AS "id!: JobId", queue_id AS "queue_id?"
-                FROM deleted
-                "#,
-                &delete_uuids,
-                self.instance_id,
-                self.retains_state,
-            )
-            .fetch_all(op.as_executor())
-            .await?;
-            for row in rows {
-                applied.insert(row.id);
-                deleted_ids.insert(row.id);
-                if let Some(queue_id) = row.queue_id {
+                .fetch_all(op.as_executor())
+                .await?
+                .into_iter()
+                .map(|row| (row.id, row.queue_id))
+                .collect()
+            } else {
+                sqlx::query!(
+                    r#"
+                    WITH to_delete AS MATERIALIZED (
+                        SELECT id FROM job_executions
+                        WHERE id = ANY($1) AND poller_instance_id = $2
+                        ORDER BY queue_id, id
+                        FOR UPDATE
+                    ), deleted AS (
+                        DELETE FROM job_executions je USING to_delete t WHERE je.id = t.id
+                        RETURNING je.id, je.queue_id
+                    ), cleanup AS (
+                        DELETE FROM job_execution_states s USING deleted d
+                        WHERE s.id = d.id AND NOT $3::boolean
+                    )
+                    SELECT id AS "id!: JobId", queue_id AS "queue_id?"
+                    FROM deleted
+                    "#,
+                    &delete_uuids,
+                    self.instance_id,
+                    self.retains_state,
+                )
+                .fetch_all(op.as_executor())
+                .await?
+                .into_iter()
+                .map(|row| (row.id, row.queue_id))
+                .collect()
+            };
+            for (id, queue_id) in rows {
+                applied.insert(id);
+                deleted_ids.insert(id);
+                if let Some(queue_id) = queue_id {
                     freed_queues.push(queue_id);
                 }
-                if complete_ids.contains(&row.id) {
-                    if let Some(job) = staged.get_mut(&row.id) {
+                if complete_ids.contains(&id) {
+                    if let Some(job) = staged.get_mut(&id) {
                         job.complete_job();
                     }
-                    outcome.completed.push(row.id);
-                } else if fail_terminal_ids.contains(&row.id) {
-                    outcome.errored_terminal.push(row.id);
+                    outcome.completed.push(id);
+                } else if fail_terminal_ids.contains(&id) {
+                    outcome.errored_terminal.push(id);
                 }
             }
         }
