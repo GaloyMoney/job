@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::JobId;
-use crate::outcome::JobTerminalState;
+use crate::outcome::JobOutcome;
 use crate::repo::JobRepo;
 use crate::task::OwnedTaskHandle;
 use crate::tracker::JobTracker;
@@ -25,13 +25,13 @@ pub(crate) enum JobNotification {
     JobTerminal { job_id: JobId },
 }
 
-type WaiterRegistration = (JobId, oneshot::Sender<JobTerminalState>);
+type WaiterRegistration = (JobId, oneshot::Sender<JobOutcome>);
 
 /// The set of oneshot senders waiting on a single job, plus when the first of
 /// them registered. `registered_at` powers the oldest-waiter-age gauge so a
 /// stalled wait is observable instead of silent.
 struct Waiters {
-    senders: Vec<oneshot::Sender<JobTerminalState>>,
+    senders: Vec<oneshot::Sender<JobOutcome>>,
     registered_at: Instant,
 }
 
@@ -81,10 +81,7 @@ impl JobNotificationRouter {
     /// Returns a oneshot receiver that delivers the terminal state, or
     /// `None` when the router has not been started yet (i.e. before
     /// `Jobs::start_poll`). Drop the receiver to unsubscribe.
-    pub fn try_wait_for_terminal(
-        &self,
-        job_id: JobId,
-    ) -> Option<oneshot::Receiver<JobTerminalState>> {
+    pub fn try_wait_for_terminal(&self, job_id: JobId) -> Option<oneshot::Receiver<JobOutcome>> {
         let register_tx = self.register_tx.get()?;
         let (tx, rx) = oneshot::channel();
         let _ = register_tx.send((job_id, tx));
@@ -245,6 +242,33 @@ impl JobNotificationRouter {
     }
 }
 
+const WAITER_BATCH_CHUNK: usize = 1000;
+
+async fn still_running(pool: &PgPool, ids: &[JobId]) -> HashSet<JobId> {
+    let mut running = HashSet::with_capacity(ids.len());
+    for chunk in ids.chunks(WAITER_BATCH_CHUNK) {
+        match sqlx::query_scalar!(
+            "SELECT id FROM job_executions WHERE id = ANY($1)",
+            chunk as &[JobId],
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => running.extend(rows.into_iter().map(JobId::from)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    chunk_len = chunk.len(),
+                    "failed to batch-check execution rows; treating this chunk as \
+                     still running so its waiters stay parked for the next sweep"
+                );
+                running.extend(chunk.iter().copied());
+            }
+        }
+    }
+    running
+}
+
 /// Register a batch of completion-waiters.
 ///
 /// Every registration is parked first (so a concurrent terminal notification can
@@ -269,30 +293,8 @@ async fn register_waiters(
             .push(tx);
     }
 
-    // Single batched query: the subset of IDs that still have execution rows
-    // (i.e. are still running). Any ID NOT returned is terminal.
-    let still_running: HashSet<JobId> = match sqlx::query_scalar!(
-        "SELECT id FROM job_executions WHERE id = ANY($1)",
-        &ids as &[JobId],
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows.into_iter().map(JobId::from).collect(),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "register_waiters: failed to batch-check execution rows"
-            );
-            // Everyone stays parked — the sweep will retry.
-            return;
-        }
-    };
-
-    let terminal_ids: Vec<JobId> = ids
-        .into_iter()
-        .filter(|id| !still_running.contains(id))
-        .collect();
+    let running = still_running(pool, &ids).await;
+    let terminal_ids: Vec<JobId> = ids.into_iter().filter(|id| !running.contains(id)).collect();
 
     if !terminal_ids.is_empty() {
         batch_load_and_notify(waiters, repo, terminal_ids).await;
@@ -339,30 +341,12 @@ async fn sweep_waiters(waiters: &mut WaiterMap, pool: &PgPool, repo: &JobRepo) {
     span.record("oldest_waiter_age_secs", oldest_age.as_secs());
 
     let ids: Vec<JobId> = waiters.keys().copied().collect();
+    let running = still_running(pool, &ids).await;
+    let terminal_ids: Vec<JobId> = ids.into_iter().filter(|id| !running.contains(id)).collect();
 
-    // Single batched query: returns the subset of IDs that still have execution rows
-    // (i.e. are still running). Any ID NOT in the result set is terminal.
-    let still_running: HashSet<JobId> = match sqlx::query_scalar!(
-        "SELECT id FROM job_executions WHERE id = ANY($1)",
-        &ids as &[JobId],
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows.into_iter().map(JobId::from).collect(),
-        Err(e) => {
-            tracing::warn!(error = %e, "sweep: failed to batch-check execution rows");
-            return;
-        }
-    };
-
-    // Notify waiters for jobs that no longer have an execution row
-    let mut n_resolved = 0usize;
-    for id in ids {
-        if !still_running.contains(&id) && load_and_notify(waiters, repo, id).await {
-            n_resolved += 1;
-        }
-    }
+    let before = waiters.len();
+    batch_load_and_notify(waiters, repo, terminal_ids).await;
+    let n_resolved = before.saturating_sub(waiters.len());
     span.record("n_resolved", n_resolved);
 
     if n_resolved > 0 {
@@ -373,41 +357,6 @@ async fn sweep_waiters(waiters: &mut WaiterMap, pool: &PgPool, repo: &JobRepo) {
             "sweep resolved already-terminal waiters whose terminal notification \
              was never delivered — notification delivery is lagging"
         );
-    }
-}
-
-/// Load a job entity and extract its terminal state.
-/// Returns `None` and logs a warning on failure.
-async fn load_terminal_state(repo: &JobRepo, job_id: JobId) -> Option<JobTerminalState> {
-    match repo.find_by_id(job_id).await {
-        Ok(job) => match job.terminal_state() {
-            Some(state) => Some(state),
-            None => {
-                tracing::warn!(%job_id, "no execution row but job entity is not terminal");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, %job_id, "failed to load job entity for notification");
-            None
-        }
-    }
-}
-
-/// Load the job entity and send the terminal state to all registered waiters.
-/// On failure, waiters remain registered so the sweep can retry.
-///
-/// Returns `true` if the job was terminal and its waiters were notified.
-async fn load_and_notify(waiters: &mut WaiterMap, repo: &JobRepo, job_id: JobId) -> bool {
-    if !waiters.contains_key(&job_id) {
-        return false;
-    }
-
-    if let Some(state) = load_terminal_state(repo, job_id).await {
-        send_to_waiters(waiters, job_id, state);
-        true
-    } else {
-        false
     }
 }
 
@@ -427,35 +376,38 @@ async fn batch_load_and_notify(waiters: &mut WaiterMap, repo: &JobRepo, ids: Vec
         return;
     }
 
-    match repo.find_all::<crate::Job>(&unique_ids).await {
-        Ok(entities) => {
-            for (job_id, job) in entities {
-                if let Some(state) = job.terminal_state() {
-                    send_to_waiters(waiters, job_id, state);
-                } else {
-                    tracing::warn!(
-                        %job_id,
-                        "no execution row but job entity is not terminal"
-                    );
+    for chunk in unique_ids.chunks(WAITER_BATCH_CHUNK) {
+        match repo.find_all::<crate::Job>(chunk).await {
+            Ok(entities) => {
+                for (job_id, job) in entities {
+                    if let Some(state) = job.terminal_state() {
+                        let outcome = JobOutcome::new(state, job.raw_return_value().cloned());
+                        send_to_waiters(waiters, job_id, outcome);
+                    } else {
+                        tracing::warn!(
+                            %job_id,
+                            "no execution row but job entity is not terminal"
+                        );
+                    }
                 }
             }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                n_jobs = unique_ids.len(),
-                "batch_load_and_notify: failed to load job entities"
-            );
-            // Waiters remain registered — sweep will retry
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    n_jobs = chunk.len(),
+                    "batch_load_and_notify: failed to load job entities"
+                );
+                // Waiters remain registered — sweep will retry
+            }
         }
     }
 }
 
 /// Deliver a known terminal state to all waiters for a job.
-fn send_to_waiters(waiters: &mut WaiterMap, job_id: JobId, state: JobTerminalState) {
+fn send_to_waiters(waiters: &mut WaiterMap, job_id: JobId, outcome: JobOutcome) {
     if let Some(w) = waiters.remove(&job_id) {
         for tx in w.senders {
-            let _ = tx.send(state);
+            let _ = tx.send(outcome.clone());
         }
     }
 }
