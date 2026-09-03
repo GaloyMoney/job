@@ -1,6 +1,6 @@
 [package]
 name = "job-fuzz"
-version = "0.13.15"
+version = "0.13.16-dev"
 publish = false
 edition = "2021"
 
