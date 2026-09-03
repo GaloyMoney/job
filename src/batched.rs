@@ -192,59 +192,11 @@ pub enum BatchItemOutcome {
 pub type BatchOutcomes = Vec<(JobId, BatchItemOutcome)>;
 
 /// How many probes [`CurrentBatchedJob::run_bisected_with`] may spend on one
-/// batch. A probe is one invocation of the caller's closure — successful or
-/// not — including the initial whole-batch attempt.
-///
-/// This is the one knob the helper exposes, and it is per-call, not a
-/// property of the job type: the right budget depends on how expensive the
-/// caller's probe closure is, which only the call site knows.
-///
-/// It bounds the *search*. A probe Postgres aborted as a deadlock victim or
-/// serialization failure is re-run against the same range without drawing on
-/// this budget, under its own small allowance — so a batch that hits conflicts
-/// can invoke the closure a few times beyond the cap. That is deliberate: the
-/// alternative is budget-failing jobs for a conflict none of them caused.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum BisectBudget {
-    /// `2 * ceil(log2(N)) + 1` probes, computed per call from the batch
-    /// size — exactly enough to fully isolate **one** culprit and complete
-    /// everything else, at any batch size (9 probes at N=10, 11 at N=25, 15
-    /// at N=100). A flat constant can't do this: at N=25 a cap of, say, 4
-    /// would exhaust after salvaging only ~12 of 25 items on a single
-    /// culprit, sending the other 12 *innocent* items through solo retry
-    /// for no reason. More than one culprit degrades gracefully:
-    /// largest-first probing still salvages the big clean ranges, and the
-    /// (smaller) remainder budget-fails into the ordinary solo-retry path.
-    #[default]
-    Auto,
-    /// An explicit hard cap, clamped to at least 1 (the first probe is
-    /// mandatory — nothing can be dispositioned without it).
-    /// `MaxProbes(1)` is the degenerate case: it probes once, and on
-    /// failure every item budget-fails — equivalent to returning `Err`
-    /// from `run_batch` directly, just routed through this helper.
-    MaxProbes(usize),
-    /// Run the search to completion instead of capping it: `2k * log2(N/k)`
-    /// probes for `k` culprits, degrading to `2N - 1` when every item is
-    /// bad. This is bounded by the batch size, not actually unbounded — but
-    /// it is the variant most likely to spend a probe budget you didn't
-    /// intend, so pick it explicitly rather than by default.
-    FullResolution,
-}
-
-/// Maps onto [`es_entity::BisectBudget`], which [`CurrentBatchedJob::run_bisected_with`]
-/// now delegates its search to. Kept as job's own type — rather than a
-/// re-export — so this crate's public API doesn't shift underneath callers
-/// as an implementation detail of *where* the bisect algorithm lives.
-#[cfg(feature = "es-entity")]
-impl From<BisectBudget> for es_entity::BisectBudget {
-    fn from(budget: BisectBudget) -> Self {
-        match budget {
-            BisectBudget::Auto => es_entity::BisectBudget::Auto,
-            BisectBudget::MaxProbes(max) => es_entity::BisectBudget::MaxProbes(max),
-            BisectBudget::FullResolution => es_entity::BisectBudget::FullResolution,
-        }
-    }
-}
+/// batch. Re-exported from es-entity, whose [`BatchIsolation`](es_entity::BatchIsolation)
+/// trait now owns the bisect search this budget governs — see its docs for
+/// the full contract (`Auto`'s formula, `MaxProbes`' clamping, `FullResolution`'s
+/// cost).
+pub use es_entity::BisectBudget;
 
 /// Result returned by [`BatchedJobRunner::run_batch`].
 ///
@@ -658,7 +610,7 @@ impl<C> CurrentBatchedJob<C> {
             transient_retries,
             last_error,
         } = op
-            .run_bisected(&self.items, budget.into(), f)
+            .run_bisected(&self.items, budget, f)
             .await
             .inspect_err(|e| {
                 tracing::warn!(
