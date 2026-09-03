@@ -513,9 +513,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "es-entity"
-version = "0.12.16"
+version = "0.12.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fb6b629df1fd29893c72cceea61bc4328fc55cc81f229a4ed074f08cd8cc52f"
+checksum = "7e7eda8c5bc6f811fad5722d822e9131c438b870b4a8f4795d7fe31001ddddd2"
 dependencies = [
  "async-stream",
  "chrono",
@@ -541,9 +541,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.12.16"
+version = "0.12.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d31a6d85db81f8cff9b8ced26dec5cb7ffce779dd544f1f855925e1616f370a0"
+checksum = "37ec505540ceee70b70d48033f347219fa53c78600c216855a1a85deca9070da"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
