@@ -387,13 +387,19 @@ impl Finalizer {
             // here is unambiguous on failure: nothing has committed, so
             // re-running on another pool re-applies plain data.
             let prepared = match acquired {
-                Ok(mut op) => match self.finalize_in_op(&mut op, items).await {
-                    Ok(outcome) => {
-                        after_write(&mut op, &outcome);
-                        Ok((op, outcome))
+                Ok(mut op) => {
+                    let written = match Self::pin_index_plans(&mut op, use_internal).await {
+                        Ok(()) => self.finalize_in_op(&mut op, items).await,
+                        Err(e) => Err(e.into()),
+                    };
+                    match written {
+                        Ok(outcome) => {
+                            after_write(&mut op, &outcome);
+                            Ok((op, outcome))
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
-                },
+                }
                 Err(e) => Err(e.into()),
             };
             let (op, outcome) = match prepared {
@@ -758,6 +764,24 @@ impl Finalizer {
         let mut jobs: Vec<Job> = applied.iter().filter_map(|id| staged.remove(id)).collect();
         self.repo.update_all_in_op(op, &mut jobs).await?;
         Ok(outcome)
+    }
+
+    /// `SET LOCAL enable_seqscan = off` for a job-end transaction on the
+    /// shared pool (the internal pool pins it per connection): `job_executions`
+    /// keeps a small heap under bloated indexes, so the planner otherwise
+    /// seq-scans it on every completion. Only ever applied to transactions
+    /// this crate owns.
+    pub(crate) async fn pin_index_plans(
+        op: &mut es_entity::DbOp<'static>,
+        use_internal: bool,
+    ) -> Result<(), sqlx::Error> {
+        if use_internal {
+            return Ok(());
+        }
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(op.as_executor())
+            .await?;
+        Ok(())
     }
 
     /// Begin one attempt's op on the pool [`Self::finalize`]'s policy
