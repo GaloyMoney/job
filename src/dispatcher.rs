@@ -153,6 +153,14 @@ impl JobDispatcher {
         }
     }
 
+    /// A job-end transaction this dispatcher owns (shared pool), with
+    /// `Finalizer::pin_index_plans` applied.
+    async fn begin_own_op(&self) -> Result<es_entity::DbOp<'static>, JobError> {
+        let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+        super::finalizer::Finalizer::pin_index_plans(&mut op, false).await?;
+        Ok(op)
+    }
+
     /// Detach this dispatcher's unit from the ordinary Drop-triggered
     /// release: [`Self::recycle_into_claim`] is handing the about-to-be-freed
     /// unit to [`JobTracker::recycle`] instead of releasing it plainly.
@@ -223,7 +231,7 @@ impl JobDispatcher {
                 }
                 Ok(JobCompletion::Complete) => {
                     span.record("conclusion", "Complete");
-                    let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                    let mut op = self.begin_own_op().await?;
                     self.complete_job(&mut op, job.id).await?;
                     op.commit().await?;
                 }
@@ -240,7 +248,7 @@ impl JobDispatcher {
                 }
                 Ok(JobCompletion::RescheduleNow) => {
                     span.record("conclusion", "RescheduleNow");
-                    let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                    let mut op = self.begin_own_op().await?;
                     let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
                     self.reschedule_job(&mut op, job.id, t).await?;
                     op.commit().await?;
@@ -260,7 +268,7 @@ impl JobDispatcher {
                 }
                 Ok(JobCompletion::RescheduleIn(d)) => {
                     span.record("conclusion", "RescheduleIn");
-                    let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                    let mut op = self.begin_own_op().await?;
                     let t = op.maybe_now().unwrap_or_else(|| self.clock.now());
                     let t = t + d;
                     self.reschedule_job(&mut op, job.id, t).await?;
@@ -282,7 +290,7 @@ impl JobDispatcher {
                 }
                 Ok(JobCompletion::RescheduleAt(t)) => {
                     span.record("conclusion", "RescheduleAt");
-                    let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
+                    let mut op = self.begin_own_op().await?;
                     self.reschedule_job(&mut op, job.id, t).await?;
                     op.commit().await?;
                 }

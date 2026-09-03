@@ -409,6 +409,23 @@ impl UnitReservation {
         self.tracker.release_unit(&self.job_type);
     }
 
+    /// Quiet release for a completion-side path that bypassed
+    /// [`JobTracker::job_completed`]; returns whether the poll loop must be
+    /// woken under that method's rule (the `min_jobs` crossing or a capped
+    /// type). The caller defers the wake past its own in-flight claims.
+    #[must_use = "the returned flag says whether the poll loop must be woken"]
+    pub(crate) fn hand_back(mut self) -> bool {
+        self.resolved = true;
+        let n_running_jobs = self.tracker.running_jobs.fetch_sub(1, Ordering::SeqCst);
+        self.tracker.release_unit(&self.job_type);
+        n_running_jobs == self.tracker.min_jobs
+            || self
+                .tracker
+                .capped_types
+                .get()
+                .is_some_and(|types| types.contains(&self.job_type))
+    }
+
     /// Batch counterpart of [`Self::into_live`]: the claimed batch landed and
     /// every id in it is about to be dispatched together as ONE unit
     /// (mirrors [`JobTracker::dispatch_batch`]'s per-id liveness / single-unit
