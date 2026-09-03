@@ -171,12 +171,8 @@ impl JobHandle {
         // Fail fast if the job doesn't exist — avoids a silent park in the
         // waiter manager for a JobId that will never resolve.
         self.repo.find_by_id(self.id).await?;
-        let state = rx
-            .await
-            .map_err(|_| JobError::AwaitCompletionShutdown(self.id))?;
-        // Reload the entity to retrieve any result value set by the runner.
-        let job = self.repo.find_by_id(self.id).await?;
-        Ok(JobOutcome::new(state, job.raw_return_value().cloned()))
+        rx.await
+            .map_err(|_| JobError::AwaitCompletionShutdown(self.id))
     }
 }
 
@@ -186,6 +182,8 @@ impl JobHandle {
 /// with [`FromIterator`]. Contract 2 (order preservation) holds for every
 /// batch method: results align positionally with the handles.
 pub struct JobHandles(Vec<JobHandle>);
+
+const AWAIT_ALL_CHUNK: usize = 1000;
 
 impl JobHandles {
     /// Block until every job reaches a terminal state and return all
@@ -211,11 +209,37 @@ impl JobHandles {
             return Ok(Vec::new());
         }
         let first_id = self.0[0].id;
-        let futs: Vec<_> = self.0.iter().map(|h| h.wait_for_outcome()).collect();
-        let results = tokio::time::timeout(timeout, futures::future::join_all(futs))
+        let repo = &self.0[0].repo;
+        let router = &self.0[0].router;
+        let ids: Vec<JobId> = self.0.iter().map(|h| h.id).collect();
+
+        let mut rxs = Vec::with_capacity(ids.len());
+        for id in &ids {
+            rxs.push(
+                router
+                    .try_wait_for_terminal(*id)
+                    .ok_or(JobError::RouterNotStarted)?,
+            );
+        }
+
+        for chunk in ids.chunks(AWAIT_ALL_CHUNK) {
+            let found = repo.find_all::<crate::Job>(chunk).await?;
+            if found.len() != chunk.len() {
+                for id in chunk {
+                    if !found.contains_key(id) {
+                        repo.find_by_id(*id).await?;
+                    }
+                }
+            }
+        }
+
+        let received = tokio::time::timeout(timeout, futures::future::join_all(rxs))
             .await
             .map_err(|_| JobError::TimedOut(first_id))?;
-        results.into_iter().collect()
+        ids.iter()
+            .zip(received)
+            .map(|(id, r)| r.map_err(|_| JobError::AwaitCompletionShutdown(*id)))
+            .collect()
     }
 
     /// Load a [`JobSnapshot`] for every job, positionally aligned with the
