@@ -1,0 +1,10 @@
+[test-groups.db-serial]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(job) & kind(lib) & test(/^poller::/)'
+test-group = 'db-serial'
+
+[[profile.default.overrides]]
+filter = 'package(job) & (binary_id(job::await_all_cross_process) | binary_id(job::await_all_wide_fanout) | binary_id(job::batched_job))'
+test-group = 'db-serial'
