@@ -1,3 +1,19 @@
+# [job release v0.13.14](https://github.com/GaloyMoney/job/releases/tag/0.13.14)
+
+
+
+### Bug Fixes
+
+- Batch and bound JobHandles::await_all, carry the outcome in the terminal notification (#207)
+
+### Miscellaneous Tasks
+
+- Bump uuid in the all-dependencies group (#195)
+
+### Performance
+
+- Restore 0.13.5-era completion cost: poll wake rule, width-1 finalize, drop jobs FKs, plan pin (#206)
+
 # [job release v0.13.13](https://github.com/GaloyMoney/job/releases/tag/0.13.13)
 
 
