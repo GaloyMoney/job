@@ -489,6 +489,38 @@ async fn a_respawn_without_the_flag_leaves_a_hold_alone() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// One key, two specs in one call, only one of them asking for a wake: the
+/// row moves once and only the asking spec reports it. The plain spec still
+/// reads as the no-op it requested.
+#[tokio::test]
+async fn only_the_specs_that_asked_report_pulled_forward() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("force-reschedule-mixed");
+    let spawner = jobs.add_keyed_initializer(Init::new(&job_type, Behaviour::Idle));
+
+    spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg).schedule_at(Utc::now() + HOLD),
+        ])
+        .await?;
+
+    let mixed = spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg),
+            KeyedJobSpec::new("k", Cfg).force_reschedule(),
+        ])
+        .await?;
+    assert!(mixed.iter().all(|s| !s.created));
+    assert!(!mixed[0].pulled_forward, "this spec never asked for a wake");
+    assert!(mixed[1].pulled_forward);
+    assert!(execute_at(&pool, &job_type, "k").await? <= Utc::now());
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
 /// Two transactions waking one key at the same time: both resolve to the same
 /// job, neither errors or deadlocks (they serialize on the key's advisory
 /// lock), and the row ends up due exactly once — never later than either

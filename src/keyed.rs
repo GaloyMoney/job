@@ -434,12 +434,14 @@ where
         let mut new_keys: Vec<String> = Vec::new();
         let mut new_schedule_times: Vec<DateTime<Utc>> = Vec::new();
         let mut wake_keys: Vec<String> = Vec::new();
+        let mut wake_outcomes: Vec<usize> = Vec::new();
         let mut outcomes = Vec::with_capacity(specs.len());
 
         for spec in specs {
             if let Some(id) = live.get(&spec.key).or_else(|| seen.get(&spec.key)) {
                 if spec.force_reschedule {
                     wake_keys.push(spec.key.clone());
+                    wake_outcomes.push(outcomes.len());
                 }
                 outcomes.push(KeyedSpawn {
                     key: spec.key,
@@ -493,10 +495,11 @@ where
         let pulled = self
             .pull_forward_in_op(op, &wake_keys, default_schedule_at)
             .await?;
-        if !pulled.is_empty() {
-            for outcome in outcomes.iter_mut() {
-                outcome.pulled_forward = !outcome.created && pulled.contains(&outcome.key);
-            }
+        // Reported only on the specs that ASKED for a wake: a plain spec
+        // sharing a key with one of them in the same call still reads as the
+        // no-op it requested.
+        for i in wake_outcomes {
+            outcomes[i].pulled_forward = pulled.contains(&outcomes[i].key);
         }
 
         // Nothing created and nothing moved means nothing to announce: a
