@@ -520,8 +520,8 @@ async fn force_reschedule_pulls_forward_to_the_specs_own_schedule_at() -> anyhow
 }
 
 /// Several wake specs for ONE key in a single call collapse to the earliest
-/// target — the `MIN` in the `targets` CTE — rather than letting the join
-/// pick one of them arbitrarily.
+/// target — folded to one target per key before the statement is built —
+/// rather than letting the join pick one of them arbitrarily.
 #[tokio::test]
 async fn repeated_wake_specs_for_one_key_take_the_earliest_target() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -649,6 +649,73 @@ async fn only_the_specs_that_asked_report_pulled_forward() -> anyhow::Result<()>
     assert!(!mixed[0].pulled_forward, "this spec never asked for a wake");
     assert!(mixed[1].pulled_forward);
     assert!(execute_at(&pool, &job_type, "k").await? <= Utc::now());
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A key CREATED and woken in the same call. The row the wake is talking
+/// about is one this call is inserting, so there is nothing to update: the
+/// insert simply carries the earlier of the two times. The observable
+/// contract is the live-key one — earliest target wins, monotonically, and
+/// only the specs that asked for a wake report it.
+#[tokio::test]
+async fn a_wake_against_a_key_created_in_the_same_call_lands_on_the_insert() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("force-reschedule-same-call");
+    let spawner = jobs.add_keyed_initializer(Init::new(&job_type, Behaviour::Idle));
+
+    let sooner = target_in(chrono::TimeDelta::minutes(5));
+    let spawned = spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg).schedule_at(Utc::now() + HOLD),
+            KeyedJobSpec::new("k", Cfg)
+                .schedule_at(sooner)
+                .force_reschedule(),
+            KeyedJobSpec::new("k", Cfg),
+        ])
+        .await?;
+
+    assert!(spawned[0].created, "the first spec creates the key");
+    assert!(
+        !spawned[0].pulled_forward,
+        "a creating spec already carries the time it asked for"
+    );
+    assert!(spawned[1..].iter().all(|s| !s.created));
+    assert!(
+        spawned[1].pulled_forward,
+        "an hour out is later than 5 minutes"
+    );
+    assert!(
+        !spawned[2].pulled_forward,
+        "this spec never asked for a wake"
+    );
+    assert!(
+        spawned
+            .iter()
+            .all(|s| s.handle.id() == spawned[0].handle.id()),
+        "every spec must resolve to the one generation the call created"
+    );
+    assert_eq!(
+        execute_at(&pool, &job_type, "k").await?,
+        sooner,
+        "the insert must carry the woken time, not the hold"
+    );
+
+    // Monotone within the call too: a LATER wake target cannot delay the
+    // insert, exactly as it cannot delay a live holder.
+    let held = spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("m", Cfg).schedule_at(sooner),
+            KeyedJobSpec::new("m", Cfg)
+                .schedule_at(Utc::now() + HOLD)
+                .force_reschedule(),
+        ])
+        .await?;
+    assert!(!held[1].pulled_forward);
+    assert_eq!(execute_at(&pool, &job_type, "m").await?, sooner);
 
     jobs.shutdown().await?;
     Ok(())

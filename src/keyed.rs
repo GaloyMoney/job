@@ -23,7 +23,12 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use es_entity::clock::ClockHandle;
 use tracing::instrument;
@@ -399,10 +404,12 @@ where
     ///   idempotent: repeated respawns of a due row are no-ops, and no
     ///   respawn can ever delay a job.
     ///
-    /// It runs AFTER this call's own inserts so that a key repeated within
-    /// one call — first spec creates it far ahead, second spec asks for a
-    /// wake — sees the row it is talking about, the same way the live-check
-    /// does.
+    /// Only keys that were ALREADY live when the call started reach that
+    /// statement. A key repeated within one call — first spec creates it far
+    /// ahead, second spec asks for a wake — is resolved in memory instead:
+    /// on a row this call is itself inserting every guard holds by
+    /// construction, so the wake is just a lower `execute_at` on the insert.
+    /// Same row, same reported `pulled_forward`, one statement fewer.
     ///
     /// Rows actually moved are then reported through the SAME two signals a
     /// creation uses (the `ExecutionReady` notify and the local poller's
@@ -425,29 +432,45 @@ where
         }
 
         let default_schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
-        let keys: Vec<String> = specs.iter().map(|s| s.key.clone()).collect();
+        // Deduped here rather than by the database: the fan-out this serves
+        // maps many upstream events onto a handful of keys, so both
+        // statements underneath would otherwise carry one array element per
+        // event to describe a handful of rows.
+        let mut keys: Vec<String> = specs.iter().map(|s| s.key.clone()).collect();
+        keys.sort_unstable();
+        keys.dedup();
         let live = self
             .repo
             .lock_and_check_live_keys_in_op(op, &self.job_type, &keys)
             .await?;
 
-        let mut seen: HashMap<String, JobId> = HashMap::new();
+        // Key -> (holder, its index into the `new_*` arrays below).
+        let mut seen: HashMap<String, (JobId, usize)> = HashMap::new();
         let mut new_jobs = Vec::new();
         let mut new_ids: Vec<JobId> = Vec::new();
         let mut new_keys: Vec<String> = Vec::new();
         let mut new_schedule_times: Vec<DateTime<Utc>> = Vec::new();
-        let mut wake_keys: Vec<String> = Vec::new();
-        let mut wake_targets: Vec<DateTime<Utc>> = Vec::new();
+        // Wakes against rows that were ALREADY live when this call started —
+        // the only ones that need a statement. One entry per key, folded to
+        // the earliest target as the specs are read.
+        let mut wake: HashMap<String, DateTime<Utc>> = HashMap::new();
         let mut wake_outcomes: Vec<usize> = Vec::new();
+        // Wakes against rows THIS call is inserting, by `new_*` index. These
+        // never reach the database — see below.
+        let mut local_wake: HashMap<usize, DateTime<Utc>> = HashMap::new();
+        let mut local_wake_outcomes: Vec<(usize, usize)> = Vec::new();
         let mut outcomes = Vec::with_capacity(specs.len());
 
         for spec in specs {
-            if let Some(id) = live.get(&spec.key).or_else(|| seen.get(&spec.key)) {
+            // The `execute_at` this spec asks for: the one a NEW job of it
+            // would be created with, and the one a wake pulls a holder to.
+            let wanted_at = spec.schedule_at.unwrap_or(default_schedule_at);
+
+            if let Some(id) = live.get(&spec.key) {
                 if spec.force_reschedule {
-                    // The same target a NEW job of this spec would get: its
-                    // own `schedule_at`, or now when it has none.
-                    wake_targets.push(spec.schedule_at.unwrap_or(default_schedule_at));
-                    wake_keys.push(spec.key.clone());
+                    wake.entry(spec.key.clone())
+                        .and_modify(|t| *t = (*t).min(wanted_at))
+                        .or_insert(wanted_at);
                     wake_outcomes.push(outcomes.len());
                 }
                 outcomes.push(KeyedSpawn {
@@ -459,8 +482,24 @@ where
                 continue;
             }
 
+            if let Some(&(id, idx)) = seen.get(&spec.key) {
+                if spec.force_reschedule {
+                    local_wake
+                        .entry(idx)
+                        .and_modify(|t| *t = (*t).min(wanted_at))
+                        .or_insert(wanted_at);
+                    local_wake_outcomes.push((outcomes.len(), idx));
+                }
+                outcomes.push(KeyedSpawn {
+                    key: spec.key,
+                    handle: self.handle(id),
+                    created: false,
+                    pulled_forward: false,
+                });
+                continue;
+            }
+
             let id = JobId::new();
-            let schedule_at = spec.schedule_at.unwrap_or(default_schedule_at);
             // The id is an internally generated v7 uuid, `resident` defaults
             // to false here (this path never sets it), and `jobs` carries no
             // unique-key-string constraint (liveness enforcement is on
@@ -472,14 +511,14 @@ where
                     .job_type(self.job_type.clone())
                     .config(spec.config)?
                     .tracing_context(es_entity::context::TracingContext::current())
-                    .schedule_at(schedule_at)
+                    .schedule_at(wanted_at)
                     .build()
                     .expect("Could not build new job"),
             );
-            seen.insert(spec.key.clone(), id);
+            seen.insert(spec.key.clone(), (id, new_ids.len()));
             new_ids.push(id);
             new_keys.push(spec.key.clone());
-            new_schedule_times.push(schedule_at);
+            new_schedule_times.push(wanted_at);
             outcomes.push(KeyedSpawn {
                 key: spec.key,
                 handle: self.handle(id),
@@ -487,6 +526,27 @@ where
                 pulled_forward: false,
             });
         }
+
+        // A wake against a row this very call is inserting needs no
+        // statement at all. Such a row is always `state = 'pending'` at
+        // `attempt_index = 1` (the column defaults), so both of
+        // `pull_forward_in_op`'s guards hold by construction and its write
+        // collapses to a `LEAST` over values already in hand — which is
+        // simply the `execute_at` the insert should carry in the first place.
+        let mut moved_locally: HashSet<usize> = HashSet::new();
+        for (idx, target) in local_wake {
+            if target < new_schedule_times[idx] {
+                new_schedule_times[idx] = target;
+                moved_locally.insert(idx);
+            }
+        }
+        for (outcome_idx, idx) in local_wake_outcomes {
+            outcomes[outcome_idx].pulled_forward = moved_locally.contains(&idx);
+        }
+
+        // Distinct by construction — they are a `HashMap`'s keys — which is
+        // what keeps `pull_forward_in_op`'s join single-rowed per key.
+        let (wake_keys, wake_targets): (Vec<String>, Vec<DateTime<Utc>>) = wake.into_iter().unzip();
 
         if new_jobs.is_empty() && wake_keys.is_empty() {
             return Ok(outcomes);
@@ -546,16 +606,19 @@ where
     /// at all is written for a key already due at or before its target,
     /// already running, or backing off.
     ///
-    /// `keys[n]` pairs with `targets[n]`. The target is the spec's own
-    /// `schedule_at`, or the caller's `now` when it has none — i.e. exactly
-    /// the `execute_at` a NEW job of that spec would have been given, so
-    /// "wake this key" and "create this key" agree on when the work is
-    /// wanted. A wake is therefore *"run no later than T"*, not just *"run
-    /// now"*: a caller that knows the work is only due in five minutes can
-    /// pull a one-hour hold to five minutes and no further. A key repeated
-    /// across several wake specs in one call collapses to its EARLIEST
-    /// target (`MIN` in the `targets` CTE), which is both the monotone
-    /// answer and what keeps the `UPDATE ... FROM` join single-rowed.
+    /// `keys[n]` pairs with `targets[n]`, and `keys` MUST be distinct: the
+    /// caller folds several wake specs for one key to their EARLIEST target
+    /// before calling, which is both the monotone answer and what keeps this
+    /// `UPDATE ... FROM` join single-rowed. A repeated key would leave the
+    /// join free to pick either target.
+    ///
+    /// The target is the spec's own `schedule_at`, or the caller's `now`
+    /// when it has none — i.e. exactly the `execute_at` a NEW job of that
+    /// spec would have been given, so "wake this key" and "create this key"
+    /// agree on when the work is wanted. A wake is therefore *"run no later
+    /// than T"*, not just *"run now"*: a caller that knows the work is only
+    /// due in five minutes can pull a one-hour hold to five minutes and no
+    /// further.
     ///
     /// The guards, in the order they matter:
     ///
@@ -609,14 +672,9 @@ where
         }
         let rows = sqlx::query!(
             r#"
-            WITH targets AS (
-                SELECT unique_key, MIN(target) AS target
-                FROM UNNEST($2::text[], $3::timestamptz[]) AS t(unique_key, target)
-                GROUP BY unique_key
-            )
             UPDATE job_executions je
                SET execute_at = LEAST(je.execute_at, t.target)
-              FROM targets t
+              FROM UNNEST($2::text[], $3::timestamptz[]) AS t(unique_key, target)
              WHERE je.job_type = $1
                AND je.unique_key = t.unique_key
                AND je.state = 'pending'
