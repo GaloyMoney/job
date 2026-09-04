@@ -1,6 +1,7 @@
-//! `KeyedJobSpec::force_reschedule`: a respawn against a LIVE key that is
-//! parked in the future pulls that key's `execute_at` forward to now, instead
-//! of resolving to the holder and doing nothing.
+//! `KeyedJobSpec::force_reschedule`: a respawn against a LIVE key scheduled
+//! later than the spec asks for pulls that key's `execute_at` forward — to
+//! the spec's own `schedule_at`, or now when it has none — instead of
+//! resolving to the holder and doing nothing.
 //!
 //! Two properties carry the whole feature, and each has a test whose failure
 //! mode is deterministic:
@@ -440,9 +441,116 @@ async fn force_reschedule_never_shortens_a_retry_backoff() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A respawn can only ever move `execute_at` EARLIER. A due row asked to
-/// reschedule far into the future stays due — `schedule_at` is a property of
-/// a job being CREATED, and a resolved spec never rewrites the holder.
+/// A wake pulls the holder in to the time the SPEC asks for, not
+/// unconditionally to now: an hour-long hold plus a five-minute
+/// `schedule_at` lands at five minutes. "Wake it" and "wake it by T" are the
+/// same operation, and a caller that knows when the work is actually due
+/// does not have to drag the job to now to say so.
+#[tokio::test]
+async fn force_reschedule_pulls_forward_to_the_specs_own_schedule_at() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("force-reschedule-target");
+    let spawner = jobs.add_keyed_initializer(Init::new(&job_type, Behaviour::Idle));
+
+    spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg).schedule_at(Utc::now() + HOLD),
+        ])
+        .await?;
+
+    let target = Utc::now() + chrono::TimeDelta::minutes(5);
+    let woken = spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg)
+                .schedule_at(target)
+                .force_reschedule(),
+        ])
+        .await?;
+    assert!(
+        woken[0].pulled_forward,
+        "an hour out is later than 5 minutes"
+    );
+    assert_eq!(
+        execute_at(&pool, &job_type, "k").await?,
+        target,
+        "the row must land on the requested time, not on now"
+    );
+
+    // Idempotent at the same target, and a LATER target moves nothing.
+    let again = spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg)
+                .schedule_at(target)
+                .force_reschedule(),
+            KeyedJobSpec::new("k", Cfg)
+                .schedule_at(Utc::now() + HOLD)
+                .force_reschedule(),
+        ])
+        .await?;
+    assert!(again.iter().all(|s| !s.pulled_forward));
+    assert_eq!(execute_at(&pool, &job_type, "k").await?, target);
+
+    // An earlier target still wins afterwards — monotone, not one-shot.
+    let sooner = Utc::now() + chrono::TimeDelta::minutes(1);
+    let third = spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg)
+                .schedule_at(sooner)
+                .force_reschedule(),
+        ])
+        .await?;
+    assert!(third[0].pulled_forward);
+    assert_eq!(execute_at(&pool, &job_type, "k").await?, sooner);
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Several wake specs for ONE key in a single call collapse to the earliest
+/// target — the `MIN` in the `targets` CTE — rather than letting the join
+/// pick one of them arbitrarily.
+#[tokio::test]
+async fn repeated_wake_specs_for_one_key_take_the_earliest_target() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("force-reschedule-earliest");
+    let spawner = jobs.add_keyed_initializer(Init::new(&job_type, Behaviour::Idle));
+
+    spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg).schedule_at(Utc::now() + HOLD),
+        ])
+        .await?;
+
+    let earliest = Utc::now() + chrono::TimeDelta::minutes(2);
+    let later = Utc::now() + chrono::TimeDelta::minutes(30);
+    let woken = spawner
+        .spawn_all(vec![
+            KeyedJobSpec::new("k", Cfg)
+                .schedule_at(later)
+                .force_reschedule(),
+            KeyedJobSpec::new("k", Cfg)
+                .schedule_at(earliest)
+                .force_reschedule(),
+        ])
+        .await?;
+    assert!(woken.iter().all(|s| s.pulled_forward));
+    assert_eq!(
+        execute_at(&pool, &job_type, "k").await?,
+        earliest,
+        "the earliest requested wake must win, deterministically"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A respawn can only ever move `execute_at` EARLIER. A row that is already
+/// due, asked to wake an hour from now, stays due: the target is a ceiling on
+/// when the job runs, never a delay imposed on a holder.
 #[tokio::test]
 async fn force_reschedule_never_pushes_execute_at_later() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;

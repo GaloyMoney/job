@@ -16,19 +16,14 @@
 //! A spawn against a LIVE key resolves to its holder and, by default,
 //! changes nothing — so a holder parked in the future runs at its own
 //! deadline no matter how much work arrives meanwhile.
-//! [`KeyedJobSpec::force_reschedule`] opts a spawn out of that: it
-//! pulls the holder's `execute_at` forward to now, monotonically (earlier
-//! only) and never over a backoff. See
-//! [`KeyedJobSpawner::spawn_all_in_op`].
+//! [`KeyedJobSpec::force_reschedule`] opts a spawn out of that: it pulls the
+//! holder's `execute_at` forward to the time the spec asks for (its
+//! `schedule_at`, or now), monotonically (earlier only) and never over a
+//! backoff. See [`KeyedJobSpawner::spawn_all_in_op`].
 
 use chrono::{DateTime, Utc};
 use serde::{Serialize, de::DeserializeOwned};
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Debug,
-    marker::PhantomData,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use es_entity::clock::ClockHandle;
 use tracing::instrument;
@@ -135,20 +130,26 @@ impl<Config> KeyedJobSpec<Config> {
     }
 
     /// Treat this spawn as a liveness signal as well as a work request: if
-    /// the key is already held by a job parked in the FUTURE, pull that
-    /// job's `execute_at` forward to now instead of doing nothing.
+    /// the key is already held by a job scheduled LATER than this spec asks
+    /// for, pull that job's `execute_at` forward instead of doing nothing.
     ///
     /// Without it, a spawn against a live key resolves to the holder and has
     /// no effect at all — so a job that parked itself far ahead (say a
     /// keyed subscriber holding a deadline via
     /// [`crate::JobCompletion::RescheduleAt`]) cannot be woken by arriving
-    /// work and runs only when its own deadline comes due. With it, the
-    /// respawn means *"run no later than now"*.
+    /// work and runs only when its own deadline comes due.
+    ///
+    /// The target is this spec's own [`Self::schedule_at`], or now when it
+    /// has none — the same `execute_at` a job created by this spec would
+    /// have been given. So the respawn means *"run no later than when I am
+    /// asking for"*: with no `schedule_at` that is "no later than now", and
+    /// with one it can pull an hour-long hold in to five minutes and no
+    /// further.
     ///
     /// The move is monotone and idempotent: `execute_at` only ever moves
-    /// EARLIER, never later, and a second call against an already-due row
-    /// changes nothing. [`KeyedSpawn::pulled_forward`] reports whether this
-    /// call was the one that moved the row.
+    /// EARLIER, never later, and a repeat of the same request changes
+    /// nothing. [`KeyedSpawn::pulled_forward`] reports whether this call was
+    /// the one that moved the row.
     ///
     /// # It never shortens a backoff
     ///
@@ -183,12 +184,13 @@ pub struct KeyedSpawn {
     /// that already held the key. Use it to decide whether to perform
     /// first-time side effects alongside the spawn, in the same `op`.
     pub created: bool,
-    /// `true` if this call moved the holder's `execute_at` forward to now —
-    /// only ever set for a [`KeyedJobSpec::force_reschedule`] spec that
-    /// resolved to a holder parked in the future and eligible to be woken
-    /// (see [`KeyedJobSpawner::spawn_all_in_op`]). Always `false` when
-    /// `created` is `true`: a job created now is already due at the time it
-    /// asked for.
+    /// `true` if this call moved the holder's `execute_at` EARLIER, to the
+    /// time this spec asked for — its [`KeyedJobSpec::schedule_at`], or now
+    /// when it has none. Only ever set for a
+    /// [`KeyedJobSpec::force_reschedule`] spec that resolved to a holder
+    /// scheduled later than that and eligible to be woken (see
+    /// [`KeyedJobSpawner::spawn_all_in_op`]). Always `false` when `created`
+    /// is `true`: a job created here already carries the time it asked for.
     ///
     /// `created == false && pulled_forward == false` is the ordinary
     /// resolve-to-holder outcome: the key was live and nothing was changed.
@@ -377,10 +379,11 @@ where
     /// # Waking a live holder ([`KeyedJobSpec::force_reschedule`])
     ///
     /// A spec that resolves to a holder normally has no effect whatsoever.
-    /// With the flag set it additionally runs
-    /// `pull_forward_in_op` — `execute_at = LEAST(execute_at, now)`
-    /// for the holder's row — turning the respawn into "run no later than
-    /// now" for a job parked in the future.
+    /// With the flag set it additionally runs `pull_forward_in_op` —
+    /// `execute_at = LEAST(execute_at, target)` for the holder's row, where
+    /// the target is the spec's own `schedule_at` or now — turning the
+    /// respawn into "run no later than the time I am asking for" for a job
+    /// scheduled beyond it.
     ///
     /// Two things make that safe:
     ///
@@ -434,12 +437,16 @@ where
         let mut new_keys: Vec<String> = Vec::new();
         let mut new_schedule_times: Vec<DateTime<Utc>> = Vec::new();
         let mut wake_keys: Vec<String> = Vec::new();
+        let mut wake_targets: Vec<DateTime<Utc>> = Vec::new();
         let mut wake_outcomes: Vec<usize> = Vec::new();
         let mut outcomes = Vec::with_capacity(specs.len());
 
         for spec in specs {
             if let Some(id) = live.get(&spec.key).or_else(|| seen.get(&spec.key)) {
                 if spec.force_reschedule {
+                    // The same target a NEW job of this spec would get: its
+                    // own `schedule_at`, or now when it has none.
+                    wake_targets.push(spec.schedule_at.unwrap_or(default_schedule_at));
                     wake_keys.push(spec.key.clone());
                     wake_outcomes.push(outcomes.len());
                 }
@@ -493,13 +500,13 @@ where
         }
 
         let pulled = self
-            .pull_forward_in_op(op, &wake_keys, default_schedule_at)
+            .pull_forward_in_op(op, &wake_keys, &wake_targets)
             .await?;
         // Reported only on the specs that ASKED for a wake: a plain spec
         // sharing a key with one of them in the same call still reads as the
         // no-op it requested.
         for i in wake_outcomes {
-            outcomes[i].pulled_forward = pulled.contains(&outcomes[i].key);
+            outcomes[i].pulled_forward = pulled.contains_key(&outcomes[i].key);
         }
 
         // Nothing created and nothing moved means nothing to announce: a
@@ -509,14 +516,21 @@ where
             return Ok(outcomes);
         }
 
+        // Fires for a row moved to a FUTURE instant too, not just a due one:
+        // a peer poller is asleep on a deadline computed before this write,
+        // and `min_wait` reports only strictly-future deadlines, so a row
+        // that just became earlier than that sleep target has no other way
+        // to be noticed until the sleep expires.
         self.notifier
             .execution_ready_in_op(op, &self.job_type)
             .await?;
 
         let now = self.clock.now();
-        // A pulled-forward row is due by construction: its `execute_at` was
-        // just set to now.
-        let n_due = new_schedule_times.iter().filter(|at| **at <= now).count() + pulled.len();
+        // Claim demand is DUE-now work only, so a row pulled forward to a
+        // still-future instant contributes nothing here — the notify above
+        // is what covers it.
+        let n_due = new_schedule_times.iter().filter(|at| **at <= now).count()
+            + pulled.values().filter(|at| **at <= now).count();
         if n_due > 0
             && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
         {
@@ -526,14 +540,26 @@ where
         Ok(outcomes)
     }
 
-    /// `execute_at = LEAST(execute_at, now)` for every one of `keys` whose
-    /// live row is parked in the future and eligible to be woken. Returns the
-    /// keys actually moved — nothing at all is written for a key already due,
+    /// `execute_at = LEAST(execute_at, target)` for every one of `keys`
+    /// whose live row sits later than that key's `target` and is eligible to
+    /// be woken. Returns each moved key with its new `execute_at` — nothing
+    /// at all is written for a key already due at or before its target,
     /// already running, or backing off.
+    ///
+    /// `keys[n]` pairs with `targets[n]`. The target is the spec's own
+    /// `schedule_at`, or the caller's `now` when it has none — i.e. exactly
+    /// the `execute_at` a NEW job of that spec would have been given, so
+    /// "wake this key" and "create this key" agree on when the work is
+    /// wanted. A wake is therefore *"run no later than T"*, not just *"run
+    /// now"*: a caller that knows the work is only due in five minutes can
+    /// pull a one-hour hold to five minutes and no further. A key repeated
+    /// across several wake specs in one call collapses to its EARLIEST
+    /// target (`MIN` in the `targets` CTE), which is both the monotone
+    /// answer and what keeps the `UPDATE ... FROM` join single-rowed.
     ///
     /// The guards, in the order they matter:
     ///
-    /// - `execute_at > now` makes the write monotone: a row can only move
+    /// - `execute_at > target` makes the write monotone: a row can only move
     ///   EARLIER. `LEAST` restates that in the `SET` so the statement is
     ///   still monotone read on its own.
     /// - `attempt_index <= 1` is the backoff guard. A `RetryPolicy` retry
@@ -552,12 +578,11 @@ where
     ///   `JobRepo::lock_and_check_live_keys_in_op` for the rest of the
     ///   transaction.
     ///
-    /// `now` is the caller's own `op.maybe_now()`-or-clock instant — the SAME
-    /// value a row created by this call would get as its `execute_at`, and the
-    /// same basis the poller compares against, rather than the server's
-    /// `NOW()`. Every `execute_at` this crate writes comes from the injected
-    /// clock (`NOW()` is used only for `alive_at`/`created_at`), and a woken
-    /// row has to look due to a poller reading that clock.
+    /// A `now`-derived target is the caller's own `op.maybe_now()`-or-clock
+    /// instant, the same basis the poller compares against, rather than the
+    /// server's `NOW()`. Every `execute_at` this crate writes comes from the
+    /// injected clock (`NOW()` is used only for `alive_at`/`created_at`), and
+    /// a woken row has to look due to a poller reading that clock.
     ///
     /// It is read before the advisory locks are waited on, so a caller that
     /// blocked behind another writer moves the row to a slightly stale
@@ -577,29 +602,38 @@ where
         &self,
         op: &mut impl es_entity::AtomicOperation,
         keys: &[String],
-        now: DateTime<Utc>,
-    ) -> Result<HashSet<String>, JobError> {
+        targets: &[DateTime<Utc>],
+    ) -> Result<HashMap<String, DateTime<Utc>>, JobError> {
         if keys.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(HashMap::new());
         }
         let rows = sqlx::query!(
             r#"
-            UPDATE job_executions
-               SET execute_at = LEAST(execute_at, $3)
-             WHERE job_type = $1
-               AND unique_key = ANY($2)
-               AND state = 'pending'
-               AND attempt_index <= 1
-               AND execute_at > $3
-            RETURNING unique_key AS "unique_key!"
+            WITH targets AS (
+                SELECT unique_key, MIN(target) AS target
+                FROM UNNEST($2::text[], $3::timestamptz[]) AS t(unique_key, target)
+                GROUP BY unique_key
+            )
+            UPDATE job_executions je
+               SET execute_at = LEAST(je.execute_at, t.target)
+              FROM targets t
+             WHERE je.job_type = $1
+               AND je.unique_key = t.unique_key
+               AND je.state = 'pending'
+               AND je.attempt_index <= 1
+               AND je.execute_at > t.target
+            RETURNING je.unique_key AS "unique_key!", je.execute_at AS "execute_at!"
             "#,
             &self.job_type as &JobType,
             keys,
-            now,
+            targets,
         )
         .fetch_all(op.as_executor())
         .await?;
-        Ok(rows.into_iter().map(|r| r.unique_key).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.unique_key, r.execute_at))
+            .collect())
     }
 
     /// Insert the `job_executions` row claiming each key.

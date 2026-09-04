@@ -297,9 +297,10 @@
 //! means a generation parked in the future (one that returned
 //! [`JobCompletion::RescheduleAt`]) waits for its own deadline no matter what
 //! arrives meanwhile. [`KeyedJobSpec::force_reschedule`] turns such a spawn
-//! into "run no later than now": it pulls the holder's `execute_at` forward,
-//! monotonically (earlier only, never later) and never over a retry backoff,
-//! and reports through [`KeyedSpawn::pulled_forward`] whether it moved
+//! into "run no later than the time I am asking for": it pulls the holder's
+//! `execute_at` forward to the spec's own `schedule_at` (or now, when it has
+//! none), monotonically — earlier only, never later — and never over a retry
+//! backoff, reporting through [`KeyedSpawn::pulled_forward`] whether it moved
 //! anything.
 //!
 //! ```ignore
@@ -307,6 +308,16 @@
 //! shard_spawner
 //!     .spawn_all_in_op(&mut op, vec![
 //!         KeyedJobSpec::new(format!("shard-{shard_id}"), cfg).force_reschedule(),
+//!     ])
+//!     .await?;
+//!
+//! // ... or no later than a deadline of the caller's own, which pulls a
+//! // longer hold in without dragging it all the way to now.
+//! shard_spawner
+//!     .spawn_all_in_op(&mut op, vec![
+//!         KeyedJobSpec::new(format!("shard-{shard_id}"), cfg)
+//!             .schedule_at(next_batch_window)
+//!             .force_reschedule(),
 //!     ])
 //!     .await?;
 //! ```
