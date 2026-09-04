@@ -1,3 +1,15 @@
+# [job release v0.13.16](https://github.com/GaloyMoney/job/releases/tag/0.13.16)
+
+
+
+### Features
+
+- `force_reschedule` pulls a live key's wake forward, never over a backoff (#209)
+
+### Performance
+
+- A wake only reaches the database for keys that were already live
+
 # [job release v0.13.15](https://github.com/GaloyMoney/job/releases/tag/0.13.15)
 
 
