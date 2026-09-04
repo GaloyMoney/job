@@ -293,6 +293,35 @@
 //! }
 //! ```
 //!
+//! A spawn that resolves to a live holder changes nothing by default, which
+//! means a generation parked in the future (one that returned
+//! [`JobCompletion::RescheduleAt`]) waits for its own deadline no matter what
+//! arrives meanwhile. [`KeyedJobSpec::force_reschedule`] turns such a spawn
+//! into "run no later than the time I am asking for": it pulls the holder's
+//! `execute_at` forward to the spec's own `schedule_at` (or now, when it has
+//! none), monotonically — earlier only, never later — and never over a retry
+//! backoff, reporting through [`KeyedSpawn::pulled_forward`] whether it moved
+//! anything.
+//!
+//! ```ignore
+//! // A held subscriber wakes as soon as work for its key shows up.
+//! shard_spawner
+//!     .spawn_all_in_op(&mut op, vec![
+//!         KeyedJobSpec::new(format!("shard-{shard_id}"), cfg).force_reschedule(),
+//!     ])
+//!     .await?;
+//!
+//! // ... or no later than a deadline of the caller's own, which pulls a
+//! // longer hold in without dragging it all the way to now.
+//! shard_spawner
+//!     .spawn_all_in_op(&mut op, vec![
+//!         KeyedJobSpec::new(format!("shard-{shard_id}"), cfg)
+//!             .schedule_at(next_batch_window)
+//!             .force_reschedule(),
+//!     ])
+//!     .await?;
+//! ```
+//!
 //! By default a keyed generation's execution state (see
 //! [`CurrentJob::update_execution_state`]) is deleted when it terminates, just
 //! like a regular job's. Set [`KeyedJobInitializer::inherits_state`] to make it
