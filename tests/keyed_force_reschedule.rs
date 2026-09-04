@@ -465,7 +465,7 @@ async fn a_respawn_without_the_flag_leaves_a_hold_alone() -> anyhow::Result<()> 
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
     let mut jobs = Jobs::init(config).await?;
-    let job_type = helpers::job_type("force-reschedule-optin");
+    let job_type = helpers::job_type("force-reschedule-opt-in");
     let spawner = jobs.add_keyed_initializer(Init::new(&job_type, Behaviour::Idle));
 
     let held = spawner
