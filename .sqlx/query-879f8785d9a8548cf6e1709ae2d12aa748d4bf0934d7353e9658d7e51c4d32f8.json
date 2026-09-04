@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE job_executions\n               SET execute_at = LEAST(execute_at, $3)\n             WHERE job_type = $1\n               AND unique_key = ANY($2)\n               AND state = 'pending'\n               AND attempt_index <= 1\n               AND execute_at > $3\n            RETURNING unique_key AS \"unique_key!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "unique_key!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "879f8785d9a8548cf6e1709ae2d12aa748d4bf0934d7353e9658d7e51c4d32f8"
+}
