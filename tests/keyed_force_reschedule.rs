@@ -23,7 +23,7 @@
 mod helpers;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use job::{
     CurrentJob, Job, JobCompletion, JobRunner, JobSvcConfig, JobType, Jobs, KeyedJobInitializer,
     KeyedJobSpawner, KeyedJobSpec, RetrySettings,
@@ -168,6 +168,17 @@ fn register_filler(jobs: &mut Jobs) {
         let job_type = helpers::job_type("force-reschedule-filler");
         let _ = jobs.add_keyed_initializer(Init::new(&job_type, Behaviour::Idle));
     }
+}
+
+/// `Utc::now() + delta`, truncated to what Postgres can actually store.
+///
+/// `timestamptz` holds microseconds; `Utc::now()` carries nanoseconds on
+/// Linux (macOS happens to give microseconds already, which is why this only
+/// ever showed up in CI). Any test asserting that a row landed on EXACTLY the
+/// instant it asked for has to ask for an instant that survives the round
+/// trip.
+fn target_in(delta: chrono::TimeDelta) -> DateTime<Utc> {
+    (Utc::now() + delta).trunc_subsecs(6)
 }
 
 async fn row(
@@ -460,7 +471,7 @@ async fn force_reschedule_pulls_forward_to_the_specs_own_schedule_at() -> anyhow
         ])
         .await?;
 
-    let target = Utc::now() + chrono::TimeDelta::minutes(5);
+    let target = target_in(chrono::TimeDelta::minutes(5));
     let woken = spawner
         .spawn_all(vec![
             KeyedJobSpec::new("k", Cfg)
@@ -493,7 +504,7 @@ async fn force_reschedule_pulls_forward_to_the_specs_own_schedule_at() -> anyhow
     assert_eq!(execute_at(&pool, &job_type, "k").await?, target);
 
     // An earlier target still wins afterwards — monotone, not one-shot.
-    let sooner = Utc::now() + chrono::TimeDelta::minutes(1);
+    let sooner = target_in(chrono::TimeDelta::minutes(1));
     let third = spawner
         .spawn_all(vec![
             KeyedJobSpec::new("k", Cfg)
@@ -525,8 +536,8 @@ async fn repeated_wake_specs_for_one_key_take_the_earliest_target() -> anyhow::R
         ])
         .await?;
 
-    let earliest = Utc::now() + chrono::TimeDelta::minutes(2);
-    let later = Utc::now() + chrono::TimeDelta::minutes(30);
+    let earliest = target_in(chrono::TimeDelta::minutes(2));
+    let later = target_in(chrono::TimeDelta::minutes(30));
     let woken = spawner
         .spawn_all(vec![
             KeyedJobSpec::new("k", Cfg)
