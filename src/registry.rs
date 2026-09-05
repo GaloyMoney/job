@@ -328,13 +328,15 @@ impl JobRegistry {
     }
 
     /// Every job type the tracker must notify on for a freed slot: the plain
-    /// types carrying a per-process cap, whose backlog only becomes claimable
-    /// again on the next poll.
+    /// types carrying a per-process cap, and every batched type (capped at
+    /// `max_concurrent_per_process` batches), whose backlog only becomes
+    /// claimable again on the next poll.
     pub(super) fn capped_types(&self) -> Vec<JobType> {
         self.concurrency
             .iter()
             .filter(|(_, cap)| cap.is_some())
             .map(|(job_type, _)| job_type.clone())
+            .chain(self.batch_policies.keys().cloned())
             .collect()
     }
 }
@@ -373,5 +375,35 @@ mod tests {
         let job_type = registry.add_initializer(ZeroCapInitializer);
 
         assert_eq!(registry.per_process_cap(&job_type), Some(1));
+    }
+
+    struct BatchedInitializer;
+
+    impl BatchedJobInitializer for BatchedInitializer {
+        type Config = ();
+
+        fn job_type(&self) -> JobType {
+            JobType::new("registry-batched-capped-test")
+        }
+
+        fn init(
+            &self,
+            _: JobSpawner<Self::Config>,
+        ) -> Result<
+            Box<dyn crate::BatchedJobRunner<Config = Self::Config>>,
+            Box<dyn std::error::Error>,
+        > {
+            unimplemented!("never invoked by this test")
+        }
+    }
+
+    /// A batched type is capped (at `max_concurrent_per_process` batches),
+    /// so a unit it hands back quietly must still count as a freed slot.
+    #[test]
+    fn capped_types_include_batched_types() {
+        let mut registry = JobRegistry::new();
+        let job_type = registry.add_batched_initializer(BatchedInitializer);
+
+        assert!(registry.capped_types().contains(&job_type));
     }
 }
