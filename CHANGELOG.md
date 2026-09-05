@@ -1,3 +1,11 @@
+# [job release v0.13.17](https://github.com/GaloyMoney/job/releases/tag/0.13.17)
+
+
+
+### Refactor
+
+- Relax _in_op fn bounds to + ?Sized, bump es-entity to 0.12.20 (#210)
+
 # [job release v0.13.16](https://github.com/GaloyMoney/job/releases/tag/0.13.16)
 
 
