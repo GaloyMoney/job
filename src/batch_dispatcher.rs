@@ -205,7 +205,7 @@ impl BatchDispatcher {
     /// recycling per completed AND per terminally-failed item would try to
     /// spend the SAME freed unit twice whenever one batch disposes items
     /// both ways.
-    fn try_recycle_own_type(&mut self, op: &mut impl AtomicOperation) {
+    fn try_recycle_own_type(&mut self, op: &mut (impl AtomicOperation + ?Sized)) {
         // "Exactly once" has to hold across the conflict retries in
         // `seal_in_own_op`/`fail_batch` too, not just across sub-outcome
         // branches. A rolled-back attempt drops its `UnitReservation`, and
@@ -548,7 +548,7 @@ impl BatchDispatcher {
     /// pass over every disposition, then the completion-recycle.
     async fn seal(
         &mut self,
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         outcomes: BatchOutcomes,
     ) -> Result<(), JobError> {
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());

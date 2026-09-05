@@ -507,7 +507,7 @@ impl JobDispatcher {
     /// extra poll: `recycle_unit` has already cleared `dispatched`, so
     /// `Drop` correctly declines to release the unit a second time.
     /// Mirrors `BatchDispatcher::try_recycle_own_type`.
-    fn recycle_into_claim(&mut self, op: &mut impl es_entity::AtomicOperation) {
+    fn recycle_into_claim(&mut self, op: &mut (impl es_entity::AtomicOperation + ?Sized)) {
         if self.recycled {
             return;
         }
@@ -529,7 +529,7 @@ impl JobDispatcher {
     #[instrument(name = "job.complete_job", skip(self, op), fields(id = %id))]
     async fn complete_job(
         &mut self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: JobId,
     ) -> Result<(), JobError> {
         let items = [(id, Disposition::Complete)];
@@ -547,7 +547,7 @@ impl JobDispatcher {
     #[instrument(name = "job.reschedule_job", skip(self, op), fields(id = %id, reschedule_at = %reschedule_at, attempt = 1))]
     async fn reschedule_job(
         &mut self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: JobId,
         reschedule_at: DateTime<Utc>,
     ) -> Result<(), JobError> {

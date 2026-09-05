@@ -27,6 +27,7 @@
 //! reservation.
 
 use chrono::{DateTime, Utc};
+use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tracing::{Span, instrument};
@@ -841,7 +842,7 @@ impl JobPoller {
 
     async fn claim_after_many(
         self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         job_type: &JobType,
         now: DateTime<Utc>,
         n_units: usize,
@@ -874,7 +875,7 @@ impl JobPoller {
 
     pub(crate) fn register_claim_demand(
         self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         job_type: &JobType,
         n_due: usize,
     ) {
@@ -887,7 +888,7 @@ impl JobPoller {
 
     pub(crate) fn register_claim_recycle(
         self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         job_type: &JobType,
         reservation: UnitReservation,
     ) {
@@ -895,8 +896,8 @@ impl JobPoller {
         Self::register_claim_hook(op, hook);
     }
 
-    fn register_claim_hook(op: &mut impl es_entity::AtomicOperation, hook: ClaimHook) {
-        if op.add_commit_hook(hook).is_err() {
+    fn register_claim_hook(mut op: &mut (impl AtomicOperation + ?Sized), hook: ClaimHook) {
+        if (&mut op).add_commit_hook(hook).is_err() {
             tracing::error!(
                 "short-circuit claim could not register its commit hook; \
                  any recycled unit released normally, any fresh demand is simply not claimed \

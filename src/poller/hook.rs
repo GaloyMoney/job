@@ -76,7 +76,7 @@ pub(crate) static PROBE_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) async fn claim_due_heads_in_op(
-    op: &mut impl es_entity::AtomicOperation,
+    op: &mut (impl es_entity::AtomicOperation + ?Sized),
     job_type: &JobType,
     instance_id: uuid::Uuid,
     now: DateTime<Utc>,
@@ -938,6 +938,73 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(200), notified)
             .await
             .expect("the hand-back that crosses min_jobs must wake the poll loop");
+        Ok(())
+    }
+
+    struct BatchedInitializer {
+        job_type: JobType,
+    }
+
+    impl crate::BatchedJobInitializer for BatchedInitializer {
+        type Config = ();
+
+        fn job_type(&self) -> JobType {
+            self.job_type.clone()
+        }
+
+        fn init(
+            &self,
+            _: crate::JobSpawner<Self::Config>,
+        ) -> Result<
+            Box<dyn crate::BatchedJobRunner<Config = Self::Config>>,
+            Box<dyn std::error::Error>,
+        > {
+            unimplemented!("never invoked by this test")
+        }
+    }
+
+    /// A batched type is capped at `max_concurrent_per_process` batches, so
+    /// the planner excludes it (and the poll prices `MAX_WAIT`) while its
+    /// slots are full. A completion that recycled its unit has detached
+    /// from `batch_completed`'s always-wake, so its empty-probe hand-back
+    /// is the freed slot's ONLY wake -- on both hand-back paths, well below
+    /// the `min_jobs` crossing.
+    #[tokio::test]
+    async fn hand_back_of_a_batched_type_wakes_the_poll_loop() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = JobType::from_owned(format!("hand-back-batched-{}", uuid::Uuid::now_v7()));
+
+        let mut registry = crate::registry::JobRegistry::new();
+        registry.add_batched_initializer(BatchedInitializer {
+            job_type: job_type.clone(),
+        });
+
+        let tracker = Arc::new(crate::tracker::JobTracker::new(10, 20));
+        tracker.set_job_types(vec![job_type.clone()]);
+        tracker.set_capped_types(registry.capped_types().into_iter().collect());
+        let poller =
+            super::super::test_support::build_poller(&pool, registry, Arc::clone(&tracker)).await?;
+        let repo = JobRepo::new(&pool);
+
+        tracker.dispatch_batch(&job_type, &[JobId::new()]);
+        tracker.dispatch_batch(&job_type, &[JobId::new()]);
+
+        tracker.set_due_hint(&job_type);
+        let notified = tracker.notified();
+        let mut op = repo.begin_op_with_clock(&poller.clock).await?;
+        poller.register_claim_recycle(&mut op, &job_type, tracker.recycle(&job_type));
+        op.commit().await?;
+        tokio::time::timeout(std::time::Duration::from_millis(200), notified)
+            .await
+            .expect("a batched type's empty probe must wake the poll loop");
+
+        let notified = tracker.notified();
+        let mut op = repo.begin_op_with_clock(&poller.clock).await?;
+        poller.register_claim_recycle(&mut op, &job_type, tracker.recycle(&job_type));
+        op.commit().await?;
+        tokio::time::timeout(std::time::Duration::from_millis(200), notified)
+            .await
+            .expect("a batched type's due-hint skip must wake the poll loop");
         Ok(())
     }
 

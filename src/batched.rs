@@ -271,7 +271,7 @@ impl<C> BatchedJobItem<C> {
     /// Update this job's execution state as part of an existing operation.
     pub async fn update_execution_state_in_op<T: Serialize>(
         &mut self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
     ) -> Result<(), JobError> {
         let execution_state_json = serde_json::to_value(execution_state)
@@ -318,7 +318,7 @@ impl<C> BatchedJobItem<C> {
     /// [`JobOutcome::result`](crate::JobOutcome::result).
     pub async fn set_result_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         result: &impl Serialize,
     ) -> Result<(), JobError> {
         let job_result =

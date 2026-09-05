@@ -125,11 +125,12 @@ async fn batched_jobs_complete_and_are_awaitable() -> anyhow::Result<()> {
                     label: format!("item-{i}"),
                 },
             )
-            // Namespaced per test: the poll query's "is this queue busy"
-            // anti-join matches on queue_id across *every* job type, so a
-            // generic name here would block an unrelated test's job of a
-            // different type that happened to pick the same one.
-            .queue_id(format!("batched-complete-all-q{i}"))
+            // Namespaced per run, not just per test: the "is this queue
+            // busy" check matches on queue_id across *every* job type, so an
+            // orphaned pending head left behind by an interrupted earlier run
+            // (see `helpers::unique`) would park this run's job in the same
+            // queue forever, never mind that its type is unregistered.
+            .queue_id(helpers::unique(&format!("batched-complete-all-q{i}")))
         })
         .collect();
     let ids: Vec<JobId> = specs.iter().map(|s| s.id).collect();

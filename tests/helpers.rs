@@ -54,6 +54,11 @@ pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
 /// own batches, corrupting exact item- and probe-count assertions. Suffixing
 /// makes every run's types disjoint; the orphans are inert, because every
 /// claim path filters on `registry.registered_job_types()`.
+///
+/// Queue ids need the same treatment: an orphaned `pending` row still
+/// occupies its queue's head, and the queue-busy check matches on `queue_id`
+/// across every job type, so a fixed queue name parks each later run's job
+/// behind an occupant nothing will ever claim.
 #[allow(dead_code)]
 pub fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::now_v7())
