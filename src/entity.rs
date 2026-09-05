@@ -132,6 +132,11 @@ pub(crate) struct RetryPolicy {
     pub min_backoff: Duration,
     pub max_backoff: Duration,
     pub backoff_jitter_pct: u8,
+    /// Retained for configuration compatibility with `RetrySettings`. The
+    /// attempt counter no longer resets on elapsed time; it resets only on
+    /// evidence of recovery (issue #163), so this value is currently unused
+    /// by the policy.
+    #[allow(dead_code)]
     pub attempt_reset_after_backoff_multiples: u32,
 }
 
@@ -169,26 +174,34 @@ impl RetryPolicy {
         backoff_ms.saturating_add_signed(jitter).min(max_ms)
     }
 
-    fn should_reset_attempt_count(&self, now: DateTime<Utc>, window: RetryWindow) -> bool {
-        let Some(elapsed_since_scheduled) = window.elapsed_since_retry_schedule(now) else {
-            return false;
-        };
-        let Some(reset_threshold) = window
-            .backoff_duration()
-            .checked_mul(self.attempt_reset_after_backoff_multiples)
-        else {
-            return false;
-        };
-        elapsed_since_scheduled > reset_threshold
+    /// Whether the accumulated attempt count may be forgiven.
+    ///
+    /// Forgiveness is reserved for a job that *demonstrably recovered* — ran
+    /// to completion after its previous failure. It must never fire on the
+    /// passage of clock time alone: under a manual/simulated domain clock an
+    /// advance is not recovery, and under the real clock scheduler/poller
+    /// latency is not recovery either (issue #163). `recovered` is supplied by
+    /// [`Job::has_recovered_since_last_failure`].
+    ///
+    /// The `attempt_reset_after_backoff_multiples` setting is retained on
+    /// `RetryPolicy`/`RetrySettings` for configuration compatibility, but
+    /// recovery — not elapsed time — is what gates the reset.
+    fn should_reset_attempt_count(&self, recovered: bool) -> bool {
+        recovered
     }
 }
 
+// `RetryWindow` and `Job::latest_retry_window` are no longer used by the
+// retry decision (which is now gated on recovery evidence, not elapsed time).
+// They are retained for the existing window-construction tests.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RetryWindow {
     failure_recorded_at: DateTime<Utc>,
     retry_scheduled_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
 impl RetryWindow {
     fn new(failure_recorded_at: DateTime<Utc>, retry_scheduled_at: DateTime<Utc>) -> Option<Self> {
         if failure_recorded_at >= retry_scheduled_at {
@@ -436,11 +449,7 @@ impl Job {
         error: String,
     ) -> Option<(DateTime<Utc>, u32)> {
         let mut current_attempt = attempt.max(1);
-        if self
-            .latest_retry_window()
-            .map(|window| retry_policy.should_reset_attempt_count(now, window))
-            .unwrap_or(false)
-        {
+        if retry_policy.should_reset_attempt_count(self.has_recovered_since_last_failure()) {
             current_attempt = 1;
             self.events.push(JobEvent::AttemptCounterReset);
         }
@@ -457,6 +466,7 @@ impl Job {
         Some((reschedule_at, next_attempt))
     }
 
+    #[cfg(test)]
     fn latest_retry_window(&self) -> Option<RetryWindow> {
         for persisted in self.events.iter_persisted().rev() {
             if let JobEvent::ExecutionScheduled {
@@ -475,6 +485,33 @@ impl Job {
             }
         }
         None
+    }
+
+    /// Whether the job ran to completion at any point after its most recent
+    /// failure — the only trustworthy evidence of recovery.
+    ///
+    /// A job that recovered emits an `ExecutionCompleted` (via
+    /// [`Self::reschedule_execution`] for a self-rescheduling run, or
+    /// [`Self::complete_job`] for a finishing one). Because that event is only
+    /// ever produced by a run that *finished*, its presence after the last
+    /// `ExecutionErrored` proves the job worked again between failures —
+    /// independent of any clock. A deterministically failing job never
+    /// produces one, so its attempt counter climbs to `max_attempts` and the
+    /// job terminates (issue #163).
+    ///
+    /// Note this is deliberately *not* a wall-clock or elapsed-time probe: the
+    /// retry window's timestamps and the `now` passed to
+    /// [`Self::maybe_schedule_retry`] all live on the injectable domain clock,
+    /// which a manual/simulated clock can advance without any run occurring.
+    fn has_recovered_since_last_failure(&self) -> bool {
+        for event in self.events.iter_all().rev() {
+            match event {
+                JobEvent::ExecutionErrored { .. } => return false,
+                JobEvent::ExecutionCompleted => return true,
+                _ => {}
+            }
+        }
+        false
     }
 }
 
@@ -596,10 +633,6 @@ mod tests {
 
         fn elapsed_just_under_reset() -> ChronoDuration {
             reset_threshold() - ChronoDuration::seconds(1)
-        }
-
-        fn elapsed_just_over_reset() -> ChronoDuration {
-            reset_threshold() + ChronoDuration::seconds(1)
         }
 
         fn schedule_window(
@@ -781,12 +814,12 @@ mod tests {
         }
 
         #[test]
-        fn maybe_schedule_retry_resets_attempt_after_healthy_gap() {
+        fn maybe_schedule_retry_resets_attempt_after_recovery() {
             let now = Clock::now();
             let job_type = JobType::new("retry-reset");
             let job_id = JobId::new();
             let first_window = schedule_window(now, ChronoDuration::minutes(15));
-            let healthy_window = schedule_window(now, elapsed_just_over_reset());
+            let retry_window = schedule_window(now, ChronoDuration::minutes(1));
             let mut events = vec![(
                 JobEvent::Initialized {
                     id: job_id,
@@ -799,7 +832,14 @@ mod tests {
                 now - ChronoDuration::minutes(30),
             )];
             push_attempt(&mut events, 1, &first_window, Some("first"));
-            events.push(scheduled_event(2, &healthy_window));
+            // The job recovered: a run completed after the failure. Only this
+            // — not the mere passage of clock time — may forgive the attempt
+            // count (issue #163).
+            events.push((
+                JobEvent::ExecutionCompleted,
+                now - ChronoDuration::minutes(2),
+            ));
+            events.push(scheduled_event(2, &retry_window));
             let mut job = job_with_history(job_id, events);
             let retry_policy = build_retry_policy(Some(5));
 
@@ -809,7 +849,7 @@ mod tests {
 
             assert_eq!(
                 next_attempt, 2,
-                "a healthy gap should treat the next run as the second attempt"
+                "a completed run since the last failure should forgive the attempt count"
             );
             let events: Vec<_> = job.events.iter_all().collect();
             assert!(matches!(
@@ -872,7 +912,7 @@ mod tests {
             let job_id = JobId::new();
             let first_window = schedule_window(now, ChronoDuration::minutes(20));
             let second_window = schedule_window(now, ChronoDuration::minutes(10));
-            let healthy_window = schedule_window(now, elapsed_just_over_reset());
+            let retry_window = schedule_window(now, ChronoDuration::minutes(1));
             let mut events = vec![(
                 JobEvent::Initialized {
                     id: job_id,
@@ -886,13 +926,20 @@ mod tests {
             )];
             push_attempt(&mut events, 1, &first_window, Some("first"));
             push_attempt(&mut events, 2, &second_window, Some("second"));
-            events.push(scheduled_event(3, &healthy_window));
+            // A genuine recovery (a completed run) after the second failure is
+            // what forgives the attempt count even at the limit — not the
+            // elapsed time that used to drive this (issue #163).
+            events.push((
+                JobEvent::ExecutionCompleted,
+                now - ChronoDuration::minutes(2),
+            ));
+            events.push(scheduled_event(3, &retry_window));
             let mut job = job_with_history(job_id, events);
             let retry_policy = build_retry_policy(Some(3));
 
             let (_, next_attempt) = job
                 .maybe_schedule_retry(Clock::now(), 3, &retry_policy, "third failure".to_string())
-                .expect("a healthy gap should reset attempt even at limit");
+                .expect("a completed run should reset attempt even at limit");
 
             assert_eq!(next_attempt, 2);
             let events: Vec<_> = job.events.iter_all().collect();
@@ -1043,6 +1090,144 @@ mod tests {
                 "the most recent schedule is not a retry"
             );
         }
+
+        // ---- issue #163 regression tests -------------------------------
+        // A deterministically failing job under an advancing (simulated or
+        // manual) domain clock: each failure is followed by a multi-hour
+        // clock jump, so the old elapsed-time check cleared the reset
+        // threshold on every pass without any successful run in between.
+
+        /// Load a job from already-serialized events, so a growing history
+        /// can be rebuilt into a fresh entity every dispatch cycle (events
+        /// are `Clone` as `serde_json::Value`; `JobEvent` itself is not).
+        fn job_from_raw_history(job_id: JobId, raw: &[(serde_json::Value, DateTime<Utc>)]) -> Job {
+            let generic_events = raw
+                .iter()
+                .enumerate()
+                .map(|(idx, (event, recorded_at))| GenericEvent {
+                    entity_id: job_id,
+                    sequence: (idx as i32) + 1,
+                    event: event.clone(),
+                    context: None,
+                    recorded_at: *recorded_at,
+                    forgettable_payload: None,
+                })
+                .collect::<Vec<_>>();
+
+            EntityEvents::<JobEvent>::load_first::<Job>(generic_events)
+                .expect("load job")
+                .expect("no events")
+        }
+
+        fn raw_event(event: JobEvent) -> serde_json::Value {
+            serde_json::to_value(event).expect("serialize event")
+        }
+
+        #[test]
+        fn maybe_schedule_retry_terminates_at_max_attempts_despite_domain_clock_jumps() {
+            let retry_policy = build_retry_policy(Some(4));
+            let job_type = JobType::new("issue-163-loop");
+            let job_id = JobId::new();
+            let mut now = Clock::now();
+            let mut history: Vec<(serde_json::Value, DateTime<Utc>)> = vec![
+                (
+                    raw_event(JobEvent::Initialized {
+                        id: job_id,
+                        job_type: job_type.clone(),
+                        config: json!({}),
+                        tracing_context: None,
+                        queue_id: None,
+                        unique_key: None,
+                    }),
+                    now - ChronoDuration::minutes(2),
+                ),
+                (
+                    raw_event(JobEvent::ExecutionScheduled {
+                        attempt: 1,
+                        scheduled_at: now - ChronoDuration::minutes(1),
+                    }),
+                    now - ChronoDuration::minutes(2),
+                ),
+            ];
+            let mut attempt = 1u32;
+            let mut terminated = false;
+            // Reload the entity from persisted history every cycle, exactly
+            // like the real dispatch loop (each failure is a separate
+            // transaction), then jump the domain clock forward by hours.
+            for _ in 0..12 {
+                let mut job = job_from_raw_history(job_id, &history);
+                match job.maybe_schedule_retry(now, attempt, &retry_policy, "boom".to_string()) {
+                    Some((reschedule_at, next_attempt)) => {
+                        history.push((
+                            raw_event(JobEvent::ExecutionErrored {
+                                error: "boom".to_string(),
+                            }),
+                            now,
+                        ));
+                        history.push((
+                            raw_event(JobEvent::ExecutionScheduled {
+                                attempt: next_attempt,
+                                scheduled_at: reschedule_at,
+                            }),
+                            now,
+                        ));
+                        attempt = next_attempt;
+                        now += ChronoDuration::hours(6);
+                    }
+                    None => {
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                terminated,
+                "a permanently failing job must terminate at max_attempts; \
+                 domain-clock advancement alone must not reset the attempt counter (issue #163)"
+            );
+        }
+
+        #[test]
+        fn maybe_schedule_retry_does_not_reset_when_only_the_clock_advanced() {
+            let now = Clock::now();
+            let job_type = JobType::new("issue-163-jump");
+            let job_id = JobId::new();
+            let first_window = schedule_window(now, ChronoDuration::hours(25));
+            // The retry was scheduled 24h of domain-clock time ago; no
+            // successful run happened in between.
+            let jumped_window = schedule_window(now, ChronoDuration::hours(24));
+            let mut events = vec![(
+                JobEvent::Initialized {
+                    id: job_id,
+                    job_type: job_type.clone(),
+                    config: json!({}),
+                    tracing_context: None,
+                    queue_id: None,
+                    unique_key: None,
+                },
+                now - ChronoDuration::hours(26),
+            )];
+            push_attempt(&mut events, 1, &first_window, Some("first"));
+            events.push(scheduled_event(2, &jumped_window));
+            let mut job = job_with_history(job_id, events);
+            let retry_policy = build_retry_policy(Some(5));
+
+            let (_, next_attempt) = job
+                .maybe_schedule_retry(Clock::now(), 2, &retry_policy, "boom".to_string())
+                .expect("retry expected");
+
+            assert_eq!(
+                next_attempt, 3,
+                "a domain-clock jump is not recovery evidence; the attempt counter must climb (issue #163)"
+            );
+            let events: Vec<_> = job.events.iter_all().collect();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, JobEvent::AttemptCounterReset)),
+                "no reset may fire when only the clock advanced"
+            );
+        }
     }
 
     mod retry_window {
@@ -1112,8 +1297,6 @@ mod tests {
 
     mod retry_policy {
         use super::*;
-        use chrono::Duration as ChronoDuration;
-        use es_entity::clock::Clock;
         use std::time::Duration;
 
         const MAX_BACKOFF_MS: u64 = 60_000;
@@ -1153,17 +1336,6 @@ mod tests {
                 actual >= min && actual <= max,
                 "Expected delay in range {min}-{max}ms, got {actual}ms"
             );
-        }
-
-        fn window_with_elapsed(
-            backoff_secs: i64,
-            elapsed_since_schedule_secs: i64,
-        ) -> (RetryWindow, DateTime<Utc>) {
-            let now = Clock::now();
-            let scheduled_at = now - ChronoDuration::seconds(elapsed_since_schedule_secs);
-            let failure_at = scheduled_at - ChronoDuration::seconds(backoff_secs);
-            let window = RetryWindow::new(failure_at, scheduled_at).expect("valid window");
-            (window, now)
         }
 
         #[test]
@@ -1251,40 +1423,17 @@ mod tests {
         }
 
         #[test]
-        fn should_reset_attempt_count_returns_false_when_schedule_in_future() {
+        fn should_reset_attempt_count_requires_recovery() {
             let policy =
                 retry_policy_with_reset(Duration::from_secs(30), Duration::from_secs(600), 0, 3);
-            let (window, now) = window_with_elapsed(30, -10);
 
             assert!(
-                !policy.should_reset_attempt_count(now, window),
-                "Should be false until the scheduled retry time has passed"
+                !policy.should_reset_attempt_count(false),
+                "no completed run => no reset, regardless of elapsed time (issue #163)"
             );
-        }
-
-        #[test]
-        fn should_reset_attempt_count_returns_false_when_within_threshold() {
-            let policy =
-                retry_policy_with_reset(Duration::from_secs(30), Duration::from_secs(600), 0, 3);
-            let (window, now) = window_with_elapsed(30, 80);
-            let reset = policy.should_reset_attempt_count(now, window);
-
             assert!(
-                !reset,
-                "Elapsed time should not reset attempts when below the threshold"
-            );
-        }
-
-        #[test]
-        fn should_reset_attempt_count_returns_true_when_past_threshold() {
-            let policy =
-                retry_policy_with_reset(Duration::from_secs(30), Duration::from_secs(600), 0, 3);
-            let (window, now) = window_with_elapsed(30, 95);
-            let reset = policy.should_reset_attempt_count(now, window);
-
-            assert!(
-                reset,
-                "Elapsed time beyond the configured threshold should reset attempts"
+                policy.should_reset_attempt_count(true),
+                "a completed run after the last failure is recovery evidence"
             );
         }
 
