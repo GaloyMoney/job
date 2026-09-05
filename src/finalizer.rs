@@ -469,7 +469,7 @@ impl Finalizer {
     /// deadlock-avoidance order (see `PromoteHeadsHook`).
     pub(crate) async fn finalize_in_op(
         &self,
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         items: &[(JobId, Disposition)],
     ) -> Result<FinalizeOutcome, JobError> {
         let mut outcome = FinalizeOutcome::default();

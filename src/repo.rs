@@ -121,7 +121,7 @@ impl JobRepo {
     /// correctly observes whatever that holder committed (or didn't).
     pub(super) async fn lock_and_check_live_keys_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         job_type: &JobType,
         keys: &[String],
     ) -> Result<HashMap<String, JobId>, JobError> {

@@ -76,7 +76,7 @@ pub(crate) static PROBE_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) async fn claim_due_heads_in_op(
-    op: &mut impl es_entity::AtomicOperation,
+    op: &mut (impl es_entity::AtomicOperation + ?Sized),
     job_type: &JobType,
     instance_id: uuid::Uuid,
     now: DateTime<Utc>,

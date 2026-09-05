@@ -117,7 +117,7 @@ impl PromoteHeadsHook {
     /// already-running row. Pinned by
     /// `tests::apply_freed_yields_to_a_concurrently_claimed_row`.
     async fn apply_freed(
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         queue_ids: &[String],
     ) -> Result<Vec<PromotedRow>, sqlx::Error> {
         let deduped: Vec<String> = queue_ids
@@ -173,7 +173,7 @@ impl PromoteHeadsHook {
     }
 
     pub(crate) async fn apply(
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         ids: &[uuid::Uuid],
     ) -> Result<Vec<PromotedRow>, sqlx::Error> {
         if ids.is_empty() {
@@ -245,7 +245,7 @@ impl PromoteHeadsHook {
     /// promote (and its notify) must not be silently dropped either way, so
     /// callers never need their own fallback branch.
     pub(crate) async fn register(
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         notifier: &Arc<JobEventNotifier>,
         own_types: impl IntoIterator<Item = JobType>,
         ids: Vec<uuid::Uuid>,
@@ -267,7 +267,7 @@ impl PromoteHeadsHook {
     /// [`Self::register`]. `own_types` is empty on purpose: a completer only
     /// ever wakes the PROMOTED row's type (see the type-level notify policy).
     pub(crate) async fn register_freed_queues(
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         notifier: &Arc<JobEventNotifier>,
         freed_queues: Vec<String>,
     ) -> Result<(), sqlx::Error> {
@@ -287,10 +287,10 @@ impl PromoteHeadsHook {
     }
 
     async fn register_hook(
-        op: &mut impl AtomicOperation,
+        mut op: &mut (impl AtomicOperation + ?Sized),
         hook: PromoteHeadsHook,
     ) -> Result<(), sqlx::Error> {
-        if let Err(hook) = op.add_commit_hook(hook) {
+        if let Err(hook) = (&mut op).add_commit_hook(hook) {
             hook.force_execute_pre_commit(op).await?;
         }
         Ok(())

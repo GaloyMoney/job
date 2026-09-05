@@ -317,7 +317,7 @@ where
     )]
     pub async fn spawn_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         key: impl Into<String> + Send + Debug,
         config: Config,
     ) -> Result<KeyedSpawn, JobError> {
@@ -423,7 +423,7 @@ where
     )]
     pub async fn spawn_all_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         specs: Vec<KeyedJobSpec<Config>>,
     ) -> Result<Vec<KeyedSpawn>, JobError> {
         tracing::Span::current().record("count", specs.len());
@@ -663,7 +663,7 @@ where
     #[instrument(name = "job.pull_keyed_executions_forward", skip_all)]
     async fn pull_forward_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         keys: &[String],
         targets: &[DateTime<Utc>],
     ) -> Result<HashMap<String, DateTime<Utc>>, JobError> {
@@ -703,7 +703,7 @@ where
     #[instrument(name = "job.insert_keyed_executions", skip_all)]
     async fn insert_executions_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         ids: &[JobId],
         keys: &[String],
         schedule_times: &[DateTime<Utc>],
@@ -763,7 +763,7 @@ where
     /// only compaction runs.
     async fn carry_state_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         ids: &[JobId],
         keys: &[String],
     ) -> Result<(), JobError> {

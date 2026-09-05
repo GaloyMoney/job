@@ -6,6 +6,7 @@
 //! notification is only an optimisation: `execution_ready` is backstopped by
 //! the poller's re-poll and `job_terminal` by the waiter-manager's sweep.
 
+use es_entity::AtomicOperation;
 use sqlx::postgres::PgPool;
 use tokio::sync::{broadcast, mpsc};
 
@@ -77,7 +78,7 @@ impl JobEventNotifier {
     /// Report that a job of `job_type` is ready to run, once `op` commits.
     pub(crate) async fn execution_ready_in_op(
         self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         job_type: &JobType,
     ) -> Result<(), sqlx::Error> {
         self.notify_in_op(
@@ -92,7 +93,7 @@ impl JobEventNotifier {
     /// Report that a job reached terminal state, once `op` commits.
     pub(crate) async fn job_terminal_in_op(
         self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         job_id: JobId,
     ) -> Result<(), sqlx::Error> {
         self.notify_in_op(op, JobNotification::JobTerminal { job_id })
@@ -103,7 +104,7 @@ impl JobEventNotifier {
     /// commit-hook buffer, where `post_commit` would never run.
     async fn notify_in_op(
         self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
+        mut op: &mut (impl AtomicOperation + ?Sized),
         notification: JobNotification,
     ) -> Result<(), sqlx::Error> {
         let serialized = payload(&notification);
@@ -115,7 +116,7 @@ impl JobEventNotifier {
             forces: HashSet::new(),
         };
 
-        if op.add_commit_hook(hook).is_err() {
+        if (&mut op).add_commit_hook(hook).is_err() {
             sqlx::query("SELECT pg_notify($1, $2)")
                 .bind(JOB_EVENTS_CHANNEL)
                 .bind(serialized)
@@ -146,7 +147,7 @@ impl JobEventNotifier {
     /// simply not registering.
     pub(crate) fn register_execution_ready_in_op(
         self: &Arc<Self>,
-        op: &mut impl es_entity::AtomicOperation,
+        mut op: &mut (impl AtomicOperation + ?Sized),
         added: HashMap<JobType, HashSet<JobId>>,
         claimed: HashMap<JobType, HashSet<JobId>>,
         forces: HashSet<JobType>,
@@ -161,7 +162,7 @@ impl JobEventNotifier {
             claimed,
             forces,
         };
-        if op.add_commit_hook(hook).is_err() {
+        if (&mut op).add_commit_hook(hook).is_err() {
             tracing::error!(
                 "execution-ready netting could not register its commit hook; \
                  its contribution is dropped rather than fired unsuppressed or \

@@ -83,7 +83,7 @@ impl ExecutionInsertHook {
     /// back to immediate execution if `op` carries no commit-hook buffer.
     /// The single-row spawn call sites' entry point.
     pub(crate) async fn register_one(
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         notifier: &Arc<JobEventNotifier>,
         poller: &PollerHandle,
         clock: &ClockHandle,
@@ -97,7 +97,7 @@ impl ExecutionInsertHook {
     /// the insert must not be silently dropped either way. A no-op if `rows`
     /// is empty (mirrors `spawn_all_in_op`'s existing empty-specs check).
     pub(crate) async fn register(
-        op: &mut impl AtomicOperation,
+        mut op: &mut (impl AtomicOperation + ?Sized),
         notifier: &Arc<JobEventNotifier>,
         poller: &PollerHandle,
         clock: &ClockHandle,
@@ -112,7 +112,7 @@ impl ExecutionInsertHook {
             clock: clock.clone(),
             rows,
         };
-        if let Err(hook) = op.add_commit_hook(hook) {
+        if let Err(hook) = (&mut op).add_commit_hook(hook) {
             hook.force_execute_pre_commit(op).await?;
         }
         Ok(())
@@ -216,7 +216,7 @@ impl ExecutionInsertHook {
     /// (`queue_id IS NULL`) sort last under plain `ORDER BY` and never
     /// conflict, so their position doesn't matter.
     async fn insert_many(
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         rows: &[NewExecutionRow],
     ) -> Result<Vec<InsertedRow>, sqlx::Error> {
         let ids: Vec<JobId> = rows.iter().map(|r| r.id).collect();
@@ -351,7 +351,7 @@ impl ExecutionInsertHook {
     /// bug was first observed in -- so the lock stays broad and the wake pays
     /// for it.
     async fn lock_queue_occupants(
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         queue_ids: &[String],
     ) -> Result<(HashSet<String>, HashSet<JobType>), sqlx::Error> {
         if queue_ids.is_empty() {
@@ -411,7 +411,7 @@ impl ExecutionInsertHook {
     /// Returns the fresh [`InsertedRow`]s (which supersede statement 1's for
     /// these ids) and the ids that landed `pending`.
     async fn adopt_orphaned_queues(
-        op: &mut impl AtomicOperation,
+        op: &mut (impl AtomicOperation + ?Sized),
         readopt: &[NewExecutionRow],
     ) -> Result<(Vec<InsertedRow>, Vec<uuid::Uuid>), sqlx::Error> {
         let ids: Vec<JobId> = readopt.iter().map(|row| row.id).collect();

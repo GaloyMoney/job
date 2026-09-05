@@ -197,7 +197,7 @@ where
     )]
     pub async fn spawn_spec_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         spec: JobSpec<Config>,
     ) -> Result<Option<Job>, JobError> {
         let schedule_at = spec
@@ -272,7 +272,7 @@ where
     )]
     pub async fn spawn_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
     ) -> Result<Job, JobError> {
@@ -308,7 +308,7 @@ where
     )]
     pub async fn spawn_at_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
         schedule_at: DateTime<Utc>,
@@ -350,7 +350,7 @@ where
     )]
     pub async fn spawn_with_queue_id_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
         queue_id: impl Into<String> + Send,
@@ -394,7 +394,7 @@ where
     )]
     pub async fn spawn_at_with_queue_id_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
         schedule_at: DateTime<Utc>,
@@ -450,7 +450,7 @@ where
     )]
     pub async fn spawn_all_in_op(
         &self,
-        op: &mut impl es_entity::AtomicOperation,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         specs: Vec<JobSpec<Config>>,
     ) -> Result<BulkSpawnResult, JobError> {
         tracing::Span::current().record("count", specs.len());
