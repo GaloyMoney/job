@@ -62,6 +62,11 @@ pub(crate) struct BatchDispatcher {
     job_type: JobType,
     ids: Vec<JobId>,
     attempts: HashMap<JobId, u32>,
+    /// How long `run_batch` actually ran, on a monotonic clock -- the retry
+    /// policy's evidence of recovery, set once the batch returns and read by
+    /// every [`Disposition::Fail`] this batch produces. Every item in a batch
+    /// shares it, which is correct: they were all up for exactly that long.
+    run_duration: std::time::Duration,
     rescheduled: bool,
     dispatched: bool,
     /// Whether this batch's unit has already been handed to a recycle
@@ -118,6 +123,7 @@ impl BatchDispatcher {
             job_type,
             ids,
             attempts,
+            run_duration: std::time::Duration::ZERO,
             rescheduled: false,
             dispatched: true,
             recycled: false,
@@ -169,6 +175,7 @@ impl BatchDispatcher {
             job_type,
             ids,
             attempts,
+            run_duration: std::time::Duration::ZERO,
             rescheduled: false,
             dispatched: true,
             recycled: false,
@@ -273,7 +280,11 @@ impl BatchDispatcher {
         };
 
         let runner = self.runner.take().expect("runner");
-        let outcome = match Self::run_batch(&self.finalizer, runner, items, ctx).await {
+        // Monotonic, deliberately not `self.clock` -- see `Self::run_duration`.
+        let started = std::time::Instant::now();
+        let batch_result = Self::run_batch(&self.finalizer, runner, items, ctx).await;
+        self.run_duration = started.elapsed();
+        let outcome = match batch_result {
             Ok(completion) => self.apply(completion).await,
             Err(e) => {
                 // Decided here, not inside `fail_batch`: `fail_batch` runs
@@ -578,6 +589,7 @@ impl BatchDispatcher {
                     BatchItemOutcome::Fail(reason) => Disposition::Fail {
                         error: reason,
                         attempt: self.attempts.get(&id).copied().unwrap_or(1),
+                        run_duration: self.run_duration,
                     },
                 };
                 (id, disposition)
@@ -638,6 +650,7 @@ impl BatchDispatcher {
                     Disposition::Fail {
                         error: message.clone(),
                         attempt: self.attempts.get(id).copied().unwrap_or(1),
+                        run_duration: self.run_duration,
                     },
                 )
             })

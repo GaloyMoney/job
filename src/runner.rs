@@ -126,6 +126,13 @@ pub trait JobRunner: Send + Sync + 'static {
 pub struct RetrySettings {
     /// Maximum number of consecutive attempts before the job is failed for good. `None` retries
     /// indefinitely.
+    ///
+    /// This budget is only enforceable if failures actually accumulate.
+    /// [`RetrySettings::attempt_reset_after_healthy_run`] forgives the counter back to `1`
+    /// whenever a single execution runs at least that long before failing, so set that threshold
+    /// ABOVE this type's typical *failing* run — otherwise a job that always fails slowly is
+    /// forgiven every time and never reaches this limit, and (because escalation keys off the
+    /// same counter) never escalates past `WARN` either.
     pub n_attempts: Option<u32>,
     /// Number of consecutive failures that can be emitted as `WARN` telemetry before the crate
     /// promotes subsequent failures to `ERROR`. `None` disables escalation and keeps every retry
@@ -139,10 +146,16 @@ pub struct RetrySettings {
     pub max_backoff: std::time::Duration,
     /// Percentage (0-100) jitter applied to the computed backoff window to avoid thundering herds.
     pub backoff_jitter_pct: u8,
-    /// Multiplier applied to the previous backoff window. Once the elapsed time since the last
-    /// scheduled run exceeds `previous_backoff * attempt_reset_after_backoff_multiples`, the job is
-    /// treated as healthy again and the attempt counter resets to `1`.
-    pub attempt_reset_after_backoff_multiples: u32,
+    /// How long a single execution must run before its failure is treated as evidence the job had
+    /// recovered, forgiving the accumulated attempt count back to `1`.
+    ///
+    /// Measured on a monotonic clock over the execution itself, so neither an application-clock
+    /// advance nor scheduler latency can satisfy it. `None` disables attempt-count forgiveness
+    /// entirely.
+    ///
+    /// Pick a value comfortably longer than a *failing* run of this job type: a deterministic
+    /// failure must not clear it, or the job can never reach `n_attempts`.
+    pub attempt_reset_after_healthy_run: Option<std::time::Duration>,
 }
 
 impl RetrySettings {
@@ -163,7 +176,9 @@ impl Default for RetrySettings {
             min_backoff: std::time::Duration::from_secs(1),
             max_backoff: std::time::Duration::from_secs(SECS_IN_ONE_HOUR),
             backoff_jitter_pct: 20,
-            attempt_reset_after_backoff_multiples: 3,
+            // Matches `max_backoff`: a job that cannot stay up for the longest
+            // backoff we would ever impose is not healthy.
+            attempt_reset_after_healthy_run: Some(std::time::Duration::from_secs(SECS_IN_ONE_HOUR)),
         }
     }
 }
@@ -175,7 +190,7 @@ impl From<&RetrySettings> for RetryPolicy {
             min_backoff: settings.min_backoff,
             max_backoff: settings.max_backoff,
             backoff_jitter_pct: settings.backoff_jitter_pct,
-            attempt_reset_after_backoff_multiples: settings.attempt_reset_after_backoff_multiples,
+            attempt_reset_after_healthy_run: settings.attempt_reset_after_healthy_run,
         }
     }
 }
