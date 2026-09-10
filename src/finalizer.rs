@@ -128,7 +128,17 @@ pub(crate) enum Disposition {
     /// The job failed with `error` on its `attempt`-th attempt: the type's
     /// `RetryPolicy` decides between a backoff retry (next `attempt_index`)
     /// and terminal deletion.
-    Fail { error: String, attempt: u32 },
+    ///
+    /// `run_duration` is how long the failing execution actually ran, on a
+    /// monotonic clock. The retry policy forgives the accumulated attempt
+    /// count when it clears `attempt_reset_after_healthy_run` -- a run that
+    /// stayed up that long is evidence the job had recovered, whether or not
+    /// it ever returned a completion.
+    Fail {
+        error: String,
+        attempt: u32,
+        run_duration: std::time::Duration,
+    },
     /// Back to `pending` at `at` with `attempt_index = 1`: a
     /// runner-requested reschedule or a rescue.
     Fresh { at: DateTime<Utc> },
@@ -535,8 +545,18 @@ impl Finalizer {
                     let streak = job.reschedule_congestion(message.clone(), *at, *attempt);
                     congestion_streaks.insert(*id, streak);
                 }
-                Disposition::Fail { error, attempt } => {
-                    match job.maybe_schedule_retry(now, *attempt, &retry_policy, error.clone()) {
+                Disposition::Fail {
+                    error,
+                    attempt,
+                    run_duration,
+                } => {
+                    match job.maybe_schedule_retry(
+                        now,
+                        *attempt,
+                        *run_duration,
+                        &retry_policy,
+                        error.clone(),
+                    ) {
                         Some((reschedule_at, next_attempt)) => {
                             retry_uuids.push(uuid::Uuid::from(*id));
                             retry_times.push(reschedule_at);

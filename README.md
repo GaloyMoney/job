@@ -234,7 +234,7 @@ telemetry:
 - `n_attempts` caps how many times the dispatcher will retry before emitting a terminal `ERROR` and deleting the job execution.
 - `n_warn_attempts` controls how many consecutive failures remain `WARN` level events before the crate promotes them to `ERROR`. Setting it to `None` keeps every retry at `WARN`.
 - `min_backoff`, `max_backoff`, and `backoff_jitter_pct` determine the delay that is recorded in the `job.fail_job` span before the next retry is scheduled.
-- `attempt_reset_after_backoff_multiples` lets a job be considered healthy again after enough idle time (measured as multiples of the last backoff); the dispatcher resets the reported attempt counter accordingly.
+- `attempt_reset_after_healthy_run` lets a job be considered healthy again once a single execution has run for at least that long before failing (measured on a monotonic clock over the run itself, so neither an application-clock advance nor scheduler latency can satisfy it); the dispatcher resets the reported attempt counter accordingly. `None` disables forgiveness, and the counter then only ever resets on a completion.
 
 Together these make the emitted telemetry reflect both the severity and cadence of retryable failures, which is especially helpful when wiring the crate into alerting systems.
 

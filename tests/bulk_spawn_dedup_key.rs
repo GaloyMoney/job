@@ -359,7 +359,9 @@ async fn dedup_key_survives_a_retry() -> anyhow::Result<()> {
             min_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(10),
             backoff_jitter_pct: 0,
-            attempt_reset_after_backoff_multiples: 100,
+            // The test drives a deliberate failure and asserts on the
+            // resulting attempt counter, so forgiveness must stay off.
+            attempt_reset_after_healthy_run: None,
         },
     });
     jobs.start_poll().await?;

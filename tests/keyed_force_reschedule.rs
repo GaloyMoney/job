@@ -387,12 +387,12 @@ async fn force_reschedule_never_shortens_a_retry_backoff() -> anyhow::Result<()>
                 n_attempts: None,
                 min_backoff,
                 max_backoff: Duration::from_secs(60),
-                // Jitter off so the schedule is exactly doubling, and the
-                // attempt counter pinned so a slow machine cannot reset it
-                // to 1 mid-test (which would hand the row to the guard for
-                // the wrong reason).
+                // Jitter off so the schedule is exactly doubling, and
+                // attempt-count forgiveness disabled outright so a slow
+                // machine cannot reset the counter to 1 mid-test (which would
+                // hand the row to the guard for the wrong reason).
                 backoff_jitter_pct: 0,
-                attempt_reset_after_backoff_multiples: 1_000,
+                attempt_reset_after_healthy_run: None,
                 ..Default::default()
             }),
     );

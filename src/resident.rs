@@ -121,7 +121,17 @@ pub trait ResidentJobInitializer: Send + Sync + 'static {
     /// ignored: registration always forces eternal retry (a resident job can
     /// never be exhausted into a terminal error) regardless of what is
     /// returned here — only `min_backoff`/`max_backoff`/`backoff_jitter_pct`/
-    /// `attempt_reset_after_backoff_multiples` are honored.
+    /// `attempt_reset_after_healthy_run` are honored.
+    ///
+    /// `attempt_reset_after_healthy_run` matters MORE here than for an
+    /// ordinary job, not less. A resident job cannot terminate, so its
+    /// failure mode is not exhaustion but a counter that only ever climbs:
+    /// past `n_warn_attempts` every retry is logged at `ERROR`, and the
+    /// backoff eventually pins at `max_backoff` for the rest of the process's
+    /// life — a daemon on an hour-long retry interval is a dead pipeline.
+    /// Forgiveness is measured over the run itself, so a resident that stays
+    /// inside `run()` for hours before a blip clears the threshold on its own
+    /// failure, without ever having to return a completion.
     fn retry_on_error_settings(&self) -> RetrySettings {
         Default::default()
     }

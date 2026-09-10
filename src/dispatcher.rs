@@ -215,7 +215,12 @@ impl JobDispatcher {
             Arc::clone(&self.repo),
         );
         let runner = self.runner.take().expect("runner");
+        // Monotonic, deliberately not `self.clock`: how long this execution
+        // actually ran is the retry policy's evidence that the job had
+        // recovered, and a domain-clock advance must not be able to forge it.
+        let started = std::time::Instant::now();
         let completion = Self::dispatch_job(&self.finalizer, runner, current_job).await;
+        let run_duration = started.elapsed();
         let disposition: Result<(), JobError> = async {
             match completion {
                 Err(e) => {
@@ -227,7 +232,8 @@ impl JobDispatcher {
                             "Error"
                         },
                     );
-                    self.fail_job(job.id, e, polled_job.attempt).await?
+                    self.fail_job(job.id, e, polled_job.attempt, run_duration)
+                        .await?
                 }
                 Ok(JobCompletion::Complete) => {
                     span.record("conclusion", "Complete");
@@ -430,7 +436,13 @@ impl JobDispatcher {
             error.message = tracing::field::Empty
         )
     )]
-    async fn fail_job(&mut self, id: JobId, error: JobError, attempt: u32) -> Result<(), JobError> {
+    async fn fail_job(
+        &mut self,
+        id: JobId,
+        error: JobError,
+        attempt: u32,
+        run_duration: std::time::Duration,
+    ) -> Result<(), JobError> {
         let span = Span::current();
         span.record("job_id", tracing::field::display(id));
         span.record("job_type", tracing::field::display(&self.job_type));
@@ -454,6 +466,7 @@ impl JobDispatcher {
             Disposition::Fail {
                 error: error_str,
                 attempt,
+                run_duration,
             },
         )];
         let finalizer = self.finalizer.clone();
