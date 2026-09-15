@@ -67,17 +67,33 @@ impl<Config> JobSpec<Config> {
     }
 
     /// Opt this spec into live-window dedup: if a LIVE (pending/parked/
-    /// running) execution already holds `(job_type, key)`, [`JobSpawner::spawn_all`]/
-    /// [`JobSpawner::spawn_all_in_op`] silently drop this spec — no `jobs`
-    /// row, no execution row — and report it via
-    /// [`BulkSpawnResult::deduped`] rather than minting a duplicate. The key
-    /// becomes respawnable the instant the holder goes terminal; this is the
-    /// SAME `(job_type, unique_key)` live-window enforced for keyed jobs
+    /// running) execution already holds `(job_type, key)`, this spec mints
+    /// nothing of its own — no `jobs` row, no execution row — and the call
+    /// yields the LIVE holder in its place, reporting the suppressed spec's
+    /// id via [`BulkSpawnResult::deduped`]. The key becomes respawnable the
+    /// instant the holder goes terminal; this is the SAME
+    /// `(job_type, unique_key)` live-window enforced for keyed jobs
     /// (`idx_job_executions_job_type_unique_key`), just opted into from the
     /// bulk/regular spawn path instead of [`crate::KeyedJobSpawner::spawn`].
     ///
     /// Like [`crate::KeyedJobSpawner::spawn`], a collision resolves to the
     /// live holder. Coalescing does not extend that job's inputs.
+    ///
+    /// # Batching
+    ///
+    /// A dedup-keyed row is inserted INLINE, within the call, rather than
+    /// buffered into the one-statement commit-time batch keyless rows get
+    /// (`execution_hooks/insert.rs::ExecutionInsertHook::register`). That is
+    /// deliberate and load-bearing: a transaction sees its own uncommitted
+    /// writes, so a LATER call on the same `op` finds this row in its own
+    /// live-check and resolves to it, which is what makes same-`op` dedup
+    /// work at all.
+    ///
+    /// The cost is that dedup-keyed rows do not batch ACROSS calls. One
+    /// [`JobSpawner::spawn_all_in_op`] carrying N keyed specs is still ONE
+    /// insert; N separate [`JobSpawner::spawn_in_op`]/`spawn_spec_in_op`
+    /// calls on one `op` are N inserts. Fan-out producers should pass the
+    /// whole shard set to a single `spawn_all_in_op` rather than looping.
     ///
     /// Only safe for a producer that re-checks and re-spawns after the
     /// holder goes terminal — e.g. a sweep/reconcile loop that re-scans its
@@ -96,13 +112,24 @@ impl<Config> JobSpec<Config> {
 /// `jobs.len()` equals the number of input specs, including coalesced specs.
 #[derive(Default)]
 pub struct BulkSpawnResult {
-    /// The resolved jobs, in spec order (including deduped specs).
+    /// The resolved jobs, positionally aligned with the input specs: for a
+    /// spec that created a job, the job it created; for a spec coalesced
+    /// onto a LIVE holder, that holder.
+    ///
+    /// The same [`Job`] can therefore appear MORE THAN ONCE — two specs in
+    /// one call sharing a `dedup_key` both resolve to the first one's job,
+    /// so `jobs[i].id == jobs[j].id` for `i != j` is expected, not a bug.
+    /// Do not treat this as a set of distinct jobs.
     pub jobs: Vec<Job>,
-    /// The `id` of each spec that was silently dropped because its
+    /// The `id` of each spec that minted nothing of its own because its
     /// `dedup_key` was already held by a LIVE execution, or duplicated an
     /// earlier spec's key within the same call. No `jobs` row, no execution
     /// row exists for these ids — do not [`crate::Jobs::handle`] them
-    /// expecting a live job.
+    /// expecting a live job; use the entry `jobs` holds at that spec's
+    /// position instead.
+    ///
+    /// This is the ONLY way to tell "I created this" from "this already
+    /// existed": both cases put a usable [`Job`] in `jobs`.
     pub deduped: Vec<JobId>,
 }
 
