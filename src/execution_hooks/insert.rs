@@ -24,8 +24,11 @@ use super::promote::{PromoteHeadsHook, PromotedRow};
 /// second keyed spawn on the SAME `op` from seeing the first's row in its
 /// live-check, and that live-check is the single mechanism keyed spawn uses
 /// to resolve same-op and cross-transaction collisions alike. See there.
-/// Plain deduplicated spawns also insert inline, through this hook's
-/// insertion support. Keyless rows remain buffered until commit.
+/// `spawn_all_in_op` resolves a
+/// dedup-key row's liveness BEFORE registering it here (see
+/// `JobRepo::lock_and_check_live_keys_in_op`), so by the time a row reaches
+/// this hook its key (if any) is free. Deduplicated rows insert inline
+/// so subsequent calls on the same operation see them.
 ///
 /// `Clone` exists for [`ExecutionInsertHook::adopt_orphaned_queues`], which
 /// re-submits a subset of these rows through [`ExecutionInsertHook::insert_many`]
@@ -76,8 +79,8 @@ pub(crate) struct ExecutionInsertHook {
 }
 
 impl ExecutionInsertHook {
-    /// Inserts a deduplicated row inline, or registers a keyless row's
-    /// commit hook (executed immediately if `op` has no hook buffer).
+    /// Builds and registers an `ExecutionInsertHook` for one row, falling
+    /// back to immediate execution for dedup rows or if `op` has no hook buffer.
     /// The single-row spawn call sites' entry point.
     pub(crate) async fn register_one(
         op: &mut (impl AtomicOperation + ?Sized),
@@ -167,10 +170,16 @@ impl ExecutionInsertHook {
     /// the occupant is still genuinely `'running'` by then. Pinned end-to-end
     /// by `tests/parked_rows.rs::retry_backoff_yields_to_an_older_parked_sibling`.
     ///
-    /// Deduplicated spawns resolve their live keys before creating jobs and
-    /// insert executions inline, so another call on the same operation sees
-    /// the holder. `deduped` remains a defensive collapse before `input`
-    /// applies the file's usual `(queue_id, id)` order.
+    /// `deduped` collapses same-`(job_type, unique_key)` rows to one BEFORE
+    /// `input` applies the file's usual `(queue_id, id)` order: it is a
+    /// defensive backstop against duplicate input rows. Left uncaught,
+    /// both rows would reach the `ins` INSERT
+    /// together and unique-violate `idx_job_executions_job_type_unique_key`
+    /// in one statement -- aborting this ENTIRE batch, including every
+    /// unrelated keyless row sharing the transaction, which is exactly what
+    /// AC5 (no statement-abort surfaced to the caller) rules out. There is
+    /// no second `ON CONFLICT` arbiter available to catch it inline (see
+    /// below), so it has to be filtered out before `ins` ever sees it.
     ///
     /// The `DISTINCT ON`/`ORDER BY` key is `(job_type,
     /// COALESCE(unique_key, id::text))`, matching

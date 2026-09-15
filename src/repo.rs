@@ -72,12 +72,18 @@ impl JobRepo {
     /// `lock_queue_occupants` already use for row locks, applied here to
     /// advisory locks instead.
     ///
-    /// Both plain deduplicated spawn (`spawner.rs`) and keyed spawn
-    /// (`keyed.rs`) insert execution rows INLINE before returning. A
-    /// transaction sees its own uncommitted writes, so another spawn on the
-    /// same `op` finds the first call's row here and resolves to its holder,
-    /// just as it would across transactions. Only keyless rows use the
-    /// deferred commit-time insert hook.
+    /// Whether this catches two calls sharing one `op` that both target the
+    /// same key depends on WHEN the caller inserts its execution rows, and
+    /// both callers insert inline:
+    ///
+    /// - `dedup_key` (`spawner.rs`) inserts inline through `ExecutionInsertHook`.
+    /// - Keyed spawn (`keyed.rs`) inserts its execution rows INLINE, before
+    ///   returning. A transaction sees its own uncommitted writes, so a
+    ///   second `spawn_in_op`/`spawn_all_in_op` on the same `op` finds the
+    ///   first call's row right here in the live-check and resolves to its
+    ///   holder -- the same answer it would give across transactions, from
+    ///   the same statement. That is precisely why keyed spawn does not use
+    ///   the deferred hook; see `keyed.rs::KeyedJobSpawner::spawn_all_in_op`.
     ///
     /// Deliberately TWO statements, not one -- two single-statement designs
     /// were tried and both are unsafe:

@@ -160,6 +160,11 @@ async fn wait_until(
 /// AC1: a spec whose `dedup_key` is already held by a LIVE execution creates
 /// NO `jobs` row and NO execution row, the rest of the batch lands
 /// normally, and the no-op is reported via `BulkSpawnResult::deduped`.
+///
+/// The live holder is seeded directly (mirrors
+/// `parked_rows.rs::keyed_spawn_is_blocked_by_a_parked_row_with_the_same_key`)
+/// rather than run through its runner, since only the LIVE row's existence
+/// matters here, not its runner.
 #[tokio::test]
 async fn dedup_key_no_ops_against_a_live_row() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;

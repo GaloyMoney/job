@@ -70,8 +70,7 @@ impl<Config> JobSpec<Config> {
     /// running) execution already holds `(job_type, key)`, [`JobSpawner::spawn_all`]/
     /// [`JobSpawner::spawn_all_in_op`] silently drop this spec — no `jobs`
     /// row, no execution row — and report it via
-    /// [`BulkSpawnResult::deduped`] rather than minting a duplicate.
-    /// [`BulkSpawnResult::jobs`] resolves each spec to its actual holder. The key
+    /// [`BulkSpawnResult::deduped`] rather than minting a duplicate. The key
     /// becomes respawnable the instant the holder goes terminal; this is the
     /// SAME `(job_type, unique_key)` live-window enforced for keyed jobs
     /// (`idx_job_executions_job_type_unique_key`), just opted into from the
@@ -94,11 +93,10 @@ impl<Config> JobSpec<Config> {
 
 /// Return value of [`JobSpawner::spawn_all`]/[`JobSpawner::spawn_all_in_op`].
 ///
-/// `jobs.len()` equals the number of input specs. Coalesced specs resolve
-/// to their existing holders; `deduped` identifies the specs that created no job.
+/// `jobs.len()` equals the number of input specs, including coalesced specs.
 #[derive(Default)]
 pub struct BulkSpawnResult {
-    /// One resolved job per input spec, in input order, including repeated holders.
+    /// The resolved jobs, in spec order (including deduped specs).
     pub jobs: Vec<Job>,
     /// The `id` of each spec that was silently dropped because its
     /// `dedup_key` was already held by a LIVE execution, or duplicated an
@@ -182,9 +180,10 @@ where
     /// [`Self::spawn_at_in_op`] / [`Self::spawn_at_with_queue_id_in_op`]).
     ///
     /// Honors [`JobSpec::dedup_key`] exactly like [`Self::spawn_all_in_op`]
-    /// does per spec: returns the existing holder without creating rows on
-    /// coalescing, or the new job otherwise. Deduplicated executions are
-    /// inserted inline so later spawns in the same operation see them.
+    /// does per spec: returns the existing job if the key is held by a LIVE
+    /// execution -- no `jobs` row, no execution row created -- or the new job
+    /// otherwise. Every other `spawn*` method builds a `JobSpec` with
+    /// `dedup_key: None`, which always creates a new job.
     #[instrument(
         name = "job_spawner.spawn_spec_in_op",
         skip(self, op, spec),
