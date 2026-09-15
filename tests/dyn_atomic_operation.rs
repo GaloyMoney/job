@@ -99,7 +99,7 @@ async fn count_jobs(
 /// `JobSpawner::spawn_in_op` -- the exact boundary lana's `SealedSpawner`
 /// needs -- durably creates a job when handed a genuinely type-erased op.
 /// Exercises the whole relaxed call chain from `spawn_in_op` down:
-/// `spawn_at_in_op` -> `spawn_all_in_op` -> `JobRepo::create_all_in_op` ->
+/// `spawn_at_in_op` -> `spawn_spec_in_op` -> `JobRepo::create_in_op` ->
 /// `ExecutionInsertHook::register` -> `(&mut op).add_commit_hook(..)` (the
 /// generic convenience method, reachable through the erased op via the
 /// `&mut O` blanket impl, es-entity#222).

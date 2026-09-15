@@ -175,8 +175,9 @@ impl<Config> KeyedJobSpec<Config> {
 
 /// The outcome of spawning one key.
 ///
-/// Every requested key yields a usable [`JobHandle`], and `created` says
-/// whether this call created its generation or resolved to a live holder.
+/// Keyed spawn resolves a collision to the LIVE holder,
+/// so every requested key yields a usable [`JobHandle`] and `created` says
+/// which generation it refers to.
 pub struct KeyedSpawn {
     /// The key that was requested.
     pub key: String,

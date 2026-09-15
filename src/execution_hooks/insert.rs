@@ -14,10 +14,18 @@ use crate::poller::PollerHandle;
 
 use super::promote::{PromoteHeadsHook, PromotedRow};
 
-/// One `job_executions` row to insert. Plain deduplicated spawns insert
-/// inline so later calls on the same operation see their live keys.
-/// Keyless spawns buffer these rows until commit; both paths share queue
-/// parking, promotion and notification handling here.
+/// One `job_executions` row to insert, as gathered by [`ExecutionInsertHook`].
+/// `unique_key` is `Some` only for a [`crate::JobSpec::dedup_key`]-bearing
+/// single or bulk-spawn row; `spawn_in_op`/`spawn_at_in_op`/`spawn_with_queue_id_in_op`
+/// (the single-item convenience methods) never set it. Keyed spawn's own
+/// inserts stay entirely separate and inline
+/// (`keyed.rs::KeyedJobSpawner::spawn_all_in_op`) rather than going through
+/// this hook -- deferring them to commit time is exactly what would stop a
+/// second keyed spawn on the SAME `op` from seeing the first's row in its
+/// live-check, and that live-check is the single mechanism keyed spawn uses
+/// to resolve same-op and cross-transaction collisions alike. See there.
+/// Plain deduplicated spawns also insert inline, through this hook's
+/// insertion support. Keyless rows remain buffered until commit.
 ///
 /// `Clone` exists for [`ExecutionInsertHook::adopt_orphaned_queues`], which
 /// re-submits a subset of these rows through [`ExecutionInsertHook::insert_many`]
@@ -68,8 +76,8 @@ pub(crate) struct ExecutionInsertHook {
 }
 
 impl ExecutionInsertHook {
-    /// Builds and registers an `ExecutionInsertHook` for one row, falling
-    /// back to immediate execution if `op` carries no commit-hook buffer.
+    /// Inserts a deduplicated row inline, or registers a keyless row's
+    /// commit hook (executed immediately if `op` has no hook buffer).
     /// The single-row spawn call sites' entry point.
     pub(crate) async fn register_one(
         op: &mut (impl AtomicOperation + ?Sized),
@@ -159,10 +167,31 @@ impl ExecutionInsertHook {
     /// the occupant is still genuinely `'running'` by then. Pinned end-to-end
     /// by `tests/parked_rows.rs::retry_backoff_yields_to_an_older_parked_sibling`.
     ///
-    /// `deduped` groups by `(job_type, COALESCE(unique_key, id::text))`,
-    /// keeping different job types and keyless rows distinct. The spawner
-    /// resolves live keys before creating jobs and inserts deduplicated
-    /// executions inline, so repeated calls cannot leave suppressed jobs.
+    /// Deduplicated spawns resolve their live keys before creating jobs and
+    /// insert executions inline, so another call on the same operation sees
+    /// the holder. `deduped` remains a defensive collapse before `input`
+    /// applies the file's usual `(queue_id, id)` order.
+    ///
+    /// The `DISTINCT ON`/`ORDER BY` key is `(job_type,
+    /// COALESCE(unique_key, id::text))`, matching
+    /// `idx_job_executions_job_type_unique_key` exactly -- NOT `unique_key`
+    /// alone (a real regression this crate shipped and caught in review:
+    /// two DIFFERENT job types sharing one dedup_key STRING, e.g.
+    /// facility-scoped cross-type work keyed by the facility id, collapsed
+    /// to one execution row even though the index would happily hold both,
+    /// silently -- both calls' own per-type live-checks had already passed,
+    /// so both reported success while one ended up with an orphan `jobs`
+    /// row and no execution row ever created). `COALESCE(unique_key,
+    /// id::text)` is the fallback for keyless rows (`unique_key IS NULL`) so
+    /// they never collapse against EACH OTHER -- Postgres treats all NULLs
+    /// as one `DISTINCT ON` group per the leading key, and every row's own
+    /// `id` is unique, so a keyless row's fallback key never collides with a
+    /// sibling's; adding `job_type` to the key cannot introduce a NEW
+    /// collapse here either, since `id` is already globally unique
+    /// regardless of `job_type` -- prepending a column can only split an
+    /// existing `DISTINCT ON` group further, never merge two apart.
+    /// `ORDER BY ..., id` picks the earliest-created (`id` is a v7 uuid) row
+    /// of a true collision deterministically.
     ///
     /// `input` is `MATERIALIZED` and re-`ORDER BY (queue_id, id)` over
     /// `deduped`'s already-collapsed rows, deliberately:

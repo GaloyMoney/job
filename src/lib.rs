@@ -740,7 +740,6 @@ impl Jobs {
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
-            Arc::clone(&self.router),
             self.clock.clone(),
             Arc::clone(&self.notifier),
             Arc::clone(&self.poller_ref),
@@ -784,7 +783,6 @@ impl Jobs {
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
-            Arc::clone(&self.router),
             self.clock.clone(),
             Arc::clone(&self.notifier),
             Arc::clone(&self.poller_ref),
