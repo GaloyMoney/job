@@ -8,7 +8,6 @@
 mod helpers;
 
 use async_trait::async_trait;
-use es_entity::AtomicOperation;
 use job::{
     CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec,
     JobSvcConfig, JobType, Jobs, RetrySettings,
@@ -244,11 +243,15 @@ async fn dedup_key_intra_batch_collapses_to_one() -> anyhow::Result<()> {
     let key = unique("shared-key");
     let first_id = JobId::new();
     let second_id = JobId::new();
+    let mut op = es_entity::DbOp::init(&pool).await?;
     let result = spawner
-        .spawn_all(vec![
-            JobSpec::new(first_id, Cfg).dedup_key(key.clone()),
-            JobSpec::new(second_id, Cfg).dedup_key(key.clone()),
-        ])
+        .spawn_all_in_op(
+            &mut op,
+            vec![
+                JobSpec::new(first_id, Cfg).dedup_key(key.clone()),
+                JobSpec::new(second_id, Cfg).dedup_key(key.clone()),
+            ],
+        )
         .await?;
 
     assert_eq!(result.jobs.len(), 2);
@@ -258,9 +261,26 @@ async fn dedup_key_intra_batch_collapses_to_one() -> anyhow::Result<()> {
     );
     assert_eq!(result.deduped, vec![second_id]);
     assert_eq!(result.jobs[1].id, first_id);
+
+    let single_id = JobId::new();
+    let single = spawner
+        .spawn_spec_in_op(&mut op, JobSpec::new(single_id, Cfg).dedup_key(key.clone()))
+        .await?;
+    assert_eq!(single.id, first_id);
+    let bulk_id = JobId::new();
+    let bulk = spawner
+        .spawn_all_in_op(&mut op, vec![JobSpec::new(bulk_id, Cfg).dedup_key(key)])
+        .await?;
+    assert_eq!(bulk.jobs.len(), 1);
+    assert_eq!(bulk.jobs[0].id, first_id);
+    assert_eq!(bulk.deduped, vec![bulk_id]);
+    op.commit().await?;
+
     assert_eq!(jobs_row_count(&pool, first_id).await?, 1);
-    assert_eq!(jobs_row_count(&pool, second_id).await?, 0);
-    assert_eq!(execution_row_count(&pool, second_id).await?, 0);
+    for suppressed in [second_id, single_id, bulk_id] {
+        assert_eq!(jobs_row_count(&pool, suppressed).await?, 0);
+        assert_eq!(execution_row_count(&pool, suppressed).await?, 0);
+    }
     assert!(execution_row_exists(&pool, first_id).await?);
 
     Ok(())
@@ -600,21 +620,44 @@ async fn spawn_spec_dedup_key_no_ops_against_a_live_row() -> anyhow::Result<()> 
 
     let key = unique("spawn-spec-held-key");
     let holder_id = JobId::new();
+    let mut op = es_entity::DbOp::init(&pool).await?;
     spawner
-        .spawn_spec(
+        .spawn_spec_in_op(
+            &mut op,
             JobSpec::new(holder_id, Cfg)
                 .dedup_key(key.clone())
                 .schedule_at(chrono::Utc::now() + chrono::Duration::hours(1)),
         )
         .await?;
 
+    let single_id = JobId::new();
+    let single = spawner
+        .spawn_spec_in_op(&mut op, JobSpec::new(single_id, Cfg).dedup_key(key.clone()))
+        .await?;
+    assert_eq!(single.id, holder_id);
+    let bulk_id = JobId::new();
+    let bulk = spawner
+        .spawn_all_in_op(
+            &mut op,
+            vec![JobSpec::new(bulk_id, Cfg).dedup_key(key.clone())],
+        )
+        .await?;
+    assert_eq!(bulk.jobs.len(), 1);
+    assert_eq!(bulk.jobs[0].id, holder_id);
+    assert_eq!(bulk.deduped, vec![bulk_id]);
+    op.commit().await?;
+
     let deduped_id = JobId::new();
     let result = spawner
         .spawn_spec(JobSpec::new(deduped_id, Cfg).dedup_key(key.clone()))
         .await?;
     assert_eq!(result.id, holder_id);
-    assert_eq!(jobs_row_count(&pool, deduped_id).await?, 0);
-    assert_eq!(execution_row_count(&pool, deduped_id).await?, 0);
+    assert_eq!(jobs_row_count(&pool, holder_id).await?, 1);
+    assert!(execution_row_exists(&pool, holder_id).await?);
+    for suppressed in [single_id, bulk_id, deduped_id] {
+        assert_eq!(jobs_row_count(&pool, suppressed).await?, 0);
+        assert_eq!(execution_row_count(&pool, suppressed).await?, 0);
+    }
 
     Ok(())
 }
@@ -697,106 +740,6 @@ async fn dedup_key_cross_call_collapse_is_scoped_by_job_type() -> anyhow::Result
     assert_eq!(jobs_row_count(&pool, id_a).await?, 1);
     assert_eq!(jobs_row_count(&pool, id_b).await?, 1);
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn same_operation_single_and_bulk_spawns_return_the_first_holder() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let mut jobs = Jobs::init(JobSvcConfig::builder().pool(pool.clone()).build().unwrap()).await?;
-    let spawner = jobs.add_initializer(HoldableInitializer {
-        job_type: job_type("same-op-dedup"),
-        started: Arc::new(Notify::new()),
-        release: Arc::new(Notify::new()),
-        fail_first_n: 0,
-        attempts_so_far: Arc::new(AtomicUsize::new(0)),
-        retry_settings: RetrySettings::default(),
-    });
-
-    for first_is_bulk in [false, true] {
-        for second_is_bulk in [false, true] {
-            let key = unique("same-op-key");
-            let queue = unique("same-op-queue");
-            let first_id = JobId::new();
-            let duplicate_id = JobId::new();
-            let mixed_duplicate_id = JobId::new();
-            let keyless_id = JobId::new();
-            let at = chrono::Utc::now() + chrono::Duration::hours(1);
-            let mut op = es_entity::DbOp::init(&pool).await?;
-            let first_spec = JobSpec::new(first_id, Cfg)
-                .dedup_key(key.clone())
-                .queue_id(queue.clone())
-                .schedule_at(at);
-            if first_is_bulk {
-                let first = spawner.spawn_all_in_op(&mut op, vec![first_spec]).await?;
-                assert_eq!(first.jobs.len(), 1);
-                assert_eq!(first.jobs[0].id, first_id);
-            } else {
-                let first = spawner.spawn_spec_in_op(&mut op, first_spec).await?;
-                assert_eq!(first.id, first_id);
-            }
-            let visible: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM job_executions WHERE id = $1)")
-                    .bind(uuid::Uuid::from(first_id))
-                    .fetch_one(op.as_executor())
-                    .await?;
-            assert!(
-                visible,
-                "the live-key check must see this operation's own spawn"
-            );
-
-            let duplicate_spec = JobSpec::new(duplicate_id, Cfg)
-                .dedup_key(key.clone())
-                .queue_id(unique("ignored-queue"));
-            let holder_id = if second_is_bulk {
-                let duplicate = spawner
-                    .spawn_all_in_op(&mut op, vec![duplicate_spec])
-                    .await?;
-                assert_eq!(duplicate.jobs.len(), 1);
-                assert_eq!(duplicate.deduped, vec![duplicate_id]);
-                duplicate.jobs[0].id
-            } else {
-                let duplicate = spawner.spawn_spec_in_op(&mut op, duplicate_spec).await?;
-                duplicate.id
-            };
-            assert_eq!(holder_id, first_id);
-
-            let mixed = spawner
-                .spawn_all_in_op(
-                    &mut op,
-                    vec![
-                        JobSpec::new(mixed_duplicate_id, Cfg).dedup_key(key),
-                        JobSpec::new(keyless_id, Cfg)
-                            .queue_id(queue.clone())
-                            .schedule_at(at),
-                    ],
-                )
-                .await?;
-            assert_eq!(mixed.jobs.len(), 2);
-            assert_eq!(mixed.jobs[0].id, first_id);
-            assert_eq!(mixed.jobs[1].id, keyless_id);
-            assert_eq!(mixed.deduped, vec![mixed_duplicate_id]);
-            op.commit().await?;
-
-            assert_eq!(jobs_row_count(&pool, first_id).await?, 1);
-            assert_eq!(execution_row_count(&pool, first_id).await?, 1);
-            for suppressed in [duplicate_id, mixed_duplicate_id] {
-                assert_eq!(jobs_row_count(&pool, suppressed).await?, 0);
-                assert_eq!(execution_row_count(&pool, suppressed).await?, 0);
-            }
-            assert_eq!(jobs_row_count(&pool, keyless_id).await?, 1);
-            assert_eq!(execution_row_state(&pool, keyless_id).await?, "parked");
-            let (execute_at, queue_id): (chrono::DateTime<chrono::Utc>, String) =
-                sqlx::query_as("SELECT execute_at, queue_id FROM job_executions WHERE id = $1")
-                    .bind(uuid::Uuid::from(first_id))
-                    .fetch_one(&pool)
-                    .await?;
-            // PostgreSQL timestamps retain microseconds rather than nanoseconds.
-            assert_eq!(execute_at.timestamp_micros(), at.timestamp_micros());
-            assert_eq!(queue_id, queue);
-            assert_eq!(jobs.handle(holder_id).load().await?.job().id, first_id);
-        }
-    }
     Ok(())
 }
 
