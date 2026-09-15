@@ -103,17 +103,31 @@ impl JobHandle {
     }
 
     /// `true` if the `spawn*` call that produced this handle CREATED the job
-    /// it points at; `false` if it resolved to a job that already existed —
-    /// a live `dedup_key`/keyed holder, or the one resident job of its type.
+    /// it points at; `false` otherwise.
     ///
     /// This is the only thing separating "I created this" from "this already
     /// existed": both cases yield an equally usable handle. Branch on it
     /// before performing first-time side effects alongside the spawn, in the
     /// same `op`.
     ///
-    /// Always `false` on a handle minted by
-    /// [`Jobs::handle`](crate::Jobs::handle)/[`Jobs::handles`](crate::Jobs::handles),
-    /// which spawn nothing.
+    /// # What it returns on every path that can produce a handle
+    ///
+    /// | produced by | `created()` |
+    /// |---|---|
+    /// | any `spawn*` that minted a new job | `true` |
+    /// | a `spawn*` that resolved onto a live `dedup_key`/keyed holder | `false` |
+    /// | [`ResidentJobSpawner::spawn`](crate::ResidentJobSpawner::spawn) onto the job that already exists | `false` |
+    /// | [`Jobs::handle`](crate::Jobs::handle) / [`handles`](crate::Jobs::handles) / [`keyed_handle`](crate::Jobs::keyed_handle) / [`keyed_handles`](crate::Jobs::keyed_handles) / [`resident_handle`](crate::Jobs::resident_handle) | `false` |
+    /// | [`Clone`] of any of the above | whatever the source said |
+    ///
+    /// **Read `false` as "this call did not create the job", not as "a spawn
+    /// found it already live".** Those coincide on the spawn paths but not on
+    /// the lookup paths: a handle obtained by lookup was not created by
+    /// anybody *in that call*, so it reports `false` for a different reason
+    /// than a coalesced spawn does — no spawn was attempted at all. Code that
+    /// branches on `created()` to decide whether to run first-time setup is
+    /// correct either way (a lookup handle never triggers it), but code that
+    /// reads `false` as evidence that a key was contended is not.
     pub fn created(&self) -> bool {
         self.created
     }

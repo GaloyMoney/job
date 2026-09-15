@@ -153,7 +153,7 @@ impl<Config> KeyedJobSpec<Config> {
     ///
     /// The move is monotone and idempotent: `execute_at` only ever moves
     /// EARLIER, never later, and a repeat of the same request changes
-    /// nothing. [`KeyedSpawn::pulled_forward`] reports whether this call was
+    /// nothing. [`JobHandle::pulled_forward`] reports whether this call was
     /// the one that moved the row.
     ///
     /// # It never shortens a backoff
