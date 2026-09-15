@@ -92,14 +92,6 @@ impl<Config> JobSpec<Config> {
     }
 }
 
-/// The outcome of spawning one spec.
-pub struct JobSpawn {
-    /// The created job's ID, or the existing live holder's ID on coalescing.
-    pub id: JobId,
-    /// The job created by this call; `None` when a live holder already exists.
-    pub job: Option<Job>,
-}
-
 /// Return value of [`JobSpawner::spawn_all`]/[`JobSpawner::spawn_all_in_op`].
 ///
 /// `jobs.len() + deduped.len() == ` the number of input specs whenever no
@@ -181,7 +173,7 @@ where
         skip(self, spec),
         fields(job_type = %self.job_type)
     )]
-    pub async fn spawn_spec(&self, spec: JobSpec<Config>) -> Result<JobSpawn, JobError> {
+    pub async fn spawn_spec(&self, spec: JobSpec<Config>) -> Result<Job, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let job = self.spawn_spec_in_op(&mut op, spec).await?;
         op.commit().await?;
@@ -194,12 +186,9 @@ where
     /// [`Self::spawn_at_in_op`] / [`Self::spawn_at_with_queue_id_in_op`]).
     ///
     /// Honors [`JobSpec::dedup_key`] exactly like [`Self::spawn_all_in_op`]
-    /// does per spec: returns the live holder's ID without creating rows on
-    /// coalescing, or the new job and its ID otherwise. Deduplicated executions
-    /// are inserted inline so later spawns in the same operation see them.
-    /// Every other `spawn*` method builds a `JobSpec` with `dedup_key: None`,
-    /// for which `JobSpawn::job` is always `Some`; those call sites `.expect(...)`
-    /// that invariant rather than changing their public signatures.
+    /// does per spec: returns the existing holder without creating rows on
+    /// coalescing, or the new job otherwise. Deduplicated executions are
+    /// inserted inline so later spawns in the same operation see them.
     #[instrument(
         name = "job_spawner.spawn_spec_in_op",
         skip(self, op, spec),
@@ -207,9 +196,9 @@ where
     )]
     pub async fn spawn_spec_in_op(
         &self,
-        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        mut op: &mut (impl es_entity::AtomicOperation + ?Sized),
         spec: JobSpec<Config>,
-    ) -> Result<JobSpawn, JobError> {
+    ) -> Result<Job, JobError> {
         let schedule_at = spec
             .schedule_at
             .unwrap_or_else(|| op.maybe_now().unwrap_or_else(|| self.clock.now()));
@@ -220,7 +209,7 @@ where
                 .lock_and_check_live_keys_in_op(op, &self.job_type, std::slice::from_ref(key))
                 .await?;
             if let Some(id) = live_keys.get(key) {
-                return Ok(JobSpawn { id: *id, job: None });
+                return Ok(self.repo.find_by_id_in_op(&mut op, *id).await?);
             }
         }
 
@@ -254,10 +243,7 @@ where
         )
         .await?;
 
-        Ok(JobSpawn {
-            id: job.id,
-            job: Some(job),
-        })
+        Ok(job)
     }
 
     /// Create and spawn a job for immediate execution.
@@ -328,10 +314,6 @@ where
     ) -> Result<Job, JobError> {
         self.spawn_spec_in_op(op, JobSpec::new(id, config).schedule_at(schedule_at))
             .await
-            .map(|job| {
-                job.job
-                    .expect("a JobSpec without dedup_key is never deduped")
-            })
     }
 
     /// Create and spawn a job for immediate execution within a queue.
@@ -423,10 +405,6 @@ where
                 .queue_id(queue_id),
         )
         .await
-        .map(|job| {
-            job.job
-                .expect("a JobSpec without dedup_key is never deduped")
-        })
     }
 
     /// Create and spawn multiple jobs in a single atomic operation.
