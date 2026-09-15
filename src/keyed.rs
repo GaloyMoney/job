@@ -37,7 +37,7 @@ use super::{
     Job, JobId,
     entity::{JobType, NewJob},
     error::JobError,
-    handle::JobHandle,
+    handle::{JobHandle, JobHandles},
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     poller::PollerHandle,
@@ -173,42 +173,6 @@ impl<Config> KeyedJobSpec<Config> {
     }
 }
 
-/// The outcome of spawning one key.
-///
-/// Like [`crate::BulkSpawnResult`], there is no "dropped" case: keyed spawn
-/// resolves a collision to the LIVE holder rather than discarding the spec,
-/// so every requested key yields a usable [`JobHandle`] and `created` says
-/// which generation it refers to.
-pub struct KeyedSpawn {
-    /// The key that was requested.
-    pub key: String,
-    /// Handle to the job now holding `key` — the one just created, or the
-    /// LIVE one that already held it.
-    pub handle: JobHandle,
-    /// `true` if this call created the job, `false` if it resolved to a job
-    /// that already held the key. Use it to decide whether to perform
-    /// first-time side effects alongside the spawn, in the same `op`.
-    pub created: bool,
-    /// `true` if this call moved the holder's `execute_at` EARLIER, to the
-    /// time this spec asked for — its [`KeyedJobSpec::schedule_at`], or now
-    /// when it has none. Only ever set for a
-    /// [`KeyedJobSpec::force_reschedule`] spec that resolved to a holder
-    /// scheduled later than that and eligible to be woken (see
-    /// [`KeyedJobSpawner::spawn_all_in_op`]). Always `false` when `created`
-    /// is `true`: a job created here already carries the time it asked for.
-    ///
-    /// `created == false && pulled_forward == false` is the ordinary
-    /// resolve-to-holder outcome: the key was live and nothing was changed.
-    pub pulled_forward: bool,
-}
-
-impl KeyedSpawn {
-    /// Discard the key/`created` context and keep just the handle.
-    pub fn into_handle(self) -> JobHandle {
-        self.handle
-    }
-}
-
 /// A handle for spawning keyed jobs of a specific type.
 ///
 /// Returned by [`crate::Jobs::add_keyed_initializer`].
@@ -294,17 +258,16 @@ where
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let spawned = self.spawn_in_op(&mut op, key, config).await?;
         op.commit().await?;
-        Ok(spawned.handle)
+        Ok(spawned)
     }
 
     /// [`Self::spawn`] as part of an existing atomic operation, so a keyed
     /// job is created in the same transaction as whatever prompted it.
     ///
     /// Same semantics as [`Self::spawn`] — create, or resolve to the LIVE
-    /// holder — but returns [`KeyedSpawn`] rather than a bare handle, since
-    /// in-op callers usually need to know whether they are the ones who
-    /// created it before writing their own side of the transaction. Use
-    /// [`KeyedSpawn::into_handle`] when they don't.
+    /// holder. In-op callers usually need to know whether they are the ones
+    /// who created it before writing their own side of the transaction;
+    /// [`JobHandle::created`] is that answer.
     ///
     /// Two calls on the SAME `op` for the same key are safe and resolve the
     /// second to the first's job: the execution row is inserted before this
@@ -320,18 +283,23 @@ where
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         key: impl Into<String> + Send + Debug,
         config: Config,
-    ) -> Result<KeyedSpawn, JobError> {
-        let mut spawned = self
+    ) -> Result<JobHandle, JobError> {
+        let spawned = self
             .spawn_all_in_op(op, vec![KeyedJobSpec::new(key, config)])
             .await?;
-        Ok(spawned.pop().expect("one spec in, exactly one outcome out"))
+        Ok(spawned
+            .into_iter()
+            .next()
+            .expect("one spec in, exactly one handle out"))
     }
 
     /// Create or resolve many keys of this type in a single atomic operation.
     ///
-    /// Outcomes are returned in the order of `specs`, one per spec. Every key
-    /// yields a [`KeyedSpawn`] — none are silently dropped — so this can be
-    /// zipped straight back against the inputs.
+    /// Handles are returned in the order of `specs`, one per spec (contract
+    /// 2). Every key yields a [`JobHandle`] — none are silently dropped — so
+    /// this can be zipped straight back against the inputs to recover which
+    /// key each handle answers for; [`JobHandle::created`] says whether it
+    /// was minted here or resolved to a live holder.
     #[instrument(
         name = "keyed_job_spawner.spawn_all",
         skip(self, specs),
@@ -340,7 +308,7 @@ where
     pub async fn spawn_all(
         &self,
         specs: Vec<KeyedJobSpec<Config>>,
-    ) -> Result<Vec<KeyedSpawn>, JobError> {
+    ) -> Result<JobHandles, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let spawned = self.spawn_all_in_op(&mut op, specs).await?;
         op.commit().await?;
@@ -425,10 +393,10 @@ where
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         specs: Vec<KeyedJobSpec<Config>>,
-    ) -> Result<Vec<KeyedSpawn>, JobError> {
+    ) -> Result<JobHandles, JobError> {
         tracing::Span::current().record("count", specs.len());
         if specs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(JobHandles::default());
         }
 
         let default_schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
@@ -459,7 +427,11 @@ where
         // never reach the database — see below.
         let mut local_wake: HashMap<usize, DateTime<Utc>> = HashMap::new();
         let mut local_wake_outcomes: Vec<(usize, usize)> = Vec::new();
-        let mut outcomes = Vec::with_capacity(specs.len());
+        let mut outcomes: Vec<JobHandle> = Vec::with_capacity(specs.len());
+        // The key each entry of `outcomes` answers for. A `JobHandle` carries
+        // no key of its own, and `pulled_forward` is resolved by key AFTER
+        // the loop, so the correspondence has to be kept alongside.
+        let mut outcome_keys: Vec<String> = Vec::with_capacity(specs.len());
 
         for spec in specs {
             // The `execute_at` this spec asks for: the one a NEW job of it
@@ -473,12 +445,8 @@ where
                         .or_insert(wanted_at);
                     wake_outcomes.push(outcomes.len());
                 }
-                outcomes.push(KeyedSpawn {
-                    key: spec.key,
-                    handle: self.handle(*id),
-                    created: false,
-                    pulled_forward: false,
-                });
+                outcomes.push(self.handle(*id).with_created(false));
+                outcome_keys.push(spec.key);
                 continue;
             }
 
@@ -490,12 +458,8 @@ where
                         .or_insert(wanted_at);
                     local_wake_outcomes.push((outcomes.len(), idx));
                 }
-                outcomes.push(KeyedSpawn {
-                    key: spec.key,
-                    handle: self.handle(id),
-                    created: false,
-                    pulled_forward: false,
-                });
+                outcomes.push(self.handle(id).with_created(false));
+                outcome_keys.push(spec.key);
                 continue;
             }
 
@@ -519,12 +483,8 @@ where
             new_ids.push(id);
             new_keys.push(spec.key.clone());
             new_schedule_times.push(wanted_at);
-            outcomes.push(KeyedSpawn {
-                key: spec.key,
-                handle: self.handle(id),
-                created: true,
-                pulled_forward: false,
-            });
+            outcomes.push(self.handle(id).with_created(true));
+            outcome_keys.push(spec.key);
         }
 
         // A wake against a row this very call is inserting needs no
@@ -541,7 +501,7 @@ where
             }
         }
         for (outcome_idx, idx) in local_wake_outcomes {
-            outcomes[outcome_idx].pulled_forward = moved_locally.contains(&idx);
+            outcomes[outcome_idx].set_pulled_forward(moved_locally.contains(&idx));
         }
 
         // Distinct by construction — they are a `HashMap`'s keys — which is
@@ -549,7 +509,7 @@ where
         let (wake_keys, wake_targets): (Vec<String>, Vec<DateTime<Utc>>) = wake.into_iter().unzip();
 
         if new_jobs.is_empty() && wake_keys.is_empty() {
-            return Ok(outcomes);
+            return Ok(outcomes.into_iter().collect());
         }
 
         if !new_jobs.is_empty() {
@@ -566,14 +526,14 @@ where
         // sharing a key with one of them in the same call still reads as the
         // no-op it requested.
         for i in wake_outcomes {
-            outcomes[i].pulled_forward = pulled.contains_key(&outcomes[i].key);
+            outcomes[i].set_pulled_forward(pulled.contains_key(&outcome_keys[i]));
         }
 
         // Nothing created and nothing moved means nothing to announce: a
         // wake that found its row already due must not add a notify to a
         // funnel that is already this crate's busiest.
         if new_ids.is_empty() && pulled.is_empty() {
-            return Ok(outcomes);
+            return Ok(outcomes.into_iter().collect());
         }
 
         // Fires for a row moved to a FUTURE instant too, not just a due one:
@@ -597,7 +557,7 @@ where
             poller.register_claim_demand(op, &self.job_type, n_due);
         }
 
-        Ok(outcomes)
+        Ok(outcomes.into_iter().collect())
     }
 
     /// `execute_at = LEAST(execute_at, target)` for every one of `keys`

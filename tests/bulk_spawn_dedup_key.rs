@@ -2,7 +2,7 @@
 //! regular spawn path. The mechanism is the SAME `(job_type, unique_key)`
 //! live-window `idx_job_executions_job_type_unique_key` already enforces for
 //! keyed jobs — these tests pin the NEW surface (`JobSpec`/`spawn_all`/
-//! `spawn_all_in_op`/`BulkSpawnResult`), not the underlying index (that's
+//! `spawn_all_in_op`/`JobHandles`), not the underlying index (that's
 //! `repo::tests::unique_per_job_type_and_key`).
 
 mod helpers;
@@ -158,7 +158,8 @@ async fn wait_until(
 
 /// AC1: a spec whose `dedup_key` is already held by a LIVE execution creates
 /// NO `jobs` row and NO execution row, the rest of the batch lands
-/// normally, and the no-op is reported via `BulkSpawnResult::deduped`.
+/// normally, and the no-op is reported by that position's handle answering
+/// `created() == false` while still pointing at the live holder.
 ///
 /// The live holder is seeded directly (mirrors
 /// `parked_rows.rs::keyed_spawn_is_blocked_by_a_parked_row_with_the_same_key`)
@@ -200,10 +201,14 @@ async fn dedup_key_no_ops_against_a_live_row() -> anyhow::Result<()> {
         ])
         .await?;
 
-    assert_eq!(result.deduped, vec![deduped_id]);
-    assert_eq!(result.jobs.len(), 2);
-    assert_eq!(result.jobs[0].id, holder_id);
-    assert_eq!(result.jobs[1].id, survivor_id);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].id(), holder_id);
+    assert!(
+        !result[0].created(),
+        "the key was live, so spec 0 resolved rather than created"
+    );
+    assert_eq!(result[1].id(), survivor_id);
+    assert!(result[1].created(), "spec 1 carried no key -- it created");
 
     assert_eq!(
         jobs_row_count(&pool, deduped_id).await?,
@@ -221,8 +226,8 @@ async fn dedup_key_no_ops_against_a_live_row() -> anyhow::Result<()> {
 }
 
 /// AC2: two specs sharing one dedup key in ONE `spawn_all` call collapse to
-/// exactly one landed job — the loser reported via `deduped`, not a
-/// constraint violation.
+/// exactly one landed job — the loser reported by `created() == false` on
+/// its own position, not a constraint violation.
 #[tokio::test]
 async fn dedup_key_intra_batch_collapses_to_one() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -254,26 +259,32 @@ async fn dedup_key_intra_batch_collapses_to_one() -> anyhow::Result<()> {
         )
         .await?;
 
-    assert_eq!(result.jobs.len(), 2);
+    assert_eq!(result.len(), 2);
     assert_eq!(
-        result.jobs[0].id, first_id,
+        result[0].id(),
+        first_id,
         "the first-listed spec wins the collapse"
     );
-    assert_eq!(result.deduped, vec![second_id]);
-    assert_eq!(result.jobs[1].id, first_id);
+    assert!(result[0].created(), "the winner created the job");
+    assert_eq!(result[1].id(), first_id);
+    assert!(
+        !result[1].created(),
+        "the second spec collapsed onto the first -- it created nothing"
+    );
 
     let single_id = JobId::new();
     let single = spawner
         .spawn_spec_in_op(&mut op, JobSpec::new(single_id, Cfg).dedup_key(key.clone()))
         .await?;
-    assert_eq!(single.id, first_id);
+    assert_eq!(single.id(), first_id);
+    assert!(!single.created());
     let bulk_id = JobId::new();
     let bulk = spawner
         .spawn_all_in_op(&mut op, vec![JobSpec::new(bulk_id, Cfg).dedup_key(key)])
         .await?;
-    assert_eq!(bulk.jobs.len(), 1);
-    assert_eq!(bulk.jobs[0].id, first_id);
-    assert_eq!(bulk.deduped, vec![bulk_id]);
+    assert_eq!(bulk.len(), 1);
+    assert_eq!(bulk[0].id(), first_id);
+    assert!(!bulk[0].created());
     op.commit().await?;
 
     assert_eq!(jobs_row_count(&pool, first_id).await?, 1);
@@ -314,8 +325,8 @@ async fn dedup_key_becomes_respawnable_after_terminal() -> anyhow::Result<()> {
     let result = spawner
         .spawn_all(vec![JobSpec::new(first_id, Cfg).dedup_key(key.clone())])
         .await?;
-    assert_eq!(result.jobs.len(), 1);
-    assert!(result.deduped.is_empty());
+    assert_eq!(result.len(), 1);
+    assert!(result[0].created(), "the key was free -- this created");
 
     started.notified().await;
 
@@ -324,9 +335,12 @@ async fn dedup_key_becomes_respawnable_after_terminal() -> anyhow::Result<()> {
     let result = spawner
         .spawn_all(vec![JobSpec::new(blocked_id, Cfg).dedup_key(key.clone())])
         .await?;
-    assert_eq!(result.jobs.len(), 1);
-    assert_eq!(result.jobs[0].id, first_id);
-    assert_eq!(result.deduped, vec![blocked_id]);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].id(), first_id);
+    assert!(
+        !result[0].created(),
+        "`{blocked_id}` created nothing -- it resolved to the live holder"
+    );
 
     // Release the holder and wait for its execution row to vanish (terminal).
     release.notify_one();
@@ -341,9 +355,12 @@ async fn dedup_key_becomes_respawnable_after_terminal() -> anyhow::Result<()> {
     let result = spawner
         .spawn_all(vec![JobSpec::new(respawned_id, Cfg).dedup_key(key.clone())])
         .await?;
-    assert_eq!(result.jobs.len(), 1);
-    assert_eq!(result.jobs[0].id, respawned_id);
-    assert!(result.deduped.is_empty());
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].id(), respawned_id);
+    assert!(
+        result[0].created(),
+        "the holder went terminal, so the key is free and this created"
+    );
 
     Ok(())
 }
@@ -386,7 +403,7 @@ async fn dedup_key_survives_a_retry() -> anyhow::Result<()> {
     let result = spawner
         .spawn_all(vec![JobSpec::new(id, Cfg).dedup_key(key.clone())])
         .await?;
-    assert_eq!(result.jobs.len(), 1);
+    assert_eq!(result.len(), 1);
 
     // Wait for the first (failing) attempt to be recorded, i.e. the retry
     // reschedule write has happened -- the SAME row, per `dispatcher.rs`.
@@ -406,9 +423,12 @@ async fn dedup_key_survives_a_retry() -> anyhow::Result<()> {
     let result = spawner
         .spawn_all(vec![JobSpec::new(blocked_id, Cfg).dedup_key(key.clone())])
         .await?;
-    assert_eq!(result.jobs.len(), 1);
-    assert_eq!(result.jobs[0].id, id);
-    assert_eq!(result.deduped, vec![blocked_id]);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].id(), id);
+    assert!(
+        !result[0].created(),
+        "a retry-rescheduled row still holds the key, so `{blocked_id}` must resolve to it"
+    );
 
     release.notify_one();
     Ok(())
@@ -455,9 +475,9 @@ async fn dedup_key_composes_with_queue_id_park_or_take() -> anyhow::Result<()> {
         ])
         .await?;
 
-    assert_eq!(
-        result.jobs.len(),
-        1,
+    assert_eq!(result.len(), 1);
+    assert!(
+        result[0].created(),
         "a free key must never be suppressed by queue occupancy"
     );
     assert_eq!(execution_row_state(&pool, parked_id).await?, "parked");
@@ -500,8 +520,11 @@ async fn dedup_key_batch_leaves_keyless_specs_unaffected() -> anyhow::Result<()>
     specs.push(JobSpec::new(keyed_id, Cfg).dedup_key(unique("mixed-batch-key")));
 
     let result = spawner.spawn_all(specs).await?;
-    assert_eq!(result.jobs.len(), 6);
-    assert!(result.deduped.is_empty());
+    assert_eq!(result.len(), 6);
+    assert!(
+        result.iter().all(|h| h.created()),
+        "every key in this batch was free -- none may resolve"
+    );
     for id in keyless_ids {
         assert!(execution_row_exists(&pool, id).await?);
     }
@@ -544,13 +567,20 @@ async fn concurrent_bulk_spawn_same_dedup_key_exactly_one_lands() -> anyhow::Res
         let ra = ra.expect("no statement-abort must ever surface to the caller");
         let rb = rb.expect("no statement-abort must ever surface to the caller");
 
-        assert_eq!(ra.jobs.len(), 1);
-        assert_eq!(rb.jobs.len(), 1);
-        assert_eq!(ra.jobs[0].id, rb.jobs[0].id);
+        assert_eq!(ra.len(), 1);
+        assert_eq!(rb.len(), 1);
+        assert_eq!(
+            ra[0].id(),
+            rb[0].id(),
+            "both callers must be handed the same winning job"
+        );
         let landed = jobs_row_count(&pool, a_id).await? + jobs_row_count(&pool, b_id).await?;
-        let deduped = ra.deduped.len() + rb.deduped.len();
+        let created = usize::from(ra[0].created()) + usize::from(rb[0].created());
         assert_eq!(landed, 1, "exactly one of the two concurrent spawns lands");
-        assert_eq!(deduped, 1, "the other must be reported, not silently lost");
+        assert_eq!(
+            created, 1,
+            "exactly one caller may claim it created; the other must report resolved, not silently lost"
+        );
 
         let live_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM job_executions WHERE job_type = $1 AND unique_key = $2",
@@ -589,8 +619,12 @@ async fn spawn_spec_without_dedup_key_creates_a_job() -> anyhow::Result<()> {
     jobs.start_poll().await?;
 
     let id = JobId::new();
-    let job = spawner.spawn_spec(JobSpec::new(id, Cfg)).await?;
-    assert_eq!(job.id, id);
+    let handle = spawner.spawn_spec(JobSpec::new(id, Cfg)).await?;
+    assert_eq!(handle.id(), id);
+    assert!(
+        handle.created(),
+        "a spec without dedup_key always creates its job"
+    );
     assert!(execution_row_exists(&pool, id).await?);
 
     Ok(())
@@ -621,7 +655,7 @@ async fn spawn_spec_dedup_key_no_ops_against_a_live_row() -> anyhow::Result<()> 
     let key = unique("spawn-spec-held-key");
     let holder_id = JobId::new();
     let mut op = es_entity::DbOp::init(&pool).await?;
-    spawner
+    let holder = spawner
         .spawn_spec_in_op(
             &mut op,
             JobSpec::new(holder_id, Cfg)
@@ -629,12 +663,17 @@ async fn spawn_spec_dedup_key_no_ops_against_a_live_row() -> anyhow::Result<()> 
                 .schedule_at(chrono::Utc::now() + chrono::Duration::hours(1)),
         )
         .await?;
+    assert!(
+        holder.created(),
+        "the key was free -- the holder created it"
+    );
 
     let single_id = JobId::new();
     let single = spawner
         .spawn_spec_in_op(&mut op, JobSpec::new(single_id, Cfg).dedup_key(key.clone()))
         .await?;
-    assert_eq!(single.id, holder_id);
+    assert_eq!(single.id(), holder_id);
+    assert!(!single.created());
     let bulk_id = JobId::new();
     let bulk = spawner
         .spawn_all_in_op(
@@ -642,16 +681,17 @@ async fn spawn_spec_dedup_key_no_ops_against_a_live_row() -> anyhow::Result<()> 
             vec![JobSpec::new(bulk_id, Cfg).dedup_key(key.clone())],
         )
         .await?;
-    assert_eq!(bulk.jobs.len(), 1);
-    assert_eq!(bulk.jobs[0].id, holder_id);
-    assert_eq!(bulk.deduped, vec![bulk_id]);
+    assert_eq!(bulk.len(), 1);
+    assert_eq!(bulk[0].id(), holder_id);
+    assert!(!bulk[0].created());
     op.commit().await?;
 
     let deduped_id = JobId::new();
     let result = spawner
         .spawn_spec(JobSpec::new(deduped_id, Cfg).dedup_key(key.clone()))
         .await?;
-    assert_eq!(result.id, holder_id);
+    assert_eq!(result.id(), holder_id);
+    assert!(!result.created());
     assert_eq!(jobs_row_count(&pool, holder_id).await?, 1);
     assert!(execution_row_exists(&pool, holder_id).await?);
     for suppressed in [single_id, bulk_id, deduped_id] {
@@ -716,12 +756,19 @@ async fn dedup_key_cross_call_collapse_is_scoped_by_job_type() -> anyhow::Result
     op.commit().await?;
 
     assert_eq!(
-        a.id, id_a,
+        a.id(),
+        id_a,
         "job_type A's own per-type live-check must pass -- the key is free under A"
     );
+    assert!(a.created());
     assert_eq!(
-        b.id, id_b,
+        b.id(),
+        id_b,
         "job_type B's own per-type live-check must pass -- the key is free under B"
+    );
+    assert!(
+        b.created(),
+        "B must not collapse onto A's identically-keyed row"
     );
 
     assert!(
@@ -771,16 +818,22 @@ async fn rolled_back_deduplicated_spawns_leave_the_key_available() -> anyhow::Re
             vec![JobSpec::new(duplicate_id, Cfg).dedup_key(key.clone())],
         )
         .await?;
-    assert_eq!(first.id, abandoned_id);
-    assert_eq!(duplicate.jobs.len(), 1);
-    assert_eq!(duplicate.jobs[0].id, abandoned_id);
+    assert_eq!(first.id(), abandoned_id);
+    assert!(first.created());
+    assert_eq!(duplicate.len(), 1);
+    assert_eq!(duplicate[0].id(), abandoned_id);
+    assert!(!duplicate[0].created());
     drop(op);
 
     let replacement_id = JobId::new();
     let replacement = spawner
         .spawn_spec(JobSpec::new(replacement_id, Cfg).dedup_key(key))
         .await?;
-    assert_eq!(replacement.id, replacement_id);
+    assert_eq!(replacement.id(), replacement_id);
+    assert!(
+        replacement.created(),
+        "the rolled-back holder never committed, so the key is free again"
+    );
     for rolled_back in [abandoned_id, duplicate_id] {
         assert_eq!(jobs_row_count(&pool, rolled_back).await?, 0);
         assert_eq!(execution_row_count(&pool, rolled_back).await?, 0);

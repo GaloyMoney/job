@@ -277,17 +277,18 @@
 //! already have open, and [`KeyedJobSpawner::spawn_all`] /
 //! [`KeyedJobSpawner::spawn_all_in_op`] do it for many keys at once.
 //! Both report per key whether they created the job or resolved to one that
-//! already held the key ([`KeyedSpawn::created`]) — the collision is never
-//! silently dropped, unlike [`JobSpec::dedup_key`] on the regular spawn path:
+//! already held the key ([`JobHandle::created`]) — the collision is never
+//! silently dropped. [`JobSpec::dedup_key`] on the regular spawn path now
+//! behaves the same way, and reports it the same way:
 //!
 //! ```ignore
-//! let spawned = shard_spawner
+//! let handles = shard_spawner
 //!     .spawn_all_in_op(&mut op, shards.iter().map(|s| {
 //!         KeyedJobSpec::new(format!("shard-{s}"), ShardConfig { shard_id: *s })
 //!     }).collect())
 //!     .await?;
-//! for s in &spawned {
-//!     if s.created {
+//! for (shard, handle) in shards.iter().zip(&handles) {
+//!     if handle.created() {
 //!         // ... first-time setup for this shard, in the same transaction
 //!     }
 //! }
@@ -300,7 +301,7 @@
 //! into "run no later than the time I am asking for": it pulls the holder's
 //! `execute_at` forward to the spec's own `schedule_at` (or now, when it has
 //! none), monotonically — earlier only, never later — and never over a retry
-//! backoff, reporting through [`KeyedSpawn::pulled_forward`] whether it moved
+//! backoff, reporting through [`JobHandle::pulled_forward`] whether it moved
 //! anything.
 //!
 //! ```ignore
@@ -450,7 +451,7 @@ pub use error::JobError;
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use handle::{JobHandle, JobHandles};
 pub use job_execution::JobStatus;
-pub use keyed::{KeyedJobInitializer, KeyedJobSpawner, KeyedJobSpec, KeyedSpawn};
+pub use keyed::{KeyedJobInitializer, KeyedJobSpawner, KeyedJobSpec};
 pub use migrate::*;
 pub use outcome::{JobOutcome, JobOutcomes, JobReturnValue, JobTerminalState};
 pub use registry::*;
@@ -740,6 +741,7 @@ impl Jobs {
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
+            Arc::clone(&self.router),
             self.clock.clone(),
             Arc::clone(&self.notifier),
             Arc::clone(&self.poller_ref),
@@ -783,6 +785,7 @@ impl Jobs {
         JobSpawner::new(
             Arc::clone(&self.repo),
             job_type,
+            Arc::clone(&self.router),
             self.clock.clone(),
             Arc::clone(&self.notifier),
             Arc::clone(&self.poller_ref),

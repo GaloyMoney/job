@@ -18,9 +18,9 @@ use crate::{
 /// await a job you did not run yourself.
 ///
 /// Obtain one from [`Jobs::handle`](crate::Jobs::handle),
-/// [`Jobs::handles`](crate::Jobs::handles),
-/// [`ResidentJobSpawner::spawn`](crate::ResidentJobSpawner::spawn), or
-/// [`KeyedJobSpawner::spawn`](crate::KeyedJobSpawner::spawn).
+/// [`Jobs::handles`](crate::Jobs::handles), or from any `spawn*` method on
+/// any spawner flavor — every one of them yields a `JobHandle`, or a
+/// [`JobHandles`] for the multi-spec forms.
 ///
 /// The handle is a capability, not a value: it holds no cached state and
 /// exposes exactly two operations — [`load`](Self::load) for a point-in-time
@@ -42,18 +42,20 @@ use crate::{
 ///    `Pending`/`Running` for a finished job, regardless of isolation level.
 /// 5. **Honest absence:** [`JobSnapshot::execution_state`] ⇒ `Ok(None)` on
 ///    no-row/no-state; `load()` ⇒ `Err(Find)` only if the job never existed.
-/// 6. **Keyed/resident handle identity:** both
-///    [`KeyedJobSpawner::spawn`](crate::KeyedJobSpawner::spawn) and
-///    [`ResidentJobSpawner::spawn`](crate::ResidentJobSpawner::spawn)
-///    generate the job's id internally; on the duplicate path the returned
-///    handle's id is the PERSISTED job's id, not a new one — for keyed, the
-///    still-LIVE job holding the key; for resident, the job that exists at
-///    all (possibly long-terminal, though a resident job never actually
-///    reaches terminal — see [`crate::ResidentJobCompletion`]). Either way,
-///    callers read the id back from the handle.
+/// 6. **Spawn handle identity:** a `spawn*` call that resolves to an
+///    existing job rather than creating one returns a handle on the
+///    PERSISTED job, not on the spec that was suppressed — for keyed and
+///    plain dedup, the still-LIVE job holding the key; for resident, the job
+///    that exists at all (possibly long-terminal, though a resident job
+///    never actually reaches terminal — see
+///    [`crate::ResidentJobCompletion`]). Keyed and resident generate the id
+///    internally in the first place. Either way, callers read the id back
+///    from the handle and ask [`created`](Self::created) which case they got.
 #[derive(Clone)]
 pub struct JobHandle {
     id: JobId,
+    created: bool,
+    pulled_forward: bool,
     repo: Arc<JobRepo>,
     router: Arc<JobNotificationRouter>,
     // Held so later stages can time-stamp reads consistently with the service
@@ -63,6 +65,10 @@ pub struct JobHandle {
 }
 
 impl JobHandle {
+    /// A handle that makes no claim about having created anything —
+    /// [`Jobs::handle`](crate::Jobs::handle)/[`Jobs::handles`](crate::Jobs::handles)
+    /// mint these, and [`created`](Self::created) reads `false` on them,
+    /// which is the truthful answer: minting a handle creates no job.
     pub(crate) fn new(
         id: JobId,
         repo: Arc<JobRepo>,
@@ -71,15 +77,64 @@ impl JobHandle {
     ) -> Self {
         Self {
             id,
+            created: false,
+            pulled_forward: false,
             repo,
             router,
             clock,
         }
     }
 
+    /// Stamp the spawn disposition onto a freshly minted handle. Spawner-only.
+    pub(crate) fn with_created(mut self, created: bool) -> Self {
+        self.created = created;
+        self
+    }
+
+    /// Spawner-only: keyed spawn resolves `pulled_forward` after the fact,
+    /// once `pull_forward_in_op` reports which holders actually moved.
+    pub(crate) fn set_pulled_forward(&mut self, pulled_forward: bool) {
+        self.pulled_forward = pulled_forward;
+    }
+
     /// The id of the job this handle observes.
     pub fn id(&self) -> JobId {
         self.id
+    }
+
+    /// `true` if the `spawn*` call that produced this handle CREATED the job
+    /// it points at; `false` if it resolved to a job that already existed —
+    /// a live `dedup_key`/keyed holder, or the one resident job of its type.
+    ///
+    /// This is the only thing separating "I created this" from "this already
+    /// existed": both cases yield an equally usable handle. Branch on it
+    /// before performing first-time side effects alongside the spawn, in the
+    /// same `op`.
+    ///
+    /// Always `false` on a handle minted by
+    /// [`Jobs::handle`](crate::Jobs::handle)/[`Jobs::handles`](crate::Jobs::handles),
+    /// which spawn nothing.
+    pub fn created(&self) -> bool {
+        self.created
+    }
+
+    /// `true` if the `spawn*` call that produced this handle moved the
+    /// holder's `execute_at` EARLIER, to the time the spec asked for.
+    ///
+    /// Only ever set for a
+    /// [`KeyedJobSpec::force_reschedule`](crate::KeyedJobSpec::force_reschedule)
+    /// spec that resolved to a holder scheduled later than that and eligible
+    /// to be woken (see
+    /// [`KeyedJobSpawner::spawn_all_in_op`](crate::KeyedJobSpawner::spawn_all_in_op)).
+    /// Always `false` when [`created`](Self::created) is `true` — a job
+    /// created here already carries the time it asked for — and always
+    /// `false` for every non-keyed flavor, which has no wake to request.
+    ///
+    /// `created() == false && pulled_forward() == false` is the ordinary
+    /// resolve-to-holder outcome: the job was already live and nothing was
+    /// changed.
+    pub fn pulled_forward(&self) -> bool {
+        self.pulled_forward
     }
 
     /// Load a point-in-time [`JobSnapshot`]: runtime status plus the committed
@@ -181,6 +236,7 @@ impl JobHandle {
 /// Mint one with [`Jobs::handles`](crate::Jobs::handles) or collect handles
 /// with [`FromIterator`]. Contract 2 (order preservation) holds for every
 /// batch method: results align positionally with the handles.
+#[derive(Default)]
 pub struct JobHandles(Vec<JobHandle>);
 
 const AWAIT_ALL_CHUNK: usize = 1000;
@@ -263,6 +319,15 @@ impl IntoIterator for JobHandles {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a JobHandles {
+    type Item = &'a JobHandle;
+    type IntoIter = std::slice::Iter<'a, JobHandle>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }
 

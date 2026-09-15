@@ -1,11 +1,11 @@
 //! Tests for the in-op and bulk keyed spawn surface:
-//! `KeyedJobSpawner::spawn_in_op` / `spawn_all` / `spawn_all_in_op` and
-//! `KeyedSpawn`.
+//! `KeyedJobSpawner::spawn_in_op` / `spawn_all` / `spawn_all_in_op`, which
+//! return `JobHandle` / `JobHandles`.
 //!
 //! The semantic under test throughout is keyed spawn's own, which differs
 //! from `JobSpec::dedup_key`'s (`bulk_spawn_dedup_key.rs`): a collision
 //! RESOLVES to the live holder rather than dropping the spec, so every
-//! requested key yields a handle and `KeyedSpawn::created` says which
+//! requested key yields a handle and `JobHandle::created` says which
 //! generation it names.
 //!
 //! The case worth the most attention is
@@ -149,13 +149,20 @@ async fn spawn_in_op_commits_with_the_caller() -> anyhow::Result<()> {
     let spawned = spawner
         .spawn_in_op(&mut op, "shard-a", Cfg { marker: 1 })
         .await?;
-    assert!(spawned.created, "a free key must report created");
-    assert_eq!(spawned.key, "shard-a");
+    assert!(spawned.created(), "a free key must report created");
     op.commit().await?;
 
+    // `spawned` no longer carries the key it was spawned for; read it back
+    // from the persisted row it names instead.
+    let (unique_key,): (String,) = sqlx::query_as("SELECT unique_key FROM jobs WHERE id = $1")
+        .bind(uuid::Uuid::from(spawned.id()))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(unique_key, "shard-a");
+
     assert_eq!(count_jobs(&pool, &job_type, "shard-a").await?, 1);
-    assert_eq!(jobs.handle(spawned.handle.id()).load().await?.job().id, {
-        spawned.handle.id()
+    assert_eq!(jobs.handle(spawned.id()).load().await?.job().id, {
+        spawned.id()
     });
 
     jobs.shutdown().await?;
@@ -228,14 +235,14 @@ async fn two_spawn_in_op_calls_on_one_op_resolve_to_the_same_job() -> anyhow::Re
         .await?;
     op.commit().await?;
 
-    assert!(first.created);
+    assert!(first.created());
     assert!(
-        !second.created,
+        !second.created(),
         "the second call on the same op must resolve, not create"
     );
     assert_eq!(
-        second.handle.id(),
-        first.handle.id(),
+        second.id(),
+        first.id(),
         "both calls must name the job that actually runs"
     );
     assert_eq!(
@@ -275,8 +282,8 @@ async fn spawn_in_op_resolves_to_a_committed_live_holder() -> anyhow::Result<()>
         .await?;
     op.commit().await?;
 
-    assert!(!spawned.created);
-    assert_eq!(spawned.handle.id(), held.id());
+    assert!(!spawned.created());
+    assert_eq!(spawned.id(), held.id());
     assert_eq!(count_jobs(&pool, &job_type, "shard-a").await?, 1);
 
     jobs.shutdown().await?;
@@ -304,14 +311,23 @@ async fn spawn_all_returns_one_outcome_per_spec_in_order() -> anyhow::Result<()>
         .await?;
 
     assert_eq!(spawned.len(), keys.len());
-    assert_eq!(
-        spawned.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
-        keys,
-        "outcomes must come back in input order, not key order"
-    );
-    assert!(spawned.iter().all(|s| s.created));
+    // `JobHandle` no longer carries the key it was spawned for; positions in
+    // `spawned` line up with `keys` by contract, but verifying "in input
+    // order, not key order" means checking against something spawn_all did
+    // not itself hand back — the persisted row each handle names.
+    for (handle, key) in spawned.iter().zip(keys) {
+        let (unique_key,): (String,) = sqlx::query_as("SELECT unique_key FROM jobs WHERE id = $1")
+            .bind(uuid::Uuid::from(handle.id()))
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            unique_key, key,
+            "outcomes must come back in input order, not key order"
+        );
+    }
+    assert!(spawned.iter().all(|s| s.created()));
 
-    let mut ids: Vec<_> = spawned.iter().map(|s| s.handle.id()).collect();
+    let mut ids: Vec<_> = spawned.iter().map(|s| s.id()).collect();
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), keys.len(), "distinct keys are distinct jobs");
@@ -344,10 +360,10 @@ async fn spawn_all_collapses_a_key_repeated_within_one_call() -> anyhow::Result<
         .await?;
 
     assert_eq!(spawned.len(), 3, "every spec still yields an outcome");
-    assert!(spawned[0].created);
-    assert!(spawned[1].created);
-    assert!(!spawned[2].created, "the repeat must resolve, not create");
-    assert_eq!(spawned[2].handle.id(), spawned[0].handle.id());
+    assert!(spawned[0].created());
+    assert!(spawned[1].created());
+    assert!(!spawned[2].created(), "the repeat must resolve, not create");
+    assert_eq!(spawned[2].id(), spawned[0].id());
     assert_eq!(count_jobs(&pool, &job_type, "shard-a").await?, 1);
 
     jobs.shutdown().await?;
@@ -373,9 +389,9 @@ async fn spawn_all_mixes_created_and_resolved() -> anyhow::Result<()> {
         ])
         .await?;
 
-    assert!(!spawned[0].created);
-    assert_eq!(spawned[0].handle.id(), held.id());
-    assert!(spawned[1].created);
+    assert!(!spawned[0].created());
+    assert_eq!(spawned[0].id(), held.id());
+    assert!(spawned[1].created());
     assert_eq!(count_jobs(&pool, &job_type, "shard-a").await?, 1);
     assert_eq!(count_jobs(&pool, &job_type, "shard-b").await?, 1);
 
@@ -423,10 +439,7 @@ async fn spawn_all_carries_state_per_key_across_generations() -> anyhow::Result<
         ])
         .await?;
     for spawned in &gen1 {
-        let outcome = spawned
-            .handle
-            .await_completion(Duration::from_secs(30))
-            .await?;
+        let outcome = spawned.await_completion(Duration::from_secs(30)).await?;
         let observed: Option<State> = outcome.result()?;
         assert_eq!(
             observed,
@@ -445,16 +458,13 @@ async fn spawn_all_carries_state_per_key_across_generations() -> anyhow::Result<
         ])
         .await?;
     assert!(
-        gen2.iter().all(|s| s.created),
+        gen2.iter().all(|s| s.created()),
         "a terminal key is respawnable"
     );
-    assert_ne!(gen2[0].handle.id(), gen1[0].handle.id());
+    assert_ne!(gen2[0].id(), gen1[0].id());
 
     for (spawned, expected) in gen2.iter().zip([10, 20]) {
-        let outcome = spawned
-            .handle
-            .await_completion(Duration::from_secs(30))
-            .await?;
+        let outcome = spawned.await_completion(Duration::from_secs(30)).await?;
         let observed: Option<State> = outcome.result()?;
         assert_eq!(
             observed,
@@ -494,18 +504,12 @@ async fn spawn_all_without_inherits_state_starts_each_generation_clean() -> anyh
     let gen1 = spawner
         .spawn_all(vec![KeyedJobSpec::new("shard-a", Cfg { marker: 10 })])
         .await?;
-    gen1[0]
-        .handle
-        .await_completion(Duration::from_secs(30))
-        .await?;
+    gen1[0].await_completion(Duration::from_secs(30)).await?;
 
     let gen2 = spawner
         .spawn_all(vec![KeyedJobSpec::new("shard-a", Cfg { marker: 11 })])
         .await?;
-    let outcome = gen2[0]
-        .handle
-        .await_completion(Duration::from_secs(30))
-        .await?;
+    let outcome = gen2[0].await_completion(Duration::from_secs(30)).await?;
     let observed: Option<State> = outcome.result()?;
     assert_eq!(
         observed,
@@ -580,7 +584,7 @@ async fn spawn_all_honors_per_spec_schedule_at() -> anyhow::Result<()> {
             KeyedJobSpec::new("later", Cfg { marker: 2 }).schedule_at(far_future),
         ])
         .await?;
-    assert!(spawned.iter().all(|s| s.created));
+    assert!(spawned.iter().all(|s| s.created()));
 
     let (execute_at,): (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
         "SELECT execute_at FROM job_executions WHERE job_type = $1 AND unique_key = 'later'",
@@ -595,7 +599,7 @@ async fn spawn_all_honors_per_spec_schedule_at() -> anyhow::Result<()> {
 
     // A not-yet-due generation still holds its key.
     let again = spawner.spawn("later", Cfg { marker: 3 }).await?;
-    assert_eq!(again.id(), spawned[1].handle.id());
+    assert_eq!(again.id(), spawned[1].id());
 
     jobs.shutdown().await?;
     Ok(())
