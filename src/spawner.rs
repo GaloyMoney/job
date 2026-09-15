@@ -71,7 +71,7 @@ impl<Config> JobSpec<Config> {
     /// [`JobSpawner::spawn_all_in_op`] silently drop this spec — no `jobs`
     /// row, no execution row — and report it via
     /// [`BulkSpawnResult::deduped`] rather than minting a duplicate.
-    /// [`BulkSpawnResult::job_ids`] resolves each spec to its actual holder. The key
+    /// [`BulkSpawnResult::jobs`] resolves each spec to its actual holder. The key
     /// becomes respawnable the instant the holder goes terminal; this is the
     /// SAME `(job_type, unique_key)` live-window enforced for keyed jobs
     /// (`idx_job_executions_job_type_unique_key`), just opted into from the
@@ -94,15 +94,11 @@ impl<Config> JobSpec<Config> {
 
 /// Return value of [`JobSpawner::spawn_all`]/[`JobSpawner::spawn_all_in_op`].
 ///
-/// `jobs.len() + deduped.len() == ` the number of input specs whenever no
-/// spec used [`JobSpec::dedup_key`] (today's behavior, unchanged); with
-/// dedup keys in play a caller can get FEWER jobs than specs given — this is
-/// deliberate (see [`JobSpec::dedup_key`]), not a partial failure.
+/// `jobs.len()` equals the number of input specs. Coalesced specs resolve
+/// to their existing holders; `deduped` identifies the specs that created no job.
 #[derive(Default)]
 pub struct BulkSpawnResult {
-    /// Actual job IDs in input order, resolving coalesced specs to their holders.
-    pub job_ids: Vec<JobId>,
-    /// The jobs actually created, in spec order (excluding deduped specs).
+    /// One resolved job per input spec, in input order, including repeated holders.
     pub jobs: Vec<Job>,
     /// The `id` of each spec that was silently dropped because its
     /// `dedup_key` was already held by a LIVE execution, or duplicated an
@@ -447,7 +443,7 @@ where
     )]
     pub async fn spawn_all_in_op(
         &self,
-        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        mut op: &mut (impl es_entity::AtomicOperation + ?Sized),
         specs: Vec<JobSpec<Config>>,
     ) -> Result<BulkSpawnResult, JobError> {
         tracing::Span::current().record("count", specs.len());
@@ -481,14 +477,6 @@ where
             }
             job_ids.push(spec.id);
             surviving.push(spec);
-        }
-
-        if surviving.is_empty() {
-            return Ok(BulkSpawnResult {
-                job_ids,
-                jobs: Vec::new(),
-                deduped,
-            });
         }
 
         let mut new_jobs = Vec::with_capacity(surviving.len());
@@ -537,10 +525,16 @@ where
         ExecutionInsertHook::register(op, &self.notifier, &self.poller_ref, &self.clock, rows)
             .await?;
 
-        Ok(BulkSpawnResult {
-            job_ids,
-            jobs,
-            deduped,
-        })
+        let mut created = jobs.into_iter().peekable();
+        let mut jobs = Vec::with_capacity(job_ids.len());
+        for id in job_ids {
+            let job = match created.next_if(|job| job.id == id) {
+                Some(job) => job,
+                None => self.repo.find_by_id_in_op(&mut op, id).await?,
+            };
+            jobs.push(job);
+        }
+
+        Ok(BulkSpawnResult { jobs, deduped })
     }
 }
