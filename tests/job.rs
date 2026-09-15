@@ -233,7 +233,7 @@ async fn test_create_and_run_job() -> anyhow::Result<()> {
     let max_attempts = 50;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let snap = jobs.handle(job.id).load().await?;
+        let snap = jobs.handle(job.id()).load().await?;
         if snap.state().is_terminal() {
             break;
         }
@@ -352,7 +352,7 @@ async fn test_scheduled_job_with_artificial_clock() -> anyhow::Result<()> {
     let max_attempts = 50;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let snap = jobs.handle(job.id).load().await?;
+        let snap = jobs.handle(job.id()).load().await?;
         if snap.state().is_terminal() {
             break;
         }
@@ -809,8 +809,11 @@ async fn test_bulk_spawn_creates_and_runs_all_jobs() -> anyhow::Result<()> {
     let ids: Vec<JobId> = specs.iter().map(|s| s.id).collect();
 
     let spawned = spawner.spawn_all(specs).await?;
-    assert_eq!(spawned.jobs.len(), 5);
-    assert!(spawned.deduped.is_empty());
+    assert_eq!(spawned.len(), 5);
+    assert!(
+        spawned.iter().all(|h| h.created()),
+        "no spec carried a dedup_key, so every one must have created its job"
+    );
 
     // Wait for all jobs to complete
     let mut attempts = 0;
@@ -899,8 +902,7 @@ async fn test_bulk_spawn_empty_batch() -> anyhow::Result<()> {
         .expect("Failed to start job polling");
 
     let result = spawner.spawn_all(vec![]).await?;
-    assert!(result.jobs.is_empty());
-    assert!(result.deduped.is_empty());
+    assert!(result.is_empty());
 
     Ok(())
 }

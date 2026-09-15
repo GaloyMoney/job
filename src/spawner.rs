@@ -7,10 +7,12 @@ use std::{marker::PhantomData, sync::Arc};
 use tracing::instrument;
 
 use super::{
-    Job, JobId,
+    JobId,
     entity::{JobType, NewJob},
     error::JobError,
     execution_hooks::{ExecutionInsertHook, NewExecutionRow},
+    handle::{JobHandle, JobHandles},
+    notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     poller::PollerHandle,
     repo::JobRepo,
@@ -69,9 +71,9 @@ impl<Config> JobSpec<Config> {
     /// Opt this spec into live-window dedup: if a LIVE (pending/parked/
     /// running) execution already holds `(job_type, key)`, this spec mints
     /// nothing of its own — no `jobs` row, no execution row — and the call
-    /// yields the LIVE holder in its place, reporting the suppressed spec's
-    /// id via [`BulkSpawnResult::deduped`]. The key becomes respawnable the
-    /// instant the holder goes terminal; this is the SAME
+    /// yields a handle on the LIVE holder in its place, with
+    /// [`JobHandle::created`] reading `false` to say so. The key becomes
+    /// respawnable the instant the holder goes terminal; this is the SAME
     /// `(job_type, unique_key)` live-window enforced for keyed jobs
     /// (`idx_job_executions_job_type_unique_key`), just opted into from the
     /// bulk/regular spawn path instead of [`crate::KeyedJobSpawner::spawn`].
@@ -107,32 +109,6 @@ impl<Config> JobSpec<Config> {
     }
 }
 
-/// Return value of [`JobSpawner::spawn_all`]/[`JobSpawner::spawn_all_in_op`].
-///
-/// `jobs.len()` equals the number of input specs, including coalesced specs.
-#[derive(Default)]
-pub struct BulkSpawnResult {
-    /// The resolved jobs, positionally aligned with the input specs: for a
-    /// spec that created a job, the job it created; for a spec coalesced
-    /// onto a LIVE holder, that holder.
-    ///
-    /// The same [`Job`] can therefore appear MORE THAN ONCE — two specs in
-    /// one call sharing a `dedup_key` both resolve to the first one's job,
-    /// so `jobs[i].id == jobs[j].id` for `i != j` is expected, not a bug.
-    /// Do not treat this as a set of distinct jobs.
-    pub jobs: Vec<Job>,
-    /// The `id` of each spec that minted nothing of its own because its
-    /// `dedup_key` was already held by a LIVE execution, or duplicated an
-    /// earlier spec's key within the same call. No `jobs` row, no execution
-    /// row exists for these ids — do not [`crate::Jobs::handle`] them
-    /// expecting a live job; use the entry `jobs` holds at that spec's
-    /// position instead.
-    ///
-    /// This is the ONLY way to tell "I created this" from "this already
-    /// existed": both cases put a usable [`Job`] in `jobs`.
-    pub deduped: Vec<JobId>,
-}
-
 /// A handle for spawning jobs of a specific type.
 ///
 /// Returned by [`crate::Jobs::add_initializer`]. The spawner encapsulates the job type
@@ -151,6 +127,7 @@ pub struct BulkSpawnResult {
 pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
     job_type: JobType,
+    router: Arc<JobNotificationRouter>,
     clock: ClockHandle,
     notifier: Arc<JobEventNotifier>,
     /// Reaches this process's poller for the short-circuit spawn fast path
@@ -166,6 +143,7 @@ where
     pub(crate) fn new(
         repo: Arc<JobRepo>,
         job_type: JobType,
+        router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
         poller_ref: PollerHandle,
@@ -173,6 +151,7 @@ where
         Self {
             repo,
             job_type,
+            router,
             clock,
             notifier,
             poller_ref,
@@ -185,6 +164,15 @@ where
         &self.job_type
     }
 
+    fn handle(&self, id: JobId) -> JobHandle {
+        JobHandle::new(
+            id,
+            Arc::clone(&self.repo),
+            Arc::clone(&self.router),
+            self.clock.clone(),
+        )
+    }
+
     /// Create and spawn a job described by `spec`, in a single atomic
     /// operation. The single-spawn entry point every other `spawn*`
     /// convenience method on this spawner ultimately delegates to (via
@@ -194,11 +182,11 @@ where
         skip(self, spec),
         fields(job_type = %self.job_type)
     )]
-    pub async fn spawn_spec(&self, spec: JobSpec<Config>) -> Result<Job, JobError> {
+    pub async fn spawn_spec(&self, spec: JobSpec<Config>) -> Result<JobHandle, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
-        let job = self.spawn_spec_in_op(&mut op, spec).await?;
+        let handle = self.spawn_spec_in_op(&mut op, spec).await?;
         op.commit().await?;
-        Ok(job)
+        Ok(handle)
     }
 
     /// Create and spawn a job described by `spec`, as part of an existing
@@ -207,10 +195,12 @@ where
     /// [`Self::spawn_at_in_op`] / [`Self::spawn_at_with_queue_id_in_op`]).
     ///
     /// Honors [`JobSpec::dedup_key`] exactly like [`Self::spawn_all_in_op`]
-    /// does per spec: returns the existing job if the key is held by a LIVE
-    /// execution -- no `jobs` row, no execution row created -- or the new job
-    /// otherwise. Every other `spawn*` method builds a `JobSpec` with
-    /// `dedup_key: None`, which always creates a new job.
+    /// does per spec: a key already held by a LIVE execution yields a handle
+    /// on that holder -- no `jobs` row, no execution row created, and
+    /// [`JobHandle::created`] reads `false` -- otherwise a handle on the job
+    /// just created, with `created` reading `true`. Every other `spawn*`
+    /// method builds a `JobSpec` with `dedup_key: None`, for which `created`
+    /// is always `true`.
     #[instrument(
         name = "job_spawner.spawn_spec_in_op",
         skip(self, op, spec),
@@ -218,9 +208,9 @@ where
     )]
     pub async fn spawn_spec_in_op(
         &self,
-        mut op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         spec: JobSpec<Config>,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         let schedule_at = spec
             .schedule_at
             .unwrap_or_else(|| op.maybe_now().unwrap_or_else(|| self.clock.now()));
@@ -230,8 +220,10 @@ where
                 .repo
                 .lock_and_check_live_keys_in_op(op, &self.job_type, std::slice::from_ref(key))
                 .await?;
+            // Only the holder's id is needed to answer the caller, so the
+            // coalesced path costs no read of its own.
             if let Some(id) = live_keys.get(key) {
-                return Ok(self.repo.find_by_id_in_op(&mut op, *id).await?);
+                return Ok(self.handle(*id).with_created(false));
             }
         }
 
@@ -265,7 +257,7 @@ where
         )
         .await?;
 
-        Ok(job)
+        Ok(self.handle(job.id).with_created(true))
     }
 
     /// Create and spawn a job for immediate execution.
@@ -278,7 +270,7 @@ where
         &self,
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let job = self.spawn_in_op(&mut op, id, config).await?;
         op.commit().await?;
@@ -296,7 +288,7 @@ where
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
         self.spawn_at_in_op(op, id, config, schedule_at).await
     }
@@ -312,7 +304,7 @@ where
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
         schedule_at: DateTime<Utc>,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let job = self
             .spawn_at_in_op(&mut op, id, config, schedule_at)
@@ -333,7 +325,7 @@ where
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
         schedule_at: DateTime<Utc>,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         self.spawn_spec_in_op(op, JobSpec::new(id, config).schedule_at(schedule_at))
             .await
     }
@@ -351,7 +343,7 @@ where
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
         queue_id: impl Into<String> + Send,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let job = self
             .spawn_with_queue_id_in_op(&mut op, id, config, queue_id)
@@ -374,7 +366,7 @@ where
         id: impl Into<JobId> + std::fmt::Debug,
         config: Config,
         queue_id: impl Into<String> + Send,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
         self.spawn_at_with_queue_id_in_op(op, id, config, schedule_at, queue_id)
             .await
@@ -394,7 +386,7 @@ where
         config: Config,
         schedule_at: DateTime<Utc>,
         queue_id: impl Into<String> + Send,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let job = self
             .spawn_at_with_queue_id_in_op(&mut op, id, config, schedule_at, queue_id)
@@ -419,7 +411,7 @@ where
         config: Config,
         schedule_at: DateTime<Utc>,
         queue_id: impl Into<String> + Send,
-    ) -> Result<Job, JobError> {
+    ) -> Result<JobHandle, JobError> {
         self.spawn_spec_in_op(
             op,
             JobSpec::new(id, config)
@@ -438,10 +430,7 @@ where
         skip(self, specs),
         fields(job_type = %self.job_type)
     )]
-    pub async fn spawn_all(
-        &self,
-        specs: Vec<JobSpec<Config>>,
-    ) -> Result<BulkSpawnResult, JobError> {
+    pub async fn spawn_all(&self, specs: Vec<JobSpec<Config>>) -> Result<JobHandles, JobError> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let result = self.spawn_all_in_op(&mut op, specs).await?;
         op.commit().await?;
@@ -454,11 +443,21 @@ where
     /// `dedup_key`. Internally uses batch inserts for both the job entities and
     /// `job_executions` rows.
     ///
-    /// A spec whose `dedup_key` is already held by a LIVE execution — or that
-    /// repeats an earlier spec's key within this same call — creates NO
-    /// `jobs` row and NO execution row; see [`JobSpec::dedup_key`] and
-    /// [`BulkSpawnResult`]. Dedup resolution (`JobRepo::lock_and_check_live_keys_in_op`)
-    /// runs BEFORE any `jobs` row is built, deliberately: `job_executions.id`
+    /// Returns one [`JobHandle`] per input spec, positionally aligned with
+    /// `specs` (contract 2), so the result zips straight back against the
+    /// inputs. A spec whose `dedup_key` is already held by a LIVE execution —
+    /// or that repeats an earlier spec's key within this same call — creates
+    /// NO `jobs` row and NO execution row, and its position instead carries a
+    /// handle on the holder, with [`JobHandle::created`] reading `false`.
+    /// That flag is the only thing separating the two cases; see
+    /// [`JobSpec::dedup_key`].
+    ///
+    /// The SAME id can therefore appear at more than one position — two specs
+    /// sharing a key both resolve to the first one's job — so this is a list
+    /// aligned to the specs, not a set of distinct jobs.
+    ///
+    /// Dedup resolution (`JobRepo::lock_and_check_live_keys_in_op`) runs
+    /// BEFORE any `jobs` row is built, deliberately: `job_executions.id`
     /// references `jobs(id)`, so a deduped spec must never reach
     /// `create_all_in_op` at all, or its `jobs` row would outlive the
     /// decision to drop it.
@@ -469,12 +468,12 @@ where
     )]
     pub async fn spawn_all_in_op(
         &self,
-        mut op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
         specs: Vec<JobSpec<Config>>,
-    ) -> Result<BulkSpawnResult, JobError> {
+    ) -> Result<JobHandles, JobError> {
         tracing::Span::current().record("count", specs.len());
         if specs.is_empty() {
-            return Ok(BulkSpawnResult::default());
+            return Ok(JobHandles::default());
         }
 
         let default_schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
@@ -489,19 +488,22 @@ where
             .lock_and_check_live_keys_in_op(op, &self.job_type, &requested_dedup_keys)
             .await?;
 
-        let mut job_ids = Vec::with_capacity(specs.len());
-        let mut deduped: Vec<JobId> = Vec::new();
+        // One entry per input spec, in spec order: the id the caller ends up
+        // holding, and whether THIS spec is the one that minted it.
+        // `live_keys` doubles as the intra-call seen-set — a surviving spec
+        // registers its own id under its key, so a later spec repeating that
+        // key resolves to it exactly as it would to a pre-existing holder.
+        let mut resolved: Vec<(JobId, bool)> = Vec::with_capacity(specs.len());
         let mut surviving = Vec::with_capacity(specs.len());
         for spec in specs {
             if let Some(key) = &spec.dedup_key {
                 if let Some(id) = live_keys.get(key) {
-                    job_ids.push(*id);
-                    deduped.push(spec.id);
+                    resolved.push((*id, false));
                     continue;
                 }
                 live_keys.insert(key.clone(), spec.id);
             }
-            job_ids.push(spec.id);
+            resolved.push((spec.id, true));
             surviving.push(spec);
         }
 
@@ -551,16 +553,11 @@ where
         ExecutionInsertHook::register(op, &self.notifier, &self.poller_ref, &self.clock, rows)
             .await?;
 
-        let mut created = jobs.into_iter().peekable();
-        let mut jobs = Vec::with_capacity(job_ids.len());
-        for id in job_ids {
-            let job = match created.next_if(|job| job.id == id) {
-                Some(job) => job,
-                None => self.repo.find_by_id_in_op(&mut op, id).await?,
-            };
-            jobs.push(job);
-        }
-
-        Ok(BulkSpawnResult { jobs, deduped })
+        // Handles are minted from ids alone, so a coalesced position costs no
+        // read of its own — the holder is never loaded just to be returned.
+        Ok(resolved
+            .into_iter()
+            .map(|(id, created)| self.handle(id).with_created(created))
+            .collect())
     }
 }

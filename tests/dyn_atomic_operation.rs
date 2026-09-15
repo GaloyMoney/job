@@ -118,10 +118,10 @@ async fn spawn_in_op_accepts_an_erased_dyn_atomic_operation() -> anyhow::Result<
     // `&mut dyn AtomicOperation` -- no concrete, `Sized` type in sight.
     let erased: &mut dyn AtomicOperation = &mut op;
     let id = JobId::new();
-    let job = spawner.spawn_in_op(erased, id, Cfg { marker: 1 }).await?;
+    let handle = spawner.spawn_in_op(erased, id, Cfg { marker: 1 }).await?;
     op.commit().await?;
 
-    assert_eq!(job.id, id);
+    assert_eq!(handle.id(), id);
     assert_eq!(count_jobs(&pool, &job_type, id).await?, 1);
 
     jobs.shutdown().await?;
@@ -147,12 +147,12 @@ async fn spawn_all_in_op_accepts_an_erased_dyn_atomic_operation() -> anyhow::Res
         job::JobSpec::new(JobId::new(), Cfg { marker: 1 }),
         job::JobSpec::new(JobId::new(), Cfg { marker: 2 }),
     ];
-    let result = spawner.spawn_all_in_op(erased, specs).await?;
+    let handles = spawner.spawn_all_in_op(erased, specs).await?;
     op.commit().await?;
 
-    assert_eq!(result.jobs.len(), 2);
-    for job in &result.jobs {
-        assert_eq!(count_jobs(&pool, &job_type, job.id).await?, 1);
+    assert_eq!(handles.len(), 2);
+    for handle in &handles {
+        assert_eq!(count_jobs(&pool, &job_type, handle.id()).await?, 1);
     }
 
     jobs.shutdown().await?;
@@ -180,8 +180,8 @@ async fn keyed_spawn_in_op_accepts_an_erased_dyn_atomic_operation() -> anyhow::R
         .await?;
     op.commit().await?;
 
-    assert!(spawned.created);
-    assert_eq!(count_jobs(&pool, &job_type, spawned.handle.id()).await?, 1);
+    assert!(spawned.created());
+    assert_eq!(count_jobs(&pool, &job_type, spawned.id()).await?, 1);
 
     jobs.shutdown().await?;
     Ok(())

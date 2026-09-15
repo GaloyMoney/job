@@ -268,9 +268,9 @@ async fn force_reschedule_pulls_a_future_hold_forward_exactly_once() -> anyhow::
             KeyedJobSpec::new("k", Cfg).schedule_at(Utc::now() + HOLD),
         ])
         .await?;
-    assert!(held[0].created);
+    assert!(held[0].created());
     assert!(
-        !held[0].pulled_forward,
+        !held[0].pulled_forward(),
         "a job created now is already due at the time it asked for"
     );
     let parked = execute_at(&pool, &job_type, "k").await?;
@@ -278,9 +278,9 @@ async fn force_reschedule_pulls_a_future_hold_forward_exactly_once() -> anyhow::
     let woken = spawner
         .spawn_all(vec![KeyedJobSpec::new("k", Cfg).force_reschedule()])
         .await?;
-    assert!(!woken[0].created, "the key is still live");
-    assert!(woken[0].pulled_forward, "the hold must have been moved");
-    assert_eq!(woken[0].handle.id(), held[0].handle.id());
+    assert!(!woken[0].created(), "the key is still live");
+    assert!(woken[0].pulled_forward(), "the hold must have been moved");
+    assert_eq!(woken[0].id(), held[0].id());
 
     let after = execute_at(&pool, &job_type, "k").await?;
     assert!(
@@ -292,7 +292,7 @@ async fn force_reschedule_pulls_a_future_hold_forward_exactly_once() -> anyhow::
         .spawn_all(vec![KeyedJobSpec::new("k", Cfg).force_reschedule()])
         .await?;
     assert!(
-        !again[0].pulled_forward,
+        !again[0].pulled_forward(),
         "a second respawn against an already-due row must be a no-op"
     );
     assert_eq!(
@@ -338,9 +338,9 @@ async fn a_held_runner_is_woken_by_a_force_reschedule_respawn() -> anyhow::Resul
     let woken = spawner
         .spawn_all(vec![KeyedJobSpec::new("k", Cfg).force_reschedule()])
         .await?;
-    assert!(!woken[0].created);
-    assert!(woken[0].pulled_forward);
-    assert_eq!(woken[0].handle.id(), spawned[0].handle.id());
+    assert!(!woken[0].created());
+    assert!(woken[0].pulled_forward());
+    assert_eq!(woken[0].id(), spawned[0].id());
 
     let second = next_run(&mut ran).await?;
     assert!(
@@ -348,10 +348,7 @@ async fn a_held_runner_is_woken_by_a_force_reschedule_respawn() -> anyhow::Resul
         "the woken run must happen long before its own deadline ({second} vs {parked})"
     );
 
-    woken[0]
-        .handle
-        .await_completion(Duration::from_secs(30))
-        .await?;
+    woken[0].await_completion(Duration::from_secs(30)).await?;
 
     jobs.shutdown().await?;
     Ok(())
@@ -411,9 +408,9 @@ async fn force_reschedule_never_shortens_a_retry_backoff() -> anyhow::Result<()>
             let respawn = spawner
                 .spawn_all(vec![KeyedJobSpec::new("k", Cfg).force_reschedule()])
                 .await?;
-            assert!(!respawn[0].created, "the failing job still holds the key");
+            assert!(!respawn[0].created(), "the failing job still holds the key");
             assert!(
-                !respawn[0].pulled_forward,
+                !respawn[0].pulled_forward(),
                 "a backing-off row (attempt {}) must never be pulled forward",
                 attempt + 1
             );
@@ -480,7 +477,7 @@ async fn force_reschedule_pulls_forward_to_the_specs_own_schedule_at() -> anyhow
         ])
         .await?;
     assert!(
-        woken[0].pulled_forward,
+        woken[0].pulled_forward(),
         "an hour out is later than 5 minutes"
     );
     assert_eq!(
@@ -500,7 +497,7 @@ async fn force_reschedule_pulls_forward_to_the_specs_own_schedule_at() -> anyhow
                 .force_reschedule(),
         ])
         .await?;
-    assert!(again.iter().all(|s| !s.pulled_forward));
+    assert!(again.iter().all(|s| !s.pulled_forward()));
     assert_eq!(execute_at(&pool, &job_type, "k").await?, target);
 
     // An earlier target still wins afterwards — monotone, not one-shot.
@@ -512,7 +509,7 @@ async fn force_reschedule_pulls_forward_to_the_specs_own_schedule_at() -> anyhow
                 .force_reschedule(),
         ])
         .await?;
-    assert!(third[0].pulled_forward);
+    assert!(third[0].pulled_forward());
     assert_eq!(execute_at(&pool, &job_type, "k").await?, sooner);
 
     jobs.shutdown().await?;
@@ -548,7 +545,7 @@ async fn repeated_wake_specs_for_one_key_take_the_earliest_target() -> anyhow::R
                 .force_reschedule(),
         ])
         .await?;
-    assert!(woken.iter().all(|s| s.pulled_forward));
+    assert!(woken.iter().all(|s| s.pulled_forward()));
     assert_eq!(
         execute_at(&pool, &job_type, "k").await?,
         earliest,
@@ -580,7 +577,7 @@ async fn force_reschedule_never_pushes_execute_at_later() -> anyhow::Result<()> 
                 .force_reschedule(),
         ])
         .await?;
-    assert!(!respawn[0].pulled_forward);
+    assert!(!respawn[0].pulled_forward());
     assert_eq!(
         execute_at(&pool, &job_type, "k").await?,
         due,
@@ -609,9 +606,9 @@ async fn a_respawn_without_the_flag_leaves_a_hold_alone() -> anyhow::Result<()> 
     let parked = execute_at(&pool, &job_type, "k").await?;
 
     let plain = spawner.spawn_all(vec![KeyedJobSpec::new("k", Cfg)]).await?;
-    assert!(!plain[0].created);
-    assert!(!plain[0].pulled_forward);
-    assert_eq!(plain[0].handle.id(), held[0].handle.id());
+    assert!(!plain[0].created());
+    assert!(!plain[0].pulled_forward());
+    assert_eq!(plain[0].id(), held[0].id());
     assert_eq!(
         execute_at(&pool, &job_type, "k").await?,
         parked,
@@ -645,9 +642,12 @@ async fn only_the_specs_that_asked_report_pulled_forward() -> anyhow::Result<()>
             KeyedJobSpec::new("k", Cfg).force_reschedule(),
         ])
         .await?;
-    assert!(mixed.iter().all(|s| !s.created));
-    assert!(!mixed[0].pulled_forward, "this spec never asked for a wake");
-    assert!(mixed[1].pulled_forward);
+    assert!(mixed.iter().all(|s| !s.created()));
+    assert!(
+        !mixed[0].pulled_forward(),
+        "this spec never asked for a wake"
+    );
+    assert!(mixed[1].pulled_forward());
     assert!(execute_at(&pool, &job_type, "k").await? <= Utc::now());
 
     jobs.shutdown().await?;
@@ -678,24 +678,22 @@ async fn a_wake_against_a_key_created_in_the_same_call_lands_on_the_insert() -> 
         ])
         .await?;
 
-    assert!(spawned[0].created, "the first spec creates the key");
+    assert!(spawned[0].created(), "the first spec creates the key");
     assert!(
-        !spawned[0].pulled_forward,
+        !spawned[0].pulled_forward(),
         "a creating spec already carries the time it asked for"
     );
-    assert!(spawned[1..].iter().all(|s| !s.created));
+    assert!(spawned[1..].iter().all(|s| !s.created()));
     assert!(
-        spawned[1].pulled_forward,
+        spawned[1].pulled_forward(),
         "an hour out is later than 5 minutes"
     );
     assert!(
-        !spawned[2].pulled_forward,
+        !spawned[2].pulled_forward(),
         "this spec never asked for a wake"
     );
     assert!(
-        spawned
-            .iter()
-            .all(|s| s.handle.id() == spawned[0].handle.id()),
+        spawned.iter().all(|s| s.id() == spawned[0].id()),
         "every spec must resolve to the one generation the call created"
     );
     assert_eq!(
@@ -714,7 +712,7 @@ async fn a_wake_against_a_key_created_in_the_same_call_lands_on_the_insert() -> 
                 .force_reschedule(),
         ])
         .await?;
-    assert!(!held[1].pulled_forward);
+    assert!(!held[1].pulled_forward());
     assert_eq!(execute_at(&pool, &job_type, "m").await?, sooner);
 
     jobs.shutdown().await?;
@@ -749,10 +747,10 @@ async fn concurrent_force_reschedules_of_one_key_agree() -> anyhow::Result<()> {
         let a = a.expect("a lost race must resolve, never error");
         let b = b.expect("a lost race must resolve, never error");
 
-        assert_eq!(a[0].handle.id(), held[0].handle.id());
-        assert_eq!(b[0].handle.id(), held[0].handle.id());
+        assert_eq!(a[0].id(), held[0].id());
+        assert_eq!(b[0].id(), held[0].id());
         assert!(
-            a[0].pulled_forward || b[0].pulled_forward,
+            a[0].pulled_forward() || b[0].pulled_forward(),
             "one of the two must have moved the row"
         );
         let after = execute_at(&pool, &job_type, &key).await?;
@@ -805,7 +803,7 @@ async fn a_congestion_shaped_row_is_indistinguishable_from_a_hold() -> anyhow::R
         .spawn_all(vec![KeyedJobSpec::new("k", Cfg).force_reschedule()])
         .await?;
     assert!(
-        woken[0].pulled_forward,
+        woken[0].pulled_forward(),
         "Q1 gap: a congestion-delayed first attempt is currently pulled forward"
     );
 

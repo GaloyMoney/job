@@ -773,15 +773,17 @@ impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
     fn init_erased(
         &self,
         repo: Arc<JobRepo>,
-        _router: Arc<crate::notification_router::JobNotificationRouter>,
+        router: Arc<crate::notification_router::JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<crate::notifier::JobEventNotifier>,
     ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error>> {
-        // Always-empty handle: fan-out spawns from within a batch runner
-        // take the ordinary insert path.
+        // Always-empty POLLER handle: fan-out spawns from within a batch
+        // runner take the ordinary insert path. The router is real, so a
+        // handle returned by such a spawn can await.
         let spawner = JobSpawner::<T::Config>::new(
             repo,
             self.job_type(),
+            router,
             clock,
             notifier,
             Arc::new(std::sync::OnceLock::new()),
