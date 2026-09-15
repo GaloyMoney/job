@@ -175,10 +175,8 @@ impl<Config> KeyedJobSpec<Config> {
 
 /// The outcome of spawning one key.
 ///
-/// Unlike [`crate::BulkSpawnResult`], there is no "dropped" case: keyed spawn
-/// resolves a collision to the LIVE holder rather than discarding the spec,
-/// so every requested key yields a usable [`JobHandle`] and `created` says
-/// which generation it refers to.
+/// Every requested key yields a usable [`JobHandle`], and `created` says
+/// whether this call created its generation or resolved to a live holder.
 pub struct KeyedSpawn {
     /// The key that was requested.
     pub key: String,
