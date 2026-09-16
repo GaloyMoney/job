@@ -36,16 +36,18 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         &self,
         job: &Job,
         repo: Arc<JobRepo>,
-        _router: Arc<JobNotificationRouter>,
+        router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         // Fan-out spawns made from WITHIN a running job's own runner take
         // the ordinary insert path: this handle is never populated, since
-        // `dispatch_job` has no `Arc<JobPoller>` to hand it here.
+        // `dispatch_job` has no `Arc<JobPoller>` to hand it here. The router
+        // IS real, so a handle returned by such a spawn can await.
         let spawner = JobSpawner::<T::Config>::new(
             repo,
             self.job_type(),
+            router,
             clock,
             notifier,
             Arc::new(std::sync::OnceLock::new()),

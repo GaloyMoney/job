@@ -203,9 +203,10 @@ where
     ///
     /// The job's id is generated internally — a resident job is identified
     /// by its type, not a caller-chosen id — so read the id back from the
-    /// returned [`JobHandle`]. Consumes the spawner: since at most one
-    /// resident job of this type can ever exist, nothing further can be
-    /// created from it.
+    /// returned [`JobHandle`], and read [`JobHandle::created`] to tell a
+    /// first spawn from a resolve onto the job that already existed.
+    /// Consumes the spawner: since at most one resident job of this type can
+    /// ever exist, nothing further can be created from it.
     ///
     /// Note: a resident job never completes (see [`ResidentJobCompletion`]),
     /// so [`JobHandle::await_completion`] on the returned handle only ever
@@ -249,7 +250,7 @@ where
                 )
                 .await?;
                 op.commit().await?;
-                Ok(self.handle(job.id))
+                Ok(self.handle(job.id).with_created(true))
             }
             // The id is an internally generated v7 uuid, so the only
             // constraint that can fire on this insert is
@@ -267,7 +268,7 @@ where
                     // `jobs` rows are never deleted and the resident
                     // collision just fired, so exactly one row exists.
                     .expect("resident collision guarantees the row exists");
-                Ok(self.handle(existing))
+                Ok(self.handle(existing).with_created(false))
             }
             Err(e) => Err(e.into()),
         }

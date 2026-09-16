@@ -74,14 +74,9 @@ impl JobRepo {
     ///
     /// Whether this catches two calls sharing one `op` that both target the
     /// same key depends on WHEN the caller inserts its execution rows, and
-    /// the two callers differ:
+    /// both callers insert inline:
     ///
-    /// - `dedup_key` (`spawner.rs`) defers its insert to
-    ///   `ExecutionInsertHook`'s commit-time batch, so a sibling call's row
-    ///   does not exist yet at live-check time and is not seen (e.g. two
-    ///   `spawn_all_in_op` calls, or `spawn_in_op` + `spawn_all_in_op`,
-    ///   merged by `ExecutionInsertHook::merge`). `insert_many`'s own
-    ///   `DISTINCT ON` collapse is the backstop for that narrower case.
+    /// - `dedup_key` (`spawner.rs`) inserts inline through `ExecutionInsertHook`.
     /// - Keyed spawn (`keyed.rs`) inserts its execution rows INLINE, before
     ///   returning. A transaction sees its own uncommitted writes, so a
     ///   second `spawn_in_op`/`spawn_all_in_op` on the same `op` finds the

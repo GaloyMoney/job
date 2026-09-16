@@ -16,7 +16,7 @@ use super::promote::{PromoteHeadsHook, PromotedRow};
 
 /// One `job_executions` row to insert, as gathered by [`ExecutionInsertHook`].
 /// `unique_key` is `Some` only for a [`crate::JobSpec::dedup_key`]-bearing
-/// bulk-spawn row; `spawn_in_op`/`spawn_at_in_op`/`spawn_with_queue_id_in_op`
+/// single or bulk-spawn row; `spawn_in_op`/`spawn_at_in_op`/`spawn_with_queue_id_in_op`
 /// (the single-item convenience methods) never set it. Keyed spawn's own
 /// inserts stay entirely separate and inline
 /// (`keyed.rs::KeyedJobSpawner::spawn_all_in_op`) rather than going through
@@ -27,8 +27,8 @@ use super::promote::{PromoteHeadsHook, PromotedRow};
 /// `spawn_all_in_op` resolves a
 /// dedup-key row's liveness BEFORE registering it here (see
 /// `JobRepo::lock_and_check_live_keys_in_op`), so by the time a row reaches
-/// this hook its key (if any) is either free or a cross-call collision
-/// `Self::insert_many`'s `deduped` CTE still has to catch (see there).
+/// this hook its key (if any) is free. Deduplicated rows insert inline
+/// so subsequent calls on the same operation see them.
 ///
 /// `Clone` exists for [`ExecutionInsertHook::adopt_orphaned_queues`], which
 /// re-submits a subset of these rows through [`ExecutionInsertHook::insert_many`]
@@ -52,7 +52,7 @@ struct InsertedRow {
     occupant_id: Option<uuid::Uuid>,
 }
 
-/// Batches every `spawn_in_op`/`spawn_all_in_op`/resident-spawn insert
+/// Batches keyless `spawn_in_op`/`spawn_all_in_op`/resident-spawn inserts
 /// registered on one `op` into ONE statement at commit time. [`Self::merge`]
 /// is what makes this a genuine batching win: N `spawn_in_op` calls sharing
 /// one transaction get one multi-row insert, without the caller ever calling
@@ -80,7 +80,7 @@ pub(crate) struct ExecutionInsertHook {
 
 impl ExecutionInsertHook {
     /// Builds and registers an `ExecutionInsertHook` for one row, falling
-    /// back to immediate execution if `op` carries no commit-hook buffer.
+    /// back to immediate execution for dedup rows or if `op` has no hook buffer.
     /// The single-row spawn call sites' entry point.
     pub(crate) async fn register_one(
         op: &mut (impl AtomicOperation + ?Sized),
@@ -92,7 +92,7 @@ impl ExecutionInsertHook {
         Self::register(op, notifier, poller, clock, vec![row]).await
     }
 
-    /// Builds and registers an `ExecutionInsertHook` for `rows`, falling
+    /// Inserts deduplicated rows inline and buffers keyless rows, falling
     /// back to immediate execution if `op` carries no commit-hook buffer --
     /// the insert must not be silently dropped either way. A no-op if `rows`
     /// is empty (mirrors `spawn_all_in_op`'s existing empty-specs check).
@@ -103,6 +103,21 @@ impl ExecutionInsertHook {
         clock: &ClockHandle,
         rows: Vec<NewExecutionRow>,
     ) -> Result<(), sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let (inline, rows): (Vec<_>, Vec<_>) =
+            rows.into_iter().partition(|row| row.unique_key.is_some());
+        if !inline.is_empty() {
+            Self {
+                notifier: Arc::clone(notifier),
+                poller: Arc::clone(poller),
+                clock: clock.clone(),
+                rows: inline,
+            }
+            .execute(op)
+            .await?;
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -156,13 +171,9 @@ impl ExecutionInsertHook {
     /// by `tests/parked_rows.rs::retry_backoff_yields_to_an_older_parked_sibling`.
     ///
     /// `deduped` collapses same-`(job_type, unique_key)` rows to one BEFORE
-    /// `input` applies the file's usual `(queue_id, id)` order: the merged
-    /// batch can contain two rows sharing a dedup key when two
-    /// `spawn_in_op`/`spawn_all_in_op` calls on the SAME `op` both target it
-    /// (see `NewExecutionRow`'s doc) -- each call's own
-    /// `lock_and_check_live_keys_in_op` pre-check only sees the durable
-    /// table, not a sibling call's still-queued row, so both can pass their
-    /// own check. Left uncaught, both rows would reach the `ins` INSERT
+    /// `input` applies the file's usual `(queue_id, id)` order: it is a
+    /// defensive backstop against duplicate input rows. Left uncaught,
+    /// both rows would reach the `ins` INSERT
     /// together and unique-violate `idx_job_executions_job_type_unique_key`
     /// in one statement -- aborting this ENTIRE batch, including every
     /// unrelated keyless row sharing the transaction, which is exactly what
@@ -189,17 +200,7 @@ impl ExecutionInsertHook {
     /// regardless of `job_type` -- prepending a column can only split an
     /// existing `DISTINCT ON` group further, never merge two apart.
     /// `ORDER BY ..., id` picks the earliest-created (`id` is a v7 uuid) row
-    /// of a true collision deterministically. The loser's `jobs` row
-    /// (already created by its own call's `create_all_in_op`, since dedup
-    /// resolution for a same-op collision only surfaces here, at commit
-    /// time) is left behind with an `Initialized` event and no execution
-    /// row and no terminal event -- a state
-    /// `load_snapshot_by_id`/`JobSnapshot::state()` treat as impossible
-    /// (surfaces as an error/panic on lookup, never a false "Completed"),
-    /// not silent corruption, but still worth avoiding: this is scoped to
-    /// the narrow same-op, overlapping-`(job_type, dedup_key)` case, and is
-    /// called out as a known edge in the PR rather than fixed further
-    /// here.
+    /// of a true collision deterministically.
     ///
     /// `input` is `MATERIALIZED` and re-`ORDER BY (queue_id, id)` over
     /// `deduped`'s already-collapsed rows, deliberately:
@@ -585,11 +586,11 @@ impl ExecutionInsertHook {
     }
 }
 
-impl CommitHook for ExecutionInsertHook {
-    async fn pre_commit(
-        self,
-        mut op: HookOperation<'_>,
-    ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
+impl ExecutionInsertHook {
+    async fn execute(
+        &self,
+        mut op: &mut (impl AtomicOperation + ?Sized),
+    ) -> Result<(), sqlx::Error> {
         let mut inserted = Self::insert_many(&mut op, &self.rows).await?;
 
         // Statement 2 and, only if a queue lost its occupant in the meantime,
@@ -653,6 +654,16 @@ impl CommitHook for ExecutionInsertHook {
             }
         }
 
+        Ok(())
+    }
+}
+
+impl CommitHook for ExecutionInsertHook {
+    async fn pre_commit(
+        self,
+        mut op: HookOperation<'_>,
+    ) -> Result<PreCommitRet<'_, Self>, sqlx::Error> {
+        self.execute(&mut op).await?;
         PreCommitRet::ok(self, op)
     }
 
