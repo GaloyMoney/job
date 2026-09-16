@@ -1,3 +1,16 @@
+# [job release v0.14.0](https://github.com/GaloyMoney/job/releases/tag/0.14.0)
+
+
+
+### Bug Fixes
+
+- [**breaking**] Return the existing job for duplicate requests (#214)
+- Forgive the retry attempt counter on execution evidence, not elapsed time (#211)
+
+### Miscellaneous Tasks
+
+- Bump futures in the all-dependencies group (#212)
+
 # [job release v0.13.17](https://github.com/GaloyMoney/job/releases/tag/0.13.17)
 
 
