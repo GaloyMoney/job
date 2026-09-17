@@ -1,3 +1,11 @@
+# [job release v0.15.0](https://github.com/GaloyMoney/job/releases/tag/0.15.0)
+
+
+
+### Features
+
+- [**breaking**] Job_waiters table + wake-by-id (JobSpec::waiter) (#217)
+
 # [job release v0.14.0](https://github.com/GaloyMoney/job/releases/tag/0.14.0)
 
 
