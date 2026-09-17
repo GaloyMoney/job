@@ -73,3 +73,34 @@ pub fn unique(prefix: &str) -> String {
 pub fn job_type(prefix: &str) -> job::JobType {
     job::JobType::new(Box::leak(unique(prefix).into_boxed_str()))
 }
+
+/// Block until `id`'s execution row reaches `state`, or `timeout` elapses.
+///
+/// A condition-wait, not a sleep: it returns the instant the row is observed
+/// in the wanted state, so a test that needs to act only AFTER a transition
+/// (a self-park landing as `parked`, say) sequences on the transition itself
+/// rather than on a guessed duration.
+#[allow(dead_code)]
+pub async fn await_state(
+    pool: &sqlx::PgPool,
+    id: job::JobId,
+    state: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let seen: Option<String> =
+            sqlx::query_scalar("SELECT state::text FROM job_executions WHERE id = $1")
+                .bind(uuid::Uuid::from(id))
+                .fetch_optional(pool)
+                .await?
+                .flatten();
+        if seen.as_deref() == Some(state) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("job {id} never reached state {state:?} (last saw {seen:?})");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}

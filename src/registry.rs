@@ -44,8 +44,14 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         // the ordinary insert path: this handle is never populated, since
         // `dispatch_job` has no `Arc<JobPoller>` to hand it here. The router
         // IS real, so a handle returned by such a spawn can await.
+        let handle_ops = Arc::new(crate::handle::HandleOps {
+            waiters: crate::waiters::JobWaiters::new(repo.pool()),
+            notifier: Arc::clone(&notifier),
+            poller_ref: Arc::new(std::sync::OnceLock::new()),
+        });
         let spawner = JobSpawner::<T::Config>::new(
             repo,
+            handle_ops,
             self.job_type(),
             router,
             clock,
@@ -90,8 +96,14 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
         // Always-empty handle: fan-out spawns of further generations made
         // from WITHIN a running keyed job's own runner take the ordinary
         // insert path, same as the plain and batched fan-out cases above.
+        let handle_ops = Arc::new(crate::handle::HandleOps {
+            waiters: crate::waiters::JobWaiters::new(repo.pool()),
+            notifier: Arc::clone(&notifier),
+            poller_ref: Arc::new(std::sync::OnceLock::new()),
+        });
         let spawner = KeyedJobSpawner::<I::Config>::new(
             repo,
+            handle_ops,
             self.inner.job_type(),
             router,
             clock,

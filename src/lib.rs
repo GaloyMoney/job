@@ -432,6 +432,7 @@ mod snapshot;
 mod spawner;
 mod task;
 mod tracker;
+mod waiters;
 
 pub mod error;
 
@@ -475,6 +476,8 @@ es_entity::entity_id! { JobId }
 pub struct Jobs {
     config: JobSvcConfig,
     repo: Arc<JobRepo>,
+    waiters: waiters::JobWaiters,
+    handle_ops: Arc<handle::HandleOps>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     router: Arc<JobNotificationRouter>,
     tracker: Arc<JobTracker>,
@@ -511,6 +514,7 @@ impl Jobs {
         }
 
         let repo = Arc::new(JobRepo::new(&pool));
+        let waiters = waiters::JobWaiters::new(&pool);
         let tracker = Arc::new(JobTracker::new(
             config.poller_config.min_jobs_per_process,
             config.poller_config.max_jobs_per_process,
@@ -528,15 +532,23 @@ impl Jobs {
             router.terminal_sender(),
         );
         let clock = config.clock.clone();
+        let poller_ref: PollerHandle = Arc::new(std::sync::OnceLock::new());
+        let handle_ops = Arc::new(handle::HandleOps {
+            waiters: waiters.clone(),
+            notifier: Arc::clone(&notifier),
+            poller_ref: Arc::clone(&poller_ref),
+        });
         Ok(Self {
             repo,
+            waiters,
+            handle_ops,
             config,
             registry,
             router,
             tracker,
             notifier,
             poller_handle: None,
-            poller_ref: Arc::new(std::sync::OnceLock::new()),
+            poller_ref,
             clock,
         })
     }
@@ -740,6 +752,7 @@ impl Jobs {
         };
         JobSpawner::new(
             Arc::clone(&self.repo),
+            Arc::clone(&self.handle_ops),
             job_type,
             Arc::clone(&self.router),
             self.clock.clone(),
@@ -784,6 +797,7 @@ impl Jobs {
         // row slot.
         JobSpawner::new(
             Arc::clone(&self.repo),
+            Arc::clone(&self.handle_ops),
             job_type,
             Arc::clone(&self.router),
             self.clock.clone(),
@@ -822,6 +836,7 @@ impl Jobs {
         };
         KeyedJobSpawner::new(
             Arc::clone(&self.repo),
+            Arc::clone(&self.handle_ops),
             job_type,
             Arc::clone(&self.router),
             self.clock.clone(),
@@ -858,11 +873,81 @@ impl Jobs {
         };
         ResidentJobSpawner::new(
             Arc::clone(&self.repo),
+            Arc::clone(&self.handle_ops),
             job_type,
             Arc::clone(&self.router),
             self.clock.clone(),
             Arc::clone(&self.notifier),
         )
+    }
+
+    /// Run the job `id` no later than `at`, if it is parked and eligible:
+    /// `pending`, on its first attempt, and currently scheduled later than
+    /// `at`. Monotone and idempotent — `execute_at` only ever moves EARLIER
+    /// and a repeat changes nothing — and it never shortens a retry backoff
+    /// or touches a running row (the same guards as
+    /// [`KeyedJobSpec::force_reschedule`], by id instead of by key). Returns
+    /// whether the row moved; a moved row is announced exactly as a spawn
+    /// is (the `ExecutionReady` notify and this process's claim demand),
+    /// once `op` commits.
+    ///
+    /// The primitive under [`JobSpec::waiter`]'s wake; on its own it is
+    /// "wake this job now" for a caller that holds an id and knows the job
+    /// parked itself via [`JobCompletion::RescheduleAt`].
+    #[instrument(name = "job.pull_forward_in_op", skip(self, op, id), fields(id))]
+    pub async fn pull_forward_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        id: impl Into<JobId>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, JobError> {
+        let id: JobId = id.into();
+        tracing::Span::current().record("id", tracing::field::display(id));
+        let moved = self.waiters.pull_forward_ids_in_op(op, &[id], at).await?;
+        let Some((_, job_type)) = moved.into_iter().next() else {
+            return Ok(false);
+        };
+        self.notifier.execution_ready_in_op(op, &job_type).await?;
+        let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        if at <= now
+            && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
+        {
+            poller.register_claim_demand(op, &job_type, 1);
+        }
+        Ok(true)
+    }
+
+    /// Register `waiter` to be woken when `callee` — a job that already
+    /// exists — reaches a terminal state, with the semantics of
+    /// [`JobSpec::waiter`]. `Ok(true)` if `callee` is live and the wait was
+    /// registered; `Ok(false)` if it is already terminal, in which case
+    /// nothing is written and the caller should read the outcome
+    /// ([`JobHandle::load`]) instead of parking. The answer is exact: the
+    /// callee's execution row is share-locked for the rest of `op`, so its
+    /// finalizer cannot slip between the check and the commit.
+    ///
+    /// For a caller that found a live run by lookup ([`Self::keyed_handle`],
+    /// [`Self::handle`]) rather than by spawning it, and wants to park on it.
+    #[instrument(
+        name = "job.register_waiter_in_op",
+        skip(self, op, callee, waiter),
+        fields(callee, waiter)
+    )]
+    pub async fn register_waiter_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        callee: impl Into<JobId>,
+        waiter: impl Into<JobId>,
+    ) -> Result<bool, JobError> {
+        let (callee, waiter): (JobId, JobId) = (callee.into(), waiter.into());
+        let span = tracing::Span::current();
+        span.record("callee", tracing::field::display(callee));
+        span.record("waiter", tracing::field::display(waiter));
+        Ok(!self
+            .waiters
+            .register_waiters_on_live_in_op(op, &[callee], &[waiter])
+            .await?
+            .is_empty())
     }
 
     /// Mint a [`JobHandle`] for `id` — cheap and non-validating.
@@ -928,6 +1013,7 @@ impl Jobs {
             id.into(),
             Arc::clone(&self.repo),
             Arc::clone(&self.router),
+            Arc::clone(&self.handle_ops),
             self.clock.clone(),
         )
     }
@@ -1065,6 +1151,36 @@ impl Jobs {
         Ok(id.map(|id| self.handle(id)))
     }
 
+    /// `_in_op` twin of [`Self::resident_handle`]: one round trip through any
+    /// [`es_entity::IntoOneTimeExecutor`] -- a pool reference (what
+    /// [`Self::resident_handle`] passes) or an in-flight operation, for a
+    /// caller that wants this read on the same connection/transaction as
+    /// work it is already doing, rather than checking out a second
+    /// connection.
+    ///
+    /// Passed an in-flight operation, the returned handle is only as good as
+    /// that operation's eventual commit: it names a row this read saw
+    /// uncommitted, and if the operation rolls back instead, the id was
+    /// never really live. Awaiting or loading such a handle then answers
+    /// [`JobError::Find`] -- the same trap as awaiting a handle minted for an
+    /// id a caller later decided not to keep.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    #[instrument(name = "job.resident_handle_in_op", skip(self, op))]
+    pub async fn resident_handle_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+    ) -> Result<Option<JobHandle>, JobError> {
+        let id = self
+            .repo
+            .find_resident_id_in_op(op, &job_type.into())
+            .await?;
+        Ok(id.map(|id| self.handle(id)))
+    }
+
     /// Mint a [`JobHandle`] for the keyed job of `(job_type, key)`, if one
     /// exists (see [`KeyedJobSpawner::spawn`]). Resolves the LIVE generation
     /// when one exists, else the latest terminal generation. `None` when no
@@ -1080,6 +1196,29 @@ impl Jobs {
         key: impl AsRef<str> + std::fmt::Debug,
     ) -> Result<Option<JobHandle>, JobError> {
         let job = self.repo.find_keyed(&job_type.into(), key.as_ref()).await?;
+        Ok(job.map(|job| self.handle(job.id)))
+    }
+
+    /// `_in_op` twin of [`Self::keyed_handle`] -- see
+    /// [`Self::resident_handle_in_op`] for why this takes an
+    /// [`es_entity::IntoOneTimeExecutor`] rather than an `AtomicOperation`,
+    /// and for the caveat that the returned handle is only as good as a
+    /// passed-in operation's eventual commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    #[instrument(name = "job.keyed_handle_in_op", skip(self, op))]
+    pub async fn keyed_handle_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+        key: impl AsRef<str> + std::fmt::Debug,
+    ) -> Result<Option<JobHandle>, JobError> {
+        let job = self
+            .repo
+            .find_keyed_in_op(op, &job_type.into(), key.as_ref())
+            .await?;
         Ok(job.map(|job| self.handle(job.id)))
     }
 
@@ -1107,6 +1246,28 @@ impl Jobs {
         let ids = self
             .repo
             .list_keyed_ids_by_job_type(&job_type.into())
+            .await?;
+        Ok(ids.into_iter().map(|(_, id)| self.handle(id)).collect())
+    }
+
+    /// `_in_op` twin of [`Self::keyed_handles`] -- see
+    /// [`Self::resident_handle_in_op`] for why this takes an
+    /// [`es_entity::IntoOneTimeExecutor`] rather than an `AtomicOperation`,
+    /// and for the caveat that the returned handles are only as good as a
+    /// passed-in operation's eventual commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    #[instrument(name = "job.keyed_handles_in_op", skip(self, op))]
+    pub async fn keyed_handles_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+    ) -> Result<JobHandles, JobError> {
+        let ids = self
+            .repo
+            .list_keyed_ids_by_job_type_in_op(op, &job_type.into())
             .await?;
         Ok(ids.into_iter().map(|(_, id)| self.handle(id)).collect())
     }

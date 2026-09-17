@@ -223,6 +223,7 @@ pub(crate) struct Finalizer {
     /// entity call goes through (the op carries the connection, so which
     /// repo instance is irrelevant there).
     repo: Arc<JobRepo>,
+    waiters: crate::waiters::JobWaiters,
     notifier: Arc<JobEventNotifier>,
     retry_settings: RetrySettings,
     /// Whether this type keeps its `job_execution_states` row past terminal
@@ -244,9 +245,15 @@ impl Finalizer {
         instance_id: uuid::Uuid,
         clock: ClockHandle,
     ) -> Self {
+        // Derived from the repo's pool rather than threaded down, the same
+        // way the poller derives its own (`poller::JobPoller::new`): a
+        // finalizer is built deep inside the poller, and its waiters must be
+        // on the same pool as its repo by construction.
+        let waiters = crate::waiters::JobWaiters::new(repo.pool());
         Self {
             poller,
             repo,
+            waiters,
             notifier,
             retry_settings,
             retains_state,
@@ -585,7 +592,7 @@ impl Finalizer {
             let rows = sqlx::query!(
                 r#"
                 WITH to_reschedule AS MATERIALIZED (
-                    SELECT je.id, u.execute_at
+                    SELECT je.id, u.execute_at, je.woken_at
                     FROM job_executions je
                     JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
                       ON je.id = u.id
@@ -593,24 +600,48 @@ impl Finalizer {
                     ORDER BY je.queue_id, je.id
                     FOR UPDATE
                 )
+                -- `t.woken_at` is the PRE-update value (the CTE read it
+                -- before this statement's SET), which is what lets the same
+                -- statement both honour the mark and clear it.
                 UPDATE job_executions AS je
-                SET state = 'pending', execute_at = t.execute_at, attempt_index = 1,
-                    poller_instance_id = NULL
+                SET state = 'pending', attempt_index = 1, poller_instance_id = NULL,
+                    -- A park a wake already overtook: the callee landed while
+                    -- this job was still running, so the wake could not move
+                    -- the row (a running row has no `execute_at`) and left a
+                    -- mark. Honouring it HERE, in the park write itself, is
+                    -- what guarantees the row is never visible to
+                    -- `PromoteHeadsHook` carrying the deadline the mark
+                    -- overrides -- the hook would otherwise swap a queued
+                    -- waiter out to `parked` on that stale time, and lowering
+                    -- a parked row's `execute_at` breaks Invariant B.
+                    execute_at = CASE WHEN t.woken_at IS NOT NULL
+                                      THEN LEAST(t.execute_at, $4)
+                                      ELSE t.execute_at END,
+                    woken_at = NULL
                 FROM to_reschedule t
                 WHERE je.id = t.id
-                RETURNING je.id AS "id!: JobId"
+                RETURNING je.id AS "id!: JobId", je.job_type,
+                          (t.woken_at IS NOT NULL) AS "was_woken!"
                 "#,
                 &fresh_uuids,
                 &fresh_times,
                 self.instance_id,
+                now,
             )
             .fetch_all(op.as_executor())
             .await?;
+            let mut overtaken: Vec<(JobId, JobType)> = Vec::new();
             for row in rows {
                 applied.insert(row.id);
                 applied_pending_uuids.push(uuid::Uuid::from(row.id));
+                if row.was_woken {
+                    overtaken.push((row.id, JobType::from_owned(row.job_type)));
+                }
                 outcome.rescheduled_pending = true;
             }
+            // Rows the mark landed due now rather than at the deadline they
+            // asked for are announced exactly as a spawn would announce them.
+            self.announce_pulled_forward(op, overtaken).await?;
         }
 
         if !congestion_uuids.is_empty() {
@@ -662,9 +693,17 @@ impl Finalizer {
                     ORDER BY je.queue_id, je.id
                     FOR UPDATE
                 )
+                -- `woken_at` is CLEARED but deliberately NOT honoured: a wake
+                -- must never shorten a retry backoff (the same guard the by-id
+                -- and keyed pull-forwards carry). The mark is spent all the
+                -- same -- the callee did finish, and this row will run at its
+                -- backoff -- so leaving it would let attempt-count
+                -- forgiveness (`attempt_reset_after_healthy_run`) resurrect a
+                -- long-stale wake and yank the job due much later.
                 UPDATE job_executions AS je
                 SET state = 'pending', execute_at = t.execute_at,
-                    attempt_index = t.attempt_index, poller_instance_id = NULL
+                    attempt_index = t.attempt_index, poller_instance_id = NULL,
+                    woken_at = NULL
                 FROM to_retry t
                 WHERE je.id = t.id
                 RETURNING je.id AS "id!: JobId"
@@ -777,6 +816,10 @@ impl Finalizer {
         for id in &deleted_ids {
             self.notifier.job_terminal_in_op(op, *id).await?;
         }
+        if !deleted_ids.is_empty() {
+            let terminal: Vec<JobId> = deleted_ids.iter().copied().collect();
+            self.wake_waiters_in_op(op, &terminal, now).await?;
+        }
 
         // Persist only entities whose row transition this instance actually
         // performed -- staged events for unapplied ids are discarded with
@@ -784,6 +827,61 @@ impl Finalizer {
         let mut jobs: Vec<Job> = applied.iter().filter_map(|id| staged.remove(id)).collect();
         self.repo.update_all_in_op(op, &mut jobs).await?;
         Ok(outcome)
+    }
+
+    /// Wake every job parked on one of `terminal` (`job_waiters`, see
+    /// `JobSpec::waiter`) and announce the rows that moved exactly as a
+    /// spawn would. The waits `terminal` jobs themselves registered are
+    /// deleted unconditionally: a terminal job waits on nothing.
+    ///
+    /// Two statements: the waits BY these jobs, then
+    /// [`JobWaiters::wake_in_op`], which fuses the pull-forward with its
+    /// `job_waiters` bookkeeping. The first stays separate because a
+    /// terminal job waiting on another terminal job in the same batch is a
+    /// row both would touch, and one statement may not write the same row
+    /// twice.
+    #[instrument(
+        name = "job.wake_waiters",
+        skip_all,
+        fields(n_terminal = terminal.len(), n_moved)
+    )]
+    async fn wake_waiters_in_op(
+        &self,
+        op: &mut (impl AtomicOperation + ?Sized),
+        terminal: &[JobId],
+        now: DateTime<Utc>,
+    ) -> Result<(), JobError> {
+        self.waiters.delete_waits_of_in_op(op, terminal).await?;
+        let moved = self.waiters.wake_in_op(op, terminal, now).await?;
+        Span::current().record("n_moved", moved.len());
+        self.announce_pulled_forward(op, moved).await
+    }
+
+    /// The two signals a spawn fires, for rows a pull-forward just made
+    /// due: the `ExecutionReady` notify per type (a peer poller may be
+    /// asleep on a deadline computed before this write) and this process's
+    /// claim demand. The target is always `now` here, so every moved row
+    /// is due.
+    async fn announce_pulled_forward(
+        &self,
+        op: &mut (impl AtomicOperation + ?Sized),
+        moved: Vec<(JobId, JobType)>,
+    ) -> Result<(), JobError> {
+        if moved.is_empty() {
+            return Ok(());
+        }
+        let mut per_type: HashMap<JobType, usize> = HashMap::new();
+        for (_, job_type) in moved {
+            *per_type.entry(job_type).or_default() += 1;
+        }
+        let poller = self.poller.upgrade();
+        for (job_type, n_due) in per_type {
+            self.notifier.execution_ready_in_op(op, &job_type).await?;
+            if let Some(poller) = &poller {
+                poller.register_claim_demand(op, &job_type, n_due);
+            }
+        }
+        Ok(())
     }
 
     /// `SET LOCAL enable_seqscan = off` for a job-end transaction on the

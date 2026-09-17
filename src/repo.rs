@@ -164,12 +164,26 @@ impl JobRepo {
         job_type: &JobType,
         key: &str,
     ) -> Result<Option<Job>, JobError> {
+        self.find_keyed_in_op(&self.pool, job_type, key).await
+    }
+
+    /// `_in_op` twin of [`Self::find_keyed`]: a single round trip, so it
+    /// takes any [`es_entity::IntoOneTimeExecutor`] rather than requiring a
+    /// commit-capable operation -- a pool reference (what [`Self::find_keyed`]
+    /// passes) or an in-flight operation, for a caller that wants this read
+    /// on the same connection/transaction as work it is already doing.
+    pub(super) async fn find_keyed_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: &JobType,
+        key: &str,
+    ) -> Result<Option<Job>, JobError> {
         Ok(es_query!(
             "SELECT id, created_at FROM jobs WHERE job_type = $1 AND unique_key = $2 ORDER BY created_at DESC, id DESC LIMIT 1",
             job_type as &JobType,
             key,
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(op.into_executor())
         .await?)
     }
 
@@ -182,11 +196,22 @@ impl JobRepo {
         &self,
         job_type: &JobType,
     ) -> Result<Option<JobId>, JobError> {
+        self.find_resident_id_in_op(&self.pool, job_type).await
+    }
+
+    /// `_in_op` twin of [`Self::find_resident_id`] -- see
+    /// [`Self::find_keyed_in_op`] for why this takes an
+    /// [`es_entity::IntoOneTimeExecutor`] rather than an `AtomicOperation`.
+    pub(super) async fn find_resident_id_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: &JobType,
+    ) -> Result<Option<JobId>, JobError> {
         let id = sqlx::query_scalar!(
             r#"SELECT id AS "id: JobId" FROM jobs WHERE job_type = $1 AND resident"#,
             job_type as &JobType,
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(op.into_executor())
         .await?;
         Ok(id)
     }
@@ -203,6 +228,18 @@ impl JobRepo {
         &self,
         job_type: &JobType,
     ) -> Result<Vec<(String, JobId)>, JobError> {
+        self.list_keyed_ids_by_job_type_in_op(&self.pool, job_type)
+            .await
+    }
+
+    /// `_in_op` twin of [`Self::list_keyed_ids_by_job_type`] -- see
+    /// [`Self::find_keyed_in_op`] for why this takes an
+    /// [`es_entity::IntoOneTimeExecutor`] rather than an `AtomicOperation`.
+    pub(super) async fn list_keyed_ids_by_job_type_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: &JobType,
+    ) -> Result<Vec<(String, JobId)>, JobError> {
         let rows = sqlx::query!(
             r#"
             SELECT DISTINCT ON (unique_key)
@@ -213,7 +250,7 @@ impl JobRepo {
             "#,
             job_type as &JobType,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(op.into_executor())
         .await?;
         Ok(rows.into_iter().map(|r| (r.unique_key, r.id)).collect())
     }

@@ -3,7 +3,11 @@
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use serde::Serialize;
-use std::{marker::PhantomData, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 use tracing::instrument;
 
 use super::{
@@ -45,6 +49,8 @@ pub struct JobSpec<Config> {
     pub schedule_at: Option<DateTime<Utc>>,
     pub queue_id: Option<String>,
     pub dedup_key: Option<String>,
+    /// A job to wake once this one is terminal — see [`Self::waiter`].
+    pub waiter: Option<JobId>,
 }
 
 impl<Config> JobSpec<Config> {
@@ -55,7 +61,37 @@ impl<Config> JobSpec<Config> {
             schedule_at: None,
             queue_id: None,
             dedup_key: None,
+            waiter: None,
         }
+    }
+
+    /// Register `waiter` to be woken when the job this spec creates (or
+    /// resolves to, under [`Self::dedup_key`]) reaches a terminal state:
+    /// its `execute_at` is pulled forward to that instant if it is parked
+    /// (pending, first attempt, scheduled later), under exactly
+    /// [`crate::KeyedJobSpec::force_reschedule`]'s guards — never over a
+    /// retry backoff, never a running row.
+    ///
+    /// The shape this exists for: a job spawns another inside its own
+    /// transaction and ends with
+    /// [`RescheduleAtWithOp`](crate::JobCompletion::RescheduleAtWithOp) on
+    /// that same operation, so the spawn and the park commit together and
+    /// the callee cannot be terminal before its waiter is parked. The
+    /// deadline it parks with is the safety net: a wake is at-least-once in
+    /// spirit, never a guarantee, so a caller re-entered by its deadline
+    /// must read the callee's outcome and decide for itself. A waiter that
+    /// parks with a plain [`RescheduleAt`](crate::JobCompletion::RescheduleAt)
+    /// (its park written after its run returns) is still covered: a wake
+    /// that finds it running marks the wait, and its park write lands the
+    /// row due when it finds the mark.
+    ///
+    /// Under [`Self::dedup_key`], resolving to a live holder registers the
+    /// waiter on the holder; a holder that went terminal between the live
+    /// check and this registration is replaced by a new job the waiter is
+    /// registered on, so the spec always yields something to wait for.
+    pub fn waiter(mut self, waiter: impl Into<JobId>) -> Self {
+        self.waiter = Some(waiter.into());
+        self
     }
 
     pub fn schedule_at(mut self, schedule_at: DateTime<Utc>) -> Self {
@@ -126,6 +162,7 @@ impl<Config> JobSpec<Config> {
 #[derive(Clone)]
 pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
+    handle_ops: Arc<crate::handle::HandleOps>,
     job_type: JobType,
     router: Arc<JobNotificationRouter>,
     clock: ClockHandle,
@@ -142,6 +179,7 @@ where
 {
     pub(crate) fn new(
         repo: Arc<JobRepo>,
+        handle_ops: Arc<crate::handle::HandleOps>,
         job_type: JobType,
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
@@ -150,6 +188,7 @@ where
     ) -> Self {
         Self {
             repo,
+            handle_ops,
             job_type,
             router,
             clock,
@@ -169,6 +208,7 @@ where
             id,
             Arc::clone(&self.repo),
             Arc::clone(&self.router),
+            Arc::clone(&self.handle_ops),
             self.clock.clone(),
         )
     }
@@ -221,9 +261,24 @@ where
                 .lock_and_check_live_keys_in_op(op, &self.job_type, std::slice::from_ref(key))
                 .await?;
             // Only the holder's id is needed to answer the caller, so the
-            // coalesced path costs no read of its own.
+            // coalesced path costs no read of its own. A waiter is the one
+            // thing that has to touch the holder: it locks the holder's row
+            // to prove it is still live, and if it is not, the key is free
+            // (this op holds its advisory lock) and a new job is created
+            // for the waiter to wait on.
             if let Some(id) = live_keys.get(key) {
-                return Ok(self.handle(*id).with_created(false));
+                let attached = match spec.waiter {
+                    None => true,
+                    Some(waiter) => !self
+                        .handle_ops
+                        .waiters
+                        .register_waiters_on_live_in_op(op, &[*id], &[waiter])
+                        .await?
+                        .is_empty(),
+                };
+                if attached {
+                    return Ok(self.handle(*id).with_created(false));
+                }
             }
         }
 
@@ -241,6 +296,12 @@ where
         let new_job = builder.build().expect("Could not build new job");
 
         let job = self.repo.create_in_op(op, new_job).await?;
+        if let Some(waiter) = spec.waiter {
+            self.handle_ops
+                .waiters
+                .insert_waiters_in_op(op, &[job.id], &[waiter])
+                .await?;
+        }
 
         ExecutionInsertHook::register_one(
             op,
@@ -483,25 +544,83 @@ where
         // method's doc and `JobRepo::lock_and_check_live_keys_in_op`.
         let requested_dedup_keys: Vec<String> =
             specs.iter().filter_map(|s| s.dedup_key.clone()).collect();
-        let mut live_keys = self
+        let live_keys = self
             .repo
             .lock_and_check_live_keys_in_op(op, &self.job_type, &requested_dedup_keys)
             .await?;
 
         // One entry per input spec, in spec order: the id the caller ends up
-        // holding, and whether THIS spec is the one that minted it.
-        // `live_keys` doubles as the intra-call seen-set — a surviving spec
-        // registers its own id under its key, so a later spec repeating that
-        // key resolves to it exactly as it would to a pre-existing holder.
+        // holding, and whether THIS spec is the one that minted it. `seen`
+        // is the intra-call seen-set — a key resolved once (to a
+        // pre-existing holder or to a surviving spec) resolves the same way
+        // for every later spec repeating it.
+        //
+        // A waiter on a pre-existing holder locks the holder's row to prove
+        // it is still live; a holder found terminal is replaced by the spec
+        // itself, so the waiter always gets a job to wait on. Waiters on
+        // jobs this call creates are plain inserts, batched after the rows
+        // exist.
+        //
+        // Liveness is a property of the KEY, not of the spec, so every proof
+        // this batch needs is taken in ONE locking statement before any spec
+        // is resolved. That is what lets a key's specs agree: all of them
+        // see the same answer, and the `FOR SHARE` taken here is held for
+        // the rest of `op`, so a later spec repeating the key can attach
+        // with a plain insert and still be covered. Registering one spec at
+        // a time instead would both leave the second spec of a key
+        // unprotected (the first, if waiter-less, proves nothing) and take
+        // the locks out of the crate's `(queue_id, id)` order.
+        let mut proof_callees: Vec<JobId> = Vec::new();
+        let mut proof_waiters: Vec<JobId> = Vec::new();
+        for spec in &specs {
+            if let (Some(key), Some(waiter)) = (&spec.dedup_key, spec.waiter)
+                && let Some(&id) = live_keys.get(key)
+            {
+                proof_callees.push(id);
+                proof_waiters.push(waiter);
+            }
+        }
+        let attached: HashSet<JobId> = self
+            .handle_ops
+            .waiters
+            .register_waiters_on_live_in_op(op, &proof_callees, &proof_waiters)
+            .await?
+            .into_iter()
+            .collect();
+        let proven: HashSet<JobId> = proof_callees.into_iter().collect();
+
+        let mut seen: HashMap<String, JobId> = HashMap::new();
         let mut resolved: Vec<(JobId, bool)> = Vec::with_capacity(specs.len());
         let mut surviving = Vec::with_capacity(specs.len());
+        let mut waiter_callees: Vec<JobId> = Vec::new();
+        let mut waiters: Vec<JobId> = Vec::new();
         for spec in specs {
             if let Some(key) = &spec.dedup_key {
-                if let Some(id) = live_keys.get(key) {
-                    resolved.push((*id, false));
+                if let Some(&id) = seen.get(key) {
+                    // Waits on a pre-existing holder were all registered
+                    // under its liveness proof above; only ids this batch
+                    // creates still need one here.
+                    if let Some(waiter) = spec.waiter
+                        && !proven.contains(&id)
+                    {
+                        waiter_callees.push(id);
+                        waiters.push(waiter);
+                    }
+                    resolved.push((id, false));
                     continue;
                 }
-                live_keys.insert(key.clone(), spec.id);
+                if let Some(&id) = live_keys.get(key)
+                    && (!proven.contains(&id) || attached.contains(&id))
+                {
+                    seen.insert(key.clone(), id);
+                    resolved.push((id, false));
+                    continue;
+                }
+                seen.insert(key.clone(), spec.id);
+            }
+            if let Some(waiter) = spec.waiter {
+                waiter_callees.push(spec.id);
+                waiters.push(waiter);
             }
             resolved.push((spec.id, true));
             surviving.push(spec);
@@ -551,6 +670,10 @@ where
             )
             .collect();
         ExecutionInsertHook::register(op, &self.notifier, &self.poller_ref, &self.clock, rows)
+            .await?;
+        self.handle_ops
+            .waiters
+            .insert_waiters_in_op(op, &waiter_callees, &waiters)
             .await?;
 
         // Handles are minted from ids alone, so a coalesced position costs no

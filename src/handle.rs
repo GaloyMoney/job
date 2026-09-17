@@ -10,9 +10,21 @@ use tracing::instrument;
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    JobId, error::JobError, notification_router::JobNotificationRouter, outcome::JobOutcome,
-    repo::JobRepo, snapshot::JobSnapshot,
+    JobId, JobType, error::JobError, notification_router::JobNotificationRouter,
+    notifier::JobEventNotifier, outcome::JobOutcome, poller::PollerHandle, repo::JobRepo,
+    snapshot::JobSnapshot, waiters::JobWaiters,
 };
+
+/// The service-side wiring a handle needs in order to ACT on its job rather
+/// than merely observe it: registering a wait and pulling the row forward
+/// both write, and a write that moves a row has to announce it exactly as a
+/// spawn does. Behind one `Arc` so a handle stays cheap to mint in bulk --
+/// a fan-out that mints tens of thousands pays one pointer, not three.
+pub(crate) struct HandleOps {
+    pub(crate) waiters: JobWaiters,
+    pub(crate) notifier: Arc<JobEventNotifier>,
+    pub(crate) poller_ref: PollerHandle,
+}
 
 /// A minted, cloneable per-job capability: the public way to observe and
 /// await a job you did not run yourself.
@@ -58,9 +70,7 @@ pub struct JobHandle {
     pulled_forward: bool,
     repo: Arc<JobRepo>,
     router: Arc<JobNotificationRouter>,
-    // Held so later stages can time-stamp reads consistently with the service
-    // clock; no current method reads it.
-    #[allow(dead_code)]
+    ops: Arc<HandleOps>,
     clock: ClockHandle,
 }
 
@@ -73,6 +83,7 @@ impl JobHandle {
         id: JobId,
         repo: Arc<JobRepo>,
         router: Arc<JobNotificationRouter>,
+        ops: Arc<HandleOps>,
         clock: ClockHandle,
     ) -> Self {
         Self {
@@ -81,6 +92,7 @@ impl JobHandle {
             pulled_forward: false,
             repo,
             router,
+            ops,
             clock,
         }
     }
@@ -102,6 +114,82 @@ impl JobHandle {
         self.id
     }
 
+    /// Run this job no later than `at`, if it is parked and eligible:
+    /// `pending`, on its first attempt, and currently scheduled later than
+    /// `at`. The [`Jobs::pull_forward_in_op`](crate::Jobs::pull_forward_in_op)
+    /// twin for a caller already holding a handle; see there for the full
+    /// semantics. Returns whether the row moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the write fails.
+    #[instrument(name = "job.handle.pull_forward_in_op", skip(self, op), fields(id = %self.id))]
+    pub async fn pull_forward_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, JobError> {
+        let moved = self
+            .ops
+            .waiters
+            .pull_forward_ids_in_op(op, &[self.id], at)
+            .await?;
+        let Some((_, job_type)) = moved.into_iter().next() else {
+            return Ok(false);
+        };
+        self.announce(op, job_type, at).await?;
+        Ok(true)
+    }
+
+    /// Register `waiter` to be woken when THIS job reaches a terminal state,
+    /// with the semantics of [`JobSpec::waiter`](crate::JobSpec::waiter).
+    /// `Ok(true)` if this job is live and the wait was registered;
+    /// `Ok(false)` if it is already terminal, in which case nothing is
+    /// written and the caller should read the outcome ([`Self::load`])
+    /// instead of parking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the write fails.
+    #[instrument(name = "job.handle.register_waiter_in_op", skip(self, op, waiter), fields(id = %self.id, waiter))]
+    pub async fn register_waiter_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        waiter: impl Into<JobId>,
+    ) -> Result<bool, JobError> {
+        let waiter: JobId = waiter.into();
+        tracing::Span::current().record("waiter", tracing::field::display(waiter));
+        Ok(!self
+            .ops
+            .waiters
+            .register_waiters_on_live_in_op(op, &[self.id], &[waiter])
+            .await?
+            .is_empty())
+    }
+
+    /// The two signals a spawn fires, for a row a pull-forward just made
+    /// due: the `ExecutionReady` notify for its type (a peer poller may be
+    /// asleep on a deadline computed before this write) and, when the target
+    /// is already due, this process's claim demand.
+    async fn announce(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        job_type: JobType,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), JobError> {
+        self.ops
+            .notifier
+            .execution_ready_in_op(op, &job_type)
+            .await?;
+        let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        if at <= now
+            && let Some(poller) = self.ops.poller_ref.get().and_then(|w| w.upgrade())
+        {
+            poller.register_claim_demand(op, &job_type, 1);
+        }
+        Ok(())
+    }
+
     /// `true` if the `spawn*` call that produced this handle CREATED the job
     /// it points at; `false` otherwise.
     ///
@@ -117,7 +205,7 @@ impl JobHandle {
     /// | any `spawn*` that minted a new job | `true` |
     /// | a `spawn*` that resolved onto a live `dedup_key`/keyed holder | `false` |
     /// | [`ResidentJobSpawner::spawn`](crate::ResidentJobSpawner::spawn) onto the job that already exists | `false` |
-    /// | [`Jobs::handle`](crate::Jobs::handle) / [`handles`](crate::Jobs::handles) / [`keyed_handle`](crate::Jobs::keyed_handle) / [`keyed_handles`](crate::Jobs::keyed_handles) / [`resident_handle`](crate::Jobs::resident_handle) | `false` |
+    /// | [`Jobs::handle`](crate::Jobs::handle) / [`handles`](crate::Jobs::handles) / [`keyed_handle`](crate::Jobs::keyed_handle) / [`keyed_handles`](crate::Jobs::keyed_handles) / [`resident_handle`](crate::Jobs::resident_handle) / [`keyed_handle_in_op`](crate::Jobs::keyed_handle_in_op) / [`keyed_handles_in_op`](crate::Jobs::keyed_handles_in_op) / [`resident_handle_in_op`](crate::Jobs::resident_handle_in_op) | `false` |
     /// | [`Clone`] of any of the above | whatever the source said |
     ///
     /// **Read `false` as "this call did not create the job", not as "a spawn
@@ -256,6 +344,57 @@ pub struct JobHandles(Vec<JobHandle>);
 const AWAIT_ALL_CHUNK: usize = 1000;
 
 impl JobHandles {
+    /// Register `waiter` to be woken when the jobs in this collection reach
+    /// a terminal state, and report which of them were still live and so
+    /// actually attached. A handle absent from the result is already
+    /// terminal: nothing was written for it, and its outcome is there to be
+    /// read ([`JobHandle::load`]) rather than waited on.
+    ///
+    /// **This is the durable counterpart to [`Self::await_all`], and the two
+    /// are not interchangeable.** `await_all` is a *continuation*: the
+    /// calling task blocks, resumes on the same line, and has the outcomes
+    /// in hand -- so a job that calls it keeps its slot and its task alive
+    /// for the whole wait. Registering a wait is a *restart*: the caller is
+    /// expected to park itself (return
+    /// [`JobCompletion::RescheduleAt`](crate::JobCompletion::RescheduleAt)
+    /// with a fallback deadline), which releases its slot, and to be run
+    /// again FROM THE TOP when a callee finishes. Nothing is handed back on
+    /// re-entry, so a job converting from one to the other has to persist
+    /// what it spawned ([`CurrentJob::update_execution_state_in_op`](crate::CurrentJob::update_execution_state_in_op))
+    /// and reload the outcomes itself. That restructuring is the real cost
+    /// of the swap; it is also what makes a wide fan-out affordable.
+    ///
+    /// The wake is per-callee, not "all of them": the waiter is pulled
+    /// forward when the FIRST of these finishes, and should re-check what is
+    /// still outstanding and park again if it is not done.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the write fails.
+    #[instrument(
+        name = "job.handles.register_waiter_in_op",
+        skip(self, op, waiter),
+        fields(count = self.0.len(), waiter)
+    )]
+    pub async fn register_waiter_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        waiter: impl Into<JobId>,
+    ) -> Result<Vec<JobId>, JobError> {
+        let waiter: JobId = waiter.into();
+        tracing::Span::current().record("waiter", tracing::field::display(waiter));
+        if self.0.is_empty() {
+            return Ok(Vec::new());
+        }
+        let callees: Vec<JobId> = self.0.iter().map(|h| h.id).collect();
+        let waiters = vec![waiter; callees.len()];
+        self.0[0]
+            .ops
+            .waiters
+            .register_waiters_on_live_in_op(op, &callees, &waiters)
+            .await
+    }
+
     /// Block until every job reaches a terminal state and return all
     /// outcomes, positionally aligned with the handles (contract 2).
     ///

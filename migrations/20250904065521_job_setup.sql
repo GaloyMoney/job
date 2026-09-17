@@ -66,6 +66,22 @@ CREATE TABLE job_executions (
   state JobExecutionState NOT NULL DEFAULT 'pending',
   execute_at TIMESTAMPTZ,
   alive_at TIMESTAMPTZ NOT NULL,
+  -- Set by a wake (`waiters.rs::wake_in_op`) that found this row and could
+  -- NOT move it: `running` (a claim nulls `execute_at`, so there is no field
+  -- to write a time into), `parked` behind a queue sibling (lowering a parked
+  -- row's `execute_at` would break Invariant B), or in retry backoff
+  -- (`attempt_index > 1`, which a wake must never shorten).
+  --
+  -- It is the record that the callee finished, for whichever write next makes
+  -- this row runnable to honour: the `Disposition::Fresh` park write, or a
+  -- parked-to-pending promote (`execution_hooks::promote`). Each consults and
+  -- CLEARS it in the same statement -- so the mark is consumed strictly
+  -- before `PromoteHeadsHook` computes swaps, and a row is therefore never
+  -- visible to the hook carrying a deadline the mark is about to override.
+  -- The retry-backoff path clears it without honouring it: the wake is spent
+  -- (the callee did finish) and the job will run at its backoff, so leaving
+  -- the mark would let attempt-count forgiveness resurrect it much later.
+  woken_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL
 );
 
@@ -145,3 +161,37 @@ ALTER TABLE job_execution_states SET (
   autovacuum_analyze_scale_factor = 0.02,
   autovacuum_vacuum_cost_delay = 0
 );
+
+-- A job waiting on another. `waiter_job_id` parked itself (`RescheduleAt`)
+-- until `job_id` reaches a terminal state; the finalizer that deletes
+-- `job_id`'s execution row pulls the waiter's `execute_at` forward
+-- (`waiters.rs::wake_in_op`), under the same guards as the keyed
+-- pull-forward: pending, first attempt, scheduled later than now.
+--
+-- A waiter that cannot be moved when its callee lands is marked `woken_at`
+-- instead, and whichever write next makes the row runnable consults the
+-- mark: its own park write (`Disposition::Fresh`) if it was RUNNING, or a
+-- parked-to-pending promote (`execution_hooks::promote`) if it was sitting
+-- `parked` behind a queue sibling. Rows are deleted when consumed by a wake,
+-- and unconditionally when the waiter itself goes terminal, so the table
+-- stays O(live waits).
+--
+-- No FK to `jobs`: `jobs` rows are never deleted, and the finalizer's
+-- `DELETE ... RETURNING` is the only consumer.
+-- Pure edges. The "you were woken" MARK is deliberately NOT here: it is a
+-- property of the WAITER, not of the (callee, waiter) pair -- a wake dedups
+-- to distinct waiters and every consumer read it that way -- so it lives on
+-- `job_executions.woken_at` instead. That keeps it on the row every consumer
+-- is already updating, which is what makes the two hot-path consults
+-- (`execution_hooks::promote`'s parked-head promote, and the
+-- `Disposition::Fresh` park write) local column tests rather than a probe
+-- into a table that is O(live waits).
+CREATE TABLE job_waiters (
+  job_id UUID NOT NULL,
+  waiter_job_id UUID NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (job_id, waiter_job_id)
+);
+
+-- Terminal cleanup (`delete_waits_of_in_op`): every wait a job registered.
+CREATE INDEX idx_job_waiters_waiter ON job_waiters (waiter_job_id);

@@ -116,6 +116,9 @@ pub struct KeyedJobSpec<Config> {
     /// [`Self::force_reschedule`]. Off by default: a spawn against a
     /// live key stays a pure no-op unless this is set.
     pub force_reschedule: bool,
+    /// A job to wake once this key's generation is terminal — see
+    /// [`Self::waiter`].
+    pub waiter: Option<JobId>,
 }
 
 impl<Config> KeyedJobSpec<Config> {
@@ -125,7 +128,18 @@ impl<Config> KeyedJobSpec<Config> {
             config,
             schedule_at: None,
             force_reschedule: false,
+            waiter: None,
         }
+    }
+
+    /// Register `waiter` to be woken when the generation this spec creates
+    /// or resolves to reaches a terminal state. Same contract as
+    /// [`crate::JobSpec::waiter`]: a live holder gets the waiter attached
+    /// (its row locked to prove it is live); a holder found terminal is
+    /// replaced by a new generation the waiter is registered on.
+    pub fn waiter(mut self, waiter: impl Into<JobId>) -> Self {
+        self.waiter = Some(waiter.into());
+        self
     }
 
     /// Schedule this job for a specific time instead of immediately.
@@ -179,6 +193,7 @@ impl<Config> KeyedJobSpec<Config> {
 #[derive(Clone)]
 pub struct KeyedJobSpawner<Config> {
     repo: Arc<JobRepo>,
+    handle_ops: Arc<crate::handle::HandleOps>,
     job_type: JobType,
     router: Arc<JobNotificationRouter>,
     clock: ClockHandle,
@@ -197,6 +212,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         repo: Arc<JobRepo>,
+        handle_ops: Arc<crate::handle::HandleOps>,
         job_type: JobType,
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
@@ -206,6 +222,7 @@ where
     ) -> Self {
         Self {
             repo,
+            handle_ops,
             job_type,
             router,
             clock,
@@ -428,29 +445,72 @@ where
         let mut local_wake: HashMap<usize, DateTime<Utc>> = HashMap::new();
         let mut local_wake_outcomes: Vec<(usize, usize)> = Vec::new();
         let mut outcomes: Vec<JobHandle> = Vec::with_capacity(specs.len());
+        // Waiters on generations this call creates, or on holders already
+        // proven live in this call: plain inserts once the rows exist.
+        let mut waiter_callees: Vec<JobId> = Vec::new();
+        let mut waiters: Vec<JobId> = Vec::new();
         // The key each entry of `outcomes` answers for. A `JobHandle` carries
         // no key of its own, and `pulled_forward` is resolved by key AFTER
         // the loop, so the correspondence has to be kept alongside.
         let mut outcome_keys: Vec<String> = Vec::with_capacity(specs.len());
+
+        // Every liveness proof this batch needs, taken in ONE locking
+        // statement before any spec resolves: liveness is a property of the
+        // key, so all specs sharing one must see the same answer, and the
+        // `FOR SHARE` is held for the rest of `op`. Locking per spec instead
+        // would take the locks out of the crate's `(queue_id, id)` order and
+        // deadlock against a batch finalizer taking `FOR UPDATE` on the same
+        // rows.
+        let mut proof_callees: Vec<JobId> = Vec::new();
+        let mut proof_waiters: Vec<JobId> = Vec::new();
+        for spec in &specs {
+            if let Some(waiter) = spec.waiter
+                && let Some(&id) = live.get(&spec.key)
+            {
+                proof_callees.push(id);
+                proof_waiters.push(waiter);
+            }
+        }
+        let attached: HashSet<JobId> = self
+            .handle_ops
+            .waiters
+            .register_waiters_on_live_in_op(op, &proof_callees, &proof_waiters)
+            .await?
+            .into_iter()
+            .collect();
+        let proven: HashSet<JobId> = proof_callees.into_iter().collect();
 
         for spec in specs {
             // The `execute_at` this spec asks for: the one a NEW job of it
             // would be created with, and the one a wake pulls a holder to.
             let wanted_at = spec.schedule_at.unwrap_or(default_schedule_at);
 
-            if let Some(id) = live.get(&spec.key) {
+            // A live holder, unless a waiter finds it terminal on the way
+            // in — then the key is free (this op holds its advisory lock)
+            // and the spec falls through to create the next generation.
+            // `seen` is consulted first so a later spec of a key whose
+            // holder was found terminal resolves to the generation created
+            // for it, not to the dead holder again.
+            if !seen.contains_key(&spec.key)
+                && let Some(&id) = live.get(&spec.key)
+                && (!proven.contains(&id) || attached.contains(&id))
+            {
                 if spec.force_reschedule {
                     wake.entry(spec.key.clone())
                         .and_modify(|t| *t = (*t).min(wanted_at))
                         .or_insert(wanted_at);
                     wake_outcomes.push(outcomes.len());
                 }
-                outcomes.push(self.handle(*id).with_created(false));
+                outcomes.push(self.handle(id).with_created(false));
                 outcome_keys.push(spec.key);
                 continue;
             }
 
             if let Some(&(id, idx)) = seen.get(&spec.key) {
+                if let Some(waiter) = spec.waiter {
+                    waiter_callees.push(id);
+                    waiters.push(waiter);
+                }
                 if spec.force_reschedule {
                     local_wake
                         .entry(idx)
@@ -479,6 +539,10 @@ where
                     .build()
                     .expect("Could not build new job"),
             );
+            if let Some(waiter) = spec.waiter {
+                waiter_callees.push(id);
+                waiters.push(waiter);
+            }
             seen.insert(spec.key.clone(), (id, new_ids.len()));
             new_ids.push(id);
             new_keys.push(spec.key.clone());
@@ -507,16 +571,21 @@ where
         // Distinct by construction — they are a `HashMap`'s keys — which is
         // what keeps `pull_forward_in_op`'s join single-rowed per key.
         let (wake_keys, wake_targets): (Vec<String>, Vec<DateTime<Utc>>) = wake.into_iter().unzip();
-
-        if new_jobs.is_empty() && wake_keys.is_empty() {
-            return Ok(outcomes.into_iter().collect());
-        }
+        let new_jobs_created = new_jobs.len();
 
         if !new_jobs.is_empty() {
             self.repo.create_all_in_op(op, new_jobs).await?;
             self.insert_executions_in_op(op, &new_ids, &new_keys, &new_schedule_times)
                 .await?;
             self.carry_state_in_op(op, &new_ids, &new_keys).await?;
+        }
+        self.handle_ops
+            .waiters
+            .insert_waiters_in_op(op, &waiter_callees, &waiters)
+            .await?;
+
+        if new_jobs_created == 0 && wake_keys.is_empty() {
+            return Ok(outcomes.into_iter().collect());
         }
 
         let pulled = self
@@ -769,6 +838,7 @@ where
             id,
             Arc::clone(&self.repo),
             Arc::clone(&self.router),
+            Arc::clone(&self.handle_ops),
             self.clock.clone(),
         )
     }
@@ -809,6 +879,11 @@ mod tests {
         let poller_ref: PollerHandle = Arc::new(std::sync::OnceLock::new());
         KeyedJobSpawner::new(
             repo,
+            Arc::new(crate::handle::HandleOps {
+                waiters: crate::waiters::JobWaiters::new(pool),
+                notifier: Arc::clone(&notifier),
+                poller_ref: Arc::clone(&poller_ref),
+            }),
             job_type,
             router,
             ClockHandle::realtime(),

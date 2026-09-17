@@ -189,6 +189,12 @@ If you are using sqlx you can copy the migration file into your project:
 cp ./migrations/20250904065521_job_setup.sql <path>/<to>/<your>/<project>/migrations/
 ```
 
+> **Upgrading across the `job_waiters` release:** this file changed in place
+> rather than gaining a second migration, so its checksum changed. `sqlx
+> migrate run` against a database that applied the older copy will fail with a
+> version-mismatch error. Re-copy the file **and** recreate the database —
+> there is no in-place upgrade path.
+
 Option 3.
 You can also add the job migrations in code when you run your own migrations without copying the file:
 ```rust
