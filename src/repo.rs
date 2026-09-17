@@ -164,7 +164,14 @@ impl JobRepo {
         job_type: &JobType,
         key: &str,
     ) -> Result<Option<Job>, JobError> {
-        self.find_keyed_in_op(&self.pool, job_type, key).await
+        // Concrete executor, not the `_in_op` twin: unspawnable (rust-lang/rust#100013).
+        Ok(es_query!(
+            "SELECT id, created_at FROM jobs WHERE job_type = $1 AND unique_key = $2 ORDER BY created_at DESC, id DESC LIMIT 1",
+            job_type as &JobType,
+            key,
+        )
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     /// `_in_op` twin of [`Self::find_keyed`]: a single round trip, so it
@@ -196,7 +203,14 @@ impl JobRepo {
         &self,
         job_type: &JobType,
     ) -> Result<Option<JobId>, JobError> {
-        self.find_resident_id_in_op(&self.pool, job_type).await
+        // Concrete executor, not the `_in_op` twin — see `find_keyed`.
+        let id = sqlx::query_scalar!(
+            r#"SELECT id AS "id: JobId" FROM jobs WHERE job_type = $1 AND resident"#,
+            job_type as &JobType,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
     }
 
     /// `_in_op` twin of [`Self::find_resident_id`] -- see
@@ -228,8 +242,20 @@ impl JobRepo {
         &self,
         job_type: &JobType,
     ) -> Result<Vec<(String, JobId)>, JobError> {
-        self.list_keyed_ids_by_job_type_in_op(&self.pool, job_type)
-            .await
+        // Concrete executor, not the `_in_op` twin — see `find_keyed`.
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT ON (unique_key)
+                unique_key AS "unique_key!", id AS "id: JobId"
+            FROM jobs
+            WHERE job_type = $1 AND unique_key IS NOT NULL
+            ORDER BY unique_key, created_at DESC, id DESC
+            "#,
+            job_type as &JobType,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.unique_key, r.id)).collect())
     }
 
     /// `_in_op` twin of [`Self::list_keyed_ids_by_job_type`] -- see
