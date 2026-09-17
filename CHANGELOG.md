@@ -1,3 +1,11 @@
+# [job release v0.15.1](https://github.com/GaloyMoney/job/releases/tag/0.15.1)
+
+
+
+### Bug Fixes
+
+- Keep pool-based handle getters spawn-awaitable
+
 # [job release v0.15.0](https://github.com/GaloyMoney/job/releases/tag/0.15.0)
 
 
