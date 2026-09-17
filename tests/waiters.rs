@@ -236,19 +236,28 @@ async fn exec_row(
     Ok(row)
 }
 
-/// Whether a `job_waiters` row exists for the pair, and its `woken_at`.
-async fn waiter_row(
-    pool: &sqlx::PgPool,
-    callee: JobId,
-    waiter: JobId,
-) -> anyhow::Result<Option<Option<DateTime<Utc>>>> {
-    let row: Option<(Option<DateTime<Utc>>,)> =
-        sqlx::query_as("SELECT woken_at FROM job_waiters WHERE job_id = $1 AND waiter_job_id = $2")
+/// Whether the `job_waiters` EDGE exists for the pair. The table holds only
+/// edges; the "you were woken" mark is a property of the waiter and lives on
+/// its execution row (see [`woken_mark`]).
+async fn wait_exists(pool: &sqlx::PgPool, callee: JobId, waiter: JobId) -> anyhow::Result<bool> {
+    let row: Option<(uuid::Uuid,)> =
+        sqlx::query_as("SELECT job_id FROM job_waiters WHERE job_id = $1 AND waiter_job_id = $2")
             .bind(uuid::Uuid::from(callee))
             .bind(uuid::Uuid::from(waiter))
             .fetch_optional(pool)
             .await?;
-    Ok(row.map(|(w,)| w))
+    Ok(row.is_some())
+}
+
+/// The waiter's wake mark, off its own execution row. `None` covers both "no
+/// mark" and "no execution row".
+async fn woken_mark(pool: &sqlx::PgPool, waiter: JobId) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let row: Option<(Option<DateTime<Utc>>,)> =
+        sqlx::query_as("SELECT woken_at FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(waiter))
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(w,)| w))
 }
 
 async fn next_run(
@@ -374,10 +383,14 @@ async fn register_waiter_in_op_attaches_to_a_live_job_and_rejects_a_terminal_one
     let attached = jobs.register_waiter_in_op(&mut op, callee, waiter).await?;
     op.commit().await?;
     assert!(attached, "the callee is live");
+    assert!(
+        wait_exists(&pool, callee, waiter).await?,
+        "an edge must exist for the registered wait"
+    );
     assert_eq!(
-        waiter_row(&pool, callee, waiter).await?,
-        Some(None),
-        "a row must exist with no wake mark yet"
+        woken_mark(&pool, waiter).await?,
+        None,
+        "no wake has happened yet"
     );
 
     // Simulate the callee going terminal: its execution row is deleted,
@@ -394,9 +407,8 @@ async fn register_waiter_in_op_attaches_to_a_live_job_and_rejects_a_terminal_one
         .await?;
     op2.commit().await?;
     assert!(!attached2, "a terminal callee must reject registration");
-    assert_eq!(
-        waiter_row(&pool, callee, other_waiter).await?,
-        None,
+    assert!(
+        !wait_exists(&pool, callee, other_waiter).await?,
         "nothing must be written for a rejected registration"
     );
 
@@ -455,7 +467,7 @@ async fn a_parked_caller_is_woken_when_its_callee_completes() -> anyhow::Result<
     // `job_waiters` row survives a consumed wake.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if waiter_row(&pool, callee_id, caller_id).await?.is_none() {
+        if !wait_exists(&pool, callee_id, caller_id).await? {
             break;
         }
         anyhow::ensure!(
@@ -516,7 +528,7 @@ async fn a_plain_rescheduled_caller_still_wakes_via_the_mark() -> anyhow::Result
     // wait a moment for the spawn to land).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if waiter_row(&pool, callee_id, caller_id).await?.is_some() {
+        if wait_exists(&pool, callee_id, caller_id).await? {
             break;
         }
         anyhow::ensure!(
@@ -532,10 +544,13 @@ async fn a_plain_rescheduled_caller_still_wakes_via_the_mark() -> anyhow::Result
     // moving it. Confirm the mark landed before the caller's park write.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        match waiter_row(&pool, callee_id, caller_id).await? {
-            None => break, // already consumed - the caller's Fresh write won the race, fine too
-            Some(Some(_woken_at)) => break,
-            Some(None) => {}
+        // Either the mark landed on the caller's execution row, or the
+        // caller's Fresh write already won the race and consumed the edge --
+        // both are the wake being honoured.
+        if woken_mark(&pool, caller_id).await?.is_some()
+            || !wait_exists(&pool, callee_id, caller_id).await?
+        {
+            break;
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,

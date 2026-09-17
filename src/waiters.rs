@@ -67,7 +67,7 @@ impl JobWaiters {
             INSERT INTO job_waiters (job_id, waiter_job_id, created_at)
             SELECT DISTINCT t.job_id, t.waiter_job_id, COALESCE($3, NOW())
             FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
-            ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET woken_at = NULL
+            ON CONFLICT (job_id, waiter_job_id) DO NOTHING
             "#,
             callees as &[JobId],
             waiters as &[JobId],
@@ -118,7 +118,7 @@ impl JobWaiters {
             SELECT DISTINCT t.job_id, t.waiter_job_id, COALESCE($3, NOW())
             FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
             JOIN locked l ON l.id = t.job_id
-            ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET woken_at = NULL
+            ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET job_id = EXCLUDED.job_id
             RETURNING job_id AS "job_id!: JobId"
             "#,
             callees as &[JobId],
@@ -133,26 +133,29 @@ impl JobWaiters {
         Ok(attached)
     }
 
-    /// Wake every job parked on one of `terminal`: pull each waiter's row
-    /// forward to `now` under the by-id guards, delete the waits of those
-    /// actually moved, and mark (`woken_at`) the waits of those not moved.
-    /// Returns the rows moved, for the caller to announce.
+    /// Wake every job waiting on one of `terminal`, and return the rows that
+    /// actually moved for the caller to announce.
     ///
-    /// A waiter that could not be moved is `running` (its park is being
-    /// written by another finalizer, or not yet at all) or `parked` behind a
-    /// queue sibling. Its mark is the record that the wake happened, for
-    /// whichever write next makes the row runnable to consult -- the
-    /// waiter's own `Fresh` disposition write
-    /// ([`Self::take_woken_marks_in_op`]) or a parked-to-pending promote
-    /// (`execution_hooks::promote`).
+    /// ONE write, against `job_executions` only: each waiter is either pulled
+    /// forward (pending, first attempt, scheduled later than `now`) or marked
+    /// `woken_at` because it could not be. A waiter that could not be moved
+    /// is `running` (a claim nulls `execute_at`, so there is no field to
+    /// write a time into), `parked` behind a queue sibling (lowering a parked
+    /// row's `execute_at` breaks Invariant B), or in retry backoff. The mark
+    /// is honoured by whichever write next makes the row runnable -- the
+    /// `Disposition::Fresh` park write, or a parked-to-pending promote
+    /// (`execution_hooks::promote`) -- each of which clears it in the same
+    /// statement.
     ///
-    /// One statement, because the delete and the mark touch provably
-    /// disjoint row sets (moved vs. not-moved): fusing writes that could
-    /// hit the SAME `job_waiters` row would be the unsupported
-    /// "update the same row twice in one statement" case. Data-modifying
-    /// CTEs always run to completion whether or not the primary query reads
-    /// them, so `consumed` and `marked` apply even though it selects only
-    /// from `moved`.
+    /// The mark lives on the waiter's execution row rather than on the wait,
+    /// because it is a property of the WAITER: a wake dedups to distinct
+    /// waiters and every consumer read it that way. Keeping it here is what
+    /// lets both consults be local column tests on a row they are already
+    /// updating, instead of a probe into a table that is O(live waits).
+    ///
+    /// `job_waiters` edges for the moved rows are consumed in the same
+    /// statement; edges for marked rows stay, so a waiter that re-parks is
+    /// still attached to callees that have not finished.
     pub(crate) async fn wake_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
@@ -164,36 +167,40 @@ impl JobWaiters {
         }
         let rows = sqlx::query!(
             r#"
+            -- Eligibility is decided INSIDE the locking CTE, not re-checked on
+            -- the UPDATE: a `FOR NO KEY UPDATE` scan that blocks resumes on
+            -- the LATEST committed row version (EvalPlanQual), so `movable`
+            -- is computed against the same version the UPDATE will write, and
+            -- the lock is held for the rest of the transaction so nothing can
+            -- change underneath it in between. That is also what lets the
+            -- flag be RETURNed honestly -- reading it back off `je` would see
+            -- the row this statement just wrote.
             WITH locked AS MATERIALIZED (
-                SELECT je.id FROM job_executions je
+                SELECT je.id,
+                       COALESCE(je.state = 'pending'
+                                AND je.attempt_index <= 1
+                                AND je.execute_at > $2, false) AS movable
+                FROM job_executions je
                 WHERE je.id IN (
                         SELECT waiter_job_id FROM job_waiters WHERE job_id = ANY($1)
                     )
-                  AND je.state = 'pending'
-                  AND je.attempt_index <= 1
-                  AND je.execute_at > $2
                 ORDER BY je.queue_id, je.id
                 FOR NO KEY UPDATE
-            ), moved AS (
+            ), woken AS (
                 UPDATE job_executions je
-                   SET execute_at = LEAST(je.execute_at, $2)
+                   SET execute_at = CASE WHEN l.movable THEN LEAST(je.execute_at, $2)
+                                         ELSE je.execute_at END,
+                       woken_at = CASE WHEN l.movable THEN je.woken_at ELSE $2 END
                   FROM locked l
                  WHERE je.id = l.id
-                   AND je.state = 'pending'
-                   AND je.attempt_index <= 1
-                   AND je.execute_at > $2
-                RETURNING je.id, je.job_type
+                RETURNING je.id, je.job_type, l.movable AS movable
             ), consumed AS (
                 DELETE FROM job_waiters
                  WHERE job_id = ANY($1)
-                   AND waiter_job_id IN (SELECT id FROM moved)
-            ), marked AS (
-                UPDATE job_waiters SET woken_at = $2
-                 WHERE job_id = ANY($1)
-                   AND woken_at IS NULL
-                   AND waiter_job_id NOT IN (SELECT id FROM moved)
+                   AND waiter_job_id IN (SELECT id FROM woken WHERE movable)
             )
-            SELECT id AS "id!: JobId", job_type AS "job_type!: JobType" FROM moved
+            SELECT id AS "id!: JobId", job_type AS "job_type!: JobType"
+            FROM woken WHERE movable
             "#,
             terminal as &[JobId],
             now,
@@ -201,33 +208,6 @@ impl JobWaiters {
         .fetch_all(op.as_executor())
         .await?;
         Ok(rows.into_iter().map(|r| (r.id, r.job_type)).collect())
-    }
-
-    /// The waiters among `ids` that a wake marked while they could not be
-    /// moved: deletes those marks and returns the distinct waiters, for the
-    /// park write to land due instead of at the deadline they asked for.
-    pub(crate) async fn take_woken_marks_in_op(
-        &self,
-        op: &mut (impl es_entity::AtomicOperation + ?Sized),
-        ids: &[JobId],
-    ) -> Result<Vec<JobId>, JobError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows = sqlx::query!(
-            r#"
-            DELETE FROM job_waiters
-            WHERE waiter_job_id = ANY($1) AND woken_at IS NOT NULL
-            RETURNING waiter_job_id AS "waiter_job_id!: JobId"
-            "#,
-            ids as &[JobId],
-        )
-        .fetch_all(op.as_executor())
-        .await?;
-        let mut waiters: Vec<JobId> = rows.into_iter().map(|r| r.waiter_job_id).collect();
-        waiters.sort_unstable();
-        waiters.dedup();
-        Ok(waiters)
     }
 
     /// Every wait registered BY `ids`: a terminal waiter leaves no rows.

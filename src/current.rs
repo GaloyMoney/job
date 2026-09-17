@@ -116,9 +116,10 @@ impl CurrentJob {
     /// Registering is only half of parking: this call writes the waits, and
     /// the runner must then RETURN a reschedule (with a fallback deadline,
     /// so a wake that never arrives cannot park the job forever) to release
-    /// its slot. See [`JobHandles::register_waiter_in_op`] for why the job
-    /// is re-entered from the top rather than resumed, and what it must
-    /// persist to survive that.
+    /// its slot. See
+    /// [`JobHandles::register_waiter_in_op`](crate::JobHandles::register_waiter_in_op)
+    /// for why the job is re-entered from the top rather than resumed, and
+    /// what it must persist to survive that.
     ///
     /// # Errors
     ///

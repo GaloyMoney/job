@@ -592,7 +592,7 @@ impl Finalizer {
             let rows = sqlx::query!(
                 r#"
                 WITH to_reschedule AS MATERIALIZED (
-                    SELECT je.id, u.execute_at
+                    SELECT je.id, u.execute_at, je.woken_at
                     FROM job_executions je
                     JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS u(id, execute_at)
                       ON je.id = u.id
@@ -600,42 +600,48 @@ impl Finalizer {
                     ORDER BY je.queue_id, je.id
                     FOR UPDATE
                 )
+                -- `t.woken_at` is the PRE-update value (the CTE read it
+                -- before this statement's SET), which is what lets the same
+                -- statement both honour the mark and clear it.
                 UPDATE job_executions AS je
-                SET state = 'pending', execute_at = t.execute_at, attempt_index = 1,
-                    poller_instance_id = NULL
+                SET state = 'pending', attempt_index = 1, poller_instance_id = NULL,
+                    -- A park a wake already overtook: the callee landed while
+                    -- this job was still running, so the wake could not move
+                    -- the row (a running row has no `execute_at`) and left a
+                    -- mark. Honouring it HERE, in the park write itself, is
+                    -- what guarantees the row is never visible to
+                    -- `PromoteHeadsHook` carrying the deadline the mark
+                    -- overrides -- the hook would otherwise swap a queued
+                    -- waiter out to `parked` on that stale time, and lowering
+                    -- a parked row's `execute_at` breaks Invariant B.
+                    execute_at = CASE WHEN t.woken_at IS NOT NULL
+                                      THEN LEAST(t.execute_at, $4)
+                                      ELSE t.execute_at END,
+                    woken_at = NULL
                 FROM to_reschedule t
                 WHERE je.id = t.id
-                RETURNING je.id AS "id!: JobId"
+                RETURNING je.id AS "id!: JobId", je.job_type,
+                          (t.woken_at IS NOT NULL) AS "was_woken!"
                 "#,
                 &fresh_uuids,
                 &fresh_times,
                 self.instance_id,
+                now,
             )
             .fetch_all(op.as_executor())
             .await?;
-            let mut fresh_applied: Vec<JobId> = Vec::with_capacity(rows.len());
+            let mut overtaken: Vec<(JobId, JobType)> = Vec::new();
             for row in rows {
                 applied.insert(row.id);
                 applied_pending_uuids.push(uuid::Uuid::from(row.id));
-                fresh_applied.push(row.id);
+                if row.was_woken {
+                    overtaken.push((row.id, JobType::from_owned(row.job_type)));
+                }
                 outcome.rescheduled_pending = true;
             }
-            // A park that a wake already overtook: the callee landed while
-            // this job was still running, so its wake could not move the
-            // row and left a mark instead. The row is `pending` at attempt
-            // 1 as of the write above, so the by-id pull-forward lands it
-            // due now rather than at the deadline it asked for.
-            let overtaken = self
-                .waiters
-                .take_woken_marks_in_op(op, &fresh_applied)
-                .await?;
-            if !overtaken.is_empty() {
-                let moved = self
-                    .waiters
-                    .pull_forward_ids_in_op(op, &overtaken, now)
-                    .await?;
-                self.announce_pulled_forward(op, moved).await?;
-            }
+            // Rows the mark landed due now rather than at the deadline they
+            // asked for are announced exactly as a spawn would announce them.
+            self.announce_pulled_forward(op, overtaken).await?;
         }
 
         if !congestion_uuids.is_empty() {
@@ -687,9 +693,17 @@ impl Finalizer {
                     ORDER BY je.queue_id, je.id
                     FOR UPDATE
                 )
+                -- `woken_at` is CLEARED but deliberately NOT honoured: a wake
+                -- must never shorten a retry backoff (the same guard the by-id
+                -- and keyed pull-forwards carry). The mark is spent all the
+                -- same -- the callee did finish, and this row will run at its
+                -- backoff -- so leaving it would let attempt-count
+                -- forgiveness (`attempt_reset_after_healthy_run`) resurrect a
+                -- long-stale wake and yank the job due much later.
                 UPDATE job_executions AS je
                 SET state = 'pending', execute_at = t.execute_at,
-                    attempt_index = t.attempt_index, poller_instance_id = NULL
+                    attempt_index = t.attempt_index, poller_instance_id = NULL,
+                    woken_at = NULL
                 FROM to_retry t
                 WHERE je.id = t.id
                 RETURNING je.id AS "id!: JobId"
