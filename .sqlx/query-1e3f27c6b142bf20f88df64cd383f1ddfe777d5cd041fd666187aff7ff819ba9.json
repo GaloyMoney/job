@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE job_waiters SET woken_at = $2\n            WHERE job_id = ANY($1) AND woken_at IS NULL\n            RETURNING waiter_job_id AS \"waiter_job_id!: JobId\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "waiter_job_id!: JobId",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1e3f27c6b142bf20f88df64cd383f1ddfe777d5cd041fd666187aff7ff819ba9"
+}

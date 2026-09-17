@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM job_waiters\n            WHERE waiter_job_id = ANY($1) AND woken_at IS NOT NULL\n            RETURNING waiter_job_id AS \"waiter_job_id!: JobId\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "waiter_job_id!: JobId",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b9885cd8803beff973be5ef6d47c0d0c56248172ae7693ff23e5dd21f7fe6503"
+}

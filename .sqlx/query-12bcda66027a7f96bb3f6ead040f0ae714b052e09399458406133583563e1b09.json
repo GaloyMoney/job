@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH live AS (\n                SELECT id FROM job_executions WHERE id = $1 FOR SHARE\n            )\n            INSERT INTO job_waiters (job_id, waiter_job_id, created_at)\n            SELECT live.id, $2, COALESCE($3, NOW()) FROM live\n            ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET woken_at = NULL\n            RETURNING job_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "job_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "12bcda66027a7f96bb3f6ead040f0ae714b052e09399458406133583563e1b09"
+}
