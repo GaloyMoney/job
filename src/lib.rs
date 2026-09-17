@@ -1131,6 +1131,36 @@ impl Jobs {
         Ok(id.map(|id| self.handle(id)))
     }
 
+    /// `_in_op` twin of [`Self::resident_handle`]: one round trip through any
+    /// [`es_entity::IntoOneTimeExecutor`] -- a pool reference (what
+    /// [`Self::resident_handle`] passes) or an in-flight operation, for a
+    /// caller that wants this read on the same connection/transaction as
+    /// work it is already doing, rather than checking out a second
+    /// connection.
+    ///
+    /// Passed an in-flight operation, the returned handle is only as good as
+    /// that operation's eventual commit: it names a row this read saw
+    /// uncommitted, and if the operation rolls back instead, the id was
+    /// never really live. Awaiting or loading such a handle then answers
+    /// [`JobError::Find`] -- the same trap as awaiting a handle minted for an
+    /// id a caller later decided not to keep.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    #[instrument(name = "job.resident_handle_in_op", skip(self, op))]
+    pub async fn resident_handle_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+    ) -> Result<Option<JobHandle>, JobError> {
+        let id = self
+            .repo
+            .find_resident_id_in_op(op, &job_type.into())
+            .await?;
+        Ok(id.map(|id| self.handle(id)))
+    }
+
     /// Mint a [`JobHandle`] for the keyed job of `(job_type, key)`, if one
     /// exists (see [`KeyedJobSpawner::spawn`]). Resolves the LIVE generation
     /// when one exists, else the latest terminal generation. `None` when no
@@ -1146,6 +1176,29 @@ impl Jobs {
         key: impl AsRef<str> + std::fmt::Debug,
     ) -> Result<Option<JobHandle>, JobError> {
         let job = self.repo.find_keyed(&job_type.into(), key.as_ref()).await?;
+        Ok(job.map(|job| self.handle(job.id)))
+    }
+
+    /// `_in_op` twin of [`Self::keyed_handle`] -- see
+    /// [`Self::resident_handle_in_op`] for why this takes an
+    /// [`es_entity::IntoOneTimeExecutor`] rather than an `AtomicOperation`,
+    /// and for the caveat that the returned handle is only as good as a
+    /// passed-in operation's eventual commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    #[instrument(name = "job.keyed_handle_in_op", skip(self, op))]
+    pub async fn keyed_handle_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+        key: impl AsRef<str> + std::fmt::Debug,
+    ) -> Result<Option<JobHandle>, JobError> {
+        let job = self
+            .repo
+            .find_keyed_in_op(op, &job_type.into(), key.as_ref())
+            .await?;
         Ok(job.map(|job| self.handle(job.id)))
     }
 
@@ -1173,6 +1226,28 @@ impl Jobs {
         let ids = self
             .repo
             .list_keyed_ids_by_job_type(&job_type.into())
+            .await?;
+        Ok(ids.into_iter().map(|(_, id)| self.handle(id)).collect())
+    }
+
+    /// `_in_op` twin of [`Self::keyed_handles`] -- see
+    /// [`Self::resident_handle_in_op`] for why this takes an
+    /// [`es_entity::IntoOneTimeExecutor`] rather than an `AtomicOperation`,
+    /// and for the caveat that the returned handles are only as good as a
+    /// passed-in operation's eventual commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the lookup fails.
+    #[instrument(name = "job.keyed_handles_in_op", skip(self, op))]
+    pub async fn keyed_handles_in_op(
+        &self,
+        op: impl es_entity::IntoOneTimeExecutor<'_>,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+    ) -> Result<JobHandles, JobError> {
+        let ids = self
+            .repo
+            .list_keyed_ids_by_job_type_in_op(op, &job_type.into())
             .await?;
         Ok(ids.into_iter().map(|(_, id)| self.handle(id)).collect())
     }

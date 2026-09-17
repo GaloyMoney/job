@@ -117,7 +117,7 @@ impl JobHandle {
     /// | any `spawn*` that minted a new job | `true` |
     /// | a `spawn*` that resolved onto a live `dedup_key`/keyed holder | `false` |
     /// | [`ResidentJobSpawner::spawn`](crate::ResidentJobSpawner::spawn) onto the job that already exists | `false` |
-    /// | [`Jobs::handle`](crate::Jobs::handle) / [`handles`](crate::Jobs::handles) / [`keyed_handle`](crate::Jobs::keyed_handle) / [`keyed_handles`](crate::Jobs::keyed_handles) / [`resident_handle`](crate::Jobs::resident_handle) | `false` |
+    /// | [`Jobs::handle`](crate::Jobs::handle) / [`handles`](crate::Jobs::handles) / [`keyed_handle`](crate::Jobs::keyed_handle) / [`keyed_handles`](crate::Jobs::keyed_handles) / [`resident_handle`](crate::Jobs::resident_handle) / [`keyed_handle_in_op`](crate::Jobs::keyed_handle_in_op) / [`keyed_handles_in_op`](crate::Jobs::keyed_handles_in_op) / [`resident_handle_in_op`](crate::Jobs::resident_handle_in_op) | `false` |
     /// | [`Clone`] of any of the above | whatever the source said |
     ///
     /// **Read `false` as "this call did not create the job", not as "a spawn
