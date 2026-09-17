@@ -173,7 +173,7 @@ impl JobWaiters {
             -- is computed against the same version the UPDATE will write, and
             -- the lock is held for the rest of the transaction so nothing can
             -- change underneath it in between. That is also what lets the
-            -- flag be RETURNed honestly -- reading it back off `je` would see
+            -- flag be returned honestly -- reading it back off `je` would see
             -- the row this statement just wrote.
             WITH locked AS MATERIALIZED (
                 SELECT je.id,
