@@ -606,10 +606,23 @@ impl Finalizer {
             )
             .fetch_all(op.as_executor())
             .await?;
+            let mut fresh_applied: Vec<uuid::Uuid> = Vec::with_capacity(rows.len());
             for row in rows {
                 applied.insert(row.id);
                 applied_pending_uuids.push(uuid::Uuid::from(row.id));
+                fresh_applied.push(uuid::Uuid::from(row.id));
                 outcome.rescheduled_pending = true;
+            }
+            // A park that a wake already overtook: the callee landed while
+            // this job was still running, so its wake could not move the
+            // row and left a mark instead. The row is `pending` at attempt
+            // 1 as of the write above, so the by-id pull-forward lands it
+            // due now rather than at the deadline it asked for.
+            let overtaken = self.repo.take_woken_marks_in_op(op, &fresh_applied).await?;
+            if !overtaken.is_empty() {
+                let ids: Vec<uuid::Uuid> = overtaken.into_iter().map(uuid::Uuid::from).collect();
+                let moved = self.repo.pull_forward_ids_in_op(op, &ids, now).await?;
+                self.announce_pulled_forward(op, moved).await?;
             }
         }
 
@@ -777,6 +790,10 @@ impl Finalizer {
         for id in &deleted_ids {
             self.notifier.job_terminal_in_op(op, *id).await?;
         }
+        if !deleted_ids.is_empty() {
+            let terminal: Vec<uuid::Uuid> = deleted_ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
+            self.wake_waiters_in_op(op, &terminal, now).await?;
+        }
 
         // Persist only entities whose row transition this instance actually
         // performed -- staged events for unapplied ids are discarded with
@@ -784,6 +801,70 @@ impl Finalizer {
         let mut jobs: Vec<Job> = applied.iter().filter_map(|id| staged.remove(id)).collect();
         self.repo.update_all_in_op(op, &mut jobs).await?;
         Ok(outcome)
+    }
+
+    /// Wake every job parked on one of `terminal` (`job_waiters`, see
+    /// `JobSpec::waiter`): mark the waits woken, pull each waiter's row
+    /// forward to `now` under the by-id guards (pending, first attempt,
+    /// scheduled later), consume the waits of those actually moved, and
+    /// announce the moved rows exactly as a spawn would. A wait whose
+    /// waiter could not be moved (running: its park is being written by
+    /// another finalizer, or not yet at all) keeps its mark for that
+    /// finalizer's `Fresh` write to find. The waits `terminal` jobs
+    /// themselves registered are deleted unconditionally: a terminal job
+    /// waits on nothing.
+    #[instrument(
+        name = "job.wake_waiters",
+        skip_all,
+        fields(n_terminal = terminal.len(), n_waiters, n_moved)
+    )]
+    async fn wake_waiters_in_op(
+        &self,
+        op: &mut (impl AtomicOperation + ?Sized),
+        terminal: &[uuid::Uuid],
+        now: DateTime<Utc>,
+    ) -> Result<(), JobError> {
+        self.repo.delete_waits_of_in_op(op, terminal).await?;
+        let waiters = self.repo.mark_waiters_woken_in_op(op, terminal, now).await?;
+        let span = Span::current();
+        span.record("n_waiters", waiters.len());
+        if waiters.is_empty() {
+            span.record("n_moved", 0);
+            return Ok(());
+        }
+        let ids: Vec<uuid::Uuid> = waiters.into_iter().map(uuid::Uuid::from).collect();
+        let moved = self.repo.pull_forward_ids_in_op(op, &ids, now).await?;
+        span.record("n_moved", moved.len());
+        let moved_ids: Vec<uuid::Uuid> = moved.iter().map(|(id, _)| uuid::Uuid::from(*id)).collect();
+        self.repo.consume_waiters_in_op(op, terminal, &moved_ids).await?;
+        self.announce_pulled_forward(op, moved).await
+    }
+
+    /// The two signals a spawn fires, for rows a pull-forward just made
+    /// due: the `ExecutionReady` notify per type (a peer poller may be
+    /// asleep on a deadline computed before this write) and this process's
+    /// claim demand. The target is always `now` here, so every moved row
+    /// is due.
+    async fn announce_pulled_forward(
+        &self,
+        op: &mut (impl AtomicOperation + ?Sized),
+        moved: Vec<(JobId, JobType)>,
+    ) -> Result<(), JobError> {
+        if moved.is_empty() {
+            return Ok(());
+        }
+        let mut per_type: HashMap<JobType, usize> = HashMap::new();
+        for (_, job_type) in moved {
+            *per_type.entry(job_type).or_default() += 1;
+        }
+        let poller = self.poller.upgrade();
+        for (job_type, n_due) in per_type {
+            self.notifier.execution_ready_in_op(op, &job_type).await?;
+            if let Some(poller) = &poller {
+                poller.register_claim_demand(op, &job_type, n_due);
+            }
+        }
+        Ok(())
     }
 
     /// `SET LOCAL enable_seqscan = off` for a job-end transaction on the
