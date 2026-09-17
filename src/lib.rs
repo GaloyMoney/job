@@ -487,6 +487,11 @@ pub struct Jobs {
     clock: ClockHandle,
 }
 
+/// The id a `pull_forward_in_op` span reports, without consuming the argument.
+fn id_of(id: &(impl Into<JobId> + Clone)) -> JobId {
+    id.clone().into()
+}
+
 impl Jobs {
     /// Initialize the service using a [`JobSvcConfig`] for connection and runtime settings.
     pub async fn init(config: JobSvcConfig) -> Result<Self, JobError> {
@@ -863,6 +868,67 @@ impl Jobs {
             self.clock.clone(),
             Arc::clone(&self.notifier),
         )
+    }
+
+    /// Run the job `id` no later than `at`, if it is parked and eligible:
+    /// `pending`, on its first attempt, and currently scheduled later than
+    /// `at`. Monotone and idempotent — `execute_at` only ever moves EARLIER
+    /// and a repeat changes nothing — and it never shortens a retry backoff
+    /// or touches a running row (the same guards as
+    /// [`KeyedJobSpec::force_reschedule`], by id instead of by key). Returns
+    /// whether the row moved; a moved row is announced exactly as a spawn
+    /// is (the `ExecutionReady` notify and this process's claim demand),
+    /// once `op` commits.
+    ///
+    /// The primitive under [`JobSpec::waiter`]'s wake; on its own it is
+    /// "wake this job now" for a caller that holds an id and knows the job
+    /// parked itself via [`JobCompletion::RescheduleAt`].
+    #[instrument(name = "job.pull_forward_in_op", skip(self, op), fields(id = %id_of(&id)))]
+    pub async fn pull_forward_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        id: impl Into<JobId> + Clone,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, JobError> {
+        let id: JobId = id.into();
+        let moved = self
+            .repo
+            .pull_forward_ids_in_op(op, &[uuid::Uuid::from(id)], at)
+            .await?;
+        let Some((_, job_type)) = moved.into_iter().next() else {
+            return Ok(false);
+        };
+        self.notifier.execution_ready_in_op(op, &job_type).await?;
+        let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        if at <= now
+            && let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade())
+        {
+            poller.register_claim_demand(op, &job_type, 1);
+        }
+        Ok(true)
+    }
+
+    /// Register `waiter` to be woken when `callee` — a job that already
+    /// exists — reaches a terminal state, with the semantics of
+    /// [`JobSpec::waiter`]. `Ok(true)` if `callee` is live and the wait was
+    /// registered; `Ok(false)` if it is already terminal, in which case
+    /// nothing is written and the caller should read the outcome
+    /// ([`JobHandle::load`]) instead of parking. The answer is exact: the
+    /// callee's execution row is share-locked for the rest of `op`, so its
+    /// finalizer cannot slip between the check and the commit.
+    ///
+    /// For a caller that found a live run by lookup ([`Self::keyed_handle`],
+    /// [`Self::handle`]) rather than by spawning it, and wants to park on it.
+    #[instrument(name = "job.register_waiter_in_op", skip(self, op))]
+    pub async fn register_waiter_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        callee: impl Into<JobId> + std::fmt::Debug,
+        waiter: impl Into<JobId> + std::fmt::Debug,
+    ) -> Result<bool, JobError> {
+        self.repo
+            .register_waiter_on_live_in_op(op, callee.into(), waiter.into())
+            .await
     }
 
     /// Mint a [`JobHandle`] for `id` — cheap and non-validating.
