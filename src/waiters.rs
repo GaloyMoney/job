@@ -153,9 +153,11 @@ impl JobWaiters {
     /// lets both consults be local column tests on a row they are already
     /// updating, instead of a probe into a table that is O(live waits).
     ///
-    /// `job_waiters` edges for the moved rows are consumed in the same
-    /// statement; edges for marked rows stay, so a waiter that re-parks is
-    /// still attached to callees that have not finished.
+    /// Every `job_waiters` edge to one of `terminal` is consumed in the same
+    /// statement, moved or marked alike -- a callee goes terminal once, so
+    /// after this the edge carries nothing. Edges to callees that have NOT
+    /// finished have a different `job_id` and are untouched, so a waiter that
+    /// re-parks stays attached to them.
     pub(crate) async fn wake_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
@@ -195,9 +197,7 @@ impl JobWaiters {
                  WHERE je.id = l.id
                 RETURNING je.id, je.job_type, l.movable AS movable
             ), consumed AS (
-                DELETE FROM job_waiters
-                 WHERE job_id = ANY($1)
-                   AND waiter_job_id IN (SELECT id FROM woken WHERE movable)
+                DELETE FROM job_waiters WHERE job_id = ANY($1)
             )
             SELECT id AS "id!: JobId", job_type AS "job_type!: JobType"
             FROM woken WHERE movable

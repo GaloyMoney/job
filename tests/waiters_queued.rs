@@ -162,6 +162,22 @@ async fn a_waiter_parked_behind_a_queue_sibling_is_woken_when_promoted() -> anyh
     op.commit().await?;
     callee.await_completion(Duration::from_secs(30)).await?;
 
+    // The waiter was MARKED, not moved, and is still very much alive -- so
+    // this is the case where an edge would be stranded. A callee goes
+    // terminal once; the edge must go with it, or `job_waiters` stops being
+    // O(live waits) for every long-lived waiter in the system.
+    let stranded: Option<(uuid::Uuid,)> =
+        sqlx::query_as("SELECT job_id FROM job_waiters WHERE job_id = $1 AND waiter_job_id = $2")
+            .bind(uuid::Uuid::from(callee_id))
+            .bind(uuid::Uuid::from(waiter.id()))
+            .fetch_optional(&pool)
+            .await?;
+    assert!(
+        stranded.is_none(),
+        "the edge to a terminal callee must be consumed even when the waiter \
+         could only be marked"
+    );
+
     // Freeing the queue promotes the waiter. Its own `execute_at` still says
     // +1h; only the mark can bring it forward.
     let mut op = es_entity::DbOp::init(&pool).await?;
