@@ -432,6 +432,7 @@ mod snapshot;
 mod spawner;
 mod task;
 mod tracker;
+mod waiters;
 
 pub mod error;
 
@@ -475,6 +476,8 @@ es_entity::entity_id! { JobId }
 pub struct Jobs {
     config: JobSvcConfig,
     repo: Arc<JobRepo>,
+    waiters: waiters::JobWaiters,
+    handle_ops: Arc<handle::HandleOps>,
     registry: Arc<Mutex<Option<JobRegistry>>>,
     router: Arc<JobNotificationRouter>,
     tracker: Arc<JobTracker>,
@@ -485,11 +488,6 @@ pub struct Jobs {
     /// runs. See `poller::PollerHandle`.
     poller_ref: PollerHandle,
     clock: ClockHandle,
-}
-
-/// The id a `pull_forward_in_op` span reports, without consuming the argument.
-fn id_of(id: &(impl Into<JobId> + Clone)) -> JobId {
-    id.clone().into()
 }
 
 impl Jobs {
@@ -516,6 +514,7 @@ impl Jobs {
         }
 
         let repo = Arc::new(JobRepo::new(&pool));
+        let waiters = waiters::JobWaiters::new(&pool);
         let tracker = Arc::new(JobTracker::new(
             config.poller_config.min_jobs_per_process,
             config.poller_config.max_jobs_per_process,
@@ -533,15 +532,23 @@ impl Jobs {
             router.terminal_sender(),
         );
         let clock = config.clock.clone();
+        let poller_ref: PollerHandle = Arc::new(std::sync::OnceLock::new());
+        let handle_ops = Arc::new(handle::HandleOps {
+            waiters: waiters.clone(),
+            notifier: Arc::clone(&notifier),
+            poller_ref: Arc::clone(&poller_ref),
+        });
         Ok(Self {
             repo,
+            waiters,
+            handle_ops,
             config,
             registry,
             router,
             tracker,
             notifier,
             poller_handle: None,
-            poller_ref: Arc::new(std::sync::OnceLock::new()),
+            poller_ref,
             clock,
         })
     }
@@ -745,6 +752,7 @@ impl Jobs {
         };
         JobSpawner::new(
             Arc::clone(&self.repo),
+            Arc::clone(&self.handle_ops),
             job_type,
             Arc::clone(&self.router),
             self.clock.clone(),
@@ -789,6 +797,7 @@ impl Jobs {
         // row slot.
         JobSpawner::new(
             Arc::clone(&self.repo),
+            Arc::clone(&self.handle_ops),
             job_type,
             Arc::clone(&self.router),
             self.clock.clone(),
@@ -827,6 +836,7 @@ impl Jobs {
         };
         KeyedJobSpawner::new(
             Arc::clone(&self.repo),
+            Arc::clone(&self.handle_ops),
             job_type,
             Arc::clone(&self.router),
             self.clock.clone(),
@@ -863,6 +873,7 @@ impl Jobs {
         };
         ResidentJobSpawner::new(
             Arc::clone(&self.repo),
+            Arc::clone(&self.handle_ops),
             job_type,
             Arc::clone(&self.router),
             self.clock.clone(),
@@ -883,18 +894,16 @@ impl Jobs {
     /// The primitive under [`JobSpec::waiter`]'s wake; on its own it is
     /// "wake this job now" for a caller that holds an id and knows the job
     /// parked itself via [`JobCompletion::RescheduleAt`].
-    #[instrument(name = "job.pull_forward_in_op", skip(self, op), fields(id = %id_of(&id)))]
+    #[instrument(name = "job.pull_forward_in_op", skip(self, op, id), fields(id))]
     pub async fn pull_forward_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
-        id: impl Into<JobId> + Clone,
+        id: impl Into<JobId>,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, JobError> {
         let id: JobId = id.into();
-        let moved = self
-            .repo
-            .pull_forward_ids_in_op(op, &[uuid::Uuid::from(id)], at)
-            .await?;
+        tracing::Span::current().record("id", tracing::field::display(id));
+        let moved = self.waiters.pull_forward_ids_in_op(op, &[id], at).await?;
         let Some((_, job_type)) = moved.into_iter().next() else {
             return Ok(false);
         };
@@ -919,16 +928,26 @@ impl Jobs {
     ///
     /// For a caller that found a live run by lookup ([`Self::keyed_handle`],
     /// [`Self::handle`]) rather than by spawning it, and wants to park on it.
-    #[instrument(name = "job.register_waiter_in_op", skip(self, op))]
+    #[instrument(
+        name = "job.register_waiter_in_op",
+        skip(self, op, callee, waiter),
+        fields(callee, waiter)
+    )]
     pub async fn register_waiter_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
-        callee: impl Into<JobId> + std::fmt::Debug,
-        waiter: impl Into<JobId> + std::fmt::Debug,
+        callee: impl Into<JobId>,
+        waiter: impl Into<JobId>,
     ) -> Result<bool, JobError> {
-        self.repo
-            .register_waiter_on_live_in_op(op, callee.into(), waiter.into())
-            .await
+        let (callee, waiter): (JobId, JobId) = (callee.into(), waiter.into());
+        let span = tracing::Span::current();
+        span.record("callee", tracing::field::display(callee));
+        span.record("waiter", tracing::field::display(waiter));
+        Ok(!self
+            .waiters
+            .register_waiters_on_live_in_op(op, &[callee], &[waiter])
+            .await?
+            .is_empty())
     }
 
     /// Mint a [`JobHandle`] for `id` — cheap and non-validating.
@@ -994,6 +1013,7 @@ impl Jobs {
             id.into(),
             Arc::clone(&self.repo),
             Arc::clone(&self.router),
+            Arc::clone(&self.handle_ops),
             self.clock.clone(),
         )
     }

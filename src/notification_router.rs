@@ -7,6 +7,7 @@ use crate::outcome::JobOutcome;
 use crate::repo::JobRepo;
 use crate::task::OwnedTaskHandle;
 use crate::tracker::JobTracker;
+use crate::waiters::JobWaiters;
 use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{Span, instrument};
@@ -103,7 +104,7 @@ impl JobNotificationRouter {
         let waiter_handle = Self::start_waiter_manager(
             register_rx,
             self.terminal_tx.subscribe(),
-            self.pool.clone(),
+            JobWaiters::new(&self.pool),
             self.repo.clone(),
             self.sweep_interval,
         );
@@ -158,7 +159,7 @@ impl JobNotificationRouter {
     fn start_waiter_manager(
         mut register_rx: mpsc::UnboundedReceiver<WaiterRegistration>,
         mut terminal_rx: broadcast::Receiver<JobId>,
-        pool: PgPool,
+        liveness: JobWaiters,
         repo: Arc<JobRepo>,
         sweep_interval: Duration,
     ) -> OwnedTaskHandle {
@@ -182,7 +183,7 @@ impl JobNotificationRouter {
                     // once per interval, so giving it priority only pre-empts the
                     // register/terminal branches for one iteration per period.
                     _ = sweep.tick() => {
-                        sweep_waiters(&mut waiters, &pool, &repo).await;
+                        sweep_waiters(&mut waiters, &liveness, &repo).await;
                     }
 
                     // Registration is polled before the terminal branch so a
@@ -195,7 +196,7 @@ impl JobNotificationRouter {
                         while let Ok(next) = register_rx.try_recv() {
                             batch.push(next);
                         }
-                        register_waiters(&mut waiters, &pool, &repo, batch).await;
+                        register_waiters(&mut waiters, &liveness, &repo, batch).await;
                     }
 
                     result = terminal_rx.recv() => {
@@ -213,7 +214,7 @@ impl JobNotificationRouter {
                                                 "terminal broadcast lagged during drain, \
                                                  running immediate sweep"
                                             );
-                                            sweep_waiters(&mut waiters, &pool, &repo).await;
+                                            sweep_waiters(&mut waiters, &liveness, &repo).await;
                                             ids.clear();
                                             break;
                                         }
@@ -230,7 +231,7 @@ impl JobNotificationRouter {
                                     missed = n,
                                     "terminal broadcast lagged, running immediate sweep"
                                 );
-                                sweep_waiters(&mut waiters, &pool, &repo).await;
+                                sweep_waiters(&mut waiters, &liveness, &repo).await;
                             }
                         }
                     }
@@ -244,17 +245,11 @@ impl JobNotificationRouter {
 
 const WAITER_BATCH_CHUNK: usize = 1000;
 
-async fn still_running(pool: &PgPool, ids: &[JobId]) -> HashSet<JobId> {
+async fn still_running(liveness: &JobWaiters, ids: &[JobId]) -> HashSet<JobId> {
     let mut running = HashSet::with_capacity(ids.len());
     for chunk in ids.chunks(WAITER_BATCH_CHUNK) {
-        match sqlx::query_scalar!(
-            "SELECT id FROM job_executions WHERE id = ANY($1)",
-            chunk as &[JobId],
-        )
-        .fetch_all(pool)
-        .await
-        {
-            Ok(rows) => running.extend(rows.into_iter().map(JobId::from)),
+        match liveness.live_ids(chunk).await {
+            Ok(rows) => running.extend(rows),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -279,7 +274,7 @@ async fn still_running(pool: &PgPool, ids: &[JobId]) -> HashSet<JobId> {
 /// waiter-manager while completion notifications piled up and overflowed.
 async fn register_waiters(
     waiters: &mut WaiterMap,
-    pool: &PgPool,
+    liveness: &JobWaiters,
     repo: &JobRepo,
     batch: Vec<WaiterRegistration>,
 ) {
@@ -293,7 +288,7 @@ async fn register_waiters(
             .push(tx);
     }
 
-    let running = still_running(pool, &ids).await;
+    let running = still_running(liveness, &ids).await;
     let terminal_ids: Vec<JobId> = ids.into_iter().filter(|id| !running.contains(id)).collect();
 
     if !terminal_ids.is_empty() {
@@ -316,7 +311,7 @@ async fn register_waiters(
     skip_all,
     fields(n_waiters, oldest_waiter_age_secs, n_resolved)
 )]
-async fn sweep_waiters(waiters: &mut WaiterMap, pool: &PgPool, repo: &JobRepo) {
+async fn sweep_waiters(waiters: &mut WaiterMap, liveness: &JobWaiters, repo: &JobRepo) {
     // Prune dropped receivers
     waiters.retain(|_, w| {
         w.senders.retain(|tx| !tx.is_closed());
@@ -341,7 +336,7 @@ async fn sweep_waiters(waiters: &mut WaiterMap, pool: &PgPool, repo: &JobRepo) {
     span.record("oldest_waiter_age_secs", oldest_age.as_secs());
 
     let ids: Vec<JobId> = waiters.keys().copied().collect();
-    let running = still_running(pool, &ids).await;
+    let running = still_running(liveness, &ids).await;
     let terminal_ids: Vec<JobId> = ids.into_iter().filter(|id| !running.contains(id)).collect();
 
     let before = waiters.len();

@@ -193,6 +193,7 @@ impl<Config> KeyedJobSpec<Config> {
 #[derive(Clone)]
 pub struct KeyedJobSpawner<Config> {
     repo: Arc<JobRepo>,
+    handle_ops: Arc<crate::handle::HandleOps>,
     job_type: JobType,
     router: Arc<JobNotificationRouter>,
     clock: ClockHandle,
@@ -211,6 +212,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         repo: Arc<JobRepo>,
+        handle_ops: Arc<crate::handle::HandleOps>,
         job_type: JobType,
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
@@ -220,6 +222,7 @@ where
     ) -> Self {
         Self {
             repo,
+            handle_ops,
             job_type,
             router,
             clock,
@@ -451,6 +454,32 @@ where
         // the loop, so the correspondence has to be kept alongside.
         let mut outcome_keys: Vec<String> = Vec::with_capacity(specs.len());
 
+        // Every liveness proof this batch needs, taken in ONE locking
+        // statement before any spec resolves: liveness is a property of the
+        // key, so all specs sharing one must see the same answer, and the
+        // `FOR SHARE` is held for the rest of `op`. Locking per spec instead
+        // would take the locks out of the crate's `(queue_id, id)` order and
+        // deadlock against a batch finalizer taking `FOR UPDATE` on the same
+        // rows.
+        let mut proof_callees: Vec<JobId> = Vec::new();
+        let mut proof_waiters: Vec<JobId> = Vec::new();
+        for spec in &specs {
+            if let Some(waiter) = spec.waiter
+                && let Some(&id) = live.get(&spec.key)
+            {
+                proof_callees.push(id);
+                proof_waiters.push(waiter);
+            }
+        }
+        let attached: HashSet<JobId> = self
+            .handle_ops
+            .waiters
+            .register_waiters_on_live_in_op(op, &proof_callees, &proof_waiters)
+            .await?
+            .into_iter()
+            .collect();
+        let proven: HashSet<JobId> = proof_callees.into_iter().collect();
+
         for spec in specs {
             // The `execute_at` this spec asks for: the one a NEW job of it
             // would be created with, and the one a wake pulls a holder to.
@@ -464,26 +493,17 @@ where
             // for it, not to the dead holder again.
             if !seen.contains_key(&spec.key)
                 && let Some(&id) = live.get(&spec.key)
+                && (!proven.contains(&id) || attached.contains(&id))
             {
-                let attached = match spec.waiter {
-                    None => true,
-                    Some(waiter) => {
-                        self.repo
-                            .register_waiter_on_live_in_op(op, id, waiter)
-                            .await?
-                    }
-                };
-                if attached {
-                    if spec.force_reschedule {
-                        wake.entry(spec.key.clone())
-                            .and_modify(|t| *t = (*t).min(wanted_at))
-                            .or_insert(wanted_at);
-                        wake_outcomes.push(outcomes.len());
-                    }
-                    outcomes.push(self.handle(id).with_created(false));
-                    outcome_keys.push(spec.key);
-                    continue;
+                if spec.force_reschedule {
+                    wake.entry(spec.key.clone())
+                        .and_modify(|t| *t = (*t).min(wanted_at))
+                        .or_insert(wanted_at);
+                    wake_outcomes.push(outcomes.len());
                 }
+                outcomes.push(self.handle(id).with_created(false));
+                outcome_keys.push(spec.key);
+                continue;
             }
 
             if let Some(&(id, idx)) = seen.get(&spec.key) {
@@ -559,7 +579,8 @@ where
                 .await?;
             self.carry_state_in_op(op, &new_ids, &new_keys).await?;
         }
-        self.repo
+        self.handle_ops
+            .waiters
             .insert_waiters_in_op(op, &waiter_callees, &waiters)
             .await?;
 
@@ -817,6 +838,7 @@ where
             id,
             Arc::clone(&self.repo),
             Arc::clone(&self.router),
+            Arc::clone(&self.handle_ops),
             self.clock.clone(),
         )
     }
@@ -857,6 +879,11 @@ mod tests {
         let poller_ref: PollerHandle = Arc::new(std::sync::OnceLock::new());
         KeyedJobSpawner::new(
             repo,
+            Arc::new(crate::handle::HandleOps {
+                waiters: crate::waiters::JobWaiters::new(pool),
+                notifier: Arc::clone(&notifier),
+                poller_ref: Arc::clone(&poller_ref),
+            }),
             job_type,
             router,
             ClockHandle::realtime(),

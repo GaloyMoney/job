@@ -780,8 +780,14 @@ impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
         // Always-empty POLLER handle: fan-out spawns from within a batch
         // runner take the ordinary insert path. The router is real, so a
         // handle returned by such a spawn can await.
+        let handle_ops = Arc::new(crate::handle::HandleOps {
+            waiters: crate::waiters::JobWaiters::new(repo.pool()),
+            notifier: Arc::clone(&notifier),
+            poller_ref: Arc::new(std::sync::OnceLock::new()),
+        });
         let spawner = JobSpawner::<T::Config>::new(
             repo,
+            handle_ops,
             self.job_type(),
             router,
             clock,

@@ -35,6 +35,25 @@ use crate::notifier::JobEventNotifier;
 ///   committed parked row. Pinned end-to-end by
 ///   `tests/parked_rows.rs::completion_blocked_on_a_spawn_pin_promotes_the_parked_row`.
 ///
+/// **Woken waiters**: both promotes also consult `job_waiters` and pull the
+/// promoted row forward to now if a wake marked it. A wake
+/// (`waiters::JobWaiters::wake_in_op`) can only MOVE a `pending` row, so a
+/// waiter sitting `parked` behind a queue sibling is marked and left; and
+/// the mark's other reader -- the waiter's own `Fresh` disposition write --
+/// never runs for it, because a parked job is not running and has no
+/// disposition to write. Promotion is therefore the only remaining moment
+/// that can honour the wake, and without this the row would be promoted
+/// still carrying the far-future `execute_at` it parked itself at and sleep
+/// to that deadline with its callee long since terminal.
+///
+/// Lowering `execute_at` here cannot break Invariant B: the row is becoming
+/// its queue's active row precisely because it is already the minimum among
+/// parked, so making it smaller only reinforces that. The mark is read, not
+/// consumed -- a promote whose `state = 'parked'` re-check fails (see
+/// [`Self::apply_freed`]) must not swallow the wake -- and is cleaned up
+/// when the waiter itself reaches terminal
+/// (`waiters::JobWaiters::delete_waits_of_in_op`).
+///
 /// Called either directly via [`Self::apply`] (when the caller has no
 /// commit-hook buffer to register into, or needs the promoted rows back
 /// synchronously within its own `pre_commit`) or via a *registered*
@@ -162,11 +181,20 @@ impl PromoteHeadsHook {
                 ORDER BY je.queue_id, je.id
                 FOR NO KEY UPDATE
             )
-            UPDATE job_executions je SET state = 'pending'
+            UPDATE job_executions je
+               SET state = 'pending',
+                   execute_at = CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM job_waiters w
+                           WHERE w.waiter_job_id = je.id AND w.woken_at IS NOT NULL
+                       ) THEN LEAST(je.execute_at, COALESCE($2, NOW()))
+                       ELSE je.execute_at
+                   END
             FROM locked l WHERE je.id = l.id AND je.state = 'parked'
             RETURNING je.job_type, je.execute_at AS "execute_at?"
             "#,
             &deduped,
+            op.maybe_now(),
         )
         .fetch_all(op.as_executor())
         .await
@@ -228,13 +256,22 @@ impl PromoteHeadsHook {
             -- them, which can transiently make two rows active for one queue
             -- within the statement's own execution and violate
             -- `idx_job_executions_queue_active`.
-            UPDATE job_executions je SET state = 'pending'
+            UPDATE job_executions je
+               SET state = 'pending',
+                   execute_at = CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM job_waiters w
+                           WHERE w.waiter_job_id = je.id AND w.woken_at IS NOT NULL
+                       ) THEN LEAST(je.execute_at, COALESCE($2, NOW()))
+                       ELSE je.execute_at
+                   END
             FROM swaps s
             JOIN demote d ON d.id = s.pending_id
             WHERE je.id = s.parked_id AND je.state = 'parked'
             RETURNING je.job_type, je.execute_at AS "execute_at?"
             "#,
             ids,
+            op.maybe_now(),
         )
         .fetch_all(op.as_executor())
         .await

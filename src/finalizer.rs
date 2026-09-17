@@ -223,6 +223,7 @@ pub(crate) struct Finalizer {
     /// entity call goes through (the op carries the connection, so which
     /// repo instance is irrelevant there).
     repo: Arc<JobRepo>,
+    waiters: crate::waiters::JobWaiters,
     notifier: Arc<JobEventNotifier>,
     retry_settings: RetrySettings,
     /// Whether this type keeps its `job_execution_states` row past terminal
@@ -244,9 +245,15 @@ impl Finalizer {
         instance_id: uuid::Uuid,
         clock: ClockHandle,
     ) -> Self {
+        // Derived from the repo's pool rather than threaded down, the same
+        // way the poller derives its own (`poller::JobPoller::new`): a
+        // finalizer is built deep inside the poller, and its waiters must be
+        // on the same pool as its repo by construction.
+        let waiters = crate::waiters::JobWaiters::new(repo.pool());
         Self {
             poller,
             repo,
+            waiters,
             notifier,
             retry_settings,
             retains_state,
@@ -606,11 +613,11 @@ impl Finalizer {
             )
             .fetch_all(op.as_executor())
             .await?;
-            let mut fresh_applied: Vec<uuid::Uuid> = Vec::with_capacity(rows.len());
+            let mut fresh_applied: Vec<JobId> = Vec::with_capacity(rows.len());
             for row in rows {
                 applied.insert(row.id);
                 applied_pending_uuids.push(uuid::Uuid::from(row.id));
-                fresh_applied.push(uuid::Uuid::from(row.id));
+                fresh_applied.push(row.id);
                 outcome.rescheduled_pending = true;
             }
             // A park that a wake already overtook: the callee landed while
@@ -618,10 +625,15 @@ impl Finalizer {
             // row and left a mark instead. The row is `pending` at attempt
             // 1 as of the write above, so the by-id pull-forward lands it
             // due now rather than at the deadline it asked for.
-            let overtaken = self.repo.take_woken_marks_in_op(op, &fresh_applied).await?;
+            let overtaken = self
+                .waiters
+                .take_woken_marks_in_op(op, &fresh_applied)
+                .await?;
             if !overtaken.is_empty() {
-                let ids: Vec<uuid::Uuid> = overtaken.into_iter().map(uuid::Uuid::from).collect();
-                let moved = self.repo.pull_forward_ids_in_op(op, &ids, now).await?;
+                let moved = self
+                    .waiters
+                    .pull_forward_ids_in_op(op, &overtaken, now)
+                    .await?;
                 self.announce_pulled_forward(op, moved).await?;
             }
         }
@@ -791,8 +803,7 @@ impl Finalizer {
             self.notifier.job_terminal_in_op(op, *id).await?;
         }
         if !deleted_ids.is_empty() {
-            let terminal: Vec<uuid::Uuid> =
-                deleted_ids.iter().map(|id| uuid::Uuid::from(*id)).collect();
+            let terminal: Vec<JobId> = deleted_ids.iter().copied().collect();
             self.wake_waiters_in_op(op, &terminal, now).await?;
         }
 
@@ -805,45 +816,30 @@ impl Finalizer {
     }
 
     /// Wake every job parked on one of `terminal` (`job_waiters`, see
-    /// `JobSpec::waiter`): mark the waits woken, pull each waiter's row
-    /// forward to `now` under the by-id guards (pending, first attempt,
-    /// scheduled later), consume the waits of those actually moved, and
-    /// announce the moved rows exactly as a spawn would. A wait whose
-    /// waiter could not be moved (running: its park is being written by
-    /// another finalizer, or not yet at all) keeps its mark for that
-    /// finalizer's `Fresh` write to find. The waits `terminal` jobs
-    /// themselves registered are deleted unconditionally: a terminal job
-    /// waits on nothing.
+    /// `JobSpec::waiter`) and announce the rows that moved exactly as a
+    /// spawn would. The waits `terminal` jobs themselves registered are
+    /// deleted unconditionally: a terminal job waits on nothing.
+    ///
+    /// Two statements: the waits BY these jobs, then
+    /// [`JobWaiters::wake_in_op`], which fuses the pull-forward with its
+    /// `job_waiters` bookkeeping. The first stays separate because a
+    /// terminal job waiting on another terminal job in the same batch is a
+    /// row both would touch, and one statement may not write the same row
+    /// twice.
     #[instrument(
         name = "job.wake_waiters",
         skip_all,
-        fields(n_terminal = terminal.len(), n_waiters, n_moved)
+        fields(n_terminal = terminal.len(), n_moved)
     )]
     async fn wake_waiters_in_op(
         &self,
         op: &mut (impl AtomicOperation + ?Sized),
-        terminal: &[uuid::Uuid],
+        terminal: &[JobId],
         now: DateTime<Utc>,
     ) -> Result<(), JobError> {
-        self.repo.delete_waits_of_in_op(op, terminal).await?;
-        let waiters = self
-            .repo
-            .mark_waiters_woken_in_op(op, terminal, now)
-            .await?;
-        let span = Span::current();
-        span.record("n_waiters", waiters.len());
-        if waiters.is_empty() {
-            span.record("n_moved", 0);
-            return Ok(());
-        }
-        let ids: Vec<uuid::Uuid> = waiters.into_iter().map(uuid::Uuid::from).collect();
-        let moved = self.repo.pull_forward_ids_in_op(op, &ids, now).await?;
-        span.record("n_moved", moved.len());
-        let moved_ids: Vec<uuid::Uuid> =
-            moved.iter().map(|(id, _)| uuid::Uuid::from(*id)).collect();
-        self.repo
-            .consume_waiters_in_op(op, terminal, &moved_ids)
-            .await?;
+        self.waiters.delete_waits_of_in_op(op, terminal).await?;
+        let moved = self.waiters.wake_in_op(op, terminal, now).await?;
+        Span::current().record("n_moved", moved.len());
         self.announce_pulled_forward(op, moved).await
     }
 

@@ -5,6 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
 use std::sync::Arc;
+use tracing::instrument;
 
 use super::{JobId, entity::JobType, error::JobError, outcome::JobReturnValue, repo::JobRepo};
 
@@ -103,6 +104,32 @@ impl CurrentJob {
         .await?;
         self.execution_state_json = Some(execution_state_json);
         Ok(())
+    }
+
+    /// Register THIS job to be woken when the jobs behind `handles` reach a
+    /// terminal state, returning the ones that were still live and so
+    /// actually attached. Sugar for
+    /// [`JobHandles::register_waiter_in_op`](crate::JobHandles::register_waiter_in_op)
+    /// with this job as the waiter -- the common case, and the one the
+    /// durable wait exists for.
+    ///
+    /// Registering is only half of parking: this call writes the waits, and
+    /// the runner must then RETURN a reschedule (with a fallback deadline,
+    /// so a wake that never arrives cannot park the job forever) to release
+    /// its slot. See [`JobHandles::register_waiter_in_op`] for why the job
+    /// is re-entered from the top rather than resumed, and what it must
+    /// persist to survive that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Query`] if the write fails.
+    #[instrument(name = "job.current.wait_for_in_op", skip(self, op, handles), fields(id = %self.id))]
+    pub async fn wait_for_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        handles: &crate::JobHandles,
+    ) -> Result<Vec<JobId>, JobError> {
+        handles.register_waiter_in_op(op, self.id).await
     }
 
     pub fn id(&self) -> &JobId {

@@ -165,6 +165,7 @@ impl JobRunner for ResidentRunnerAdapter {
 #[derive(Clone)]
 pub struct ResidentJobSpawner<Config> {
     repo: Arc<JobRepo>,
+    handle_ops: Arc<crate::handle::HandleOps>,
     job_type: JobType,
     router: Arc<JobNotificationRouter>,
     clock: ClockHandle,
@@ -178,6 +179,7 @@ where
 {
     pub(crate) fn new(
         repo: Arc<JobRepo>,
+        handle_ops: Arc<crate::handle::HandleOps>,
         job_type: JobType,
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
@@ -185,6 +187,7 @@ where
     ) -> Self {
         Self {
             repo,
+            handle_ops,
             job_type,
             router,
             clock,
@@ -279,6 +282,7 @@ where
             id,
             Arc::clone(&self.repo),
             Arc::clone(&self.router),
+            Arc::clone(&self.handle_ops),
             self.clock.clone(),
         )
     }

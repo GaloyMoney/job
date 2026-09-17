@@ -3,7 +3,11 @@
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use serde::Serialize;
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 use tracing::instrument;
 
 use super::{
@@ -158,6 +162,7 @@ impl<Config> JobSpec<Config> {
 #[derive(Clone)]
 pub struct JobSpawner<Config> {
     repo: Arc<JobRepo>,
+    handle_ops: Arc<crate::handle::HandleOps>,
     job_type: JobType,
     router: Arc<JobNotificationRouter>,
     clock: ClockHandle,
@@ -174,6 +179,7 @@ where
 {
     pub(crate) fn new(
         repo: Arc<JobRepo>,
+        handle_ops: Arc<crate::handle::HandleOps>,
         job_type: JobType,
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
@@ -182,6 +188,7 @@ where
     ) -> Self {
         Self {
             repo,
+            handle_ops,
             job_type,
             router,
             clock,
@@ -201,6 +208,7 @@ where
             id,
             Arc::clone(&self.repo),
             Arc::clone(&self.router),
+            Arc::clone(&self.handle_ops),
             self.clock.clone(),
         )
     }
@@ -261,11 +269,12 @@ where
             if let Some(id) = live_keys.get(key) {
                 let attached = match spec.waiter {
                     None => true,
-                    Some(waiter) => {
-                        self.repo
-                            .register_waiter_on_live_in_op(op, *id, waiter)
-                            .await?
-                    }
+                    Some(waiter) => !self
+                        .handle_ops
+                        .waiters
+                        .register_waiters_on_live_in_op(op, &[*id], &[waiter])
+                        .await?
+                        .is_empty(),
                 };
                 if attached {
                     return Ok(self.handle(*id).with_created(false));
@@ -288,7 +297,8 @@ where
 
         let job = self.repo.create_in_op(op, new_job).await?;
         if let Some(waiter) = spec.waiter {
-            self.repo
+            self.handle_ops
+                .waiters
                 .insert_waiters_in_op(op, &[job.id], &[waiter])
                 .await?;
         }
@@ -546,11 +556,39 @@ where
         // for every later spec repeating it.
         //
         // A waiter on a pre-existing holder locks the holder's row to prove
-        // it is still live (`register_waiter_on_live_in_op`); a holder found
-        // terminal is replaced by the spec itself, so the waiter always gets
-        // a job to wait on. Waiters on jobs this call creates — and on a
-        // holder already proven live in this call — are plain inserts,
-        // batched after the rows exist.
+        // it is still live; a holder found terminal is replaced by the spec
+        // itself, so the waiter always gets a job to wait on. Waiters on
+        // jobs this call creates are plain inserts, batched after the rows
+        // exist.
+        //
+        // Liveness is a property of the KEY, not of the spec, so every proof
+        // this batch needs is taken in ONE locking statement before any spec
+        // is resolved. That is what lets a key's specs agree: all of them
+        // see the same answer, and the `FOR SHARE` taken here is held for
+        // the rest of `op`, so a later spec repeating the key can attach
+        // with a plain insert and still be covered. Registering one spec at
+        // a time instead would both leave the second spec of a key
+        // unprotected (the first, if waiter-less, proves nothing) and take
+        // the locks out of the crate's `(queue_id, id)` order.
+        let mut proof_callees: Vec<JobId> = Vec::new();
+        let mut proof_waiters: Vec<JobId> = Vec::new();
+        for spec in &specs {
+            if let (Some(key), Some(waiter)) = (&spec.dedup_key, spec.waiter)
+                && let Some(&id) = live_keys.get(key)
+            {
+                proof_callees.push(id);
+                proof_waiters.push(waiter);
+            }
+        }
+        let attached: HashSet<JobId> = self
+            .handle_ops
+            .waiters
+            .register_waiters_on_live_in_op(op, &proof_callees, &proof_waiters)
+            .await?
+            .into_iter()
+            .collect();
+        let proven: HashSet<JobId> = proof_callees.into_iter().collect();
+
         let mut seen: HashMap<String, JobId> = HashMap::new();
         let mut resolved: Vec<(JobId, bool)> = Vec::with_capacity(specs.len());
         let mut surviving = Vec::with_capacity(specs.len());
@@ -559,27 +597,24 @@ where
         for spec in specs {
             if let Some(key) = &spec.dedup_key {
                 if let Some(&id) = seen.get(key) {
-                    if let Some(waiter) = spec.waiter {
+                    // Waits on a pre-existing holder were all registered
+                    // under its liveness proof above; only ids this batch
+                    // creates still need one here.
+                    if let Some(waiter) = spec.waiter
+                        && !proven.contains(&id)
+                    {
                         waiter_callees.push(id);
                         waiters.push(waiter);
                     }
                     resolved.push((id, false));
                     continue;
                 }
-                if let Some(&id) = live_keys.get(key) {
-                    let attached = match spec.waiter {
-                        None => true,
-                        Some(waiter) => {
-                            self.repo
-                                .register_waiter_on_live_in_op(op, id, waiter)
-                                .await?
-                        }
-                    };
-                    if attached {
-                        seen.insert(key.clone(), id);
-                        resolved.push((id, false));
-                        continue;
-                    }
+                if let Some(&id) = live_keys.get(key)
+                    && (!proven.contains(&id) || attached.contains(&id))
+                {
+                    seen.insert(key.clone(), id);
+                    resolved.push((id, false));
+                    continue;
                 }
                 seen.insert(key.clone(), spec.id);
             }
@@ -636,7 +671,8 @@ where
             .collect();
         ExecutionInsertHook::register(op, &self.notifier, &self.poller_ref, &self.clock, rows)
             .await?;
-        self.repo
+        self.handle_ops
+            .waiters
             .insert_waiters_in_op(op, &waiter_callees, &waiters)
             .await?;
 
