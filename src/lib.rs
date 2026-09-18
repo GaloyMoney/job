@@ -949,7 +949,7 @@ impl Jobs {
         span.record("waiter", tracing::field::display(waiter));
         Ok(!self
             .waiters
-            .register_waiters_in_op(op, &[callee], &[waiter])
+            .register_waiters_in_op(op, &[waiters::Wait { callee, waiter }])
             .await?
             .is_empty())
     }

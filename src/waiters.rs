@@ -10,6 +10,16 @@ use sqlx::PgPool;
 
 use crate::{JobId, entity::JobType, error::JobError};
 
+/// One wait to register: `waiter` is to be woken when `callee` reaches a
+/// terminal state. Pairs the two [`JobId`]s at the call site so a batch
+/// registration ([`JobWaiters::register_waiters_in_op`]) cannot receive a
+/// callee list out of sync with its waiter list.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Wait {
+    pub(crate) callee: JobId,
+    pub(crate) waiter: JobId,
+}
+
 /// Writes and reads of `job_waiters`, plus the by-id pull-forward that a
 /// wake is built from.
 #[derive(Clone)]
@@ -139,34 +149,35 @@ impl JobWaiters {
         Ok(attached)
     }
 
-    /// Register `waiters[n]` on `callees[n]`, whether the callee already
-    /// exists or is being created on this same `op`. Returns the callees
-    /// attached; a callee absent from the result is terminal and nothing
-    /// was written for it.
+    /// Register each `waits[n].waiter` on `waits[n].callee`, whether the
+    /// callee already exists or is being created on this same `op`.
+    /// Returns the callees attached; a callee absent from the result is
+    /// terminal and nothing was written for it.
     ///
     /// A callee whose execution row this op will insert at commit
     /// ([`crate::execution_hooks::ExecutionInsertHook::pending_ids`])
     /// cannot be terminal before this op commits, so it takes the lock-free
     /// insert form; every other callee takes the share-locked form that
     /// proves liveness. Both forms exist already; this is only the routing
-    /// between them.
+    /// between them -- they still take two parallel `JobId` slices each,
+    /// matching the two separate arrays their `UNNEST($1::uuid[],
+    /// $2::uuid[])` binds; pairing them here, where the caller assembles
+    /// the batch, is what rules out a length mismatch by construction.
     pub(crate) async fn register_waiters_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
-        callees: &[JobId],
-        waiters: &[JobId],
+        waits: &[Wait],
     ) -> Result<Vec<JobId>, JobError> {
-        debug_assert_eq!(callees.len(), waiters.len());
         let pending = crate::execution_hooks::ExecutionInsertHook::pending_ids(op);
         let (mut same_op_callees, mut same_op_waiters) = (Vec::new(), Vec::new());
         let (mut live_callees, mut live_waiters) = (Vec::new(), Vec::new());
-        for (callee, waiter) in callees.iter().zip(waiters) {
-            if pending.contains(callee) {
-                same_op_callees.push(*callee);
-                same_op_waiters.push(*waiter);
+        for wait in waits {
+            if pending.contains(&wait.callee) {
+                same_op_callees.push(wait.callee);
+                same_op_waiters.push(wait.waiter);
             } else {
-                live_callees.push(*callee);
-                live_waiters.push(*waiter);
+                live_callees.push(wait.callee);
+                live_waiters.push(wait.waiter);
             }
         }
         self.insert_waiters_in_op(op, &same_op_callees, &same_op_waiters)
