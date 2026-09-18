@@ -10,9 +10,15 @@ use tracing::instrument;
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    JobId, JobType, error::JobError, notification_router::JobNotificationRouter,
-    notifier::JobEventNotifier, outcome::JobOutcome, poller::PollerHandle, repo::JobRepo,
-    snapshot::JobSnapshot, waiters::JobWaiters,
+    JobId, JobType,
+    error::JobError,
+    notification_router::JobNotificationRouter,
+    notifier::JobEventNotifier,
+    outcome::JobOutcome,
+    poller::PollerHandle,
+    repo::JobRepo,
+    snapshot::JobSnapshot,
+    waiters::{JobWaiters, Wait},
 };
 
 /// The service-side wiring a handle needs in order to ACT on its job rather
@@ -148,6 +154,10 @@ impl JobHandle {
     /// written and the caller should read the outcome ([`Self::load`])
     /// instead of parking.
     ///
+    /// A job spawned on this same `op` (`spawn_in_op` / `spawn_all_in_op`,
+    /// keyless or not) is live by construction and is attached; the wait
+    /// and the spawn commit together.
+    ///
     /// # Errors
     ///
     /// Returns [`JobError::Query`] if the write fails.
@@ -162,7 +172,13 @@ impl JobHandle {
         Ok(!self
             .ops
             .waiters
-            .register_waiters_on_live_in_op(op, &[self.id], &[waiter])
+            .register_waiters_in_op(
+                op,
+                &[Wait {
+                    callee: self.id,
+                    waiter,
+                }],
+            )
             .await?
             .is_empty())
     }
@@ -368,6 +384,10 @@ impl JobHandles {
     /// forward when the FIRST of these finishes, and should re-check what is
     /// still outstanding and park again if it is not done.
     ///
+    /// A callee spawned on this same `op` (`spawn_in_op` / `spawn_all_in_op`,
+    /// keyless or not) is live by construction and is attached; the wait
+    /// and the spawn commit together.
+    ///
     /// # Errors
     ///
     /// Returns [`JobError::Query`] if the write fails.
@@ -386,12 +406,18 @@ impl JobHandles {
         if self.0.is_empty() {
             return Ok(Vec::new());
         }
-        let callees: Vec<JobId> = self.0.iter().map(|h| h.id).collect();
-        let waiters = vec![waiter; callees.len()];
+        let waits: Vec<Wait> = self
+            .0
+            .iter()
+            .map(|h| Wait {
+                callee: h.id,
+                waiter,
+            })
+            .collect();
         self.0[0]
             .ops
             .waiters
-            .register_waiters_on_live_in_op(op, &callees, &waiters)
+            .register_waiters_in_op(op, &waits)
             .await
     }
 

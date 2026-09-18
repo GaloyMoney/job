@@ -29,6 +29,21 @@
 //!
 //! Waiting is by state polling (explicit conditions) or the runner's own
 //! channel, never by sleeping for "long enough".
+//!
+//! `register_waiter_in_op_*same_op*` / `register_waiter_in_op_*no_hooks*` /
+//! `a_caller_that_registers_at_park_time_is_woken` cover
+//! `handoff-register-waiter-same-op.md`: every handle-based registration
+//! (`JobHandle`/`JobHandles`/`Jobs::register_waiter_in_op`,
+//! `CurrentJob::wait_for_in_op`) funnels to `JobWaiters::register_waiters_in_op`,
+//! which must attach to a callee this SAME op is itself spawning (its
+//! execution row may not exist yet — keyless rows insert at commit) instead
+//! of reading the absent row as terminal. `a_caller_that_registers_at_park_time_is_woken`
+//! is the actual race: a live poller completing the callee concurrently with
+//! (or immediately after) the caller's commit, through the handle path that
+//! was broken before this fix — not a sequential register-then-complete.
+//! `register_waiter_in_op_same_op_rolls_back_with_the_op` pins the other
+//! half: the registration is ordinary same-transaction writes, so a caller
+//! whose op rolls back is left holding neither the spawn nor the wait.
 #![cfg(feature = "es-entity")]
 
 mod helpers;
@@ -36,8 +51,8 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, SubsecRound, Utc};
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec,
-    JobSvcConfig, JobType, Jobs,
+    CurrentJob, Job, JobCompletion, JobHandles, JobId, JobInitializer, JobRunner, JobSpawner,
+    JobSpec, JobSvcConfig, JobType, Jobs,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -217,6 +232,69 @@ impl JobInitializer for CallerInit {
             callee_spawner: self.callee_spawner.clone(),
             ran: self.ran.clone(),
             plain_reschedule: self.plain_reschedule,
+        }))
+    }
+}
+
+/// A caller that spawns its callee KEYLESS (no `.waiter()` on the spec) and
+/// registers itself through `CurrentJob::wait_for_in_op` — the handle-based
+/// path `handoff-register-waiter-same-op.md` fixes — rather than through
+/// `JobSpec::waiter`, which was already correct before this handoff.
+struct HandleParkCaller {
+    callee_id: JobId,
+    callee_spawner: JobSpawner<CalleeCfg>,
+    ran: mpsc::UnboundedSender<DateTime<Utc>>,
+}
+
+#[async_trait]
+impl JobRunner for HandleParkCaller {
+    async fn run(
+        &self,
+        mut current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        let _ = self.ran.send(Utc::now());
+        let state: Option<CallerState> = current_job.execution_state()?;
+        if state.is_some() {
+            return Ok(JobCompletion::Complete);
+        }
+
+        let mut op = current_job.begin_op().await?;
+        let callee = self
+            .callee_spawner
+            .spawn_in_op(&mut op, self.callee_id, CalleeCfg)
+            .await?;
+        let handles: JobHandles = std::iter::once(callee).collect();
+        current_job.wait_for_in_op(&mut op, &handles).await?;
+        current_job
+            .update_execution_state_in_op(&mut op, &CallerState { spawned: true })
+            .await?;
+        Ok(JobCompletion::RescheduleAtWithOp(op, Utc::now() + HOLD))
+    }
+}
+
+struct HandleParkCallerInit {
+    job_type: JobType,
+    callee_spawner: JobSpawner<CalleeCfg>,
+    ran: mpsc::UnboundedSender<DateTime<Utc>>,
+}
+
+impl JobInitializer for HandleParkCallerInit {
+    type Config = CallerCfg;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        job: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        let config: CallerCfg = job.config()?;
+        Ok(Box::new(HandleParkCaller {
+            callee_id: config.callee_id,
+            callee_spawner: self.callee_spawner.clone(),
+            ran: self.ran.clone(),
         }))
     }
 }
@@ -568,6 +646,384 @@ async fn a_plain_rescheduled_caller_still_wakes_via_the_mark() -> anyhow::Result
         second - first < chrono::TimeDelta::seconds(10),
         "the mark consult must land the caller due within seconds, not the hour it \
          plainly rescheduled for ({second} vs {first})"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+// -- handoff-register-waiter-same-op.md ------------------------------------
+
+/// The defect, pinned directly: a keyless callee spawned on THIS op has no
+/// execution row yet (`ExecutionInsertHook` buffers it for commit), so the
+/// old `register_waiters_on_live_in_op`-only path's `FOR SHARE` finds
+/// nothing and reports it terminal. Fails on the pre-fix code (`false`, no
+/// `job_waiters` row); `register_waiters_in_op`'s `pending_ids` routing
+/// fixes it by taking the lock-free insert form for a callee this op is
+/// itself creating.
+#[tokio::test]
+async fn register_waiter_in_op_attaches_to_a_keyless_callee_spawned_on_the_same_op()
+-> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("waiters-same-op-keyless");
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: job_type.clone(),
+        behaviour: CalleeBehaviour::Complete,
+    });
+    // No poller: the row must stay parked so the assertions are about
+    // registration alone, not a race with a claim.
+
+    let callee_id = JobId::new();
+    let waiter = JobId::new();
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    spawner
+        .spawn_at_in_op(&mut op, callee_id, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+    let attached = jobs
+        .handle(callee_id)
+        .register_waiter_in_op(&mut op, waiter)
+        .await?;
+    op.commit().await?;
+
+    assert!(
+        attached,
+        "a keyless callee spawned on this same op must attach, not read as terminal"
+    );
+    assert!(
+        wait_exists(&pool, callee_id, waiter).await?,
+        "a wait edge must exist for the pair"
+    );
+    assert!(
+        exec_row(&pool, callee_id).await?.is_some(),
+        "the buffered spawn must have landed at commit"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// The `JobHandles` (multi-callee) form of the same fix: every keyless
+/// callee from one `spawn_all_in_op` batch on this op must attach.
+#[tokio::test]
+async fn register_waiter_in_op_attaches_all_of_a_keyless_spawn_all_on_the_same_op()
+-> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("waiters-same-op-spawn-all");
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: job_type.clone(),
+        behaviour: CalleeBehaviour::Complete,
+    });
+
+    let ids: Vec<JobId> = (0..3).map(|_| JobId::new()).collect();
+    let waiter = JobId::new();
+    let specs: Vec<JobSpec<CalleeCfg>> = ids
+        .iter()
+        .map(|id| JobSpec::new(*id, CalleeCfg).schedule_at(Utc::now() + HOLD))
+        .collect();
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    spawner.spawn_all_in_op(&mut op, specs).await?;
+    let attached = jobs
+        .handles(ids.clone())
+        .register_waiter_in_op(&mut op, waiter)
+        .await?;
+    op.commit().await?;
+
+    let mut attached_sorted = attached;
+    attached_sorted.sort_unstable();
+    let mut ids_sorted = ids.clone();
+    ids_sorted.sort_unstable();
+    assert_eq!(
+        attached_sorted, ids_sorted,
+        "every keyless spawn_all callee on this op must attach"
+    );
+    for id in &ids {
+        assert!(
+            wait_exists(&pool, *id, waiter).await?,
+            "a wait edge must exist for {id}"
+        );
+    }
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// One `JobHandles::register_waiter_in_op` call spanning three callees in
+/// three different states -- live (already committed), terminal (its
+/// execution row deleted, as a completion leaves it), and same-op (still
+/// buffered in this op's `ExecutionInsertHook`) -- attaches exactly the
+/// live and same-op ones. Pins that the routing is per-callee, not
+/// all-or-nothing.
+#[tokio::test]
+async fn register_waiter_in_op_partitions_same_op_live_and_terminal_callees() -> anyhow::Result<()>
+{
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("waiters-same-op-partition");
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: job_type.clone(),
+        behaviour: CalleeBehaviour::Complete,
+    });
+
+    let live_id = JobId::new();
+    spawner
+        .spawn_at(live_id, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+
+    let terminal_id = JobId::new();
+    spawner
+        .spawn_at(terminal_id, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+    sqlx::query("DELETE FROM job_executions WHERE id = $1")
+        .bind(uuid::Uuid::from(terminal_id))
+        .execute(&pool)
+        .await?;
+
+    let same_op_id = JobId::new();
+    let waiter = JobId::new();
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    spawner
+        .spawn_at_in_op(&mut op, same_op_id, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+    let attached = jobs
+        .handles([live_id, terminal_id, same_op_id])
+        .register_waiter_in_op(&mut op, waiter)
+        .await?;
+    op.commit().await?;
+
+    let mut attached_sorted = attached;
+    attached_sorted.sort_unstable();
+    let mut expected = vec![live_id, same_op_id];
+    expected.sort_unstable();
+    assert_eq!(
+        attached_sorted, expected,
+        "only the live and same-op callees attach; the terminal one is rejected"
+    );
+    assert!(wait_exists(&pool, live_id, waiter).await?);
+    assert!(wait_exists(&pool, same_op_id, waiter).await?);
+    assert!(
+        !wait_exists(&pool, terminal_id, waiter).await?,
+        "nothing is written for the terminal callee"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// THE race, not a sequential register-then-complete: a caller spawns its
+/// callee KEYLESS and registers through `CurrentJob::wait_for_in_op` — the
+/// handle path that was broken — on the SAME op as the spawn, then commits
+/// and parks for an HOUR. A live poller is running the whole time and is
+/// free to claim and complete the callee the instant its row lands, racing
+/// the caller's own commit. On the pre-fix code this is not a close race at
+/// all: `register_waiters_on_live_in_op` finds no row for the still-buffered
+/// callee and reports it terminal, so no wait is ever written and the
+/// caller sleeps out the full hour -- this test times out (30s) waiting for
+/// the second run. On the fixed code the wait is written in the same
+/// transaction as the spawn, so the callee -- however fast it completes --
+/// can never observe an attached-but-un-woken state: the wake and the
+/// caller's own second run land within seconds.
+#[tokio::test]
+async fn a_caller_that_registers_at_park_time_is_woken() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let callee_type = helpers::job_type("waiters-same-op-race-callee");
+    let caller_type = helpers::job_type("waiters-same-op-race-caller");
+
+    let callee_spawner = jobs.add_initializer(CalleeInit {
+        job_type: callee_type.clone(),
+        behaviour: CalleeBehaviour::Complete,
+    });
+    let (tx, mut ran) = mpsc::unbounded_channel();
+    let caller_spawner = jobs.add_initializer(HandleParkCallerInit {
+        job_type: caller_type.clone(),
+        callee_spawner,
+        ran: tx,
+    });
+    jobs.start_poll().await?;
+
+    let caller_id = JobId::new();
+    let callee_id = JobId::new();
+    caller_spawner
+        .spawn(caller_id, CallerCfg { callee_id })
+        .await?;
+
+    let first = next_run(&mut ran).await?;
+    let second = next_run(&mut ran).await?;
+    assert!(
+        second - first < chrono::TimeDelta::seconds(10),
+        "a caller registering through the handle path on the same op as its spawn \
+         must be woken within seconds, not the hour it parked for ({second} vs {first})"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if !wait_exists(&pool, callee_id, caller_id).await? {
+            break;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the consumed wait must eventually be deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// `SavepointOp::commit_hook_dyn` reads its own staged buffer first and
+/// falls back to its parent's -- so a callee spawned on the PARENT op must
+/// still be found from a nested savepoint, and, mirrored, a callee spawned
+/// INSIDE a savepoint that is then released (folding its hook into the
+/// parent) must be found by a registration made on the parent afterwards.
+#[tokio::test]
+async fn register_waiter_in_op_sees_a_spawn_made_on_the_parent_of_a_savepoint() -> anyhow::Result<()>
+{
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("waiters-same-op-savepoint");
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: job_type.clone(),
+        behaviour: CalleeBehaviour::Complete,
+    });
+
+    // Spawn on the parent, register from a savepoint nested inside it.
+    let callee_id = JobId::new();
+    let waiter = JobId::new();
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    spawner
+        .spawn_at_in_op(&mut op, callee_id, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+    let attached = op
+        .with_savepoint(async |sp| {
+            jobs.handle(callee_id)
+                .register_waiter_in_op(sp, waiter)
+                .await
+        })
+        .await??;
+    op.commit().await?;
+    assert!(
+        attached,
+        "a spawn on the parent op must be visible from a nested savepoint"
+    );
+    assert!(wait_exists(&pool, callee_id, waiter).await?);
+
+    // Spawn inside a savepoint that is released, register on the parent.
+    let callee_id2 = JobId::new();
+    let waiter2 = JobId::new();
+    let mut op2 = es_entity::DbOp::init(&pool).await?;
+    op2.with_savepoint(async |sp| -> Result<(), job::JobError> {
+        spawner
+            .spawn_at_in_op(sp, callee_id2, CalleeCfg, Utc::now() + HOLD)
+            .await?;
+        Ok(())
+    })
+    .await??;
+    let attached2 = jobs
+        .handle(callee_id2)
+        .register_waiter_in_op(&mut op2, waiter2)
+        .await?;
+    op2.commit().await?;
+    assert!(
+        attached2,
+        "a spawn inside a released savepoint must be visible on the parent afterwards"
+    );
+    assert!(wait_exists(&pool, callee_id2, waiter2).await?);
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A bare `sqlx::Transaction` reports `AtomicOperation::supports_hooks() ==
+/// false`, so `ExecutionInsertHook::register` cannot buffer a keyless row on
+/// it and falls back to inserting inline (`force_execute_pre_commit`) --
+/// `pending_ids`'s `unwrap_or_default` on such an op is correctly empty, and
+/// the row is still found by the live `FOR SHARE` form because it already
+/// exists (uncommitted, but visible within the same transaction).
+#[tokio::test]
+async fn register_waiter_in_op_on_an_op_without_hooks_still_attaches() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("waiters-same-op-no-hooks");
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: job_type.clone(),
+        behaviour: CalleeBehaviour::Complete,
+    });
+
+    let callee_id = JobId::new();
+    let waiter = JobId::new();
+
+    let mut tx = pool.begin().await?;
+    spawner
+        .spawn_at_in_op(&mut tx, callee_id, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+    let attached = jobs
+        .handle(callee_id)
+        .register_waiter_in_op(&mut tx, waiter)
+        .await?;
+    tx.commit().await?;
+
+    assert!(
+        attached,
+        "the inline-inserted row must be found by the live FOR SHARE form"
+    );
+    assert!(wait_exists(&pool, callee_id, waiter).await?);
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Rollback semantics: the registration is ordinary writes against the
+/// caller's own `op`, nothing more -- so when that op rolls back (dropped
+/// without `commit`), both the spawn and the wait roll back with it. The
+/// caller is left holding neither a callee nor a wait; nothing to clean up,
+/// nothing dangling.
+#[tokio::test]
+async fn register_waiter_in_op_same_op_rolls_back_with_the_op() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("waiters-same-op-rollback");
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: job_type.clone(),
+        behaviour: CalleeBehaviour::Complete,
+    });
+
+    let callee_id = JobId::new();
+    let waiter = JobId::new();
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    spawner
+        .spawn_at_in_op(&mut op, callee_id, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+    let attached = jobs
+        .handle(callee_id)
+        .register_waiter_in_op(&mut op, waiter)
+        .await?;
+    assert!(
+        attached,
+        "the same-op callee is attached inside the still-open transaction"
+    );
+    drop(op);
+
+    assert!(
+        exec_row(&pool, callee_id).await?.is_none(),
+        "the rolled-back spawn must never have landed"
+    );
+    assert!(
+        !wait_exists(&pool, callee_id, waiter).await?,
+        "the wait registered inside the rolled-back op must not survive it"
     );
 
     jobs.shutdown().await?;
