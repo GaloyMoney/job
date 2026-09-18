@@ -1,3 +1,15 @@
+# [job release v0.15.3](https://github.com/GaloyMoney/job/releases/tag/0.15.3)
+
+
+
+### Bug Fixes
+
+- Attach a handle-based wait to a keyless callee spawned on the same op (#220)
+
+### Miscellaneous Tasks
+
+- Bump the all-dependencies group across 1 directory with 2 updates (#219)
+
 # [job release v0.15.2](https://github.com/GaloyMoney/job/releases/tag/0.15.2)
 
 
