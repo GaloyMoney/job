@@ -97,6 +97,12 @@ impl JobWaiters {
     /// time in spec order deadlocks against a batch finalizer locking the
     /// same rows in the crate order, and an application-owned `op` gets no
     /// retry.
+    ///
+    /// For a callee this op is itself creating (a keyless spawn whose
+    /// execution row has not been inserted yet), go through
+    /// [`Self::register_waiters_in_op`] instead -- this form's `FOR SHARE`
+    /// finds nothing for a row that does not exist yet and reports it
+    /// terminal.
     pub(crate) async fn register_waiters_on_live_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
@@ -128,6 +134,47 @@ impl JobWaiters {
         .fetch_all(op.as_executor())
         .await?;
         let mut attached: Vec<JobId> = rows.into_iter().map(|r| r.job_id).collect();
+        attached.sort_unstable();
+        attached.dedup();
+        Ok(attached)
+    }
+
+    /// Register `waiters[n]` on `callees[n]`, whether the callee already
+    /// exists or is being created on this same `op`. Returns the callees
+    /// attached; a callee absent from the result is terminal and nothing
+    /// was written for it.
+    ///
+    /// A callee whose execution row this op will insert at commit
+    /// ([`crate::execution_hooks::ExecutionInsertHook::pending_ids`])
+    /// cannot be terminal before this op commits, so it takes the lock-free
+    /// insert form; every other callee takes the share-locked form that
+    /// proves liveness. Both forms exist already; this is only the routing
+    /// between them.
+    pub(crate) async fn register_waiters_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        callees: &[JobId],
+        waiters: &[JobId],
+    ) -> Result<Vec<JobId>, JobError> {
+        debug_assert_eq!(callees.len(), waiters.len());
+        let pending = crate::execution_hooks::ExecutionInsertHook::pending_ids(op);
+        let (mut same_op_callees, mut same_op_waiters) = (Vec::new(), Vec::new());
+        let (mut live_callees, mut live_waiters) = (Vec::new(), Vec::new());
+        for (callee, waiter) in callees.iter().zip(waiters) {
+            if pending.contains(callee) {
+                same_op_callees.push(*callee);
+                same_op_waiters.push(*waiter);
+            } else {
+                live_callees.push(*callee);
+                live_waiters.push(*waiter);
+            }
+        }
+        self.insert_waiters_in_op(op, &same_op_callees, &same_op_waiters)
+            .await?;
+        let mut attached = self
+            .register_waiters_on_live_in_op(op, &live_callees, &live_waiters)
+            .await?;
+        attached.extend(same_op_callees);
         attached.sort_unstable();
         attached.dedup();
         Ok(attached)

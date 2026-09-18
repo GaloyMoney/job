@@ -89,6 +89,11 @@ impl<Config> JobSpec<Config> {
     /// waiter on the holder; a holder that went terminal between the live
     /// check and this registration is replaced by a new job the waiter is
     /// registered on, so the spec always yields something to wait for.
+    ///
+    /// Equivalent to spawning and then registering through the handle on
+    /// the same op (e.g. [`crate::JobHandle::register_waiter_in_op`]); this
+    /// form saves the hook lookup, the other lets the wait be decided after
+    /// the spawn.
     pub fn waiter(mut self, waiter: impl Into<JobId>) -> Self {
         self.waiter = Some(waiter.into());
         self

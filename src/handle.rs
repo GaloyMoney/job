@@ -148,6 +148,10 @@ impl JobHandle {
     /// written and the caller should read the outcome ([`Self::load`])
     /// instead of parking.
     ///
+    /// A job spawned on this same `op` (`spawn_in_op` / `spawn_all_in_op`,
+    /// keyless or not) is live by construction and is attached; the wait
+    /// and the spawn commit together.
+    ///
     /// # Errors
     ///
     /// Returns [`JobError::Query`] if the write fails.
@@ -162,7 +166,7 @@ impl JobHandle {
         Ok(!self
             .ops
             .waiters
-            .register_waiters_on_live_in_op(op, &[self.id], &[waiter])
+            .register_waiters_in_op(op, &[self.id], &[waiter])
             .await?
             .is_empty())
     }
@@ -368,6 +372,10 @@ impl JobHandles {
     /// forward when the FIRST of these finishes, and should re-check what is
     /// still outstanding and park again if it is not done.
     ///
+    /// A callee spawned on this same `op` (`spawn_in_op` / `spawn_all_in_op`,
+    /// keyless or not) is live by construction and is attached; the wait
+    /// and the spawn commit together.
+    ///
     /// # Errors
     ///
     /// Returns [`JobError::Query`] if the write fails.
@@ -391,7 +399,7 @@ impl JobHandles {
         self.0[0]
             .ops
             .waiters
-            .register_waiters_on_live_in_op(op, &callees, &waiters)
+            .register_waiters_in_op(op, &callees, &waiters)
             .await
     }
 

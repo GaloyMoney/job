@@ -79,6 +79,17 @@ pub(crate) struct ExecutionInsertHook {
 }
 
 impl ExecutionInsertHook {
+    /// Ids of the execution rows this op will insert at commit: the
+    /// keyless spawns registered on it so far (merged across calls, see
+    /// [`Self::merge`]). Empty when the op has no hook buffer -- in that
+    /// case [`Self::register`] inserted inline and the rows already exist.
+    pub(crate) fn pending_ids(op: &(impl AtomicOperation + ?Sized)) -> HashSet<JobId> {
+        op.commit_hook_dyn(std::any::TypeId::of::<Self>())
+            .and_then(|hook| hook.as_any().downcast_ref::<Self>())
+            .map(|hook| hook.rows.iter().map(|row| row.id).collect())
+            .unwrap_or_default()
+    }
+
     /// Builds and registers an `ExecutionInsertHook` for one row, falling
     /// back to immediate execution for dedup rows or if `op` has no hook buffer.
     /// The single-row spawn call sites' entry point.

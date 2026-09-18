@@ -928,6 +928,10 @@ impl Jobs {
     ///
     /// For a caller that found a live run by lookup ([`Self::keyed_handle`],
     /// [`Self::handle`]) rather than by spawning it, and wants to park on it.
+    ///
+    /// A callee spawned on this same `op` (`spawn_in_op` / `spawn_all_in_op`,
+    /// keyless or not) is live by construction and is attached; the wait
+    /// and the spawn commit together.
     #[instrument(
         name = "job.register_waiter_in_op",
         skip(self, op, callee, waiter),
@@ -945,7 +949,7 @@ impl Jobs {
         span.record("waiter", tracing::field::display(waiter));
         Ok(!self
             .waiters
-            .register_waiters_on_live_in_op(op, &[callee], &[waiter])
+            .register_waiters_in_op(op, &[callee], &[waiter])
             .await?
             .is_empty())
     }
