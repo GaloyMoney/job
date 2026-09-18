@@ -1,3 +1,11 @@
+# [job release v0.15.2](https://github.com/GaloyMoney/job/releases/tag/0.15.2)
+
+
+
+### Miscellaneous Tasks
+
+- Remove all comments in migration
+
 # [job release v0.15.1](https://github.com/GaloyMoney/job/releases/tag/0.15.1)
 
 
