@@ -43,6 +43,7 @@ use super::{
     poller::PollerHandle,
     repo::JobRepo,
     runner::{JobRunner, RetrySettings},
+    waiters::Wait,
 };
 
 /// Describes how to construct a [`crate::JobRunner`] for a keyed job type.
@@ -447,8 +448,7 @@ where
         let mut outcomes: Vec<JobHandle> = Vec::with_capacity(specs.len());
         // Waiters on generations this call creates, or on holders already
         // proven live in this call: plain inserts once the rows exist.
-        let mut waiter_callees: Vec<JobId> = Vec::new();
-        let mut waiters: Vec<JobId> = Vec::new();
+        let mut waits: Vec<Wait> = Vec::new();
         // The key each entry of `outcomes` answers for. A `JobHandle` carries
         // no key of its own, and `pulled_forward` is resolved by key AFTER
         // the loop, so the correspondence has to be kept alongside.
@@ -461,24 +461,22 @@ where
         // would take the locks out of the crate's `(queue_id, id)` order and
         // deadlock against a batch finalizer taking `FOR UPDATE` on the same
         // rows.
-        let mut proof_callees: Vec<JobId> = Vec::new();
-        let mut proof_waiters: Vec<JobId> = Vec::new();
+        let mut proof: Vec<Wait> = Vec::new();
         for spec in &specs {
             if let Some(waiter) = spec.waiter
                 && let Some(&id) = live.get(&spec.key)
             {
-                proof_callees.push(id);
-                proof_waiters.push(waiter);
+                proof.push(Wait { callee: id, waiter });
             }
         }
         let attached: HashSet<JobId> = self
             .handle_ops
             .waiters
-            .register_waiters_on_live_in_op(op, &proof_callees, &proof_waiters)
+            .register_waiters_on_live_in_op(op, &proof)
             .await?
             .into_iter()
             .collect();
-        let proven: HashSet<JobId> = proof_callees.into_iter().collect();
+        let proven: HashSet<JobId> = proof.into_iter().map(|w| w.callee).collect();
 
         for spec in specs {
             // The `execute_at` this spec asks for: the one a NEW job of it
@@ -508,8 +506,7 @@ where
 
             if let Some(&(id, idx)) = seen.get(&spec.key) {
                 if let Some(waiter) = spec.waiter {
-                    waiter_callees.push(id);
-                    waiters.push(waiter);
+                    waits.push(Wait { callee: id, waiter });
                 }
                 if spec.force_reschedule {
                     local_wake
@@ -540,8 +537,7 @@ where
                     .expect("Could not build new job"),
             );
             if let Some(waiter) = spec.waiter {
-                waiter_callees.push(id);
-                waiters.push(waiter);
+                waits.push(Wait { callee: id, waiter });
             }
             seen.insert(spec.key.clone(), (id, new_ids.len()));
             new_ids.push(id);
@@ -581,7 +577,7 @@ where
         }
         self.handle_ops
             .waiters
-            .insert_waiters_in_op(op, &waiter_callees, &waiters)
+            .insert_waiters_in_op(op, &waits)
             .await?;
 
         if new_jobs_created == 0 && wake_keys.is_empty() {

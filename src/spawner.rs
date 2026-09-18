@@ -20,6 +20,7 @@ use super::{
     notifier::JobEventNotifier,
     poller::PollerHandle,
     repo::JobRepo,
+    waiters::Wait,
 };
 
 /// Describes a job to be created as part of a bulk [`JobSpawner::spawn_all`] call.
@@ -277,7 +278,13 @@ where
                     Some(waiter) => !self
                         .handle_ops
                         .waiters
-                        .register_waiters_on_live_in_op(op, &[*id], &[waiter])
+                        .register_waiters_on_live_in_op(
+                            op,
+                            &[Wait {
+                                callee: *id,
+                                waiter,
+                            }],
+                        )
                         .await?
                         .is_empty(),
                 };
@@ -304,7 +311,13 @@ where
         if let Some(waiter) = spec.waiter {
             self.handle_ops
                 .waiters
-                .insert_waiters_in_op(op, &[job.id], &[waiter])
+                .insert_waiters_in_op(
+                    op,
+                    &[Wait {
+                        callee: job.id,
+                        waiter,
+                    }],
+                )
                 .await?;
         }
 
@@ -575,30 +588,27 @@ where
         // a time instead would both leave the second spec of a key
         // unprotected (the first, if waiter-less, proves nothing) and take
         // the locks out of the crate's `(queue_id, id)` order.
-        let mut proof_callees: Vec<JobId> = Vec::new();
-        let mut proof_waiters: Vec<JobId> = Vec::new();
+        let mut proof: Vec<Wait> = Vec::new();
         for spec in &specs {
             if let (Some(key), Some(waiter)) = (&spec.dedup_key, spec.waiter)
                 && let Some(&id) = live_keys.get(key)
             {
-                proof_callees.push(id);
-                proof_waiters.push(waiter);
+                proof.push(Wait { callee: id, waiter });
             }
         }
         let attached: HashSet<JobId> = self
             .handle_ops
             .waiters
-            .register_waiters_on_live_in_op(op, &proof_callees, &proof_waiters)
+            .register_waiters_on_live_in_op(op, &proof)
             .await?
             .into_iter()
             .collect();
-        let proven: HashSet<JobId> = proof_callees.into_iter().collect();
+        let proven: HashSet<JobId> = proof.into_iter().map(|w| w.callee).collect();
 
         let mut seen: HashMap<String, JobId> = HashMap::new();
         let mut resolved: Vec<(JobId, bool)> = Vec::with_capacity(specs.len());
         let mut surviving = Vec::with_capacity(specs.len());
-        let mut waiter_callees: Vec<JobId> = Vec::new();
-        let mut waiters: Vec<JobId> = Vec::new();
+        let mut waits: Vec<Wait> = Vec::new();
         for spec in specs {
             if let Some(key) = &spec.dedup_key {
                 if let Some(&id) = seen.get(key) {
@@ -608,8 +618,7 @@ where
                     if let Some(waiter) = spec.waiter
                         && !proven.contains(&id)
                     {
-                        waiter_callees.push(id);
-                        waiters.push(waiter);
+                        waits.push(Wait { callee: id, waiter });
                     }
                     resolved.push((id, false));
                     continue;
@@ -624,8 +633,10 @@ where
                 seen.insert(key.clone(), spec.id);
             }
             if let Some(waiter) = spec.waiter {
-                waiter_callees.push(spec.id);
-                waiters.push(waiter);
+                waits.push(Wait {
+                    callee: spec.id,
+                    waiter,
+                });
             }
             resolved.push((spec.id, true));
             surviving.push(spec);
@@ -678,7 +689,7 @@ where
             .await?;
         self.handle_ops
             .waiters
-            .insert_waiters_in_op(op, &waiter_callees, &waiters)
+            .insert_waiters_in_op(op, &waits)
             .await?;
 
         // Handles are minted from ids alone, so a coalesced position costs no

@@ -11,9 +11,10 @@ use sqlx::PgPool;
 use crate::{JobId, entity::JobType, error::JobError};
 
 /// One wait to register: `waiter` is to be woken when `callee` reaches a
-/// terminal state. Pairs the two [`JobId`]s at the call site so a batch
-/// registration ([`JobWaiters::register_waiters_in_op`]) cannot receive a
-/// callee list out of sync with its waiter list.
+/// terminal state. Every batch registration in this module -- and every
+/// caller assembling one -- pairs the two [`JobId`]s at the call site
+/// instead of building two parallel slices, so a callee list can never end
+/// up out of sync with its waiter list.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Wait {
     pub(crate) callee: JobId,
@@ -51,8 +52,8 @@ impl JobWaiters {
         Ok(rows.into_iter().map(JobId::from).collect())
     }
 
-    /// Register `waiters[n]` on `callees[n]` for callees created in this
-    /// same `op` (their execution rows may not even exist yet -- keyless
+    /// Register every `wait.waiter` on `wait.callee` for a callee created in
+    /// this same `op` (its execution row may not even exist yet -- keyless
     /// rows insert at commit), so there is nothing to lock against: a callee
     /// created here cannot be terminal before this op commits. A repeated
     /// pair re-arms the wait (clears `woken_at`).
@@ -66,12 +67,13 @@ impl JobWaiters {
     pub(crate) async fn insert_waiters_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
-        callees: &[JobId],
-        waiters: &[JobId],
+        waits: &[Wait],
     ) -> Result<(), JobError> {
-        if callees.is_empty() {
+        if waits.is_empty() {
             return Ok(());
         }
+        let callees: Vec<JobId> = waits.iter().map(|w| w.callee).collect();
+        let waiters: Vec<JobId> = waits.iter().map(|w| w.waiter).collect();
         sqlx::query!(
             r#"
             INSERT INTO job_waiters (job_id, waiter_job_id, created_at)
@@ -79,8 +81,8 @@ impl JobWaiters {
             FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
             ON CONFLICT (job_id, waiter_job_id) DO NOTHING
             "#,
-            callees as &[JobId],
-            waiters as &[JobId],
+            &callees as &[JobId],
+            &waiters as &[JobId],
             op.maybe_now(),
         )
         .execute(op.as_executor())
@@ -88,11 +90,11 @@ impl JobWaiters {
         Ok(())
     }
 
-    /// Register `waiters[n]` on `callees[n]` for callees that already exist,
-    /// returning the callees that were live and so actually attached. A
-    /// callee absent from the result is already terminal: nothing was
-    /// written for it and the caller should read its outcome rather than
-    /// park.
+    /// Register every `wait.waiter` on `wait.callee` for callees that
+    /// already exist, returning the callees that were live and so actually
+    /// attached. A callee absent from the result is already terminal:
+    /// nothing was written for it and the caller should read its outcome
+    /// rather than park.
     ///
     /// `FOR SHARE` is what makes the answer honest: the finalizer that
     /// deletes an execution row takes `FOR UPDATE` on it first, so this
@@ -116,12 +118,13 @@ impl JobWaiters {
     pub(crate) async fn register_waiters_on_live_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
-        callees: &[JobId],
-        waiters: &[JobId],
+        waits: &[Wait],
     ) -> Result<Vec<JobId>, JobError> {
-        if callees.is_empty() {
+        if waits.is_empty() {
             return Ok(Vec::new());
         }
+        let callees: Vec<JobId> = waits.iter().map(|w| w.callee).collect();
+        let waiters: Vec<JobId> = waits.iter().map(|w| w.waiter).collect();
         let rows = sqlx::query!(
             r#"
             WITH locked AS MATERIALIZED (
@@ -137,8 +140,8 @@ impl JobWaiters {
             ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET job_id = EXCLUDED.job_id
             RETURNING job_id AS "job_id!: JobId"
             "#,
-            callees as &[JobId],
-            waiters as &[JobId],
+            &callees as &[JobId],
+            &waiters as &[JobId],
             op.maybe_now(),
         )
         .fetch_all(op.as_executor())
@@ -159,33 +162,24 @@ impl JobWaiters {
     /// cannot be terminal before this op commits, so it takes the lock-free
     /// insert form; every other callee takes the share-locked form that
     /// proves liveness. Both forms exist already; this is only the routing
-    /// between them -- they still take two parallel `JobId` slices each,
-    /// matching the two separate arrays their `UNNEST($1::uuid[],
-    /// $2::uuid[])` binds; pairing them here, where the caller assembles
-    /// the batch, is what rules out a length mismatch by construction.
+    /// between them.
     pub(crate) async fn register_waiters_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
     ) -> Result<Vec<JobId>, JobError> {
         let pending = crate::execution_hooks::ExecutionInsertHook::pending_ids(op);
-        let (mut same_op_callees, mut same_op_waiters) = (Vec::new(), Vec::new());
-        let (mut live_callees, mut live_waiters) = (Vec::new(), Vec::new());
+        let (mut same_op, mut live): (Vec<Wait>, Vec<Wait>) = (Vec::new(), Vec::new());
         for wait in waits {
             if pending.contains(&wait.callee) {
-                same_op_callees.push(wait.callee);
-                same_op_waiters.push(wait.waiter);
+                same_op.push(*wait);
             } else {
-                live_callees.push(wait.callee);
-                live_waiters.push(wait.waiter);
+                live.push(*wait);
             }
         }
-        self.insert_waiters_in_op(op, &same_op_callees, &same_op_waiters)
-            .await?;
-        let mut attached = self
-            .register_waiters_on_live_in_op(op, &live_callees, &live_waiters)
-            .await?;
-        attached.extend(same_op_callees);
+        self.insert_waiters_in_op(op, &same_op).await?;
+        let mut attached = self.register_waiters_on_live_in_op(op, &live).await?;
+        attached.extend(same_op.into_iter().map(|w| w.callee));
         attached.sort_unstable();
         attached.dedup();
         Ok(attached)
