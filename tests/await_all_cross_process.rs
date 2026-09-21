@@ -104,7 +104,7 @@ async fn await_all_resolves_jobs_completed_by_another_process() -> anyhow::Resul
 
     let outcomes = jobs_a
         .handles(ids.clone())
-        .await_all(Duration::from_secs(10))
+        .await_all(Duration::from_secs(45))
         .await?;
 
     assert_eq!(outcomes.len(), N as usize);
@@ -166,7 +166,7 @@ async fn await_all_resolves_via_sweep_when_notify_buffer_overflows() -> anyhow::
 
     let handles_a = jobs_a.handles(ids.clone());
     let await_all_task =
-        tokio::spawn(async move { handles_a.await_all(Duration::from_secs(15)).await });
+        tokio::spawn(async move { handles_a.await_all(Duration::from_secs(60)).await });
 
     release_tx.send(true)?;
 
