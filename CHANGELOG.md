@@ -1,3 +1,19 @@
+# [job release v0.16.0](https://github.com/GaloyMoney/job/releases/tag/0.16.0)
+
+
+
+### Bug Fixes
+
+- Realign es-entity pin with workspace + GHA fuzz smoke test (#222)
+
+### Miscellaneous Tasks
+
+- [**breaking**] Upgrade es-entity to 0.14.0 (#223)
+
+### Testing
+
+- Widen cross-process timeouts for slow CI runners (#224)
+
 # [job release v0.15.3](https://github.com/GaloyMoney/job/releases/tag/0.15.3)
 
 
