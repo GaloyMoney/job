@@ -204,6 +204,20 @@ sqlx::migrate!().include_job_migrations().run(&pool).await?;
 
 ### Optional Features
 
+#### `tracing-context`
+
+Enabled by default. Captures the current OpenTelemetry trace context in each
+job's persisted `initialized` event and restores it as the parent when the job
+runs. Applications that do not want durable trace metadata can disable default
+features:
+
+```toml
+job = { version = "0.15", default-features = false }
+```
+
+Historical events containing trace context remain readable when the feature is
+disabled; newly initialized jobs persist `tracing_context: null`.
+
 #### `tokio-task-names`
 
 Enables named tokio tasks for better debugging and observability. **This feature requires both the feature flag AND setting the `tokio_unstable` compiler flag.**

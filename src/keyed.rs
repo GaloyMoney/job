@@ -531,7 +531,7 @@ where
                     .unique_key(spec.key.clone())
                     .job_type(self.job_type.clone())
                     .config(spec.config)?
-                    .tracing_context(es_entity::context::TracingContext::current())
+                    .tracing_context(crate::entity::current_tracing_context())
                     .schedule_at(wanted_at)
                     .build()
                     .expect("Could not build new job"),

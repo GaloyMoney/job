@@ -228,7 +228,7 @@ where
             .resident(true)
             .job_type(self.job_type.clone())
             .config(config)?
-            .tracing_context(es_entity::context::TracingContext::current())
+            .tracing_context(crate::entity::current_tracing_context())
             .schedule_at(schedule_at)
             .build()
             .expect("Could not build new job");

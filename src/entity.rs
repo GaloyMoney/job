@@ -15,6 +15,17 @@ use crate::{
     outcome::{JobReturnValue, JobTerminalState},
 };
 
+pub(crate) fn current_tracing_context() -> Option<TracingContext> {
+    #[cfg(feature = "tracing-context")]
+    {
+        TracingContext::current()
+    }
+    #[cfg(not(feature = "tracing-context"))]
+    {
+        None
+    }
+}
+
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 /// Identifier describing a job type or class of work.
@@ -270,6 +281,7 @@ impl Job {
     }
 
     pub(crate) fn inject_tracing_parent(&self) {
+        #[cfg(feature = "tracing-context")]
         if let JobEvent::Initialized {
             tracing_context: Some(tracing_context),
             ..
