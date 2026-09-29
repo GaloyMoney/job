@@ -128,7 +128,7 @@ impl JobHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the write fails.
+    /// Returns [`JobError::Repo`] if the write fails.
     #[instrument(name = "job.handle.pull_forward_in_op", skip(self, op), fields(id = %self.id))]
     pub async fn pull_forward_in_op(
         &self,
@@ -160,7 +160,7 @@ impl JobHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the write fails.
+    /// Returns [`JobError::Repo`] if the write fails.
     #[instrument(name = "job.handle.register_waiter_in_op", skip(self, op, waiter), fields(id = %self.id, waiter))]
     pub async fn register_waiter_in_op(
         &self,
@@ -260,7 +260,7 @@ impl JobHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Find`] if the job never existed.
+    /// Returns [`JobError::Read`] if the job never existed.
     #[instrument(name = "job.handle.load", skip(self), fields(id = %self.id))]
     pub async fn load(&self) -> Result<JobSnapshot, JobError> {
         self.repo.load_snapshot_by_id(self.id).await
@@ -310,7 +310,7 @@ impl JobHandle {
     ///
     /// Returns [`JobError::RouterNotStarted`] if called before
     /// [`Jobs::start_poll`](crate::Jobs::start_poll).
-    /// Returns [`JobError::Find`] if the job does not exist.
+    /// Returns [`JobError::Read`] if the job does not exist.
     /// Returns [`JobError::TimedOut`] if the timeout elapses first.
     /// Returns [`JobError::AwaitCompletionShutdown`] if the notification
     /// channel is dropped (e.g., during shutdown) before delivering the
@@ -390,7 +390,7 @@ impl JobHandles {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the write fails.
+    /// Returns [`JobError::Repo`] if the write fails.
     #[instrument(
         name = "job.handles.register_waiter_in_op",
         skip(self, op, waiter),
@@ -433,7 +433,7 @@ impl JobHandles {
     ///
     /// Returns [`JobError::RouterNotStarted`] if called before
     /// [`Jobs::start_poll`](crate::Jobs::start_poll).
-    /// Returns [`JobError::Find`] if any job in the batch does not exist.
+    /// Returns [`JobError::Read`] if any job in the batch does not exist.
     /// Returns [`JobError::TimedOut`] if the timeout elapses before every job
     /// reaches a terminal state.
     /// Returns [`JobError::AwaitCompletionShutdown`] if the notification

@@ -3159,7 +3159,7 @@ async fn load_not_found_is_find_error() -> anyhow::Result<()> {
 
     let result = jobs.handle(JobId::new()).load().await;
     assert!(
-        matches!(result, Err(JobError::Find(_))),
+        matches!(result, Err(JobError::Read(_))),
         "expected Find error for a job that never existed, got Ok or wrong error",
     );
 
@@ -3381,7 +3381,7 @@ async fn handle_await_find_timeout_and_batch() -> anyhow::Result<()> {
         .await_completion(Duration::from_secs(1))
         .await;
     assert!(
-        matches!(result, Err(JobError::Find(_))),
+        matches!(result, Err(JobError::Read(_))),
         "expected Find error, got: {result:?}"
     );
 

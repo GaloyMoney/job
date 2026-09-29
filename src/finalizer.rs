@@ -77,7 +77,7 @@ use std::sync::{Arc, Weak};
 use super::{
     JobId,
     entity::{Job, JobType, RetryPolicy},
-    error::{JobError, TX_ABORT_MAX_ATTEMPTS, is_retryable_conflict},
+    error::{JobError, TX_ABORT_MAX_ATTEMPTS},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::{JobPoller, pool_connection_headroom},
@@ -275,6 +275,9 @@ impl Finalizer {
     /// this module exists for (see the module doc) -- real errors at WARN.
     pub(crate) fn maybe_reclassify(&self, error: Box<dyn std::error::Error>) -> JobError {
         let span = Span::current();
+        if let Some(lane) = es_entity::errlanes::lane_of(error.as_ref()) {
+            span.record("error.lane", lane.as_str());
+        }
         let congestion = Self::is_pool_congestion(error.as_ref());
         let error = error.to_string();
         span.record("error", true);
@@ -356,7 +359,7 @@ impl Finalizer {
     /// module doc: first attempt on the shared pool when it has headroom,
     /// any first-attempt failure there switches to the internal pool, and
     /// internal-pool attempts retry transient aborts
-    /// ([`is_retryable_conflict`]) up to [`TX_ABORT_MAX_ATTEMPTS`].
+    /// (transient aborts) up to [`TX_ABORT_MAX_ATTEMPTS`].
     /// Retrying is sound because the transaction is the finalizer's own:
     /// it holds nothing but this job end's bookkeeping, an abort rolled all
     /// of it back, and `items` is plain data that re-applies identically.
@@ -436,7 +439,11 @@ impl Finalizer {
                     use_internal = true;
                     continue;
                 }
-                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e)
+                    if attempt_no < TX_ABORT_MAX_ATTEMPTS
+                        && es_entity::errlanes::lane_of(&e)
+                            == Some(es_entity::errlanes::Lane::Transient) =>
+                {
                     tracing::warn!(
                         job_ids = %Self::display_ids_of(items),
                         attempt_no,
@@ -450,7 +457,7 @@ impl Finalizer {
             };
 
             // Phase 2 -- the commit, uncapped and retried ONLY on a
-            // server-reported abort (`is_retryable_conflict`: deadlock
+            // server-reported abort (deadlock
             // victim / serialization failure), which guarantees the
             // transaction rolled back. Every other commit error is
             // AMBIGUOUS -- the server may have committed before the
@@ -461,7 +468,11 @@ impl Finalizer {
             // later rescue of an actually-committed attempt a no-op).
             match op.commit().await {
                 Ok(()) => return Ok(outcome),
-                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e)
+                    if attempt_no < TX_ABORT_MAX_ATTEMPTS
+                        && es_entity::errlanes::lane_of(&e)
+                            == Some(es_entity::errlanes::Lane::Transient) =>
+                {
                     tracing::warn!(
                         job_ids = %Self::display_ids_of(items),
                         attempt_no,

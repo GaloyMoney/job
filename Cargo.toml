@@ -45,7 +45,7 @@ anyhow = { workspace = true }
 
 [workspace.dependencies]
 
-es-entity = "0.14.1"
+es-entity = "=0.14.4-dev"
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -62,3 +62,9 @@ uuid = { version = "1.23", features = ["serde", "v7"] }
 futures = "0.3"
 rand = "0.10"
 schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"] }
+
+# Temporary pre-release validation pin; remove when es-entity #245 is released.
+[patch.crates-io]
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }
+errlanes = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }
+errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }

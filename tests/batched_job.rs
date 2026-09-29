@@ -1238,6 +1238,6 @@ async fn missing_initializer_surfaces_for_unregistered_batched_type() -> anyhow:
     let config = JobSvcConfig::builder().pool(pool).build().unwrap();
     let jobs = Jobs::init(config).await?;
     let missing = jobs.handle(JobId::new()).load().await;
-    assert!(matches!(missing, Err(JobError::Find(_))));
+    assert!(matches!(missing, Err(JobError::Read(_))));
     Ok(())
 }

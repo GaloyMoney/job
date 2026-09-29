@@ -432,6 +432,7 @@ impl JobDispatcher {
             attempt,
             will_retry = tracing::field::Empty,
             error = tracing::field::Empty,
+            error.lane = tracing::field::Empty,
             error.level = tracing::field::Empty,
             error.message = tracing::field::Empty
         )
@@ -447,6 +448,9 @@ impl JobDispatcher {
         span.record("job_id", tracing::field::display(id));
         span.record("job_type", tracing::field::display(&self.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
+        if let Some(lane) = es_entity::errlanes::lane_of(&error) {
+            span.record("error.lane", lane.as_str());
+        }
 
         let error_str = match error {
             JobError::PoolCongestion(message) => {

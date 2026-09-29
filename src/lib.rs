@@ -959,7 +959,7 @@ impl Jobs {
     /// No I/O happens until a method on the handle is called; handles hold no
     /// cached state, so every read is a live committed read. The id does not
     /// need to belong to an existing job: [`JobHandle::load`] and the
-    /// awaits return [`JobError::Find`] if it never existed.
+    /// awaits return [`JobError::Read`] if it never existed.
     ///
     /// See [`Jobs::handles`] for the batch mint and the
     /// persist-ids → re-mint → await pattern.
@@ -1099,7 +1099,7 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns [`JobError::Read`] if the lookup fails.
     ///
     /// # Examples
     ///
@@ -1166,12 +1166,12 @@ impl Jobs {
     /// that operation's eventual commit: it names a row this read saw
     /// uncommitted, and if the operation rolls back instead, the id was
     /// never really live. Awaiting or loading such a handle then answers
-    /// [`JobError::Find`] -- the same trap as awaiting a handle minted for an
+    /// [`JobError::Read`] -- the same trap as awaiting a handle minted for an
     /// id a caller later decided not to keep.
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns [`JobError::Read`] if the lookup fails.
     #[instrument(name = "job.resident_handle_in_op", skip(self, op))]
     pub async fn resident_handle_in_op(
         &self,
@@ -1192,7 +1192,7 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns [`JobError::Read`] if the lookup fails.
     #[instrument(name = "job.keyed_handle", skip(self))]
     pub async fn keyed_handle(
         &self,
@@ -1211,7 +1211,7 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns [`JobError::Read`] if the lookup fails.
     #[instrument(name = "job.keyed_handle_in_op", skip(self, op))]
     pub async fn keyed_handle_in_op(
         &self,
@@ -1241,7 +1241,7 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns [`JobError::Read`] if the lookup fails.
     #[instrument(name = "job.keyed_handles", skip(self))]
     pub async fn keyed_handles(
         &self,
@@ -1262,7 +1262,7 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns [`JobError::Read`] if the lookup fails.
     #[instrument(name = "job.keyed_handles_in_op", skip(self, op))]
     pub async fn keyed_handles_in_op(
         &self,

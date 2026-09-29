@@ -627,10 +627,15 @@ impl BatchDispatcher {
     /// back up by the next pool-aware poll instead.
     #[instrument(name = "job.fail_batch", skip_all,
         fields(job_type = %self.job_type, n_items = self.ids.len(), error = true,
-               error.message = %error,
+               error.message = %error, error.lane = tracing::field::Empty,
+               error.level = tracing::field::Empty,
                n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
     )]
     async fn fail_batch(&mut self, error: JobError) -> Result<(), JobError> {
+        let span = tracing::Span::current();
+        if let Some(lane) = es_entity::errlanes::lane_of(&error) {
+            span.record("error.lane", lane.as_str());
+        }
         let message = match error {
             JobError::PoolCongestion(message) => {
                 self.rescheduled = true;
@@ -659,6 +664,14 @@ impl BatchDispatcher {
         let outcome = finalizer
             .finalize(&items, |op, _| self.try_recycle_own_type(op))
             .await?;
+        span.record(
+            "error.level",
+            tracing::field::display(if outcome.retried.is_empty() {
+                tracing::Level::ERROR
+            } else {
+                tracing::Level::WARN
+            }),
+        );
         self.record_seal_outcome(&outcome);
         Ok(())
     }

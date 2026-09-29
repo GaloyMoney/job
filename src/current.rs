@@ -123,7 +123,7 @@ impl CurrentJob {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the write fails.
+    /// Returns [`JobError::Repo`] if the write fails.
     #[instrument(name = "job.current.wait_for_in_op", skip(self, op, handles), fields(id = %self.id))]
     pub async fn wait_for_in_op(
         &self,

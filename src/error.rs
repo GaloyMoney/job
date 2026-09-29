@@ -3,22 +3,23 @@
 use thiserror::Error;
 
 use super::entity::JobType;
-use super::repo::{JobCreateError, JobFindError, JobModifyError, JobQueryError};
+use super::repo::{JobColumn, JobConstraintViolation};
 use crate::JobId;
+
+use es_entity::errlanes::{Fail, Fault};
 
 #[derive(Error, Debug)]
 /// Exhaustive list of failures the job service can report.
 pub enum JobError {
     #[error("JobError - Sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("JobError - Create: {0}")]
-    Create(JobCreateError),
-    #[error("JobError - Modify: {0}")]
-    Modify(#[from] JobModifyError),
-    #[error("JobError - Find: {0}")]
-    Find(#[from] JobFindError),
-    #[error("JobError - Query: {0}")]
-    Query(#[from] JobQueryError),
+    /// A repository write failure. Rejected violations are lifted to the
+    /// duplicate variants below when they describe job-owned uniqueness.
+    #[error("JobError - Repo: {0}")]
+    Repo(Fail<JobConstraintViolation>),
+    /// A repository read failure. Reads cannot produce a domain rejection.
+    #[error("JobError - Read: {0}")]
+    Read(#[from] Fault),
     #[error("JobError - InvalidPollInterval: {0}")]
     InvalidPollInterval(String),
     #[error("JobError - InvalidJobType: expected '{0}' but initializer was '{1}'")]
@@ -67,43 +68,9 @@ pub enum JobError {
     RouterNotStarted,
 }
 
-/// The SQLSTATE, if this error (or anything it wraps) is a Postgres abort that
-/// is retryable by definition: `40P01` deadlock detected, `40001` serialization
-/// failure. The victim did nothing wrong -- the server picked it to break a
-/// cycle -- so the work is worth re-attempting rather than blaming on the job.
-///
-/// Walks the source chain rather than matching one variant: the same abort
-/// surfaces as a bare [`sqlx::Error`] from raw statements, wrapped in a repo
-/// error from es-entity's own writes, and wrapped again in whatever error type
-/// a caller's closure returns.
-pub(crate) fn retryable_conflict_code(
-    err: &(dyn std::error::Error + 'static),
-) -> Option<&'static str> {
-    let mut source = Some(err);
-    while let Some(e) = source {
-        if let Some(db) = e
-            .downcast_ref::<sqlx::Error>()
-            .and_then(|e| e.as_database_error())
-        {
-            match db.code().as_deref() {
-                Some("40P01") => return Some("40P01"),
-                Some("40001") => return Some("40001"),
-                _ => {}
-            }
-        }
-        source = e.source();
-    }
-    None
-}
-
-/// [`retryable_conflict_code`] as a predicate.
-pub(crate) fn is_retryable_conflict(err: &(dyn std::error::Error + 'static)) -> bool {
-    retryable_conflict_code(err).is_some()
-}
-
 /// Total attempts a crate-owned bookkeeping transaction (batch seal / fail,
 /// congestion reschedule) gets when Postgres keeps ABORTING it as a
-/// deadlock victim or serialization failure ([`is_retryable_conflict`]) --
+/// deadlock victim or serialization failure --
 /// transient aborts where the transaction lost to a concurrent partner and
 /// is safe to simply re-run. Counted as attempts, not retries: `3` means
 /// the original try plus two re-runs.
@@ -120,26 +87,22 @@ impl From<Box<dyn std::error::Error>> for JobError {
     }
 }
 
-impl From<JobCreateError> for JobError {
-    fn from(error: JobCreateError) -> Self {
-        match error {
-            JobCreateError::ConstraintViolation {
-                column: Some(super::repo::JobColumn::Id),
-                value,
-                ..
-            } => Self::DuplicateId(value),
+impl From<Fail<JobConstraintViolation>> for JobError {
+    fn from(error: Fail<JobConstraintViolation>) -> Self {
+        match &error {
+            Fail::Rejected(cv) if cv.is_duplicate_of(JobColumn::Id) => {
+                return Self::DuplicateId(cv.value().map(str::to_owned));
+            }
             // `idx_jobs_job_type_resident` (the absolutely-unique
             // `ResidentJobSpawner::spawn` enforcement,
             // migrations/20250904065521_job_setup.sql) is a single-column
             // index on `job_type` — its partial predicate (`WHERE
             // resident`) isn't itself an indexed column, so es_entity
             // attributes the violation deterministically to `JobType`.
-            JobCreateError::ConstraintViolation {
-                column: Some(super::repo::JobColumn::JobType),
-                value,
-                ..
-            } => Self::DuplicateResident(value),
-            other => Self::Create(other),
+            Fail::Rejected(cv) if cv.is_duplicate_of(JobColumn::JobType) => {
+                return Self::DuplicateResident(cv.value().map(str::to_owned));
+            }
+            _ => Self::Repo(error),
         }
     }
 }

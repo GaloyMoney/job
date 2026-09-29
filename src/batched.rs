@@ -572,9 +572,9 @@ impl<C> CurrentBatchedJob<C> {
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>
         + Clone
         + Sync,
-    ) -> Result<BatchOutcomes, sqlx::Error>
+    ) -> Result<BatchOutcomes, E>
     where
-        E: std::error::Error + 'static,
+        E: std::error::Error + From<es_entity::Fatal> + 'static,
     {
         self.run_bisected_with(op, BisectBudget::default(), f).await
     }
@@ -597,9 +597,9 @@ impl<C> CurrentBatchedJob<C> {
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>
         + Clone
         + Sync,
-    ) -> Result<BatchOutcomes, sqlx::Error>
+    ) -> Result<BatchOutcomes, E>
     where
-        E: std::error::Error + 'static,
+        E: std::error::Error + From<es_entity::Fatal> + 'static,
     {
         use es_entity::{BatchIsolation, ItemOutcome};
 
