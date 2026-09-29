@@ -299,7 +299,7 @@ where
             .id(spec.id)
             .job_type(self.job_type.clone())
             .config(spec.config)?
-            .tracing_context(es_entity::context::TracingContext::current())
+            .tracing_context(crate::entity::current_tracing_context())
             .queue_id(spec.queue_id.clone())
             .schedule_at(schedule_at);
         if let Some(key) = spec.dedup_key.clone() {
@@ -656,7 +656,7 @@ where
                 .id(spec.id)
                 .job_type(self.job_type.clone())
                 .config(spec.config)?
-                .tracing_context(es_entity::context::TracingContext::current())
+                .tracing_context(crate::entity::current_tracing_context())
                 .queue_id(spec.queue_id.clone())
                 .schedule_at(schedule_at);
             if let Some(key) = spec.dedup_key.clone() {

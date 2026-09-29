@@ -16,13 +16,15 @@ all-features = true
 
 [features]
 
+default = ["tracing-context"]
 fail-on-warnings = []
 es-entity = []
+tracing-context = ["es-entity/tracing-context"]
 json-schema = ["dep:schemars", "es-entity/json-schema"]
 tokio-task-names = ["tokio/tracing"]
 
 [dependencies]
-es-entity = { workspace = true, features = ["tracing-context"] }
+es-entity = { workspace = true }
 
 async-trait = { workspace = true }
 derive_builder = { workspace = true }
