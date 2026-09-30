@@ -63,8 +63,9 @@ futures = "0.3"
 rand = "0.10"
 schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"] }
 
-# Temporary pre-release validation pin; remove when es-entity #245 is released.
+# Temporary pre-release validation pin; remove when es-entity #246 is released.
 [patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }
-errlanes = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }
-errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", branch = "task/errlanes-repo-error-lanes-01a0ec55" }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
+errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }
+errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "36f765c75d827f72734910661502f7a33278180a" }

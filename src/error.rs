@@ -3,10 +3,10 @@
 use thiserror::Error;
 
 use super::entity::JobType;
-use super::repo::{JobColumn, JobConstraintViolation};
+use super::repo::JobConstraintViolation;
 use crate::JobId;
 
-use es_entity::errlanes::{Fail, Fault};
+use es_entity::errlanes::Fail;
 
 #[derive(Error, Debug)]
 /// Exhaustive list of failures the job service can report.
@@ -16,10 +16,10 @@ pub enum JobError {
     /// A repository write failure. Rejected violations are lifted to the
     /// duplicate variants below when they describe job-owned uniqueness.
     #[error("JobError - Repo: {0}")]
-    Repo(Fail<JobConstraintViolation>),
+    Repo(#[source] es_entity::RepoWriteError<JobConstraintViolation>),
     /// A repository read failure. Reads cannot produce a domain rejection.
     #[error("JobError - Read: {0}")]
-    Read(#[from] Fault),
+    Read(#[source] es_entity::RepoReadError),
     #[error("JobError - InvalidPollInterval: {0}")]
     InvalidPollInterval(String),
     #[error("JobError - InvalidJobType: expected '{0}' but initializer was '{1}'")]
@@ -87,22 +87,29 @@ impl From<Box<dyn std::error::Error>> for JobError {
     }
 }
 
-impl From<Fail<JobConstraintViolation>> for JobError {
-    fn from(error: Fail<JobConstraintViolation>) -> Self {
+impl From<es_entity::RepoWriteError<JobConstraintViolation>> for JobError {
+    fn from(error: es_entity::RepoWriteError<JobConstraintViolation>) -> Self {
         match &error {
-            Fail::Rejected(cv) if cv.is_duplicate_of(JobColumn::Id) => {
-                return Self::DuplicateId(cv.value().map(str::to_owned));
+            Fail::Rejected(JobConstraintViolation::Pkey(conflict)) => {
+                return Self::DuplicateId(conflict.attempted.map(|id| id.to_string()));
             }
-            // `idx_jobs_job_type_resident` (the absolutely-unique
-            // `ResidentJobSpawner::spawn` enforcement,
-            // migrations/20250904065521_job_setup.sql) is a single-column
-            // index on `job_type` — its partial predicate (`WHERE
-            // resident`) isn't itself an indexed column, so es_entity
-            // attributes the violation deterministically to `JobType`.
-            Fail::Rejected(cv) if cv.is_duplicate_of(JobColumn::JobType) => {
-                return Self::DuplicateResident(cv.value().map(str::to_owned));
+            // This exact generated case represents the partial unique index
+            // on resident job types; other job-type constraints retain Repo.
+            Fail::Rejected(JobConstraintViolation::IdxJobsJobTypeResident(conflict)) => {
+                return Self::DuplicateResident(
+                    conflict
+                        .attempted
+                        .as_ref()
+                        .map(|job_type| job_type.to_string()),
+                );
             }
             _ => Self::Repo(error),
         }
+    }
+}
+
+impl From<es_entity::RepoReadError> for JobError {
+    fn from(error: es_entity::RepoReadError) -> Self {
+        Self::Read(error)
     }
 }

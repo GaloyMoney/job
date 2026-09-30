@@ -26,7 +26,7 @@ use super::{
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     poller::PollerHandle,
-    repo::{JobColumn, JobRepo},
+    repo::{JobConstraintViolation, JobRepo},
     runner::{JobCompletion, JobRunner, RetrySettings},
 };
 
@@ -263,8 +263,12 @@ where
             // the persisted job by lookup; the violation poisons the
             // transaction, so drop (roll back) the op before reading.
             Err(e)
-                if matches!(&e, es_entity::errlanes::Fail::Rejected(cv)
-                    if cv.is_duplicate_of(JobColumn::JobType)) =>
+                if matches!(
+                    &e,
+                    es_entity::errlanes::Fail::Rejected(
+                        JobConstraintViolation::IdxJobsJobTypeResident(_)
+                    )
+                ) =>
             {
                 drop(op);
                 let existing = self

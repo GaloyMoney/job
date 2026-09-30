@@ -101,6 +101,20 @@ const CONGESTION_JITTER_MS: i64 = 1_000;
 /// event stream by [`Job::consecutive_congestion_reschedules`].
 const CONGESTION_WARN_STREAK: u32 = 10;
 
+/// A commit error is safe to retry only when Postgres confirms that it
+/// aborted the transaction. Other connection failures are ambiguous: the
+/// server may have committed before the client observed the error.
+fn is_safe_commit_abort(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| is_safe_commit_abort_code(code.as_ref()))
+}
+
+fn is_safe_commit_abort_code(code: &str) -> bool {
+    matches!(code, "40P01" | "40001")
+}
+
 /// Deadline on ACQUIRING the shared-pool connection for
 /// [`Finalizer::finalize`]'s first attempt -- deliberately much shorter
 /// than any plausible pool `acquire_timeout` (sqlx default 30s) and
@@ -468,11 +482,7 @@ impl Finalizer {
             // later rescue of an actually-committed attempt a no-op).
             match op.commit().await {
                 Ok(()) => return Ok(outcome),
-                Err(e)
-                    if attempt_no < TX_ABORT_MAX_ATTEMPTS
-                        && es_entity::errlanes::lane_of(&e)
-                            == Some(es_entity::errlanes::Lane::Transient) =>
-                {
+                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_safe_commit_abort(&e) => {
                     tracing::warn!(
                         job_ids = %Self::display_ids_of(items),
                         attempt_no,
@@ -976,5 +986,19 @@ impl Finalizer {
     fn display_ids_of(items: &[(JobId, Disposition)]) -> String {
         let ids: Vec<JobId> = items.iter().map(|(id, _)| *id).collect();
         Self::display_ids(&ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_commit_abort_code;
+
+    #[test]
+    fn only_server_confirmed_transaction_aborts_are_retryable_at_commit() {
+        assert!(is_safe_commit_abort_code("40P01"));
+        assert!(is_safe_commit_abort_code("40001"));
+        assert!(!is_safe_commit_abort_code("08006"));
+        assert!(!is_safe_commit_abort_code("57P03"));
+        assert!(!is_safe_commit_abort_code("23505"));
     }
 }
