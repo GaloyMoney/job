@@ -1268,3 +1268,255 @@ mod tests {
         assert!(!is_safe_commit_abort_code("23505"));
     }
 }
+
+/// End-to-end regression for the dead abort-retry bug: before errlanes
+/// adoption, `JobError` was a `thiserror` enum whose `Sqlx` variant wrapped
+/// a raw `sqlx::Error` opaquely, so `lane_of`/`e.is_transient()` could never
+/// classify a deadlock/serialization abort on the finalizer's OWN
+/// disposition write, and `Finalizer::finalize`'s abort-retry guard
+/// (`finalize`, phase 1b) never fired. Now `sqlx::Error` converts through
+/// errlanes' blanket `From` into a proper `Transient`, so a real deadlock
+/// injected on the write must be retried up to `TX_ABORT_MAX_ATTEMPTS`
+/// instead of propagating.
+///
+/// Needs a live Postgres (`PG_CON`); not run as part of `cargo test --lib`
+/// without one, same as every other DB-backed unit test in this crate.
+#[cfg(test)]
+mod deadlock_regression_tests {
+    use super::*;
+    use crate::{
+        entity::NewJob, notification_router::JobNotificationRouter, notifier::JobEventNotifier,
+        repo::JobRepo, tracker::JobTracker,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    async fn init_pool() -> sqlx::PgPool {
+        let pg_con = std::env::var("PG_CON").expect("PG_CON must be set for this test");
+        sqlx::PgPool::connect(&pg_con).await.expect("connect")
+    }
+
+    /// Observes whether `Finalizer::finalize`'s own
+    /// "disposition write lost a lock conflict; retrying" warning fired --
+    /// the one direct signal, short of parsing logs, that the abort-retry
+    /// branch was actually taken rather than the write simply succeeding
+    /// because no conflict ever materialised.
+    struct RetryWarnObserved(Arc<AtomicBool>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RetryWarnObserved {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Finder(bool);
+            impl tracing::field::Visit for Finder {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" && format!("{value:?}").contains("lock conflict") {
+                        self.0 = true;
+                    }
+                }
+            }
+            let mut finder = Finder(false);
+            event.record(&mut finder);
+            if finder.0 {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// One row of a job that actually exists (a `jobs` entity plus its
+    /// `job_executions` row, "claimed" by `instance_id`) so
+    /// `Finalizer::finalize_in_op`'s entity load and row writes both find
+    /// something real to work with.
+    async fn seed_claimed_job(
+        repo: &JobRepo,
+        job_type: &JobType,
+        queue_id: &str,
+        instance_id: uuid::Uuid,
+    ) -> JobId {
+        let id = JobId::new();
+        let mut op = repo
+            .begin_op_with_clock(&ClockHandle::realtime())
+            .await
+            .unwrap();
+        let new_job = NewJob::builder()
+            .id(id)
+            .job_type(job_type.clone())
+            .config(serde_json::json!({}))
+            .unwrap()
+            .queue_id(Some(queue_id.to_string()))
+            .schedule_at(chrono::Utc::now())
+            .build()
+            .expect("build NewJob");
+        repo.create_in_op(&mut op, new_job)
+            .await
+            .expect("create job");
+        op.commit().await.expect("commit job create");
+
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, queue_id, poller_instance_id, attempt_index, state, alive_at, created_at) \
+             VALUES ($1, $2, $3, $4, 1, 'running', NOW(), NOW())",
+        )
+        .bind(uuid::Uuid::from(id))
+        .bind(job_type.as_str())
+        .bind(queue_id)
+        .bind(instance_id)
+        .execute(repo.pool())
+        .await
+        .expect("insert job_executions row");
+        id
+    }
+
+    /// Holds a `FOR UPDATE` lock on `first`, signals, waits, then tries to
+    /// lock `second` -- the reverse of the order `Finalizer::finalize`'s own
+    /// CTE takes (`ORDER BY queue_id, id`), so a cycle forms once the
+    /// finalizer's write is also mid-flight. Retries the whole attempt if
+    /// IT is the deadlock victim, so the loop always converges once the
+    /// finalizer (if it was instead the victim) has released and retried.
+    /// One contestant in the reverse-order lock dance: holds `first`, waits
+    /// for the finalizer to be mid-flight, then tries `second`. On a
+    /// deadlock loss it just ends (dropping the transaction rolls back and
+    /// releases `first`) rather than retrying its own attempt from scratch
+    /// -- several of these are spawned PRE-QUEUED on `first` instead (see
+    /// the caller), so the next contestant in Postgres's own lock wait
+    /// queue takes over with no re-acquisition latency, which is what lets
+    /// the deadlock recur on the finalizer's later (`use_internal = true`,
+    /// attempt-counted) tries and not just its first (shared-pool,
+    /// uncounted-fallback) one.
+    async fn contest_once(
+        pool: sqlx::PgPool,
+        first: uuid::Uuid,
+        second: uuid::Uuid,
+        on_holding_first: Option<Arc<tokio::sync::Notify>>,
+    ) {
+        let Ok(mut tx) = pool.begin().await else {
+            return;
+        };
+        if sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR UPDATE")
+            .bind(first)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Some(ready) = on_holding_first {
+            ready.notify_one();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR UPDATE")
+            .bind(second)
+            .execute(&mut *tx)
+            .await;
+        // Releases `first` (and `second`, if won) either way: these probes
+        // never write anything, so a rollback is exactly as good as a
+        // commit for the purpose of freeing the locks.
+        let _ = tx.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn finalize_retries_a_server_confirmed_deadlock_on_its_own_disposition_write() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let subscriber =
+            tracing_subscriber::registry().with(RetryWarnObserved(Arc::clone(&observed)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let pool = init_pool().await;
+        let repo = Arc::new(JobRepo::new(&pool));
+        let tracker = Arc::new(JobTracker::new(1, 1));
+        let router = Arc::new(JobNotificationRouter::new(
+            &pool,
+            Arc::clone(&repo),
+            16,
+            std::time::Duration::from_secs(60),
+        ));
+        let notifier =
+            JobEventNotifier::spawn(&pool, Arc::clone(&tracker), router.terminal_sender());
+        let instance_id = uuid::Uuid::now_v7();
+        let job_type = JobType::new(Box::leak(
+            format!("deadlock-regression-{}", uuid::Uuid::now_v7()).into_boxed_str(),
+        ));
+
+        // Bounded attempts at reproducing the cycle: Postgres's victim
+        // choice between two symmetric waiters isn't guaranteed to pick the
+        // finalizer every round, so retry the whole scenario with fresh
+        // rows until the retry warning is actually observed (or give up
+        // with a clear failure rather than flake silently).
+        for round in 0..8 {
+            if observed.load(Ordering::SeqCst) {
+                break;
+            }
+            // `idx_job_executions_queue_active` is a unique index on
+            // `queue_id` for any `pending`/`running` row, so each round
+            // needs its own queue ids -- the "a-"/"z-" prefixes are what
+            // matters (guarantees `ORDER BY queue_id` sorts A before B),
+            // the suffix just keeps rounds from colliding.
+            let suffix = uuid::Uuid::now_v7();
+            let id_a =
+                seed_claimed_job(&repo, &job_type, &format!("a-queue-{suffix}"), instance_id).await;
+            let id_b =
+                seed_claimed_job(&repo, &job_type, &format!("z-queue-{suffix}"), instance_id).await;
+
+            let finalizer = Finalizer::new(
+                Weak::new(),
+                Arc::clone(&repo),
+                Arc::clone(&notifier),
+                RetrySettings::default(),
+                false,
+                instance_id,
+                ClockHandle::realtime(),
+            );
+
+            // Several contestants, pre-queued on `first` (= B) before
+            // `finalize()` even starts: once the leader releases (deadlock
+            // loss or a clean win), the next one in Postgres's own lock
+            // wait queue takes over with no re-acquisition latency, so a
+            // fresh contestant is already in position for whichever
+            // finalizer attempt (shared-pool first, or an internal-pool
+            // retry after it) comes next.
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let contestants: Vec<_> = (0..4)
+                .map(|i| {
+                    tokio::spawn(contest_once(
+                        pool.clone(),
+                        uuid::Uuid::from(id_b),
+                        uuid::Uuid::from(id_a),
+                        (i == 0).then(|| Arc::clone(&ready)),
+                    ))
+                })
+                .collect();
+            ready.notified().await;
+
+            let now = chrono::Utc::now();
+            let items = [
+                (id_a, Disposition::Fresh { at: now }),
+                (id_b, Disposition::Fresh { at: now }),
+            ];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                finalizer.finalize(&items, |_, _| {}),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: finalize() did not return within 15s"));
+            result.unwrap_or_else(|e| {
+                panic!("round {round}: finalize() should retry a server-confirmed deadlock and succeed, got: {e}")
+            });
+
+            for c in contestants {
+                let _ = c.await;
+            }
+        }
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "finalize() never hit its own abort-retry warning across 8 rounds of a genuine \
+             two-row deadlock -- either the retry path regressed, or this environment's \
+             deadlock detector never picked the finalizer as victim in any round"
+        );
+    }
+}
