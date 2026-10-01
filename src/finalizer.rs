@@ -118,7 +118,65 @@ impl RunFailure {
         if let Some(d) = errlanes::denied_of(error.as_ref()) {
             return Self::Denied(d.clone());
         }
+        // Second pass: a raw, never-laned `sqlx::Error` anywhere in the
+        // chain -- the shape a runner not built on errlanes returns
+        // directly (`Err(Box::new(sqlx::Error::PoolTimedOut))`, or boxed
+        // through an intermediate wrapper). The laned walk above takes
+        // precedence: an errlanes-based runner's own classification must
+        // win over any incidental raw `sqlx::Error` elsewhere in its chain.
+        let mut cur: Option<&(dyn Error + 'static)> = Some(error.as_ref());
+        while let Some(e) = cur {
+            if let Some(sqlx_err) = e.downcast_ref::<sqlx::Error>() {
+                return Self::classify_raw_sqlx(sqlx_err);
+            }
+            cur = e.source();
+        }
         Self::Unclassified(error)
+    }
+
+    /// Classifies a raw, borrowed `sqlx::Error`, mirroring
+    /// `errlanes::classify_sqlx_fault`'s rules without consuming it (a
+    /// `downcast_ref` walk can only borrow). The original can't be attached
+    /// as a `Transient`/`Fatal` source from a borrow, so its `Display` is
+    /// kept as context instead.
+    fn classify_raw_sqlx(e: &sqlx::Error) -> Self {
+        use es_entity::errlanes::{FatalKind, TransientKind, transient_sqlstate};
+        let context = e.to_string();
+        let transient = |kind: TransientKind| {
+            Self::Transient(Transient::new(kind).with_context(context.clone()))
+        };
+        let fatal = |kind: FatalKind| Self::Fatal(Fatal::new(kind).with_context(context.clone()));
+        match e {
+            sqlx::Error::PoolTimedOut => transient(TransientKind::PoolTimeout),
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) => transient(TransientKind::ConnectionLost),
+            sqlx::Error::PoolClosed | sqlx::Error::WorkerCrashed => {
+                transient(TransientKind::ConnectionLost)
+            }
+            sqlx::Error::Database(db) => {
+                if let Some(kind) = db.code().and_then(|c| transient_sqlstate(&c)) {
+                    transient(kind)
+                } else if db.is_unique_violation()
+                    || db.is_foreign_key_violation()
+                    || db.is_check_violation()
+                {
+                    fatal(FatalKind::Invariant)
+                } else {
+                    fatal(FatalKind::Config)
+                }
+            }
+            sqlx::Error::RowNotFound
+            | sqlx::Error::ColumnNotFound(_)
+            | sqlx::Error::ColumnIndexOutOfBounds { .. }
+            | sqlx::Error::ColumnDecode { .. }
+            | sqlx::Error::Decode(_)
+            | sqlx::Error::Encode(_)
+            | sqlx::Error::TypeNotFound { .. } => fatal(FatalKind::CorruptState),
+            sqlx::Error::Configuration(_) | sqlx::Error::AnyDriverError(_) => {
+                fatal(FatalKind::Config)
+            }
+            sqlx::Error::Protocol(_) => fatal(FatalKind::Dependency),
+            _ => fatal(FatalKind::Dependency),
+        }
     }
 
     /// Whether this classification will not succeed on retry -- `Fatal` or
@@ -214,6 +272,63 @@ mod run_failure_tests {
             RunFailure::classify(e),
             RunFailure::Unclassified(_)
         ));
+    }
+
+    /// Regression: a runner not built on errlanes at all returns a raw,
+    /// never-laned `sqlx::Error::PoolTimedOut` directly. The pre-errlanes
+    /// `is_pool_congestion` downcast the chain for exactly this shape; the
+    /// first errlanes pass of `classify` (laned-payload walk only) dropped
+    /// it, regressing a runner returning `Err(Box::new(sqlx::Error::
+    /// PoolTimedOut))` back to spending an ordinary retry attempt instead
+    /// of taking the congestion path. See
+    /// `tests/pool_congestion.rs::congestion_reschedule_keeps_job_batchable`
+    /// for the end-to-end sibling.
+    #[test]
+    fn classify_detects_congestion_from_a_raw_unlaned_sqlx_pool_timed_out() {
+        let e = boxed(sqlx::Error::PoolTimedOut);
+        let failure = RunFailure::classify(e);
+        assert!(
+            failure.is_congestion(),
+            "expected congestion classification"
+        );
+        assert!(!failure.is_terminal());
+    }
+
+    /// The same raw-chain walk also classifies a deadlock/serialization
+    /// failure as transient (not just `PoolTimedOut`), and anything else
+    /// database-shaped as fatal -- the general form of the fix, not just
+    /// the one kind the regression above pins.
+    #[test]
+    fn classify_raw_sqlx_mirrors_classify_sqlx_fault_for_non_pool_errors() {
+        let connection_lost = boxed(sqlx::Error::Io(std::io::Error::other("conn reset")));
+        match RunFailure::classify(connection_lost) {
+            RunFailure::Transient(t) => assert_eq!(t.kind, TransientKind::ConnectionLost),
+            _ => panic!("expected Transient(ConnectionLost)"),
+        }
+
+        let protocol = boxed(sqlx::Error::Protocol("synthesized".into()));
+        match RunFailure::classify(protocol) {
+            RunFailure::Fatal(f) => assert_eq!(f.kind, FatalKind::Dependency),
+            _ => panic!("expected Fatal(Dependency)"),
+        }
+    }
+
+    /// A laned payload elsewhere in the chain still wins over an incidental
+    /// raw `sqlx::Error` deeper in the same chain -- the errlanes-based
+    /// classification must take precedence, not just be tried first on a
+    /// coin flip of which happens to be nearer the top.
+    #[test]
+    fn a_laned_fatal_outranks_a_raw_sqlx_error_in_its_own_source_chain() {
+        // `Fatal::from_error` attaches the sqlx error as this Fatal's own
+        // source -- a raw `sqlx::Error::PoolTimedOut` genuinely further
+        // down the same chain, which must not flip the classification to
+        // congestion once the laned walk has already found the Fatal.
+        let fatal = Fatal::from_error(FatalKind::Invariant, sqlx::Error::PoolTimedOut);
+        let boxed: Box<dyn Error + Send + Sync> = Box::new(fatal);
+        match RunFailure::classify(boxed) {
+            RunFailure::Fatal(f) => assert_eq!(f.kind, FatalKind::Invariant),
+            _ => panic!("expected the laned Fatal to win over the raw sqlx::Error in its source"),
+        }
     }
 
     #[test]
