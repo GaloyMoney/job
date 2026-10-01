@@ -12,8 +12,10 @@ libfuzzer-sys = "0.4"
 # Path to the crate under test.
 job = { path = ".." }
 # The hydration machinery (`EntityEvents`, `GenericEvent`, …) lives in
-# es-entity; pin the same version `job` depends on so the impls unify.
-es-entity = "0.14.0"
+# es-entity; pin the EXACT version `job` depends on so the impls unify. A
+# caret requirement would not do: the version under test is a `-dev`
+# pre-release, which caret requirements never match.
+es-entity = "=0.14.4-dev"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["clock"], default-features = false }
@@ -28,3 +30,16 @@ doc = false
 # Standalone workspace so the fuzz crate is excluded from the parent workspace
 # (cargo-fuzz convention).
 [workspace]
+
+# A standalone workspace does NOT inherit the parent's `[patch.crates-io]`, so
+# the pre-release es-entity pin has to be repeated here or resolution falls
+# through to crates.io, which has no `0.14.4-dev` -- `cargo fuzz build` then
+# fails at "failed to select a version" before compiling anything.
+#
+# KEEP THE FOUR REVS IDENTICAL TO THE ROOT `Cargo.toml`. Temporary, like the
+# root's: both blocks go when es-entity #246 is released.
+[patch.crates-io]
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "3ff1a25e4e30ca01c19a202c09cf6718eae2a371" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "3ff1a25e4e30ca01c19a202c09cf6718eae2a371" }
+errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "3ff1a25e4e30ca01c19a202c09cf6718eae2a371" }
+errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "3ff1a25e4e30ca01c19a202c09cf6718eae2a371" }
