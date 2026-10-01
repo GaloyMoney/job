@@ -564,8 +564,9 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Sqlx`] if the poller cannot initialise its database listeners or
-    /// supporting tasks.
+    /// Returns a `Transient` or `Fatal` lane -- classified from the underlying
+    /// `sqlx::Error` -- if the poller cannot initialise its database listeners
+    /// or supporting tasks.
     ///
     /// # Panics
     ///
@@ -962,7 +963,8 @@ impl Jobs {
     /// No I/O happens until a method on the handle is called; handles hold no
     /// cached state, so every read is a live committed read. The id does not
     /// need to belong to an existing job: [`JobHandle::load`] and the
-    /// awaits return [`JobError::Read`] if it never existed.
+    /// awaits return a `Fatal` carrying an [`es_entity::NotFound`] source if
+    /// it never existed.
     ///
     /// See [`Jobs::handles`] for the batch mint and the
     /// persist-ids → re-mint → await pattern.
@@ -1102,7 +1104,8 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Read`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     ///
     /// # Examples
     ///
@@ -1168,13 +1171,14 @@ impl Jobs {
     /// Passed an in-flight operation, the returned handle is only as good as
     /// that operation's eventual commit: it names a row this read saw
     /// uncommitted, and if the operation rolls back instead, the id was
-    /// never really live. Awaiting or loading such a handle then answers
-    /// [`JobError::Read`] -- the same trap as awaiting a handle minted for an
-    /// id a caller later decided not to keep.
+    /// never really live. Awaiting or loading such a handle then answers a
+    /// `Fatal` with an [`es_entity::NotFound`] source -- the same trap as
+    /// awaiting a handle minted for an id a caller later decided not to keep.
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Read`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.resident_handle_in_op", skip(self, op))]
     pub async fn resident_handle_in_op(
         &self,
@@ -1195,7 +1199,8 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Read`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.keyed_handle", skip(self))]
     pub async fn keyed_handle(
         &self,
@@ -1214,7 +1219,8 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Read`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.keyed_handle_in_op", skip(self, op))]
     pub async fn keyed_handle_in_op(
         &self,
@@ -1244,7 +1250,8 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Read`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.keyed_handles", skip(self))]
     pub async fn keyed_handles(
         &self,
@@ -1265,7 +1272,8 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Read`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.keyed_handles_in_op", skip(self, op))]
     pub async fn keyed_handles_in_op(
         &self,

@@ -128,7 +128,8 @@ impl JobHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Repo`] if the write fails.
+    /// Returns a `Transient` lane if the write loses a race it can retry
+    /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(name = "job.handle.pull_forward_in_op", skip(self, op), fields(id = %self.id))]
     pub async fn pull_forward_in_op(
         &self,
@@ -160,7 +161,8 @@ impl JobHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Repo`] if the write fails.
+    /// Returns a `Transient` lane if the write loses a race it can retry
+    /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(name = "job.handle.register_waiter_in_op", skip(self, op, waiter), fields(id = %self.id, waiter))]
     pub async fn register_waiter_in_op(
         &self,
@@ -260,7 +262,9 @@ impl JobHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Read`] if the job never existed.
+    /// Returns a `Fatal` carrying an [`es_entity::NotFound`] source if the
+    /// job never existed -- test for it with
+    /// [`es_entity::fatal_is_not_found`].
     #[instrument(name = "job.handle.load", skip(self), fields(id = %self.id))]
     pub async fn load(&self) -> Result<JobSnapshot, JobError> {
         self.repo.load_snapshot_by_id(self.id).await
@@ -280,8 +284,8 @@ impl JobHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::CouldNotDeserializeExecutionState`] if the stored
-    /// state does not decode into `S`.
+    /// Returns a `Fatal(CorruptState)` if the stored state does not decode
+    /// into `S`.
     #[instrument(
         name = "job.handle.execution_state",
         skip(self),
@@ -306,19 +310,23 @@ impl JobHandle {
     ///
     /// The timeout is REQUIRED: the await is structurally bounded.
     /// Wait-forever is expressed only by an explicit caller loop that
-    /// re-awaits on [`JobError::TimedOut`] — each re-await re-registers a
+    /// re-awaits on [`JobRejection::TimedOut`](crate::JobRejection::TimedOut)
+    /// — each re-await re-registers a
     /// fresh waiter, which is also what makes a lost in-memory notification
     /// self-heal instead of wedging.
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::RouterNotStarted`] if called before
+    /// Returns a `Fatal(Invariant)` if called before
     /// [`Jobs::start_poll`](crate::Jobs::start_poll).
-    /// Returns [`JobError::Read`] if the job does not exist.
-    /// Returns [`JobError::TimedOut`] if the timeout elapses first.
-    /// Returns [`JobError::AwaitCompletionShutdown`] if the notification
-    /// channel is dropped (e.g., during shutdown) before delivering the
-    /// terminal state.
+    /// Returns a `Fatal` carrying an [`es_entity::NotFound`] source if the job
+    /// does not exist.
+    /// Returns [`JobRejection::TimedOut`](crate::JobRejection::TimedOut) if the
+    /// timeout elapses first.
+    /// Returns
+    /// [`JobRejection::AwaitInterrupted`](crate::JobRejection::AwaitInterrupted)
+    /// if the notification channel is dropped (e.g., during shutdown) before
+    /// delivering the terminal state.
     #[instrument(
         name = "job.handle.await_completion",
         skip(self),
@@ -395,7 +403,8 @@ impl JobHandles {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Repo`] if the write fails.
+    /// Returns a `Transient` lane if the write loses a race it can retry
+    /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(
         name = "job.handles.register_waiter_in_op",
         skip(self, op, waiter),
@@ -436,13 +445,16 @@ impl JobHandles {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::RouterNotStarted`] if called before
+    /// Returns a `Fatal(Invariant)` if called before
     /// [`Jobs::start_poll`](crate::Jobs::start_poll).
-    /// Returns [`JobError::Read`] if any job in the batch does not exist.
-    /// Returns [`JobError::TimedOut`] if the timeout elapses before every job
-    /// reaches a terminal state.
-    /// Returns [`JobError::AwaitCompletionShutdown`] if the notification
-    /// channel is dropped (e.g., during shutdown) before all jobs resolve.
+    /// Returns a `Fatal` carrying an [`es_entity::NotFound`] source if any job
+    /// in the batch does not exist.
+    /// Returns [`JobRejection::TimedOut`](crate::JobRejection::TimedOut) if the
+    /// timeout elapses before every job reaches a terminal state.
+    /// Returns
+    /// [`JobRejection::AwaitInterrupted`](crate::JobRejection::AwaitInterrupted)
+    /// if the notification channel is dropped (e.g., during shutdown) before
+    /// all jobs resolve.
     #[instrument(name = "job.handles.await_all", skip(self), fields(count = self.0.len()))]
     pub async fn await_all(&self, timeout: Duration) -> Result<Vec<JobOutcome>, JobError> {
         if self.0.is_empty() {

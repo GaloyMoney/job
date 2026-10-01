@@ -126,7 +126,8 @@ impl CurrentJob {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Repo`] if the write fails.
+    /// Returns a `Transient` lane if the write loses a race it can retry
+    /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(name = "job.current.wait_for_in_op", skip(self, op, handles), fields(id = %self.id))]
     pub async fn wait_for_in_op(
         &self,
