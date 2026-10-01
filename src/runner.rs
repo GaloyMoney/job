@@ -156,9 +156,11 @@ pub struct RetrySettings {
     /// Pick a value comfortably longer than a *failing* run of this job type: a deterministic
     /// failure must not clear it, or the job can never reach `n_attempts`.
     pub attempt_reset_after_healthy_run: Option<std::time::Duration>,
-    /// When `true`, a runner error classified as `Fatal` or `Denied` ends
-    /// the job on the attempt that produced it, instead of going through
-    /// this policy's ordinary attempt-count retry.
+    /// When `true`, a runner error classified as `Fatal` (a `Denied` is
+    /// narrowed into `Fatal(Denied)` at the job boundary -- job is not an
+    /// authorization boundary) ends the job on the attempt that produced
+    /// it, instead of going through this policy's ordinary attempt-count
+    /// retry.
     ///
     /// Defaults to `false`: the lane is *reported* on the span the moment
     /// it is classified (`error.lane`, `error.code`, `exception.message`),

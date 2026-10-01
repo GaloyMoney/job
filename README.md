@@ -236,26 +236,35 @@ fields -- `error`, `error.lane`, `error.code`, `error.level`, `exception.message
 `exception.type` -- plus `will_retry`, so you can stream the events into your existing observability
 pipeline without wrapping the runner in additional logging.
 
-A runner error is classified once, at the job boundary, by `errlanes::classify_dyn`: a lane payload
+A runner error is classified once, at the job boundary, by `Fault::classify`: a lane payload
 anywhere in the error's `source()` chain wins; failing that, the first `sqlx::Error` in the chain is
 read through errlanes' own table; failing both, it is reported as `Fatal(Dependency)` carrying the
 whole `Display` chain, so an error from a runner that knows nothing of errlanes still surfaces as
-something you can alert on rather than as nothing.
+something you can alert on rather than as nothing. Job is not an authorization boundary -- there is
+no caller on the other end of a job to tell no -- so a `Denied` anywhere in the chain is narrowed
+with `.narrow_denied()` into `Fatal(Denied)` on the spot: the span records `error.lane = "fatal"`,
+`error.code = "denied"`, not `"denied"`/`"FORBIDDEN"`.
 
 **Reporting the lane and acting on it are separate.** The span always says what the lane was. What job
 *does* with it is deliberately conservative for now:
 
-- `Transient` with kind `PoolTimeout` or `Congestion` reschedules without spending a retry attempt --
-  pool-wide pressure is no evidence that this particular job is broken.
-- Everything else -- `Transient`, `Fatal`, `Denied`, a panic (`Fatal(Panic)`), an unlaned error -- goes
-  through the ordinary attempt-count retry policy, exactly as every failure did before `job` adopted
-  errlanes. A `Fatal` is reported as fatal immediately but does not by itself end the job.
-- Set `terminal_on_fatal` on a job type to act on the lane as well: a `Fatal` or `Denied` then ends
-  that job on the attempt that produced it.
+- A transient whose `is_congestion()` is true (`PoolTimeout` or `Congestion`) reschedules without
+  spending a retry attempt -- pool-wide pressure is no evidence that this particular job is broken.
+- Everything else -- `Transient`, `Fatal` (including a narrowed `Denied`), a panic (`Fatal(Panic)`),
+  an unlaned error -- goes through the ordinary attempt-count retry policy, exactly as every failure
+  did before `job` adopted errlanes. A `Fatal` is reported as fatal immediately but does not by
+  itself end the job.
+- Set `terminal_on_fatal` on a job type to act on the lane as well: a `Fatal` then ends that job on
+  the attempt that produced it.
 
 The asymmetry is intentional. Trusting a `Fatal` ends a job after one attempt, and a `Fatal` that was
 really transient would turn a blip into a dead job -- so that trust is opt-in per job type, earned on
 the telemetry, which is there from the first deploy.
+
+When attempts run out on the ordinary retry path, the stored error is not just the last transient's
+text: the entity narrows it into `Fatal(Exhausted)` first, so `ExecutionErrored.error` reads
+`fatal(exhausted): exhausted after N attempts: transient(...): ...` and a reader can tell "retried to
+exhaustion" apart from "fatal from the first attempt" without cross-referencing the attempt count.
 
 The [`RetrySettings`](https://docs.rs/job/latest/job/struct.RetrySettings.html) that you configure for each
 [`JobInitializer`](https://docs.rs/job/latest/job/trait.JobInitializer.html) directly influence that
@@ -265,7 +274,7 @@ telemetry:
 - `n_warn_attempts` controls how many consecutive failures remain `WARN` level events before the crate promotes them to `ERROR`. Setting it to `None` keeps every retry at `WARN`.
 - `min_backoff`, `max_backoff`, and `backoff_jitter_pct` determine the delay that is recorded in the `job.fail_job` span before the next retry is scheduled.
 - `attempt_reset_after_healthy_run` lets a job be considered healthy again once a single execution has run for at least that long before failing (measured on a monotonic clock over the run itself, so neither an application-clock advance nor scheduler latency can satisfy it); the dispatcher resets the reported attempt counter accordingly. `None` disables forgiveness, and the counter then only ever resets on a completion.
-- `terminal_on_fatal` (default `false`) makes a `Fatal`/`Denied` runner error end the job on the attempt that produced it, instead of taking the ordinary attempt-count retry. Leave it off until you trust how faithfully the crates behind a given job type lane their errors; the lane is reported on the span either way. Resident types force it off -- they have no terminal state to go to.
+- `terminal_on_fatal` (default `false`) makes a `Fatal` runner error (including a narrowed `Denied`) end the job on the attempt that produced it, instead of taking the ordinary attempt-count retry. Leave it off until you trust how faithfully the crates behind a given job type lane their errors; the lane is reported on the span either way. Resident types force it off -- they have no terminal state to go to.
 
 Together these make the emitted telemetry reflect both the severity and cadence of retryable failures, which is especially helpful when wiring the crate into alerting systems.
 

@@ -17,15 +17,26 @@
 - Span fields on `job.execute_job` / `job.fail_job` / `job.execute_batch` / `job.fail_batch` and
   friends follow errlanes: `error`, `error.lane`, `error.code`, `error.level`,
   `exception.message`, `exception.type`. `error.message` is gone, replaced by `exception.message`.
+- [**breaking**] A `Denied` runner error is now reported as `error.lane = fatal`, `error.code =
+  denied` (previously `error.lane = denied`, `error.code = FORBIDDEN`): job is not an authorization
+  boundary, so the `Denied` is narrowed to `Fatal(Denied)` at the job boundary rather than kept as
+  its own lane. Behaviour is unchanged -- `terminal_on_fatal` still gates it like any other `Fatal`.
+- [**breaking**] An exhausted job's stored error now starts with `fatal(exhausted): exhausted after
+  N attempts:` instead of being just the last attempt's transient text -- the entity narrows the
+  failure into `Fatal(Exhausted)` before persisting it, so the stored string itself says the job was
+  retried to exhaustion.
 
 ### Features
 
-- A runner's boxed error is classified once at the job boundary by `errlanes::classify_dyn`: a lane
+- A runner's boxed error is classified once at the job boundary by `Fault::classify`: a lane
   payload anywhere in its `source()` chain, else the first `sqlx::Error` in the chain read through
   errlanes' own table, else `Fatal(Dependency)` carrying the whole `Display` chain. An error from a
-  runner that knows nothing of errlanes is therefore reported rather than silently unclassified.
-- Runner traits keep `Box<dyn std::error::Error>` -- **no** `Send + Sync` bound. `classify_dyn`
+  runner that knows nothing of errlanes is therefore reported rather than silently unclassified. A
+  `Denied` found this way is narrowed with `.narrow_denied()` into `Fatal(Denied)` immediately.
+- Runner traits keep `Box<dyn std::error::Error>` -- **no** `Send + Sync` bound. `Fault::classify`
   borrows the error and clones the lane out, so no existing `impl JobRunner` needs to change.
+- Congestion detection moved to errlanes' own `TransientKind::is_congestion` /
+  `Fault::is_congestion`, dropping job's own `finalizer::is_congestion` predicate.
 
 ### Bug Fixes
 
