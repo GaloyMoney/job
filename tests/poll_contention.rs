@@ -37,7 +37,7 @@ impl JobInitializer for CountingInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(CountingRunner {
             ran: Arc::clone(&self.ran),
         }))
@@ -50,10 +50,7 @@ struct CountingRunner {
 
 #[async_trait]
 impl JobRunner for CountingRunner {
-    async fn run(
-        &self,
-        _: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         self.ran.fetch_add(1, Ordering::SeqCst);
         Ok(JobCompletion::Complete)
     }

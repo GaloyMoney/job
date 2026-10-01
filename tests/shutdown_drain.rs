@@ -55,7 +55,7 @@ impl JobInitializer for ChurnInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(ChurnRunner {
             watch: Arc::clone(&self.watch),
         }))
@@ -71,7 +71,7 @@ impl JobRunner for ChurnRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         // `set_result` is an ordinary entity write that does NOT touch the
         // `job_executions` row, so it is not serialized behind the row locks
         // `kill_remaining_jobs` holds — it is the write that collides.

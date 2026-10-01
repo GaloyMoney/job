@@ -1,5 +1,5 @@
 //! Live-PG coverage for the pool-congestion classification
-//! (`Finalizer::maybe_reclassify`,
+//! (`finalizer::is_congestion`,
 //! `Finalizer::reschedule_congested`).
 //!
 //! Deliberately a separate file from `batched_job.rs`: these tests assert on
@@ -28,7 +28,7 @@ struct Cfg {
 
 /// A runner that fails its FIRST invocation with
 /// `sqlx::Error::PoolTimedOut` (the client-side "no connection available"
-/// error `Finalizer::maybe_reclassify` classifies as congestion, never a
+/// error `finalizer::is_congestion` classifies as congestion, never a
 /// database-side error a real runner's body could hit) and completes
 /// every subsequent invocation. Failing by call-count rather than by
 /// `attempt` is deliberate: a congestion reschedule must NOT bump
@@ -53,7 +53,7 @@ impl BatchedJobRunner for CongestionOnceRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<Cfg>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         let attempts: Vec<u32> = current_batch.items().iter().map(|i| i.attempt()).collect();
         self.calls.lock().await.push(attempts);
 
@@ -94,10 +94,7 @@ impl BatchedJobInitializer for CongestionOnceInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(CongestionOnceRunner {
             calls: Arc::clone(&self.calls),
             invocations: Arc::clone(&self.invocations),

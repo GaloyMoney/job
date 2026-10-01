@@ -41,7 +41,7 @@ impl JobRunner for StarvePoolThenFailRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         let pool = current_job.pool().clone();
         let mut held = self.held.lock().await;
         loop {
@@ -83,7 +83,7 @@ impl JobInitializer for StarvePoolThenFailInitializer {
         &self,
         _job: &job::Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(StarvePoolThenFailRunner {
             held: Arc::clone(&self.held),
         }))

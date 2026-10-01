@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use es_entity::errlanes;
-use es_entity::errlanes::{Fatal, FatalKind};
+use es_entity::errlanes::{Fatal, FatalKind, Laned};
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
 use tracing::Span;
@@ -16,7 +16,9 @@ use super::{
     current::CurrentJob,
     entity::{Job, JobType},
     error::JobError,
-    finalizer::{ClaimDisposition, Disposition, Finalizer, RunFailure},
+    finalizer::{
+        ClaimDisposition, Disposition, Finalizer, RunFailure, is_congestion, is_fatal_lane,
+    },
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -229,7 +231,7 @@ impl JobDispatcher {
                 Err(e) => {
                     span.record(
                         "conclusion",
-                        if e.is_congestion() {
+                        if is_congestion(&e) {
                             "Congestion"
                         } else {
                             "Error"
@@ -390,7 +392,9 @@ impl JobDispatcher {
         {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
-                let failure = RunFailure::classify(e);
+                // Classified here, while the box is still borrowable and
+                // before the next `.await`: see `RunFailure`.
+                let failure = errlanes::classify_dyn(&*e);
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -441,16 +445,16 @@ impl JobDispatcher {
         span.record("poller_id", tracing::field::display(self.instance_id));
         error.record(&span);
 
-        if error.is_congestion() {
+        if is_congestion(&error) {
             self.rescheduled = true;
-            let message = error.message();
+            let message = error.to_string();
             return self
                 .finalizer
                 .reschedule_congested_one(id, attempt, message)
                 .await;
         }
-        let terminal = error.is_terminal();
-        let error_str = error.message();
+        let terminal = is_fatal_lane(&error);
+        let error_str = error.to_string();
 
         let items = [(
             id,

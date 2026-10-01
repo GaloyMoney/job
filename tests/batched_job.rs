@@ -66,10 +66,7 @@ impl BatchedJobInitializer for RecordingInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(RecordingRunner {
             log: Arc::clone(&self.log),
         }))
@@ -87,7 +84,7 @@ impl BatchedJobRunner for RecordingRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<BatchConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         {
             let mut log = self.log.lock().await;
             log.sizes.push(current_batch.len());
@@ -290,10 +287,7 @@ impl BatchedJobInitializer for MixedOutcomeInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(MixedOutcomeRunner))
     }
 }
@@ -307,7 +301,7 @@ impl BatchedJobRunner for MixedOutcomeRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<BatchConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         let outcomes: BatchOutcomes = current_batch.outcomes_for_each(|item| {
             if item.config().label.starts_with("ok") {
                 BatchItemOutcome::Complete
@@ -414,10 +408,7 @@ impl BatchedJobInitializer for FailFirstInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(FailFirstRunner {
             log: Arc::clone(&self.log),
         }))
@@ -435,7 +426,7 @@ impl BatchedJobRunner for FailFirstRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<BatchConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         self.log.lock().await.sizes.push(current_batch.len());
         // Every item on its first attempt => fail the batch. Retries (attempt
         // > 1) succeed, so the batch drains.
@@ -534,10 +525,7 @@ impl BatchedJobInitializer for CheckpointBatchInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(CheckpointBatchRunner))
     }
 }
@@ -551,7 +539,7 @@ impl BatchedJobRunner for CheckpointBatchRunner {
     async fn run_batch(
         &self,
         mut current_batch: CurrentBatchedJob<BatchConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         for item in current_batch.items_mut() {
             item.update_execution_state(&BatchCheckpoint { processed: 1 })
                 .await?;
@@ -647,10 +635,7 @@ impl BatchedJobInitializer for IncompleteOutcomeInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(IncompleteOutcomeRunner))
     }
 }
@@ -664,7 +649,7 @@ impl BatchedJobRunner for IncompleteOutcomeRunner {
     async fn run_batch(
         &self,
         _current_batch: CurrentBatchedJob<BatchConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         // Deliberately empty: no outcome for any item.
         Ok(JobBatchCompletion::WithOutcomes(Vec::new()))
     }
@@ -786,10 +771,7 @@ impl BatchedJobInitializer for ResultPerItemInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(ResultPerItemRunner))
     }
 }
@@ -803,7 +785,7 @@ impl BatchedJobRunner for ResultPerItemRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<BatchConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         for item in current_batch.items() {
             item.set_result(&ItemResult {
                 label: item.config().label.clone(),
@@ -876,10 +858,7 @@ impl BatchedJobInitializer for RescheduleOnceInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(RescheduleOnceRunner {
             seen: Arc::clone(&self.seen),
         }))
@@ -897,7 +876,7 @@ impl BatchedJobRunner for RescheduleOnceRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<BatchConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         let mut seen = self.seen.lock().await;
         let outcomes: BatchOutcomes = current_batch
             .items()
@@ -986,10 +965,8 @@ async fn unknown_outcome_id_is_rejected() -> anyhow::Result<()> {
         fn init(
             &self,
             _: JobSpawner<Self::Config>,
-        ) -> Result<
-            Box<dyn BatchedJobRunner<Config = Self::Config>>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
+        ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>>
+        {
             Ok(Box::new(StrayRunner))
         }
     }
@@ -1000,7 +977,7 @@ async fn unknown_outcome_id_is_rejected() -> anyhow::Result<()> {
         async fn run_batch(
             &self,
             current_batch: CurrentBatchedJob<BatchConfig>,
-        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
             let mut outcomes = current_batch.outcomes_for_each(|_| BatchItemOutcome::Complete);
             // A job id that was never part of this batch.
             outcomes.push((JobId::new(), BatchItemOutcome::Complete));
@@ -1072,10 +1049,7 @@ impl BatchedJobInitializer for BlockingInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(BlockingRunner {
             seen: Arc::clone(&self.seen),
             release: Arc::clone(&self.release),
@@ -1095,7 +1069,7 @@ impl BatchedJobRunner for BlockingRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<BatchConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         {
             let mut seen = self.seen.lock().await;
             for item in current_batch.items() {

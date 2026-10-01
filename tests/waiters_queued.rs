@@ -23,10 +23,7 @@ struct Instant;
 
 #[async_trait]
 impl job::JobRunner for Instant {
-    async fn run(
-        &self,
-        _: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         Ok(JobCompletion::Complete)
     }
 }
@@ -46,7 +43,7 @@ impl JobInitializer for InstantInit {
         &self,
         _: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(Instant))
     }
 }
@@ -61,7 +58,7 @@ impl job::JobRunner for Waiter {
     async fn run(
         &self,
         mut current: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         if current.execution_state::<bool>()?.is_some() {
             return Ok(JobCompletion::Complete);
         }
@@ -90,7 +87,7 @@ impl JobInitializer for WaiterInit {
         &self,
         _: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(Waiter))
     }
 }

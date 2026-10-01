@@ -101,7 +101,7 @@ pub trait ResidentJobRunner: Send + Sync + 'static {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>>;
 }
 
 /// Describes how to construct a [`ResidentJobRunner`] for a resident job
@@ -137,10 +137,7 @@ pub trait ResidentJobInitializer: Send + Sync + 'static {
     }
 
     /// Produce a runner instance for the resident job.
-    fn init(
-        &self,
-        job: &Job,
-    ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>>;
+    fn init(&self, job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>>;
 }
 
 /// Adapts a [`ResidentJobRunner`] to the ordinary [`JobRunner`] the
@@ -154,7 +151,7 @@ impl JobRunner for ResidentRunnerAdapter {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         self.0.run(current_job).await.map(Into::into)
     }
 }

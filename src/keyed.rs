@@ -100,7 +100,7 @@ pub trait KeyedJobInitializer: Send + Sync + 'static {
         &self,
         job: &Job,
         spawner: KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
 /// Describes one keyed job to create as part of a bulk

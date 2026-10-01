@@ -51,7 +51,7 @@ impl BatchedJobRunner for StarvePoolThenFailRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<Cfg>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
         let pool = current_batch.pool().clone();
         let mut held = self.held.lock().await;
         loop {
@@ -92,10 +92,7 @@ impl BatchedJobInitializer for StarvePoolThenFailInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<
-        Box<dyn BatchedJobRunner<Config = Self::Config>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
         Ok(Box::new(StarvePoolThenFailRunner {
             held: Arc::clone(&self.held),
         }))

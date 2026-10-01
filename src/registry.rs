@@ -28,7 +28,7 @@ pub(crate) trait AnyJobInitializer: Send + Sync + 'static {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
 }
 
 impl<T: JobInitializer> AnyJobInitializer for T {
@@ -39,7 +39,7 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         // Fan-out spawns made from WITHIN a running job's own runner take
         // the ordinary insert path: this handle is never populated, since
         // `dispatch_job` has no `Arc<JobPoller>` to hand it here. The router
@@ -92,7 +92,7 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         // Always-empty handle: fan-out spawns of further generations made
         // from WITHIN a running keyed job's own runner take the ordinary
         // insert path, same as the plain and batched fan-out cases above.
@@ -127,7 +127,7 @@ impl<I: ResidentJobInitializer> AnyJobInitializer for ErasedResidentInitializer<
         _router: Arc<JobNotificationRouter>,
         _clock: ClockHandle,
         _notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let runner = ResidentJobInitializer::init(&self.0, job)?;
         Ok(Box::new(ResidentRunnerAdapter(runner)))
     }
@@ -224,16 +224,17 @@ impl JobRegistry {
         initializer: I,
     ) -> JobType {
         let job_type = initializer.job_type();
-        // `retry_fatal: true` alongside `n_attempts: None` for the same
-        // reason: a resident job can never be exhausted into a terminal
-        // error, and `maybe_schedule_retry`'s `terminal` branch (a runner
-        // classified as Fatal/Denied) terminates on the attempt that
-        // produced it UNLESS `retry_fatal` opts back into the ordinary
-        // attempt-count path -- which residents must always do, since they
-        // have no terminal state to go to (see `ResidentJobCompletion`).
+        // `terminal_on_fatal: false` alongside `n_attempts: None` for the
+        // same reason: a resident job can never be exhausted into a
+        // terminal error, and `maybe_schedule_retry`'s `terminal` branch (a
+        // runner classified as Fatal/Denied) would end the job on the
+        // attempt that produced it. Forced rather than merely defaulted:
+        // the type's own `retry_on_error_settings()` could turn it on, and
+        // a resident has no terminal state to go to (see
+        // `ResidentJobCompletion`).
         let retry_settings = RetrySettings {
             n_attempts: None,
-            retry_fatal: true,
+            terminal_on_fatal: false,
             ..initializer.retry_on_error_settings()
         };
         self.initializers.insert(
@@ -280,8 +281,14 @@ impl JobRegistry {
                 )))
             })?
             .init(job, repo, router, clock, notifier)
+            // An initializer's error cannot become this `Fatal`'s source
+            // (`init` returns a plain `Box<dyn Error>`, which is not
+            // `Send + Sync`), so its whole `Display` chain is folded into
+            // the context instead -- the same trade `classify_dyn` makes at
+            // the runner boundary.
             .map_err(|e| {
-                es_entity::errlanes::Fatal::from_boxed(es_entity::errlanes::FatalKind::Config, e)
+                es_entity::errlanes::Fatal::new(es_entity::errlanes::FatalKind::Config)
+                    .with_context(es_entity::errlanes::message_chain(&*e))
                     .into()
             })
     }
@@ -326,8 +333,14 @@ impl JobRegistry {
                 )))
             })?
             .init_erased(repo, router, clock, notifier)
+            // An initializer's error cannot become this `Fatal`'s source
+            // (`init` returns a plain `Box<dyn Error>`, which is not
+            // `Send + Sync`), so its whole `Display` chain is folded into
+            // the context instead -- the same trade `classify_dyn` makes at
+            // the runner boundary.
             .map_err(|e| {
-                es_entity::errlanes::Fatal::from_boxed(es_entity::errlanes::FatalKind::Config, e)
+                es_entity::errlanes::Fatal::new(es_entity::errlanes::FatalKind::Config)
+                    .with_context(es_entity::errlanes::message_chain(&*e))
                     .into()
             })
     }
@@ -399,7 +412,7 @@ mod tests {
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
             unimplemented!("never invoked by this test")
         }
     }
@@ -428,7 +441,7 @@ mod tests {
             _: JobSpawner<Self::Config>,
         ) -> Result<
             Box<dyn crate::BatchedJobRunner<Config = Self::Config>>,
-            Box<dyn std::error::Error + Send + Sync>,
+            Box<dyn std::error::Error>,
         > {
             unimplemented!("never invoked by this test")
         }

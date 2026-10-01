@@ -65,7 +65,7 @@ impl JobRunner for HoldableRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         let attempt = self.attempts_so_far.fetch_add(1, Ordering::SeqCst) + 1;
         self.started.notify_one();
         // Gates BOTH outcomes, failing included: a caller that wants to
@@ -108,7 +108,7 @@ impl JobInitializer for HoldableInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(HoldableRunner {
             started: Arc::clone(&self.started),
             release: Arc::clone(&self.release),
@@ -374,7 +374,7 @@ async fn keyed_spawn_is_blocked_by_a_parked_row_with_the_same_key() -> anyhow::R
             &self,
             _job: &Job,
             _: KeyedJobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
             unreachable!("not dispatched in this test")
         }
     }
@@ -439,7 +439,7 @@ impl JobRunner for ImmediateRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         // Before the gate, so `completed` still proves the runner body ran
         // even while it is being held.
         self.completed.notify_one();
@@ -462,7 +462,7 @@ impl JobInitializer for ImmediateInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(ImmediateRunner {
             completed: Arc::clone(&self.completed),
             gate: self.gate.clone(),

@@ -1,5 +1,5 @@
 //! Live-PG coverage for the pool-congestion classification
-//! (`Finalizer::maybe_reclassify`,
+//! (`finalizer::is_congestion`,
 //! `Finalizer::reschedule_congested`) on the single-job (non-batched)
 //! path.
 //!
@@ -44,7 +44,7 @@ impl JobRunner for CongestionOnceRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         self.calls.lock().await.push(current_job.attempt());
 
         if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -85,7 +85,7 @@ impl JobInitializer for CongestionOnceInitializer {
         &self,
         _job: &job::Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(CongestionOnceRunner {
             calls: Arc::clone(&self.calls),
             invocations: Arc::clone(&self.invocations),

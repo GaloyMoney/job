@@ -41,12 +41,12 @@ struct AlwaysFailsRunner<F> {
 #[async_trait]
 impl<F> JobRunner for AlwaysFailsRunner<F>
 where
-    F: Fn() -> Box<dyn std::error::Error + Send + Sync> + Send + Sync + 'static,
+    F: Fn() -> Box<dyn std::error::Error> + Send + Sync + 'static,
 {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         self.attempts.lock().await.push(current_job.attempt());
         Err((self.build_error)())
     }
@@ -61,7 +61,7 @@ struct AlwaysFailsInitializer<F> {
 
 impl<F> JobInitializer for AlwaysFailsInitializer<F>
 where
-    F: Fn() -> Box<dyn std::error::Error + Send + Sync> + Send + Sync + Clone + 'static,
+    F: Fn() -> Box<dyn std::error::Error> + Send + Sync + Clone + 'static,
 {
     type Config = Cfg;
 
@@ -77,7 +77,7 @@ where
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(AlwaysFailsRunner {
             attempts: Arc::clone(&self.attempts),
             build_error: self.build_error.clone(),
@@ -110,8 +110,7 @@ async fn transient_runner_error_retries_with_attempt_plus_one() -> anyhow::Resul
         },
         attempts: Arc::clone(&attempts),
         build_error: || {
-            Box::new(Transient::new(TransientKind::Other))
-                as Box<dyn std::error::Error + Send + Sync>
+            Box::new(Transient::new(TransientKind::Other)) as Box<dyn std::error::Error>
         },
     });
     jobs.start_poll().await?;
@@ -135,52 +134,15 @@ async fn transient_runner_error_retries_with_attempt_plus_one() -> anyhow::Resul
     Ok(())
 }
 
-/// A `Fatal` runner error is terminal on the attempt that produced it --
-/// `retry_fatal` defaults to `false` -- so the job errors after exactly one
-/// invocation, not after spending its retry budget.
+/// A `Fatal` runner error takes the ordinary attempt-count retry path by
+/// default: `terminal_on_fatal` is `false`, so errlanes' claim that this
+/// will not succeed on retry is *reported* on the span but not acted on.
+/// Until there is live experience with how faithfully upstream crates lane
+/// their errors, a `Fatal` that is really transient must not turn a blip
+/// into a dead job.
 #[tokio::test]
-async fn fatal_runner_error_goes_terminal_on_attempt_one() -> anyhow::Result<()> {
-    let (mut jobs, _pool, job_type) = start("lanes-fatal-terminal").await?;
-    let attempts = Arc::new(Mutex::new(Vec::new()));
-    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
-        job_type,
-        retry: RetrySettings {
-            n_attempts: Some(30),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            ..Default::default()
-        },
-        attempts: Arc::clone(&attempts),
-        build_error: || {
-            Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error + Send + Sync>
-        },
-    });
-    jobs.start_poll().await?;
-
-    let id = JobId::new();
-    spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-
-    let seen = attempts.lock().await.clone();
-    assert_eq!(
-        seen,
-        vec![1],
-        "a Fatal error must go terminal on the first attempt, not burn the retry budget, got {seen:?}"
-    );
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// The same always-`Fatal` runner, but `retry_fatal: true` opts back into
-/// the ordinary attempt-count retry path -- the migration escape hatch.
-#[tokio::test]
-async fn fatal_runner_error_retries_with_retry_fatal_true() -> anyhow::Result<()> {
-    let (mut jobs, _pool, job_type) = start("lanes-fatal-retry-fatal").await?;
+async fn fatal_runner_error_retries_by_default() -> anyhow::Result<()> {
+    let (mut jobs, _pool, job_type) = start("lanes-fatal-retries").await?;
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let spawner = jobs.add_initializer(AlwaysFailsInitializer {
         job_type,
@@ -188,13 +150,10 @@ async fn fatal_runner_error_retries_with_retry_fatal_true() -> anyhow::Result<()
             n_attempts: Some(2),
             min_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(20),
-            retry_fatal: true,
             ..Default::default()
         },
         attempts: Arc::clone(&attempts),
-        build_error: || {
-            Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error + Send + Sync>
-        },
+        build_error: || Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error>,
     });
     jobs.start_poll().await?;
 
@@ -210,7 +169,49 @@ async fn fatal_runner_error_retries_with_retry_fatal_true() -> anyhow::Result<()
     assert_eq!(
         seen,
         vec![1, 2],
-        "retry_fatal: true must send Fatal through the ordinary retry budget, got {seen:?}"
+        "a Fatal error must take the ordinary retry budget while `terminal_on_fatal` \
+         is off, got {seen:?}"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// The same always-`Fatal` runner with `terminal_on_fatal: true`: the type
+/// opts into trusting the lane, and the job ends on the attempt that
+/// produced it rather than spending its retry budget.
+#[tokio::test]
+async fn fatal_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Result<()> {
+    let (mut jobs, _pool, job_type) = start("lanes-fatal-terminal").await?;
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
+        job_type,
+        retry: RetrySettings {
+            n_attempts: Some(30),
+            min_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+            terminal_on_fatal: true,
+            ..Default::default()
+        },
+        attempts: Arc::clone(&attempts),
+        build_error: || Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error>,
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    spawner.spawn(id, Cfg).await?;
+    let outcome = jobs
+        .handle(id)
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+
+    let seen = attempts.lock().await.clone();
+    assert_eq!(
+        seen,
+        vec![1],
+        "terminal_on_fatal: true must end the job on the attempt that produced the \
+         Fatal, not burn the retry budget, got {seen:?}"
     );
 
     jobs.shutdown().await?;
@@ -218,8 +219,10 @@ async fn fatal_runner_error_retries_with_retry_fatal_true() -> anyhow::Result<()
 }
 
 /// A plain, unlaned string error (no errlanes payload anywhere in its
-/// chain) is `Unclassified` and falls back to the pre-errlanes behaviour:
-/// an ordinary attempt-count retry, exactly like the transient case.
+/// chain) gets `classify_dyn`'s `Fatal(Dependency)` default -- reported as
+/// fatal on the span, so it is visible -- and still takes the pre-errlanes
+/// behaviour of an ordinary attempt-count retry, because `terminal_on_fatal`
+/// is off. Reporting the lane and acting on it are separate.
 #[tokio::test]
 async fn unclassified_string_error_retries_like_before() -> anyhow::Result<()> {
     let (mut jobs, _pool, job_type) = start("lanes-unclassified-retries").await?;
@@ -257,10 +260,13 @@ async fn unclassified_string_error_retries_like_before() -> anyhow::Result<()> {
 }
 
 /// A panic inside `run` is classified as `Fatal(FatalKind::Panic)` (see
-/// `JobDispatcher::dispatch_job`), so it goes terminal on the attempt that
-/// panicked -- a panicking runner must not be retried.
+/// `JobDispatcher::dispatch_job`), so the span says `error.lane = fatal`,
+/// `error.code = panic` straight away -- but like any other `Fatal` it is
+/// gated by `terminal_on_fatal`, which is off here. So the job spends its
+/// retry budget and errors only when that runs out, which is exactly what
+/// pre-errlanes job did with a panic (`JobError::JobExecutionError`).
 #[tokio::test]
-async fn panicking_runner_goes_terminal() -> anyhow::Result<()> {
+async fn panicking_runner_errors_after_spending_its_retry_budget() -> anyhow::Result<()> {
     struct PanicInitializer {
         job_type: JobType,
     }
@@ -269,11 +275,22 @@ async fn panicking_runner_goes_terminal() -> anyhow::Result<()> {
         fn job_type(&self) -> JobType {
             self.job_type.clone()
         }
+        // Small budget with a short backoff: the panic is retried now, so
+        // the default 30 attempts at a 1s floor would outlast the timeout
+        // below. Two attempts is enough to show it retried AND errored.
+        fn retry_on_error_settings(&self) -> RetrySettings {
+            RetrySettings {
+                n_attempts: Some(2),
+                min_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(20),
+                ..Default::default()
+            }
+        }
         fn init(
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
             Ok(Box::new(PanicRunner))
         }
     }
@@ -283,12 +300,12 @@ async fn panicking_runner_goes_terminal() -> anyhow::Result<()> {
         async fn run(
             &self,
             _current_job: CurrentJob,
-        ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
             panic!("intentional test panic");
         }
     }
 
-    let (mut jobs, _pool, job_type) = start("lanes-panic-terminal").await?;
+    let (mut jobs, _pool, job_type) = start("lanes-panic-retries").await?;
     let spawner = jobs.add_initializer(PanicInitializer { job_type });
     jobs.start_poll().await?;
 
@@ -304,7 +321,8 @@ async fn panicking_runner_goes_terminal() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A `Denied` runner error is terminal on attempt one, same as `Fatal`.
+/// A `Denied` runner error takes the ordinary retry path by default,
+/// same as `Fatal`: `terminal_on_fatal` gates both lanes together.
 /// The span-assertion half of this (`job.fail_job`'s `error.lane`/
 /// `error.code`) lives in `tests/lanes_denied_span.rs`: `tracing`'s
 /// per-callsite interest cache is process-wide, so a `set_default`
@@ -312,46 +330,8 @@ async fn panicking_runner_goes_terminal() -> anyhow::Result<()> {
 /// own test BINARY (a separate OS process), not merely its own test
 /// function within this one.
 #[tokio::test]
-async fn denied_runner_error_goes_terminal_on_attempt_one() -> anyhow::Result<()> {
-    let (mut jobs, _pool, job_type) = start("lanes-denied-terminal").await?;
-    let attempts = Arc::new(Mutex::new(Vec::new()));
-    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
-        job_type,
-        retry: RetrySettings {
-            n_attempts: Some(30),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            ..Default::default()
-        },
-        attempts: Arc::clone(&attempts),
-        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error + Send + Sync>,
-    });
-    jobs.start_poll().await?;
-
-    let id = JobId::new();
-    spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-
-    let seen = attempts.lock().await.clone();
-    assert_eq!(
-        seen,
-        vec![1],
-        "Denied must go terminal on the first attempt like Fatal, got {seen:?}"
-    );
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// The same always-`Denied` runner, but `retry_fatal: true` opts back into
-/// the ordinary attempt-count retry path, exactly as it does for `Fatal`.
-#[tokio::test]
-async fn denied_runner_error_retries_with_retry_fatal_true() -> anyhow::Result<()> {
-    let (mut jobs, _pool, job_type) = start("lanes-denied-retry-fatal").await?;
+async fn denied_runner_error_retries_by_default() -> anyhow::Result<()> {
+    let (mut jobs, _pool, job_type) = start("lanes-denied-retries").await?;
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let spawner = jobs.add_initializer(AlwaysFailsInitializer {
         job_type,
@@ -359,11 +339,10 @@ async fn denied_runner_error_retries_with_retry_fatal_true() -> anyhow::Result<(
             n_attempts: Some(2),
             min_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(20),
-            retry_fatal: true,
             ..Default::default()
         },
         attempts: Arc::clone(&attempts),
-        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error + Send + Sync>,
+        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error>,
     });
     jobs.start_poll().await?;
 
@@ -379,7 +358,48 @@ async fn denied_runner_error_retries_with_retry_fatal_true() -> anyhow::Result<(
     assert_eq!(
         seen,
         vec![1, 2],
-        "retry_fatal: true must send Denied through the ordinary retry budget, got {seen:?}"
+        "Denied must take the ordinary retry budget while `terminal_on_fatal` is \
+         off, like Fatal, got {seen:?}"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// The same always-`Denied` runner with `terminal_on_fatal: true`: the
+/// job ends on the attempt that produced it, exactly as for `Fatal`.
+#[tokio::test]
+async fn denied_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Result<()> {
+    let (mut jobs, _pool, job_type) = start("lanes-denied-terminal").await?;
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
+        job_type,
+        retry: RetrySettings {
+            n_attempts: Some(30),
+            min_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+            terminal_on_fatal: true,
+            ..Default::default()
+        },
+        attempts: Arc::clone(&attempts),
+        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error>,
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    spawner.spawn(id, Cfg).await?;
+    let outcome = jobs
+        .handle(id)
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+
+    let seen = attempts.lock().await.clone();
+    assert_eq!(
+        seen,
+        vec![1],
+        "terminal_on_fatal: true must end the job on the attempt that produced the \
+         Denied, got {seen:?}"
     );
 
     jobs.shutdown().await?;
@@ -389,7 +409,7 @@ async fn denied_runner_error_retries_with_retry_fatal_true() -> anyhow::Result<(
 /// A resident job can never reach a terminal state (see
 /// `ResidentJobCompletion`'s doc), so a `Fatal` runner error must be
 /// rescheduled, not terminated: `JobRegistry::add_resident_initializer`
-/// forces `retry_fatal: true` alongside `n_attempts: None` for exactly this
+/// forces `terminal_on_fatal: false` alongside `n_attempts: None` for exactly this
 /// reason. `await_completion` times out -- the job never becomes terminal --
 /// and the runner keeps being invoked.
 #[tokio::test]
@@ -413,7 +433,7 @@ async fn resident_job_returning_fatal_is_rescheduled_not_terminated() -> anyhow:
         fn init(
             &self,
             _job: &Job,
-        ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
             Ok(Box::new(AlwaysFatalResidentRunner {
                 invocations: Arc::clone(&self.invocations),
             }))
@@ -427,7 +447,7 @@ async fn resident_job_returning_fatal_is_rescheduled_not_terminated() -> anyhow:
         async fn run(
             &self,
             _current_job: CurrentJob,
-        ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
             self.invocations.fetch_add(1, Ordering::SeqCst);
             Err(Box::new(Fatal::new(FatalKind::Invariant)))
         }
@@ -487,7 +507,7 @@ async fn resident_job_returning_fatal_is_rescheduled_not_terminated() -> anyhow:
 /// PoolTimeout)` directly (no `sqlx::Error` anywhere in its chain -- the
 /// shape any errlanes-based runner produces) must take the congestion-
 /// reschedule path end to end, not just be labelled congestion by
-/// `RunFailure::classify` in isolation: `attempt_index` stays unchanged
+/// `classify_dyn` in isolation: `attempt_index` stays unchanged
 /// across the failure and the retry, and the job still completes.
 #[tokio::test]
 async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to_end()
@@ -519,7 +539,7 @@ async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
             Ok(Box::new(CongestionOnceRunner {
                 attempts: Arc::clone(&self.attempts),
                 invocations: Arc::clone(&self.invocations),
@@ -535,7 +555,7 @@ async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to
         async fn run(
             &self,
             current_job: CurrentJob,
-        ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
             self.attempts.lock().await.push(current_job.attempt());
             if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(Box::new(Transient::new(TransientKind::PoolTimeout)));

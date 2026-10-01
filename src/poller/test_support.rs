@@ -36,7 +36,7 @@ impl crate::JobInitializer for ElasticInitializer {
         &self,
         _job: &Job,
         _: crate::JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn crate::JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn crate::JobRunner>, Box<dyn std::error::Error>> {
         unimplemented!("never invoked by this test")
     }
 }

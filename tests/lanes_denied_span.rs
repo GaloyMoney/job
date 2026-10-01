@@ -1,6 +1,6 @@
 //! Span-assertion half of the `Denied` disposition coverage (see
-//! `tests/lanes.rs::denied_runner_error_goes_terminal_on_attempt_one` for
-//! the disposition half): `job.fail_job`'s span must record `error.lane =
+//! `tests/lanes.rs::denied_runner_error_goes_terminal_with_terminal_on_fatal`
+//! for the disposition half): `job.fail_job`'s span must record `error.lane =
 //! "denied"` / `error.code = "FORBIDDEN"` on a `Denied` runner error.
 //!
 //! Deliberately its own file/binary, not a test function alongside the rest
@@ -42,7 +42,7 @@ impl JobRunner for AlwaysDeniedRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         self.attempts.lock().await.push(current_job.attempt());
         Err(Box::new(Denied::default()))
     }
@@ -65,6 +65,12 @@ impl JobInitializer for AlwaysDeniedInitializer {
             n_attempts: Some(30),
             min_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(20),
+            // Opts into acting on the lane, so the job ends on attempt one
+            // and there is exactly one `job.fail_job` span to assert on.
+            // The span fields below are recorded either way -- reporting
+            // the lane never depended on this knob -- but a 30-attempt
+            // retry would leave 30 spans to disambiguate.
+            terminal_on_fatal: true,
             ..Default::default()
         }
     }
@@ -73,7 +79,7 @@ impl JobInitializer for AlwaysDeniedInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(AlwaysDeniedRunner {
             attempts: Arc::clone(&self.attempts),
         }))

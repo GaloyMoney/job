@@ -37,7 +37,7 @@ impl JobRunner for HoldableRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         let attempt = self.attempts_so_far.fetch_add(1, Ordering::SeqCst) + 1;
         self.started.notify_one();
         if attempt <= self.fail_first_n {
@@ -72,7 +72,7 @@ impl JobInitializer for HoldableInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(Box::new(HoldableRunner {
             started: Arc::clone(&self.started),
             release: Arc::clone(&self.release),
@@ -394,7 +394,7 @@ async fn dedup_key_survives_a_retry() -> anyhow::Result<()> {
             // The test drives a deliberate failure and asserts on the
             // resulting attempt counter, so forgiveness must stay off.
             attempt_reset_after_healthy_run: None,
-            retry_fatal: false,
+            terminal_on_fatal: false,
         },
     });
     jobs.start_poll().await?;

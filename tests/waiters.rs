@@ -88,10 +88,7 @@ struct CompleteImmediately;
 
 #[async_trait]
 impl JobRunner for CompleteImmediately {
-    async fn run(
-        &self,
-        _: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         Ok(JobCompletion::Complete)
     }
 }
@@ -104,10 +101,7 @@ struct Held {
 
 #[async_trait]
 impl JobRunner for Held {
-    async fn run(
-        &self,
-        _: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         while !self.release.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -136,7 +130,7 @@ impl JobInitializer for CalleeInit {
         &self,
         _: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         Ok(match &self.behaviour {
             CalleeBehaviour::Complete => Box::new(CompleteImmediately) as Box<dyn JobRunner>,
             CalleeBehaviour::Held(release) => Box::new(Held {
@@ -164,7 +158,7 @@ impl JobRunner for Caller {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         let _ = self.ran.send(Utc::now());
         let state: Option<CallerState> = current_job.execution_state()?;
         if state.is_some() {
@@ -231,7 +225,7 @@ impl JobInitializer for CallerInit {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let config: CallerCfg = job.config()?;
         Ok(Box::new(Caller {
             callee_id: config.callee_id,
@@ -257,7 +251,7 @@ impl JobRunner for HandleParkCaller {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
         let _ = self.ran.send(Utc::now());
         let state: Option<CallerState> = current_job.execution_state()?;
         if state.is_some() {
@@ -295,7 +289,7 @@ impl JobInitializer for HandleParkCallerInit {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
         let config: CallerCfg = job.config()?;
         Ok(Box::new(HandleParkCaller {
             callee_id: config.callee_id,

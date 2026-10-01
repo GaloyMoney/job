@@ -133,7 +133,7 @@ pub(crate) struct RetryPolicy {
     pub max_backoff: Duration,
     pub backoff_jitter_pct: u8,
     pub attempt_reset_after_healthy_run: Option<Duration>,
-    pub retry_fatal: bool,
+    pub terminal_on_fatal: bool,
 }
 
 impl RetryPolicy {
@@ -325,7 +325,7 @@ impl Job {
     }
 
     /// Reschedule after a pool-congestion classification
-    /// (`Finalizer::maybe_reclassify`, `finalizer.rs`): same shape
+    /// (`finalizer::is_congestion`, `finalizer.rs`): same shape
     /// as [`Self::schedule_retry`]
     /// but at the SAME `attempt` rather than the next one, and via
     /// `CongestionRescheduled` rather than `ExecutionErrored` -- congestion
@@ -397,13 +397,14 @@ impl Job {
         es_entity::Idempotent::Executed(())
     }
 
-    /// `terminal` is `RunFailure::is_terminal()` (`Fatal`/`Denied`) for the
-    /// error that ended this attempt. Such an error will not succeed on
-    /// retry, so it goes terminal on THIS attempt regardless of the
-    /// attempt-count budget -- unless `retry_policy.retry_fatal` opts back
-    /// into the ordinary attempt-count path, the migration escape hatch for
-    /// a type whose downstream still returns `Fatal` for a merely-not-yet-
-    /// visible row.
+    /// `terminal` is `finalizer::is_fatal_lane()` (`Fatal`/`Denied`) for
+    /// the error that ended this attempt: errlanes' claim that it will not
+    /// succeed on retry. Job acts on that claim only when the type opts in
+    /// with `retry_policy.terminal_on_fatal`, in which case the job ends on
+    /// THIS attempt regardless of the attempt-count budget. By default the
+    /// lane is reported but not acted on, and the error takes the ordinary
+    /// attempt-count path like any other -- see
+    /// `RetrySettings::terminal_on_fatal`.
     pub(super) fn maybe_schedule_retry(
         &mut self,
         now: DateTime<Utc>,
@@ -423,7 +424,7 @@ impl Job {
             self.events.push(JobEvent::AttemptCounterReset);
         }
 
-        if terminal && !retry_policy.retry_fatal {
+        if terminal && retry_policy.terminal_on_fatal {
             self.error_job(error);
             return None;
         }
@@ -647,7 +648,7 @@ mod tests {
                 max_backoff: Duration::from_secs(TEST_MAX_BACKOFF_SECS),
                 backoff_jitter_pct: 0,
                 attempt_reset_after_healthy_run,
-                retry_fatal: false,
+                terminal_on_fatal: false,
             }
         }
 
@@ -1264,7 +1265,7 @@ mod tests {
                 max_backoff,
                 backoff_jitter_pct: jitter_pct,
                 attempt_reset_after_healthy_run: Some(Duration::from_secs(60 * 60)),
-                retry_fatal: false,
+                terminal_on_fatal: false,
             }
         }
 
@@ -1392,7 +1393,7 @@ mod tests {
                 max_backoff: Duration::from_secs(600),
                 backoff_jitter_pct: 0,
                 attempt_reset_after_healthy_run: None,
-                retry_fatal: false,
+                terminal_on_fatal: false,
             };
 
             assert!(
@@ -1412,7 +1413,7 @@ mod tests {
                 max_backoff: Duration::from_millis(huge),
                 backoff_jitter_pct: u8::MAX,
                 attempt_reset_after_healthy_run: None,
-                retry_fatal: false,
+                terminal_on_fatal: false,
             };
             for _ in 0..256 {
                 let backoff = policy.calculate_backoff(1);

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use es_entity::errlanes;
-use es_entity::errlanes::{Fatal, FatalKind};
+use es_entity::errlanes::{Fatal, FatalKind, Laned};
 use futures::FutureExt;
 use tracing::Span;
 
@@ -26,7 +26,10 @@ use super::{
     },
     entity::JobType,
     error::JobError,
-    finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer, RunFailure},
+    finalizer::{
+        ClaimDisposition, Disposition, FinalizeOutcome, Finalizer, RunFailure, is_congestion,
+        is_fatal_lane,
+    },
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -296,7 +299,7 @@ impl BatchDispatcher {
                 // field.
                 span.record(
                     "conclusion",
-                    if e.is_congestion() {
+                    if is_congestion(&e) {
                         "Congestion"
                     } else {
                         "Error"
@@ -407,7 +410,9 @@ impl BatchDispatcher {
         {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
-                let failure = RunFailure::classify(e);
+                // Classified here, while the box is still borrowable and
+                // before the next `.await`: see `RunFailure`.
+                let failure = errlanes::classify_dyn(&*e);
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -500,9 +505,10 @@ impl BatchDispatcher {
     /// breaks this contract has an unclear intent for the jobs it left out, so
     /// nothing is guessed: the batch is rolled back and retried. A mismatch is
     /// a bug in the runner, not evidence about any particular job, so it is
-    /// always `Fatal` -- never routed through `retry_fatal`'s opt-out, which
-    /// exists for a runner's own classification, not the dispatcher's own
-    /// contract check.
+    /// always `Fatal` -- the dispatcher's own contract check states the lane
+    /// itself rather than inferring one from whatever the runner returned.
+    /// Whether a `Fatal` ends the job is then the type's
+    /// `RetrySettings::terminal_on_fatal` decision, like any other fatal.
     fn validate(&self, outcomes: &BatchOutcomes) -> Result<(), RunFailure> {
         let expected: HashSet<JobId> = self.ids.iter().copied().collect();
         let mut seen: HashSet<JobId> = HashSet::with_capacity(outcomes.len());
@@ -617,7 +623,7 @@ impl BatchDispatcher {
     /// rescheduled for another attempt while others exhaust their attempts
     /// and become terminal, all in the same transaction.
     ///
-    /// A `RunFailure::is_congestion()` error is routed to the finalizer's
+    /// A `finalizer::is_congestion()` error is routed to the finalizer's
     /// congestion reschedule instead of the retry-policy path: congestion carries no
     /// evidence any of these jobs is broken, so applying `RetryPolicy`'s
     /// attempt escalation to it would walk perfectly good jobs toward
@@ -636,16 +642,16 @@ impl BatchDispatcher {
     async fn fail_batch(&mut self, error: RunFailure) -> Result<(), JobError> {
         let span = tracing::Span::current();
         error.record(&span);
-        if error.is_congestion() {
+        if is_congestion(&error) {
             self.rescheduled = true;
-            let message = error.message();
+            let message = error.to_string();
             return self
                 .finalizer
                 .reschedule_congested(&self.ids, &self.attempts, message)
                 .await;
         }
-        let terminal = error.is_terminal();
-        let message = error.message();
+        let terminal = is_fatal_lane(&error);
+        let message = error.to_string();
         let items: Vec<(JobId, Disposition)> = self
             .ids
             .iter()

@@ -70,7 +70,7 @@
 //!         JobType::new("my-job")
 //!     }
 //!
-//!     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+//!     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
 //!         let config: MyConfig = job.config()?;
 //!         Ok(Box::new(MyRunner { value: config.value }))
 //!     }
@@ -86,7 +86,7 @@
 //!     async fn run(
 //!         &self,
 //!         _current_job: CurrentJob,
-//!     ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+//!     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
 //!         println!("Processing value: {}", self.value);
 //!         Ok(JobCompletion::Complete)
 //!     }
@@ -157,7 +157,7 @@
 //!     fn max_batch_size(&self) -> usize { 25 }
 //!
 //!     fn init(&self, _: JobSpawner<Self::Config>)
-//!         -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn Error + Send + Sync>>
+//!         -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn Error>>
 //!     {
 //!         Ok(Box::new(RevalueRunner { accounts: self.accounts.clone() }))
 //!     }
@@ -168,7 +168,7 @@
 //!     type Config = RevalueConfig;
 //!
 //!     async fn run_batch(&self, batch: CurrentBatchedJob<RevalueConfig>)
-//!         -> Result<JobBatchCompletion, Box<dyn Error + Send + Sync>>
+//!         -> Result<JobBatchCompletion, Box<dyn Error>>
 //!     {
 //!         let mut op = batch.begin_op().await?;
 //!         for item in batch.items() {
@@ -601,7 +601,7 @@ impl Jobs {
     ///         JobType::new("example")
     ///     }
     ///
-    ///     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error + Send + Sync>> {
+    ///     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
     ///         Ok(Box::new(MyRunner))
     ///     }
     /// }
@@ -613,7 +613,7 @@ impl Jobs {
     ///     async fn run(
     ///         &self,
     ///         _current_job: CurrentJob,
-    ///     ) -> Result<JobCompletion, Box<dyn Error + Send + Sync>> {
+    ///     ) -> Result<JobCompletion, Box<dyn Error>> {
     ///         Ok(JobCompletion::Complete)
     ///     }
     /// }
@@ -664,7 +664,7 @@ impl Jobs {
     ///         JobType::new("example")
     ///     }
     ///
-    ///     fn init(&self, _job: &Job, _spawner: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error + Send + Sync>> {
+    ///     fn init(&self, _job: &Job, _spawner: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
     ///         Ok(Box::new(MyRunner))
     ///     }
     /// }
@@ -676,7 +676,7 @@ impl Jobs {
     ///     async fn run(
     ///         &self,
     ///         _current_job: CurrentJob,
-    ///     ) -> Result<JobCompletion, Box<dyn Error + Send + Sync>> {
+    ///     ) -> Result<JobCompletion, Box<dyn Error>> {
     ///         Ok(JobCompletion::Complete)
     ///     }
     /// }
@@ -986,14 +986,14 @@ impl Jobs {
     /// # impl JobInitializer for MyInitializer {
     /// #     type Config = MyConfig;
     /// #     fn job_type(&self) -> JobType { JobType::new("example") }
-    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error + Send + Sync>> {
+    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
     /// #         Ok(Box::new(MyRunner))
     /// #     }
     /// # }
     /// # struct MyRunner;
     /// # #[async_trait]
     /// # impl JobRunner for MyRunner {
-    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error + Send + Sync>> {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error>> {
     /// #         Ok(JobCompletion::Complete)
     /// #     }
     /// # }
@@ -1052,14 +1052,14 @@ impl Jobs {
     /// # impl JobInitializer for MyInitializer {
     /// #     type Config = MyConfig;
     /// #     fn job_type(&self) -> JobType { JobType::new("example") }
-    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error + Send + Sync>> {
+    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
     /// #         Ok(Box::new(MyRunner))
     /// #     }
     /// # }
     /// # struct MyRunner;
     /// # #[async_trait]
     /// # impl JobRunner for MyRunner {
-    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error + Send + Sync>> {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error>> {
     /// #         Ok(JobCompletion::Complete)
     /// #     }
     /// # }
@@ -1123,14 +1123,14 @@ impl Jobs {
     /// # impl ResidentJobInitializer for MyInitializer {
     /// #     type Config = MyConfig;
     /// #     fn job_type(&self) -> JobType { JobType::new("cleanup") }
-    /// #     fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn Error + Send + Sync>> {
+    /// #     fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn Error>> {
     /// #         Ok(Box::new(MyRunner))
     /// #     }
     /// # }
     /// # struct MyRunner;
     /// # #[async_trait]
     /// # impl ResidentJobRunner for MyRunner {
-    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<ResidentJobCompletion, Box<dyn Error + Send + Sync>> {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<ResidentJobCompletion, Box<dyn Error>> {
     /// #         Ok(ResidentJobCompletion::RescheduleIn(Duration::from_secs(60)))
     /// #     }
     /// # }
