@@ -69,7 +69,7 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use es_entity::errlanes;
-use es_entity::errlanes::{Fault, TransientKind, WidenResult};
+use es_entity::errlanes::{Fault, WidenResult, lanes};
 use rand::{RngExt, rng};
 use tracing::{Span, instrument};
 
@@ -87,38 +87,33 @@ use super::{
     runner::RetrySettings,
 };
 
-/// A runner's failure, classified into an errlanes lane at the job
-/// boundary.
+/// A runner's failure, classified at the job boundary.
 ///
-/// The runner traits return a plain `Box<dyn Error>` -- deliberately NOT
-/// `Send + Sync`, so that every `impl JobRunner` in every consumer keeps
-/// compiling unchanged. That box therefore cannot cross the `.await` that
-/// writes the disposition, nor be stored as a lane payload's source
-/// (`Fatal`/`Transient` hold theirs as `Arc<dyn Error + Send + Sync>` so a
-/// `Fault` can cross a spawn). [`es_entity::errlanes::classify_dyn`] closes
-/// the gap: it only ever *borrows* the box, cloning any lane payload out of
-/// its `source()` chain, and hands back a `Fault`, which is `Send + Sync`
-/// by construction.
+/// The runner traits return a plain `Box<dyn Error>` (not `Send + Sync` --
+/// see the es-entity addendum). `Fault::classify` borrows it, so the box
+/// is classified before the next `.await` and dropped there; the `Fault`
+/// is `Send + Sync` by construction. Job is not an authorization boundary,
+/// so a `Denied` found in the chain is narrowed to `Fatal(Denied)` here:
+/// nobody is on the other end of a job to be told no.
 ///
 /// So: classify at the boundary, before the next `.await`, and let the box
 /// drop there. See `dispatcher.rs::dispatch_job` and
 /// `batch_dispatcher.rs::dispatch_batch`.
 ///
-/// Classification never comes back empty. `classify_dyn` falls back to
+/// Classification never comes back empty. `Fault::classify` falls back to
 /// `Fatal(Dependency)` carrying the error's whole `Display` chain as
 /// context, so a runner that knows nothing of errlanes still arrives as
-/// something an operator can page on -- see [`is_fatal_lane`] for why that
-/// does not, by itself, end the job.
-pub(crate) type RunFailure = Fault;
-
-/// Whether this classification says the job will not succeed on retry.
+/// something an operator can page on -- see `RunFailure::is_fatal` (via
+/// `Laned`/the inherent method) for why that does not, by itself, end the
+/// job.
 ///
-/// **Job does not act on this by default.**
+/// **Job does not act on `is_fatal` by default.**
 /// [`RetrySettings::terminal_on_fatal`] defaults to `false`, so a `Fatal`
-/// or `Denied` runner error is retried on the ordinary attempt-count
-/// policy exactly like a `Transient` one -- while still being *reported*
-/// as fatal on the span (`error.lane`, `error.code`, `exception.message`,
-/// written by `Laned::record` the moment it is classified).
+/// runner error (including a narrowed `Denied`) is retried on the ordinary
+/// attempt-count policy exactly like a `Transient` one -- while still being
+/// *reported* as fatal on the span (`error.lane`, `error.code`,
+/// `exception.message`, written by `Laned::record` the moment it is
+/// classified).
 ///
 /// The split is deliberate: observability should reflect what the runner
 /// said immediately, but acting on it ends a job after one attempt, and we
@@ -126,33 +121,12 @@ pub(crate) type RunFailure = Fault;
 /// job lane their errors. A `Fatal` that is really transient would turn a
 /// blip into a dead job. Until that confidence exists, trusting the lane
 /// that far is opt-in per job type.
-pub(crate) fn is_fatal_lane(failure: &RunFailure) -> bool {
-    !failure.is_transient()
-}
-
-/// Pool-wide congestion carries no evidence that THIS job is broken, so it
-/// routes to the congestion reschedule (`attempt_index` untouched) instead
-/// of `RetryPolicy`'s attempt escalation.
-///
-/// Unlike [`is_fatal_lane`], this lane is trusted by default -- it can only
-/// ever be more forgiving than the ordinary retry path, never less, so a
-/// runner that mislabels something as congestion costs at most a few extra
-/// dispatches (and trips the consecutive-congestion WARN streak), where a
-/// mislabelled `Fatal` would cost the job. It is also what the pre-errlanes
-/// `is_pool_congestion` did for a raw `sqlx::Error::PoolTimedOut`, which
-/// `classify_dyn` still classifies as `Transient(PoolTimeout)`.
-pub(crate) fn is_congestion(failure: &RunFailure) -> bool {
-    matches!(
-        failure,
-        Fault::Transient(t)
-            if matches!(t.kind, TransientKind::PoolTimeout | TransientKind::Congestion)
-    )
-}
+pub(crate) type RunFailure = Fault<lanes!(Transient, Fatal)>;
 
 #[cfg(test)]
 mod run_failure_tests {
     use super::*;
-    use es_entity::errlanes::{Denied, Fatal, FatalKind, Lane, Transient, classify_dyn};
+    use es_entity::errlanes::{Denied, Fatal, FatalKind, Lane, Transient, TransientKind};
     use std::error::Error;
 
     #[derive(Debug)]
@@ -175,7 +149,7 @@ mod run_failure_tests {
         Box::new(e)
     }
 
-    /// A runner that knows nothing of errlanes gets `classify_dyn`'s
+    /// A runner that knows nothing of errlanes gets `Fault::classify`'s
     /// `Fatal(Dependency)` safety default rather than vanishing -- but it
     /// is NOT terminal on its own: `terminal_on_fatal` is `false` by
     /// default, so this still retries per policy, as it did pre-errlanes.
@@ -183,7 +157,8 @@ mod run_failure_tests {
     #[test]
     fn classifies_a_bare_string_as_fatal_dependency_carrying_its_message() {
         let e = boxed(std::io::Error::other("boom"));
-        match classify_dyn(&*e) {
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+        match failure {
             Fault::Fatal(f) => {
                 assert_eq!(f.kind, FatalKind::Dependency);
                 assert_eq!(f.context.as_deref(), Some("boom"));
@@ -198,14 +173,15 @@ mod run_failure_tests {
     /// a laned-payload-only walk would drop it, regressing a runner
     /// returning `Err(Box::new(sqlx::Error::PoolTimedOut))` back to
     /// spending an ordinary retry attempt instead of taking the congestion
-    /// path. `classify_dyn`'s second rule covers it, using errlanes' own
+    /// path. `Fault::classify`'s second rule covers it, using errlanes' own
     /// sqlx table -- job keeps no second copy. See
     /// `tests/pool_congestion.rs::congestion_reschedule_keeps_job_batchable`
     /// for the end-to-end sibling.
     #[test]
     fn classify_detects_congestion_from_a_raw_unlaned_sqlx_pool_timed_out() {
         let e = boxed(sqlx::Error::PoolTimedOut);
-        assert!(is_congestion(&classify_dyn(&*e)));
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+        assert!(failure.is_congestion());
     }
 
     /// The same raw-chain walk classifies the rest of the sqlx table too,
@@ -214,13 +190,15 @@ mod run_failure_tests {
     #[test]
     fn classify_reads_the_rest_of_the_raw_sqlx_table() {
         let connection_lost = boxed(sqlx::Error::Io(std::io::Error::other("conn reset")));
-        match classify_dyn(&*connection_lost) {
+        let failure: RunFailure = Fault::classify(&*connection_lost).narrow_denied();
+        match failure {
             Fault::Transient(t) => assert_eq!(t.kind, TransientKind::ConnectionLost),
             _ => panic!("expected Transient(ConnectionLost)"),
         }
 
         let protocol = boxed(sqlx::Error::Protocol("synthesized".into()));
-        match classify_dyn(&*protocol) {
+        let failure: RunFailure = Fault::classify(&*protocol).narrow_denied();
+        match failure {
             Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Dependency),
             _ => panic!("expected Fatal(Dependency)"),
         }
@@ -240,7 +218,8 @@ mod run_failure_tests {
             FatalKind::Invariant,
             sqlx::Error::PoolTimedOut,
         ));
-        match classify_dyn(&*e) {
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+        match failure {
             Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Invariant),
             _ => panic!("expected the laned Fatal to win over the raw sqlx::Error in its source"),
         }
@@ -249,7 +228,8 @@ mod run_failure_tests {
     #[test]
     fn classifies_a_transient_three_hops_deep() {
         let e = boxed(Wrapped(Wrapped(Transient::new(TransientKind::Deadlock))));
-        match classify_dyn(&*e) {
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+        match failure {
             Fault::Transient(t) => assert_eq!(t.kind, TransientKind::Deadlock),
             _ => panic!("expected Transient, got a different classification"),
         }
@@ -258,16 +238,28 @@ mod run_failure_tests {
     #[test]
     fn classifies_a_fatal() {
         let e = boxed(Fatal::new(FatalKind::CorruptState));
-        match classify_dyn(&*e) {
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+        match failure {
             Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::CorruptState),
             _ => panic!("expected Fatal"),
         }
     }
 
+    /// A `Denied` anywhere in the chain is narrowed at the job boundary:
+    /// job is not an authorization boundary, so there is nobody left to
+    /// tell no. It becomes `Fatal(Denied)`, with the `Denied` as its
+    /// source.
     #[test]
-    fn classifies_a_denied() {
+    fn classifies_a_denied_narrowed_to_fatal_denied() {
         let e = boxed(Denied::default());
-        assert!(matches!(classify_dyn(&*e), Fault::Denied(_)));
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => {
+                assert_eq!(f.kind, FatalKind::Denied);
+                assert!(f.source().unwrap().downcast_ref::<Denied>().is_some());
+            }
+            _ => panic!("expected Fatal(Denied)"),
+        }
     }
 
     /// A boxed `Fail::Rejected(_)` carries no marker type that survives
@@ -280,25 +272,9 @@ mod run_failure_tests {
         use crate::error::{JobError, JobRejection};
         let fail: JobError = JobError::Rejected(JobRejection::TimedOut(crate::JobId::new()));
         let e: Box<dyn Error> = Box::new(fail);
-        let failure = classify_dyn(&*e);
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
         assert!(matches!(failure, Fault::Fatal(_)));
-        assert!(!is_congestion(&failure));
-    }
-
-    #[test]
-    fn pool_timeout_and_congestion_are_congestion_other_kinds_are_not() {
-        assert!(is_congestion(&Fault::Transient(Transient::new(
-            TransientKind::PoolTimeout
-        ))));
-        assert!(is_congestion(&Fault::Transient(Transient::new(
-            TransientKind::Congestion
-        ))));
-        assert!(!is_congestion(&Fault::Transient(Transient::new(
-            TransientKind::Deadlock
-        ))));
-        assert!(!is_congestion(&Fault::Fatal(Fatal::new(
-            FatalKind::Invariant
-        ))));
+        assert!(!failure.is_congestion());
     }
 
     /// Regression for the pre-errlanes bug: `is_pool_congestion` only ever
@@ -311,18 +287,8 @@ mod run_failure_tests {
     #[test]
     fn classify_detects_congestion_from_a_bare_laned_transient_with_no_sqlx_source() {
         let e = boxed(Transient::new(TransientKind::PoolTimeout));
-        assert!(is_congestion(&classify_dyn(&*e)));
-    }
-
-    #[test]
-    fn fatal_and_denied_are_the_fatal_lane_transient_is_not() {
-        assert!(is_fatal_lane(&Fault::Fatal(Fatal::new(
-            FatalKind::Invariant
-        ))));
-        assert!(is_fatal_lane(&Fault::Denied(Denied::default())));
-        assert!(!is_fatal_lane(&Fault::Transient(Transient::new(
-            TransientKind::Deadlock
-        ))));
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+        assert!(failure.is_congestion());
     }
 
     /// The contract this whole boundary exists to keep: a runner error that
@@ -343,7 +309,7 @@ mod run_failure_tests {
         impl Error for NotSend {}
 
         let e: Box<dyn Error> = Box::new(NotSend(std::rc::Rc::new(())));
-        let failure = classify_dyn(&*e);
+        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
         drop(e);
         let lane = std::thread::spawn(move || failure.lane()).join().unwrap();
         assert_eq!(lane, Lane::Fatal);
@@ -404,9 +370,9 @@ const SHARED_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub(crate) enum Disposition {
     /// The job ran to completion: execution row deleted, completion event.
     Complete,
-    /// The job failed with `error` on its `attempt`-th attempt: the type's
-    /// `RetryPolicy` decides between a backoff retry (next `attempt_index`)
-    /// and terminal deletion.
+    /// The job failed with `failure` on its `attempt`-th attempt: the
+    /// type's `RetryPolicy` decides between a backoff retry (next
+    /// `attempt_index`) and terminal deletion.
     ///
     /// `run_duration` is how long the failing execution actually ran, on a
     /// monotonic clock. The retry policy forgives the accumulated attempt
@@ -414,15 +380,11 @@ pub(crate) enum Disposition {
     /// stayed up that long is evidence the job had recovered, whether or not
     /// it ever returned a completion.
     Fail {
-        error: String,
+        /// The classified failure. The entity reads its lane for the
+        /// `terminal_on_fatal` decision and narrows it on exhaustion.
+        failure: RunFailure,
         attempt: u32,
         run_duration: std::time::Duration,
-        /// `is_fatal_lane()` for the error that produced this disposition:
-        /// `true` for `Fatal`/`Denied`. Sends the job terminal on THIS
-        /// attempt only when `RetryPolicy::terminal_on_fatal` opts in;
-        /// otherwise it takes the ordinary attempt-count path like any
-        /// other failure.
-        terminal: bool,
     },
     /// Back to `pending` at `at` with `attempt_index = 1`: a
     /// runner-requested reschedule or a rescue.
@@ -806,18 +768,16 @@ impl Finalizer {
                     congestion_streaks.insert(*id, streak);
                 }
                 Disposition::Fail {
-                    error,
+                    failure,
                     attempt,
                     run_duration,
-                    terminal,
                 } => {
                     match job.maybe_schedule_retry(
                         now,
                         *attempt,
                         *run_duration,
                         &retry_policy,
-                        error.clone(),
-                        *terminal,
+                        failure,
                     ) {
                         Some((reschedule_at, next_attempt)) => {
                             retry_uuids.push(uuid::Uuid::from(*id));
@@ -1216,7 +1176,7 @@ mod tests {
 
 /// End-to-end regression for the dead abort-retry bug: before errlanes
 /// adoption, `JobError` was a `thiserror` enum whose `Sqlx` variant wrapped
-/// a raw `sqlx::Error` opaquely, so `lane_of`/`e.is_transient()` could never
+/// a raw `sqlx::Error` opaquely, so `Lane::of`/`e.is_transient()` could never
 /// classify a deadlock/serialization abort on the finalizer's OWN
 /// disposition write, and `Finalizer::finalize`'s abort-retry guard
 /// (`finalize`, phase 1b) never fired. Now `sqlx::Error` converts through

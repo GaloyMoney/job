@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use es_entity::errlanes;
-use es_entity::errlanes::{Fatal, FatalKind, Laned};
+use es_entity::errlanes::{Fatal, FatalKind, Fault, Laned, Transient, TransientKind};
 use futures::FutureExt;
 use tracing::Span;
 
@@ -26,10 +26,7 @@ use super::{
     },
     entity::JobType,
     error::JobError,
-    finalizer::{
-        ClaimDisposition, Disposition, FinalizeOutcome, Finalizer, RunFailure, is_congestion,
-        is_fatal_lane,
-    },
+    finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer, RunFailure},
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -299,7 +296,7 @@ impl BatchDispatcher {
                 // field.
                 span.record(
                     "conclusion",
-                    if is_congestion(&e) {
+                    if e.is_congestion() {
                         "Congestion"
                     } else {
                         "Error"
@@ -412,7 +409,7 @@ impl BatchDispatcher {
             Ok(Err(e)) => {
                 // Classified here, while the box is still borrowable and
                 // before the next `.await`: see `RunFailure`.
-                let failure = errlanes::classify_dyn(&*e);
+                let failure: RunFailure = Fault::classify(&*e).narrow_denied();
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -432,7 +429,7 @@ impl BatchDispatcher {
                     "Batched job panicked during execution"
                 );
 
-                let failure = RunFailure::Fatal(Fatal::new(FatalKind::Panic).with_context(message));
+                let failure: RunFailure = Fatal::new(FatalKind::Panic).with_context(message).into();
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -514,14 +511,15 @@ impl BatchDispatcher {
         let mut seen: HashSet<JobId> = HashSet::with_capacity(outcomes.len());
         for (id, _) in outcomes {
             if !expected.contains(id) {
-                return Err(RunFailure::Fatal(Fatal::invariant(format!(
+                return Err(Fatal::invariant(format!(
                     "outcome returned for job {id}, which is not part of the batch"
-                ))));
+                ))
+                .into());
             }
             if !seen.insert(*id) {
-                return Err(RunFailure::Fatal(Fatal::invariant(format!(
-                    "duplicate outcome returned for job {id}"
-                ))));
+                return Err(
+                    Fatal::invariant(format!("duplicate outcome returned for job {id}")).into(),
+                );
             }
         }
         if seen.len() != expected.len() {
@@ -530,10 +528,11 @@ impl BatchDispatcher {
                 .map(|id| id.to_string())
                 .collect();
             missing.sort();
-            return Err(RunFailure::Fatal(Fatal::invariant(format!(
+            return Err(Fatal::invariant(format!(
                 "no outcome returned for job(s): {}",
                 missing.join(", ")
-            ))));
+            ))
+            .into());
         }
         Ok(())
     }
@@ -593,13 +592,16 @@ impl BatchDispatcher {
                     BatchItemOutcome::RescheduleAt(t) => Disposition::Fresh { at: t },
                     // A per-item `BatchItemOutcome::Fail` is a plain string
                     // the runner chose to report -- no lane payload travels
-                    // with it, so it is never terminal on its own; it goes
-                    // through the ordinary attempt-count retry path.
+                    // with it, so it is laned as `Transient(Other)` so it can
+                    // never be terminal on its own regardless of
+                    // `terminal_on_fatal`; it goes through the ordinary
+                    // attempt-count retry path.
                     BatchItemOutcome::Fail(reason) => Disposition::Fail {
-                        error: reason,
+                        failure: Transient::new(TransientKind::Other)
+                            .with_context(reason)
+                            .into(),
                         attempt: self.attempts.get(&id).copied().unwrap_or(1),
                         run_duration: self.run_duration,
-                        terminal: false,
                     },
                 };
                 (id, disposition)
@@ -623,7 +625,7 @@ impl BatchDispatcher {
     /// rescheduled for another attempt while others exhaust their attempts
     /// and become terminal, all in the same transaction.
     ///
-    /// A `finalizer::is_congestion()` error is routed to the finalizer's
+    /// A `failure.is_congestion()` error is routed to the finalizer's
     /// congestion reschedule instead of the retry-policy path: congestion carries no
     /// evidence any of these jobs is broken, so applying `RetryPolicy`'s
     /// attempt escalation to it would walk perfectly good jobs toward
@@ -639,19 +641,17 @@ impl BatchDispatcher {
         fields(job_type = %self.job_type, n_items = self.ids.len(),
                n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
     )]
-    async fn fail_batch(&mut self, error: RunFailure) -> Result<(), JobError> {
+    async fn fail_batch(&mut self, failure: RunFailure) -> Result<(), JobError> {
         let span = tracing::Span::current();
-        error.record(&span);
-        if is_congestion(&error) {
+        failure.record(&span);
+        if failure.is_congestion() {
             self.rescheduled = true;
-            let message = error.to_string();
+            let message = failure.message();
             return self
                 .finalizer
                 .reschedule_congested(&self.ids, &self.attempts, message)
                 .await;
         }
-        let terminal = is_fatal_lane(&error);
-        let message = error.to_string();
         let items: Vec<(JobId, Disposition)> = self
             .ids
             .iter()
@@ -659,10 +659,9 @@ impl BatchDispatcher {
                 (
                     *id,
                     Disposition::Fail {
-                        error: message.clone(),
+                        failure: failure.clone(),
                         attempt: self.attempts.get(id).copied().unwrap_or(1),
                         run_duration: self.run_duration,
-                        terminal,
                     },
                 )
             })

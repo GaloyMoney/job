@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use es_entity::errlanes;
-use es_entity::errlanes::{Fatal, FatalKind, Laned};
+use es_entity::errlanes::{Fatal, FatalKind, Fault, Laned};
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
 use tracing::Span;
@@ -16,9 +16,7 @@ use super::{
     current::CurrentJob,
     entity::{Job, JobType},
     error::JobError,
-    finalizer::{
-        ClaimDisposition, Disposition, Finalizer, RunFailure, is_congestion, is_fatal_lane,
-    },
+    finalizer::{ClaimDisposition, Disposition, Finalizer, RunFailure},
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -231,7 +229,7 @@ impl JobDispatcher {
                 Err(e) => {
                     span.record(
                         "conclusion",
-                        if is_congestion(&e) {
+                        if e.is_congestion() {
                             "Congestion"
                         } else {
                             "Error"
@@ -394,7 +392,7 @@ impl JobDispatcher {
             Ok(Err(e)) => {
                 // Classified here, while the box is still borrowable and
                 // before the next `.await`: see `RunFailure`.
-                let failure = errlanes::classify_dyn(&*e);
+                let failure: RunFailure = Fault::classify(&*e).narrow_denied();
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -414,7 +412,7 @@ impl JobDispatcher {
                     "Job panicked during execution"
                 );
 
-                let failure = RunFailure::Fatal(Fatal::new(FatalKind::Panic).with_context(message));
+                let failure: RunFailure = Fatal::new(FatalKind::Panic).with_context(message).into();
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -435,7 +433,7 @@ impl JobDispatcher {
     async fn fail_job(
         &mut self,
         id: JobId,
-        error: RunFailure,
+        failure: RunFailure,
         attempt: u32,
         run_duration: std::time::Duration,
     ) -> Result<(), JobError> {
@@ -443,26 +441,23 @@ impl JobDispatcher {
         span.record("job_id", tracing::field::display(id));
         span.record("job_type", tracing::field::display(&self.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
-        error.record(&span);
+        failure.record(&span);
 
-        if is_congestion(&error) {
+        if failure.is_congestion() {
             self.rescheduled = true;
-            let message = error.to_string();
+            let message = failure.message();
             return self
                 .finalizer
                 .reschedule_congested_one(id, attempt, message)
                 .await;
         }
-        let terminal = is_fatal_lane(&error);
-        let error_str = error.to_string();
 
         let items = [(
             id,
             Disposition::Fail {
-                error: error_str,
+                failure,
                 attempt,
                 run_duration,
-                terminal,
             },
         )];
         let finalizer = self.finalizer.clone();
