@@ -284,11 +284,12 @@ impl JobRegistry {
             // An initializer's error cannot become this `Fatal`'s source
             // (`init` returns a plain `Box<dyn Error>`, which is not
             // `Send + Sync`), so its whole `Display` chain is folded into
-            // the context instead -- the same trade `classify_dyn` makes at
-            // the runner boundary.
+            // the context instead -- the same trade `Fault::classify` makes
+            // at the runner boundary. `Config` is right here: an initializer
+            // that cannot build its runner from the job's config is a
+            // configuration failure, not a narrowed lane.
             .map_err(|e| {
-                es_entity::errlanes::Fatal::new(es_entity::errlanes::FatalKind::Config)
-                    .with_context(es_entity::errlanes::message_chain(&*e))
+                es_entity::errlanes::Fatal::from_dyn(es_entity::errlanes::FatalKind::Config, &*e)
                     .into()
             })
     }
@@ -336,11 +337,12 @@ impl JobRegistry {
             // An initializer's error cannot become this `Fatal`'s source
             // (`init` returns a plain `Box<dyn Error>`, which is not
             // `Send + Sync`), so its whole `Display` chain is folded into
-            // the context instead -- the same trade `classify_dyn` makes at
-            // the runner boundary.
+            // the context instead -- the same trade `Fault::classify` makes
+            // at the runner boundary. `Config` is right here: an initializer
+            // that cannot build its runner from the job's config is a
+            // configuration failure, not a narrowed lane.
             .map_err(|e| {
-                es_entity::errlanes::Fatal::new(es_entity::errlanes::FatalKind::Config)
-                    .with_context(es_entity::errlanes::message_chain(&*e))
+                es_entity::errlanes::Fatal::from_dyn(es_entity::errlanes::FatalKind::Config, &*e)
                     .into()
             })
     }
