@@ -1,3 +1,40 @@
+# Unreleased
+
+### Breaking
+
+- [**breaking**] `RetrySettings::retry_fatal` is replaced by `RetrySettings::terminal_on_fatal`,
+  with the inverse meaning and a changed default disposition. A runner error classified `Fatal` or
+  `Denied` is now **retried on the ordinary attempt-count policy by default**, as every failure was
+  before `job` adopted errlanes; set `terminal_on_fatal: true` on a job type to end the job on the
+  attempt that produced it. The lane is recorded on the span (`error.lane`, `error.code`,
+  `exception.message`) either way -- reporting the lane and acting on it are now separate, so a
+  `Fatal` that is really transient cannot turn a blip into a dead job before there is live
+  experience with how faithfully upstream crates lane their errors. Resident types force it off.
+- [**breaking**] `JobError` is now `Fail<JobRejection, lanes!(Transient, Fatal)>` -- an `errlanes`
+  carrier rather than a hand-rolled enum. Rejections match as
+  `Err(Fail::Rejected(JobRejection::TimedOut(id)))`; infrastructure failures carry a `Transient` or
+  `Fatal` lane.
+- Span fields on `job.execute_job` / `job.fail_job` / `job.execute_batch` / `job.fail_batch` and
+  friends follow errlanes: `error`, `error.lane`, `error.code`, `error.level`,
+  `exception.message`, `exception.type`. `error.message` is gone, replaced by `exception.message`.
+
+### Features
+
+- A runner's boxed error is classified once at the job boundary by `errlanes::classify_dyn`: a lane
+  payload anywhere in its `source()` chain, else the first `sqlx::Error` in the chain read through
+  errlanes' own table, else `Fatal(Dependency)` carrying the whole `Display` chain. An error from a
+  runner that knows nothing of errlanes is therefore reported rather than silently unclassified.
+- Runner traits keep `Box<dyn std::error::Error>` -- **no** `Send + Sync` bound. `classify_dyn`
+  borrows the error and clones the lane out, so no existing `impl JobRunner` needs to change.
+
+### Bug Fixes
+
+- A pool timeout from a runner built on errlanes (an already-laned
+  `Transient(PoolTimeout)` with no `sqlx::Error` source) now takes the congestion-reschedule path
+  instead of spending a retry attempt; the pre-errlanes check only matched a raw `sqlx::Error`.
+- `JobRegistry::add_resident_initializer` forces the non-terminal disposition alongside
+  `n_attempts: None`, so a resident job returning `Fatal` is rescheduled rather than terminated.
+
 # [job release v0.16.1](https://github.com/GaloyMoney/job/releases/tag/0.16.1)
 
 
