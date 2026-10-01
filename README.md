@@ -48,7 +48,7 @@ impl JobInitializer for MyJobInitializer {
         JobType::new("my_job")
     }
 
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: MyJobConfig = job.config()?;
         Ok(Box::new(MyJobRunner { config }))
     }
@@ -64,7 +64,7 @@ impl JobRunner for MyJobRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Simulate some work
         tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
         println!("Job completed!");
@@ -160,7 +160,7 @@ impl JobInitializer for TenantJobInitializer {
         self.job_type.clone()  // From instance, not hardcoded
     }
 
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         // ...
     }
 }
@@ -229,9 +229,19 @@ When fully enabled, all spawned tasks will have descriptive names like `job-poll
 ## Telemetry
 
 `job` emits structured telemetry via [`tracing`](https://docs.rs/tracing) spans such as `job.poll_jobs`,
-`job.fail_job`, and `job.complete_job`. Failed attempts push fields like `error`, `error.message`,
-`error.level`, and `will_retry`, so you can stream the events into your existing observability pipeline
-without wrapping the runner in additional logging.
+`job.fail_job`, and `job.complete_job`. `JobError` and a runner's own boxed error are both classified
+through [`errlanes`](https://github.com/GaloyMoney/es-entity/tree/main/errlanes) lanes (`Transient`,
+`Fatal`, `Denied`, or an unclassified fallback), and `#[es_entity::errlanes::instrument]` records that
+classification as six span fields -- `error`, `error.lane`, `error.code`, `error.level`,
+`exception.message`, and `exception.type` -- plus `will_retry`, so you can stream the events into your
+existing observability pipeline without wrapping the runner in additional logging.
+
+A runner error is classified once, at the job boundary: a `Fatal` or `Denied` goes terminal on the
+attempt that produced it (see `RetrySettings::retry_fatal` below for the migration opt-out); a
+`Transient` goes through the ordinary retry policy, except `PoolTimeout`/`Congestion`, which reschedule
+without spending a retry attempt; anything the chain carries no lane payload for (including a runner's
+own boxed `Rejected` outcome, which cannot be told apart from an unlaned error once erased) falls back
+to the pre-errlanes behaviour of an ordinary attempt-count retry.
 
 The [`RetrySettings`](https://docs.rs/job/latest/job/struct.RetrySettings.html) that you configure for each
 [`JobInitializer`](https://docs.rs/job/latest/job/trait.JobInitializer.html) directly influence that
@@ -241,6 +251,7 @@ telemetry:
 - `n_warn_attempts` controls how many consecutive failures remain `WARN` level events before the crate promotes them to `ERROR`. Setting it to `None` keeps every retry at `WARN`.
 - `min_backoff`, `max_backoff`, and `backoff_jitter_pct` determine the delay that is recorded in the `job.fail_job` span before the next retry is scheduled.
 - `attempt_reset_after_healthy_run` lets a job be considered healthy again once a single execution has run for at least that long before failing (measured on a monotonic clock over the run itself, so neither an application-clock advance nor scheduler latency can satisfy it); the dispatcher resets the reported attempt counter accordingly. `None` disables forgiveness, and the counter then only ever resets on a completion.
+- `retry_fatal` (default `false`) sends a `Fatal`/`Denied` runner error through the ordinary attempt-count retry instead of going terminal on the attempt that produced it -- a migration escape hatch for a type whose downstream still returns `Fatal` (`Invariant`/`NotFound`, typically) for rows that are merely not yet visible.
 
 Together these make the emitted telemetry reflect both the severity and cadence of retryable failures, which is especially helpful when wiring the crate into alerting systems.
 
