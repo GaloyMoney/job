@@ -15,8 +15,8 @@ mod helpers;
 use async_trait::async_trait;
 use es_entity::errlanes::{Denied, Fatal, FatalKind, Transient, TransientKind};
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSvcConfig,
-    JobTerminalState, JobType, Jobs, ResidentJobCompletion, ResidentJobInitializer,
+    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobStatus,
+    JobSvcConfig, JobTerminalState, JobType, Jobs, ResidentJobCompletion, ResidentJobInitializer,
     ResidentJobRunner, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
@@ -219,7 +219,7 @@ async fn fatal_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Re
 }
 
 /// A plain, unlaned string error (no errlanes payload anywhere in its
-/// chain) gets `classify_dyn`'s `Fatal(Dependency)` default -- reported as
+/// chain) gets `Fault::classify`'s `Fatal(Dependency)` default -- reported as
 /// fatal on the span, so it is visible -- and still takes the pre-errlanes
 /// behaviour of an ordinary attempt-count retry, because `terminal_on_fatal`
 /// is off. Reporting the lane and acting on it are separate.
@@ -321,9 +321,11 @@ async fn panicking_runner_errors_after_spending_its_retry_budget() -> anyhow::Re
     Ok(())
 }
 
-/// A `Denied` runner error takes the ordinary retry path by default,
-/// same as `Fatal`: `terminal_on_fatal` gates both lanes together.
-/// The span-assertion half of this (`job.fail_job`'s `error.lane`/
+/// A `Denied` runner error arrives as `Fatal(Denied)` (narrowed at the job
+/// boundary, since job is not an authorization boundary) and takes the
+/// ordinary retry path by default, same as any other `Fatal`:
+/// `terminal_on_fatal` gates it. The span-assertion half of this
+/// (`job.fail_job`'s `error.lane`/
 /// `error.code`) lives in `tests/lanes_denied_span.rs`: `tracing`'s
 /// per-callsite interest cache is process-wide, so a `set_default`
 /// subscriber trick like `span_capture` is only reliable isolated in its
@@ -367,7 +369,8 @@ async fn denied_runner_error_retries_by_default() -> anyhow::Result<()> {
 }
 
 /// The same always-`Denied` runner with `terminal_on_fatal: true`: the
-/// job ends on the attempt that produced it, exactly as for `Fatal`.
+/// job ends on the attempt that produced it, exactly as for any other
+/// `Fatal` (the narrowed `Denied` IS a `Fatal` by the time this gates it).
 #[tokio::test]
 async fn denied_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Result<()> {
     let (mut jobs, _pool, job_type) = start("lanes-denied-terminal").await?;
@@ -507,7 +510,7 @@ async fn resident_job_returning_fatal_is_rescheduled_not_terminated() -> anyhow:
 /// PoolTimeout)` directly (no `sqlx::Error` anywhere in its chain -- the
 /// shape any errlanes-based runner produces) must take the congestion-
 /// reschedule path end to end, not just be labelled congestion by
-/// `classify_dyn` in isolation: `attempt_index` stays unchanged
+/// `Fault::classify` in isolation: `attempt_index` stays unchanged
 /// across the failure and the retry, and the job still completes.
 #[tokio::test]
 async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to_end()
@@ -593,6 +596,90 @@ async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to
         vec![1, 1],
         "attempt_index must stay unchanged across the congestion reschedule, got {seen:?}"
     );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// On exhaustion the entity narrows the failure itself (`Job::
+/// maybe_schedule_retry` -> `narrow_transient`) before persisting it: the
+/// stored error says the job was retried to exhaustion, not just that it
+/// last saw one more ordinary transient like every attempt before it.
+#[tokio::test]
+async fn exhausted_transient_is_persisted_as_fatal_exhausted() -> anyhow::Result<()> {
+    let (mut jobs, _pool, job_type) = start("lanes-exhausted-transient").await?;
+    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
+        job_type,
+        retry: RetrySettings {
+            n_attempts: Some(2),
+            min_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+            ..Default::default()
+        },
+        attempts: Arc::new(Mutex::new(Vec::new())),
+        build_error: || {
+            Box::new(Transient::new(TransientKind::Other)) as Box<dyn std::error::Error>
+        },
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    spawner.spawn(id, Cfg).await?;
+    let outcome = jobs
+        .handle(id)
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+
+    match jobs.handle(id).load().await?.state() {
+        JobStatus::Errored { error, .. } => {
+            assert!(
+                error.starts_with("fatal(exhausted): exhausted after 2 attempts: transient(other)"),
+                "expected the exhausted wrapper naming the attempt count and the last \
+                 transient, got {error:?}"
+            );
+        }
+        other => panic!("expected Errored, got {other:?}"),
+    }
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A `Fatal` that ends the job on its own attempt (`terminal_on_fatal:
+/// true`) is persisted as its own message with no wrapper: `narrow_transient`
+/// is only ever applied on the attempt-count exhaustion path, never here.
+#[tokio::test]
+async fn fatal_runner_error_is_persisted_as_its_own_message() -> anyhow::Result<()> {
+    let (mut jobs, _pool, job_type) = start("lanes-fatal-persisted-message").await?;
+    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
+        job_type,
+        retry: RetrySettings {
+            n_attempts: Some(30),
+            min_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+            terminal_on_fatal: true,
+            ..Default::default()
+        },
+        attempts: Arc::new(Mutex::new(Vec::new())),
+        build_error: || Box::new(Fatal::invariant("bad")) as Box<dyn std::error::Error>,
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    spawner.spawn(id, Cfg).await?;
+    let outcome = jobs
+        .handle(id)
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    assert_eq!(outcome.state(), JobTerminalState::Errored);
+
+    match jobs.handle(id).load().await?.state() {
+        JobStatus::Errored { error, .. } => {
+            assert_eq!(error, "fatal(invariant): bad");
+        }
+        other => panic!("expected Errored, got {other:?}"),
+    }
 
     jobs.shutdown().await?;
     Ok(())

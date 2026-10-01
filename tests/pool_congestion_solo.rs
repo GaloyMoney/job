@@ -1,5 +1,5 @@
 //! Live-PG coverage for the pool-congestion classification
-//! (`finalizer::is_congestion`,
+//! (`RunFailure::is_congestion`,
 //! `Finalizer::reschedule_congested`) on the single-job (non-batched)
 //! path.
 //!

@@ -1,7 +1,10 @@
 //! Span-assertion half of the `Denied` disposition coverage (see
 //! `tests/lanes.rs::denied_runner_error_goes_terminal_with_terminal_on_fatal`
-//! for the disposition half): `job.fail_job`'s span must record `error.lane =
-//! "denied"` / `error.code = "FORBIDDEN"` on a `Denied` runner error.
+//! for the disposition half): job narrows a `Denied` runner error to
+//! `Fatal(Denied)` at the boundary (job is not an authorization boundary --
+//! see the handoff's §2.4), so `job.fail_job`'s span must record
+//! `error.lane = "fatal"` / `error.code = "denied"`, not `"denied"`/
+//! `"FORBIDDEN"`.
 //!
 //! Deliberately its own file/binary, not a test function alongside the rest
 //! of `tests/lanes.rs`. `tracing`'s per-callsite "interest" cache is
@@ -87,7 +90,7 @@ impl JobInitializer for AlwaysDeniedInitializer {
 }
 
 #[tokio::test]
-async fn denied_runner_error_records_error_lane_denied_on_fail_job_span() -> anyhow::Result<()> {
+async fn denied_runner_error_is_recorded_as_fatal_denied_on_fail_job_span() -> anyhow::Result<()> {
     let (fields, _guard) = span_capture::install();
 
     let pool = helpers::init_pool().await?;
@@ -112,14 +115,28 @@ async fn denied_runner_error_records_error_lane_denied_on_fail_job_span() -> any
 
     assert_eq!(
         fields.get("job.fail_job", "error.lane").as_deref(),
-        Some("denied"),
-        "job.fail_job span should record error.lane = denied; captured: {}",
+        Some("fatal"),
+        "job.fail_job span should record error.lane = fatal (a Denied is narrowed at \
+         the job boundary); captured: {}",
         fields.debug_dump()
     );
     assert_eq!(
         fields.get("job.fail_job", "error.code").as_deref(),
-        Some("FORBIDDEN"),
-        "job.fail_job span should record error.code = FORBIDDEN"
+        Some("denied"),
+        "job.fail_job span should record error.code = denied"
+    );
+    assert_eq!(
+        fields.get("job.fail_job", "error.level").as_deref(),
+        Some("ERROR"),
+        "job.fail_job span should record error.level = ERROR"
+    );
+    let message = fields
+        .get("job.fail_job", "exception.message")
+        .unwrap_or_default();
+    assert!(
+        message.starts_with("fatal(denied): denied"),
+        "job.fail_job span's exception.message should start with the narrowed Denied's \
+         Display; captured: {message:?}"
     );
 
     jobs.shutdown().await?;
