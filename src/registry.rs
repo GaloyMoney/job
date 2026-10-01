@@ -28,7 +28,7 @@ pub(crate) trait AnyJobInitializer: Send + Sync + 'static {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 impl<T: JobInitializer> AnyJobInitializer for T {
@@ -39,7 +39,7 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         // Fan-out spawns made from WITHIN a running job's own runner take
         // the ordinary insert path: this handle is never populated, since
         // `dispatch_job` has no `Arc<JobPoller>` to hand it here. The router
@@ -92,7 +92,7 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         // Always-empty handle: fan-out spawns of further generations made
         // from WITHIN a running keyed job's own runner take the ordinary
         // insert path, same as the plain and batched fan-out cases above.
@@ -127,7 +127,7 @@ impl<I: ResidentJobInitializer> AnyJobInitializer for ErasedResidentInitializer<
         _router: Arc<JobNotificationRouter>,
         _clock: ClockHandle,
         _notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let runner = ResidentJobInitializer::init(&self.0, job)?;
         Ok(Box::new(ResidentRunnerAdapter(runner)))
     }
@@ -265,9 +265,17 @@ impl JobRegistry {
     ) -> Result<Box<dyn JobRunner>, JobError> {
         self.initializers
             .get(&job.job_type)
-            .ok_or(JobError::NoInitializerPresent)?
+            .ok_or_else(|| {
+                JobError::from(es_entity::errlanes::Fatal::invariant(format!(
+                    "no initializer registered for job type {}",
+                    job.job_type
+                )))
+            })?
             .init(job, repo, router, clock, notifier)
-            .map_err(|e| JobError::JobInitError(e.to_string()))
+            .map_err(|e| {
+                es_entity::errlanes::Fatal::from_boxed(es_entity::errlanes::FatalKind::Config, e)
+                    .into()
+            })
     }
 
     /// Whether this type keeps its execution state past terminal. True only
@@ -304,9 +312,16 @@ impl JobRegistry {
     ) -> Result<Box<dyn AnyBatchedJobRunner>, JobError> {
         self.batched_initializers
             .get(job_type)
-            .ok_or(JobError::NoInitializerPresent)?
+            .ok_or_else(|| {
+                JobError::from(es_entity::errlanes::Fatal::invariant(format!(
+                    "no initializer registered for job type {job_type}"
+                )))
+            })?
             .init_erased(repo, router, clock, notifier)
-            .map_err(|e| JobError::JobInitError(e.to_string()))
+            .map_err(|e| {
+                es_entity::errlanes::Fatal::from_boxed(es_entity::errlanes::FatalKind::Config, e)
+                    .into()
+            })
     }
 
     /// Retrieve retry settings for a given job type.
@@ -376,7 +391,7 @@ mod tests {
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
             unimplemented!("never invoked by this test")
         }
     }
@@ -405,7 +420,7 @@ mod tests {
             _: JobSpawner<Self::Config>,
         ) -> Result<
             Box<dyn crate::BatchedJobRunner<Config = Self::Config>>,
-            Box<dyn std::error::Error>,
+            Box<dyn std::error::Error + Send + Sync>,
         > {
             unimplemented!("never invoked by this test")
         }

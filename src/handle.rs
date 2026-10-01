@@ -289,9 +289,13 @@ impl JobHandle {
     )]
     pub async fn execution_state<S: DeserializeOwned>(&self) -> Result<Option<S>, JobError> {
         match self.repo.execution_state_json_by_id(self.id).await? {
-            Some(json) => serde_json::from_value(json)
-                .map(Some)
-                .map_err(JobError::CouldNotDeserializeExecutionState),
+            Some(json) => serde_json::from_value(json).map(Some).map_err(|e| {
+                es_entity::errlanes::Fatal::from_error(
+                    es_entity::errlanes::FatalKind::CorruptState,
+                    e,
+                )
+                .into()
+            }),
             None => Ok(None),
         }
     }
@@ -323,7 +327,7 @@ impl JobHandle {
     pub async fn await_completion(&self, timeout: Duration) -> Result<JobOutcome, JobError> {
         tokio::time::timeout(timeout, self.wait_for_outcome())
             .await
-            .map_err(|_| JobError::TimedOut(self.id))?
+            .map_err(|_| JobError::Rejected(crate::error::JobRejection::TimedOut(self.id)))?
     }
 
     /// Unbounded wait shared by [`Self::await_completion`] and
@@ -337,15 +341,16 @@ impl JobHandle {
         // before `Jobs::start_poll` is a `RouterNotStarted` error, not a
         // panic. Registering before the find is race-free: the waiter
         // manager checks the DB for already-terminal jobs at registration.
-        let rx = self
-            .router
-            .try_wait_for_terminal(self.id)
-            .ok_or(JobError::RouterNotStarted)?;
+        let rx = self.router.try_wait_for_terminal(self.id).ok_or_else(|| {
+            JobError::from(es_entity::errlanes::Fatal::invariant(
+                "await called before Jobs::start_poll",
+            ))
+        })?;
         // Fail fast if the job doesn't exist — avoids a silent park in the
         // waiter manager for a JobId that will never resolve.
         self.repo.find_by_id(self.id).await?;
         rx.await
-            .map_err(|_| JobError::AwaitCompletionShutdown(self.id))
+            .map_err(|_| JobError::Rejected(crate::error::JobRejection::AwaitInterrupted(self.id)))
     }
 }
 
@@ -450,11 +455,11 @@ impl JobHandles {
 
         let mut rxs = Vec::with_capacity(ids.len());
         for id in &ids {
-            rxs.push(
-                router
-                    .try_wait_for_terminal(*id)
-                    .ok_or(JobError::RouterNotStarted)?,
-            );
+            rxs.push(router.try_wait_for_terminal(*id).ok_or_else(|| {
+                JobError::from(es_entity::errlanes::Fatal::invariant(
+                    "await called before Jobs::start_poll",
+                ))
+            })?);
         }
 
         for chunk in ids.chunks(AWAIT_ALL_CHUNK) {
@@ -470,10 +475,12 @@ impl JobHandles {
 
         let received = tokio::time::timeout(timeout, futures::future::join_all(rxs))
             .await
-            .map_err(|_| JobError::TimedOut(first_id))?;
+            .map_err(|_| JobError::Rejected(crate::error::JobRejection::TimedOut(first_id)))?;
         ids.iter()
             .zip(received)
-            .map(|(id, r)| r.map_err(|_| JobError::AwaitCompletionShutdown(*id)))
+            .map(|(id, r): (&JobId, _)| {
+                r.map_err(|_| JobError::Rejected(crate::error::JobRejection::AwaitInterrupted(*id)))
+            })
             .collect()
     }
 

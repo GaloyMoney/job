@@ -68,10 +68,13 @@
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes;
+use es_entity::errlanes::{Denied, Fatal, Lane, Transient, TransientKind, WidenResult};
 use rand::{RngExt, rng};
 use tracing::{Span, instrument};
 
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::sync::{Arc, Weak};
 
 use super::{
@@ -84,6 +87,209 @@ use super::{
     repo::JobRepo,
     runner::RetrySettings,
 };
+
+/// Classification of a runner's boxed error at the job boundary: the lane
+/// walked out of its `source()` chain via `transient_of`/`fatal_of`/
+/// `denied_of`, or `Unclassified` when none is found -- including a boxed
+/// `Fail::Rejected(_)`, which carries no marker type that survives erasure
+/// and so cannot be told apart from an ordinary unlaned error. Unclassified
+/// safely falls back to the pre-errlanes behaviour (retry per policy)
+/// rather than risk misclassifying a rejection as transient or fatal.
+pub(crate) enum RunFailure {
+    Transient(Transient),
+    Fatal(Fatal),
+    Denied(Denied),
+    Unclassified(Box<dyn Error + Send + Sync>),
+}
+
+impl RunFailure {
+    /// Walks `error`'s `source()` chain for a lane payload -- transient,
+    /// then fatal, then denied (the same precedence errlanes' own dynamic
+    /// lane lookup uses) -- cloning it out so the box can be dropped. Does
+    /// not record onto any span; call [`Self::record`] separately once this
+    /// classification is final.
+    pub(crate) fn classify(error: Box<dyn Error + Send + Sync>) -> Self {
+        if let Some(t) = errlanes::transient_of(error.as_ref()) {
+            return Self::Transient(t.clone());
+        }
+        if let Some(f) = errlanes::fatal_of(error.as_ref()) {
+            return Self::Fatal(f.clone());
+        }
+        if let Some(d) = errlanes::denied_of(error.as_ref()) {
+            return Self::Denied(d.clone());
+        }
+        Self::Unclassified(error)
+    }
+
+    /// Whether this classification will not succeed on retry -- `Fatal` or
+    /// `Denied` -- and so should go terminal on the attempt that produced
+    /// it (see `RetrySettings::retry_fatal` for the migration opt-out).
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self, Self::Fatal(_) | Self::Denied(_))
+    }
+
+    /// Pool-wide congestion carries no evidence this job is broken, so it
+    /// routes to the congestion reschedule instead of `RetryPolicy`'s
+    /// attempt escalation.
+    pub(crate) fn is_congestion(&self) -> bool {
+        matches!(
+            self,
+            Self::Transient(t)
+                if matches!(t.kind, TransientKind::PoolTimeout | TransientKind::Congestion)
+        )
+    }
+
+    /// The message persisted on `JobEvent::ExecutionErrored`/
+    /// `CongestionRescheduled` and shown in logs.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Transient(t) => t.to_string(),
+            Self::Fatal(f) => f.to_string(),
+            Self::Denied(d) => d.to_string(),
+            Self::Unclassified(e) => e.to_string(),
+        }
+    }
+
+    /// Records the errlanes span fields (`error`, `error.lane`,
+    /// `error.code`, `error.level`, `exception.message`, `exception.type`)
+    /// onto `span`. Separate from [`Self::classify`] so a caller can record
+    /// onto more than one span (the parent `job.execute_job`/
+    /// `job.execute_batch` span via the call in [`Self::classify`]'s
+    /// caller, and the nested `job.fail_job`/`job.fail_batch` span).
+    pub(crate) fn record(&self, span: &Span) {
+        span.record("error", true);
+        match self {
+            Self::Transient(t) => {
+                span.record("error.lane", Lane::Transient.as_str());
+                span.record("error.code", t.kind.as_str());
+                span.record("error.level", "INFO");
+                span.record("exception.message", t.to_string());
+            }
+            Self::Fatal(f) => {
+                span.record("error.lane", Lane::Fatal.as_str());
+                span.record("error.code", f.kind.as_str());
+                span.record("error.level", "ERROR");
+                span.record("exception.message", f.to_string());
+                span.record("exception.type", f.kind.as_str());
+            }
+            Self::Denied(_) => {
+                span.record("error.lane", Lane::Denied.as_str());
+                span.record("error.code", "FORBIDDEN");
+                span.record("error.level", "WARN");
+            }
+            Self::Unclassified(e) => {
+                span.record("exception.message", e.to_string());
+                span.record("exception.type", std::any::type_name_of_val(e.as_ref()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_failure_tests {
+    use super::*;
+    use es_entity::errlanes::FatalKind;
+
+    #[derive(Debug)]
+    struct Wrapped<E>(E);
+    impl<E: std::fmt::Display> std::fmt::Display for Wrapped<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "wrapped: {}", self.0)
+        }
+    }
+    impl<E: Error + 'static> Error for Wrapped<E> {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    fn boxed<E: Error + Send + Sync + 'static>(e: E) -> Box<dyn Error + Send + Sync> {
+        Box::new(e)
+    }
+
+    #[test]
+    fn classifies_a_bare_string_as_unclassified() {
+        let e = boxed(std::io::Error::other("boom"));
+        assert!(matches!(
+            RunFailure::classify(e),
+            RunFailure::Unclassified(_)
+        ));
+    }
+
+    #[test]
+    fn classifies_a_transient_three_hops_deep() {
+        let e = boxed(Wrapped(Wrapped(Transient::new(TransientKind::Deadlock))));
+        match RunFailure::classify(e) {
+            RunFailure::Transient(t) => assert_eq!(t.kind, TransientKind::Deadlock),
+            _other => panic!("expected Transient, got a different classification"),
+        }
+    }
+
+    #[test]
+    fn classifies_a_fatal() {
+        let e = boxed(Fatal::new(FatalKind::CorruptState));
+        match RunFailure::classify(e) {
+            RunFailure::Fatal(f) => assert_eq!(f.kind, FatalKind::CorruptState),
+            _ => panic!("expected Fatal"),
+        }
+    }
+
+    #[test]
+    fn classifies_a_denied() {
+        let e = boxed(Denied::default());
+        assert!(matches!(RunFailure::classify(e), RunFailure::Denied(_)));
+    }
+
+    #[test]
+    fn a_boxed_rejected_fail_is_unclassified_not_misread() {
+        // A boxed `Fail::Rejected(_)` carries no marker type that survives
+        // erasure -- it must land as `Unclassified`, never silently treated
+        // as transient or fatal.
+        use crate::error::{JobError, JobRejection};
+        let fail: JobError = JobError::Rejected(JobRejection::TimedOut(crate::JobId::new()));
+        let boxed_err: Box<dyn Error + Send + Sync> = Box::new(fail);
+        assert!(matches!(
+            RunFailure::classify(boxed_err),
+            RunFailure::Unclassified(_)
+        ));
+    }
+
+    #[test]
+    fn pool_timeout_and_congestion_are_congestion_other_kinds_are_not() {
+        assert!(RunFailure::Transient(Transient::new(TransientKind::PoolTimeout)).is_congestion());
+        assert!(RunFailure::Transient(Transient::new(TransientKind::Congestion)).is_congestion());
+        assert!(!RunFailure::Transient(Transient::new(TransientKind::Deadlock)).is_congestion());
+        assert!(!RunFailure::Fatal(Fatal::new(FatalKind::Invariant)).is_congestion());
+    }
+
+    /// Regression for the pre-errlanes bug: `is_pool_congestion` only ever
+    /// matched a raw `sqlx::Error::PoolTimedOut` by downcasting the error
+    /// chain, so a runner returning an already-laned
+    /// `Transient::new(TransientKind::PoolTimeout)` with no `sqlx::Error`
+    /// source attached (exactly what a runner built on the errlanes
+    /// boundary returns) never matched, and every such pool timeout spent a
+    /// `RetryPolicy` attempt instead of taking the congestion path.
+    /// `RunFailure::classify` must find it via `transient_of`'s `source()`
+    /// walk, with no `sqlx::Error` anywhere in the chain.
+    #[test]
+    fn classify_detects_congestion_from_a_bare_laned_transient_with_no_sqlx_source() {
+        let boxed: Box<dyn Error + Send + Sync> = boxed(Transient::new(TransientKind::PoolTimeout));
+        let failure = RunFailure::classify(boxed);
+        assert!(
+            failure.is_congestion(),
+            "expected congestion classification"
+        );
+        assert!(!failure.is_terminal());
+    }
+
+    #[test]
+    fn fatal_and_denied_are_terminal_transient_and_unclassified_are_not() {
+        assert!(RunFailure::Fatal(Fatal::new(FatalKind::Invariant)).is_terminal());
+        assert!(RunFailure::Denied(Denied::default()).is_terminal());
+        assert!(!RunFailure::Transient(Transient::new(TransientKind::Deadlock)).is_terminal());
+        assert!(!RunFailure::Unclassified(boxed(std::io::Error::other("boom"))).is_terminal());
+    }
+}
 
 /// Base delay before a pool-congestion reschedule becomes due again. Fixed
 /// and short, not the type's exponential `RetryPolicy` schedule: congestion
@@ -152,6 +358,11 @@ pub(crate) enum Disposition {
         error: String,
         attempt: u32,
         run_duration: std::time::Duration,
+        /// `RunFailure::is_terminal()` for the error that produced this
+        /// disposition: `true` for `Fatal`/`Denied`, sending the job
+        /// terminal on THIS attempt unless `RetryPolicy::retry_fatal` opts
+        /// back into the ordinary attempt-count path.
+        terminal: bool,
     },
     /// Back to `pending` at `at` with `attempt_index = 1`: a
     /// runner-requested reschedule or a rescue.
@@ -276,42 +487,7 @@ impl Finalizer {
         }
     }
 
-    /// Classify a runner's error and convert it into the right `JobError`,
-    /// recording the `error`/`error.message`/`error.level` fields on the
-    /// CURRENT span. Classification happens BEFORE stringifying: `error` is
-    /// the runner's own boxed error, the only point where an underlying
-    /// `sqlx::Error::PoolTimedOut` still has its structure to downcast --
-    /// `.to_string()` is a one-way trip into `JobExecutionError(String)`,
-    /// and a plain `String` has no `.source()` chain for
-    /// [`Self::is_pool_congestion`] to walk afterward.
-    ///
-    /// Congestion logs at INFO -- it is the expected, non-punitive signal
-    /// this module exists for (see the module doc) -- real errors at WARN.
-    pub(crate) fn maybe_reclassify(&self, error: Box<dyn std::error::Error>) -> JobError {
-        let span = Span::current();
-        if let Some(lane) = es_entity::errlanes::lane_of(error.as_ref()) {
-            span.record("error.lane", lane.as_str());
-        }
-        let congestion = Self::is_pool_congestion(error.as_ref());
-        let error = error.to_string();
-        span.record("error", true);
-        span.record("error.message", tracing::field::display(&error));
-        span.record(
-            "error.level",
-            tracing::field::display(if congestion {
-                tracing::Level::INFO
-            } else {
-                tracing::Level::WARN
-            }),
-        );
-        if congestion {
-            JobError::PoolCongestion(error)
-        } else {
-            JobError::JobExecutionError(error)
-        }
-    }
-
-    /// Reschedule `ids` after a `PoolCongestion` classification: every row
+    /// Reschedule `ids` after a congestion classification: every row
     /// goes back to `pending` at now + [`CONGESTION_DELAY_MS`] +/-
     /// [`CONGESTION_JITTER_MS`], `attempt_index` untouched, on a fresh
     /// `CongestionRescheduled` entity event -- one [`Disposition::Congestion`]
@@ -320,7 +496,7 @@ impl Finalizer {
     /// `attempts` maps each id to its in-flight attempt number, recorded
     /// unchanged on the entity's next `ExecutionScheduled` event; an id
     /// missing from the map defaults to attempt 1.
-    #[instrument(name = "job.congestion_reschedule", skip_all,
+    #[errlanes::instrument(name = "job.congestion_reschedule", skip_all,
         fields(n_jobs = ids.len(), congestion_streak)
     )]
     pub(crate) async fn reschedule_congested(
@@ -453,11 +629,7 @@ impl Finalizer {
                     use_internal = true;
                     continue;
                 }
-                Err(e)
-                    if attempt_no < TX_ABORT_MAX_ATTEMPTS
-                        && es_entity::errlanes::lane_of(&e)
-                            == Some(es_entity::errlanes::Lane::Transient) =>
-                {
+                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && e.is_transient() => {
                     tracing::warn!(
                         job_ids = %Self::display_ids_of(items),
                         attempt_no,
@@ -577,6 +749,7 @@ impl Finalizer {
                     error,
                     attempt,
                     run_duration,
+                    terminal,
                 } => {
                     match job.maybe_schedule_retry(
                         now,
@@ -584,6 +757,7 @@ impl Finalizer {
                         *run_duration,
                         &retry_policy,
                         error.clone(),
+                        *terminal,
                     ) {
                         Some((reschedule_at, next_attempt)) => {
                             retry_uuids.push(uuid::Uuid::from(*id));
@@ -846,7 +1020,7 @@ impl Finalizer {
         // performed -- staged events for unapplied ids are discarded with
         // their entities.
         let mut jobs: Vec<Job> = applied.iter().filter_map(|id| staged.remove(id)).collect();
-        self.repo.update_all_in_op(op, &mut jobs).await?;
+        self.repo.update_all_in_op(op, &mut jobs).await.widen()?;
         Ok(outcome)
     }
 
@@ -944,29 +1118,6 @@ impl Finalizer {
     /// at it at all (see the module doc's "Pool choice").
     fn shared_pool_has_headroom(&self) -> bool {
         pool_connection_headroom(self.repo.pool()) > 0
-    }
-
-    /// Whether this error (or anything it wraps) is
-    /// `sqlx::Error::PoolTimedOut` -- the shared pool had no connection to
-    /// hand out within its acquire timeout. This carries no evidence the
-    /// job is broken: it says the pool was busy, not that the work is
-    /// wrong.
-    ///
-    /// Walks the `source()` chain because a runner's error crosses an
-    /// object-erasure boundary (`run`/`run_batch_erased` return
-    /// `Box<dyn std::error::Error>`) before it reaches this crate's own
-    /// error handling, so the check has to happen on the *original* error
-    /// -- [`Self::maybe_reclassify`], the only caller, does exactly that
-    /// before stringifying.
-    fn is_pool_congestion(err: &(dyn std::error::Error + 'static)) -> bool {
-        let mut source = Some(err);
-        while let Some(e) = source {
-            if let Some(sqlx::Error::PoolTimedOut) = e.downcast_ref::<sqlx::Error>() {
-                return true;
-            }
-            source = e.source();
-        }
-        false
     }
 
     /// Renders ids as a comma-separated list for one log field, so a warn

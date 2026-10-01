@@ -9,8 +9,10 @@
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes;
+use es_entity::errlanes::{Fatal, FatalKind};
 use futures::FutureExt;
-use tracing::{Span, instrument};
+use tracing::Span;
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
@@ -24,7 +26,7 @@ use super::{
     },
     entity::JobType,
     error::JobError,
-    finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer},
+    finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer, RunFailure},
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -234,9 +236,10 @@ impl BatchDispatcher {
         poller.register_claim_recycle(op, &self.job_type, reservation);
     }
 
-    #[instrument(name = "job.execute_batch", skip_all,
-        fields(job_type, n_items, poller_id, error, error.level, error.message, conclusion, now,
-               claim_disposition)
+    #[errlanes::instrument(
+        name = "job.execute_batch",
+        skip_all,
+        fields(job_type, n_items, poller_id, conclusion, now, claim_disposition)
     )]
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_batch(
@@ -282,7 +285,7 @@ impl BatchDispatcher {
         let runner = self.runner.take().expect("runner");
         // Monotonic, deliberately not `self.clock` -- see `Self::run_duration`.
         let started = std::time::Instant::now();
-        let batch_result = Self::run_batch(&self.finalizer, runner, items, ctx).await;
+        let batch_result = Self::run_batch(runner, items, ctx).await;
         self.run_duration = started.elapsed();
         let outcome = match batch_result {
             Ok(completion) => self.apply(completion).await,
@@ -293,7 +296,7 @@ impl BatchDispatcher {
                 // field.
                 span.record(
                     "conclusion",
-                    if matches!(e, JobError::PoolCongestion(_)) {
+                    if e.is_congestion() {
                         "Congestion"
                     } else {
                         "Error"
@@ -394,19 +397,21 @@ impl BatchDispatcher {
     }
 
     async fn run_batch(
-        finalizer: &Finalizer,
         runner: Box<dyn AnyBatchedJobRunner>,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
-    ) -> Result<JobBatchCompletion, JobError> {
+    ) -> Result<JobBatchCompletion, RunFailure> {
         match AssertUnwindSafe(runner.run_batch_erased(items, ctx))
             .catch_unwind()
             .await
         {
             Ok(Ok(completion)) => Ok(completion),
-            Ok(Err(e)) => Err(finalizer.maybe_reclassify(e)),
+            Ok(Err(e)) => {
+                let failure = RunFailure::classify(e);
+                failure.record(&Span::current());
+                Err(failure)
+            }
             Err(panic) => {
-                let span = Span::current();
                 let message = if let Some(s) = panic.downcast_ref::<&str>() {
                     s.to_string()
                 } else if let Some(s) = panic.downcast_ref::<String>() {
@@ -415,16 +420,6 @@ impl BatchDispatcher {
                     "Unknown panic payload".to_string()
                 };
 
-                span.record("error", true);
-                span.record(
-                    "error.message",
-                    tracing::field::display(&format!("Panic: {message}")),
-                );
-                span.record(
-                    "error.level",
-                    tracing::field::display(tracing::Level::ERROR),
-                );
-
                 tracing::error!(
                     target: "job.panic",
                     panic_message = %message,
@@ -432,9 +427,9 @@ impl BatchDispatcher {
                     "Batched job panicked during execution"
                 );
 
-                Err(JobError::JobExecutionError(format!(
-                    "Job panicked: {message}"
-                )))
+                let failure = RunFailure::Fatal(Fatal::new(FatalKind::Panic).with_context(message));
+                failure.record(&Span::current());
+                Err(failure)
             }
         }
     }
@@ -503,20 +498,24 @@ impl BatchDispatcher {
 
     /// Every job in the batch must be dispositioned exactly once. A runner that
     /// breaks this contract has an unclear intent for the jobs it left out, so
-    /// nothing is guessed: the batch is rolled back and retried.
-    fn validate(&self, outcomes: &BatchOutcomes) -> Result<(), JobError> {
+    /// nothing is guessed: the batch is rolled back and retried. A mismatch is
+    /// a bug in the runner, not evidence about any particular job, so it is
+    /// always `Fatal` -- never routed through `retry_fatal`'s opt-out, which
+    /// exists for a runner's own classification, not the dispatcher's own
+    /// contract check.
+    fn validate(&self, outcomes: &BatchOutcomes) -> Result<(), RunFailure> {
         let expected: HashSet<JobId> = self.ids.iter().copied().collect();
         let mut seen: HashSet<JobId> = HashSet::with_capacity(outcomes.len());
         for (id, _) in outcomes {
             if !expected.contains(id) {
-                return Err(JobError::BatchOutcomeMismatch(format!(
+                return Err(RunFailure::Fatal(Fatal::invariant(format!(
                     "outcome returned for job {id}, which is not part of the batch"
-                )));
+                ))));
             }
             if !seen.insert(*id) {
-                return Err(JobError::BatchOutcomeMismatch(format!(
+                return Err(RunFailure::Fatal(Fatal::invariant(format!(
                     "duplicate outcome returned for job {id}"
-                )));
+                ))));
             }
         }
         if seen.len() != expected.len() {
@@ -525,10 +524,10 @@ impl BatchDispatcher {
                 .map(|id| id.to_string())
                 .collect();
             missing.sort();
-            return Err(JobError::BatchOutcomeMismatch(format!(
+            return Err(RunFailure::Fatal(Fatal::invariant(format!(
                 "no outcome returned for job(s): {}",
                 missing.join(", ")
-            )));
+            ))));
         }
         Ok(())
     }
@@ -586,10 +585,15 @@ impl BatchDispatcher {
                     BatchItemOutcome::Complete => Disposition::Complete,
                     BatchItemOutcome::RescheduleIn(d) => Disposition::Fresh { at: now + d },
                     BatchItemOutcome::RescheduleAt(t) => Disposition::Fresh { at: t },
+                    // A per-item `BatchItemOutcome::Fail` is a plain string
+                    // the runner chose to report -- no lane payload travels
+                    // with it, so it is never terminal on its own; it goes
+                    // through the ordinary attempt-count retry path.
                     BatchItemOutcome::Fail(reason) => Disposition::Fail {
                         error: reason,
                         attempt: self.attempts.get(&id).copied().unwrap_or(1),
                         run_duration: self.run_duration,
+                        terminal: false,
                     },
                 };
                 (id, disposition)
@@ -613,8 +617,8 @@ impl BatchDispatcher {
     /// rescheduled for another attempt while others exhaust their attempts
     /// and become terminal, all in the same transaction.
     ///
-    /// A `PoolCongestion` error is routed to the finalizer's congestion
-    /// reschedule instead of the retry-policy path: congestion carries no
+    /// A `RunFailure::is_congestion()` error is routed to the finalizer's
+    /// congestion reschedule instead of the retry-policy path: congestion carries no
     /// evidence any of these jobs is broken, so applying `RetryPolicy`'s
     /// attempt escalation to it would walk perfectly good jobs toward
     /// `max_attempts` termination for a condition they didn't cause. The
@@ -625,27 +629,23 @@ impl BatchDispatcher {
     /// the congestion delay's cool-off, so the unit releases through the
     /// ORDINARY path (`Drop`'s `batch_completed`) and the backlog is picked
     /// back up by the next pool-aware poll instead.
-    #[instrument(name = "job.fail_batch", skip_all,
-        fields(job_type = %self.job_type, n_items = self.ids.len(), error = true,
-               error.message = %error, error.lane = tracing::field::Empty,
-               error.level = tracing::field::Empty,
+    #[errlanes::instrument(name = "job.fail_batch", skip_all,
+        fields(job_type = %self.job_type, n_items = self.ids.len(),
                n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
     )]
-    async fn fail_batch(&mut self, error: JobError) -> Result<(), JobError> {
+    async fn fail_batch(&mut self, error: RunFailure) -> Result<(), JobError> {
         let span = tracing::Span::current();
-        if let Some(lane) = es_entity::errlanes::lane_of(&error) {
-            span.record("error.lane", lane.as_str());
+        error.record(&span);
+        if error.is_congestion() {
+            self.rescheduled = true;
+            let message = error.message();
+            return self
+                .finalizer
+                .reschedule_congested(&self.ids, &self.attempts, message)
+                .await;
         }
-        let message = match error {
-            JobError::PoolCongestion(message) => {
-                self.rescheduled = true;
-                return self
-                    .finalizer
-                    .reschedule_congested(&self.ids, &self.attempts, message)
-                    .await;
-            }
-            other => other.to_string(),
-        };
+        let terminal = error.is_terminal();
+        let message = error.message();
         let items: Vec<(JobId, Disposition)> = self
             .ids
             .iter()
@@ -656,6 +656,7 @@ impl BatchDispatcher {
                         error: message.clone(),
                         attempt: self.attempts.get(id).copied().unwrap_or(1),
                         run_duration: self.run_duration,
+                        terminal,
                     },
                 )
             })

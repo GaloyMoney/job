@@ -249,7 +249,7 @@ mod tests {
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
             unimplemented!("never invoked by this test")
         }
     }
@@ -267,7 +267,7 @@ mod tests {
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
             unimplemented!("never invoked by this test")
         }
     }

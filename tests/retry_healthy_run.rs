@@ -63,7 +63,10 @@ struct RunsLongThenFails {
 
 #[async_trait]
 impl JobRunner for RunsLongThenFails {
-    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let _ = self.ran.send(Utc::now());
         tokio::time::sleep(RUN_FOR).await;
         Err("blip after a healthy stretch".into())
@@ -78,7 +81,10 @@ struct FailsFast {
 
 #[async_trait]
 impl JobRunner for FailsFast {
-    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let _ = self.ran.send(Utc::now());
         Err("deterministic failure".into())
     }
@@ -111,7 +117,7 @@ impl JobInitializer for Init {
         &self,
         _: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(match self.behaviour {
             Behaviour::RunsLongThenFails => Box::new(RunsLongThenFails {
                 ran: self.ran.clone(),
@@ -200,6 +206,7 @@ async fn a_long_running_execution_is_forgiven_and_never_terminates() -> anyhow::
             max_backoff: Duration::from_millis(10),
             backoff_jitter_pct: 0,
             attempt_reset_after_healthy_run: Some(HEALTHY_RUN),
+            retry_fatal: false,
         },
     });
     jobs.start_poll().await?;
@@ -260,6 +267,7 @@ async fn a_fast_failure_terminates_at_max_attempts_despite_clock_jumps() -> anyh
             backoff_jitter_pct: 0,
             // Far longer than any run this job will ever manage.
             attempt_reset_after_healthy_run: Some(Duration::from_secs(60 * 60)),
+            retry_fatal: false,
         },
     });
     jobs.start_poll().await?;
@@ -337,6 +345,7 @@ async fn a_reclaimed_attempt_is_forgiven_by_the_next_healthy_run() -> anyhow::Re
             max_backoff: Duration::from_secs(60),
             backoff_jitter_pct: 0,
             attempt_reset_after_healthy_run: Some(HEALTHY_RUN),
+            retry_fatal: false,
         },
     });
     jobs.start_poll().await?;

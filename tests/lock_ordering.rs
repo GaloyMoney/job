@@ -29,7 +29,7 @@ impl JobRunner for NoopRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         Ok(JobCompletion::Complete)
     }
 }
@@ -52,7 +52,7 @@ impl JobInitializer for NoopInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(NoopRunner))
     }
 }
@@ -127,7 +127,7 @@ impl JobRunner for GatedRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let _permit = self.gate.acquire().await?;
         Ok(JobCompletion::Complete)
     }
@@ -147,7 +147,7 @@ impl JobInitializer for GatedInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(GatedRunner {
             gate: Arc::clone(&self.gate),
         }))

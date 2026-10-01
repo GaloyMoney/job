@@ -66,7 +66,10 @@ impl BatchedJobInitializer for SavepointInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
+    ) -> Result<
+        Box<dyn BatchedJobRunner<Config = Self::Config>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         Ok(Box::new(SavepointRunner))
     }
 }
@@ -80,7 +83,7 @@ impl BatchedJobRunner for SavepointRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<SavepointConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let mut op = current_batch.begin_op().await?;
         let outcomes = current_batch
             .run_isolated(&mut op, async |sp, item| {

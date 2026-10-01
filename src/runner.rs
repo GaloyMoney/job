@@ -71,7 +71,7 @@ pub trait JobInitializer: Send + Sync + 'static {
         &self,
         job: &Job,
         spawner: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Result returned by [`JobRunner::run`] describing how to progress the job.
@@ -116,7 +116,7 @@ pub trait JobRunner: Send + Sync + 'static {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>>;
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +156,15 @@ pub struct RetrySettings {
     /// Pick a value comfortably longer than a *failing* run of this job type: a deterministic
     /// failure must not clear it, or the job can never reach `n_attempts`.
     pub attempt_reset_after_healthy_run: Option<std::time::Duration>,
+    /// Migration escape hatch: when `true`, a runner error classified as
+    /// `Fatal`/`Denied` is sent through this policy's ordinary attempt-count
+    /// retry instead of going terminal on the attempt that produced it.
+    /// Defaults to `false` -- errlanes semantics say a `Fatal` will not
+    /// succeed on retry, so terminal-on-attempt is the right default; this
+    /// knob only covers types whose downstream still returns `Fatal`
+    /// (`Invariant`/`NotFound`, typically) for rows that are merely not yet
+    /// visible.
+    pub retry_fatal: bool,
 }
 
 impl RetrySettings {
@@ -179,6 +188,7 @@ impl Default for RetrySettings {
             // Matches `max_backoff`: a job that cannot stay up for the longest
             // backoff we would ever impose is not healthy.
             attempt_reset_after_healthy_run: Some(std::time::Duration::from_secs(SECS_IN_ONE_HOUR)),
+            retry_fatal: false,
         }
     }
 }
@@ -191,6 +201,7 @@ impl From<&RetrySettings> for RetryPolicy {
             max_backoff: settings.max_backoff,
             backoff_jitter_pct: settings.backoff_jitter_pct,
             attempt_reset_after_healthy_run: settings.attempt_reset_after_healthy_run,
+            retry_fatal: settings.retry_fatal,
         }
     }
 }

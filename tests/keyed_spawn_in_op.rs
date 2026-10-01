@@ -57,7 +57,7 @@ impl JobRunner for Runner {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let observed: Option<State> = current_job.execution_state()?;
         current_job
             .set_result(&State {
@@ -107,7 +107,7 @@ impl KeyedJobInitializer for Init {
         &self,
         job: &Job,
         _: KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: Cfg = job.config()?;
         Ok(Box::new(Runner {
             marker: config.marker,

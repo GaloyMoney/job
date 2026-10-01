@@ -51,6 +51,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes::WidenResult;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
@@ -146,7 +147,10 @@ pub trait BatchedJobInitializer: Send + Sync + 'static {
     fn init(
         &self,
         spawner: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>>;
+    ) -> Result<
+        Box<dyn BatchedJobRunner<Config = Self::Config>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
 }
 
 /// Implemented by executors that process many jobs of one type together.
@@ -159,7 +163,7 @@ pub trait BatchedJobRunner: Send + Sync + 'static {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<Self::Config>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>>;
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// How a single job within a batch should be progressed.
@@ -274,8 +278,9 @@ impl<C> BatchedJobItem<C> {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)
-            .map_err(JobError::CouldNotSerializeExecutionState)?;
+        let execution_state_json = serde_json::to_value(execution_state).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::CorruptState, e)
+        })?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -296,8 +301,9 @@ impl<C> BatchedJobItem<C> {
         &mut self,
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)
-            .map_err(JobError::CouldNotSerializeExecutionState)?;
+        let execution_state_json = serde_json::to_value(execution_state).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::CorruptState, e)
+        })?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -321,23 +327,25 @@ impl<C> BatchedJobItem<C> {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         result: &impl Serialize,
     ) -> Result<(), JobError> {
-        let job_result =
-            JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
+        let job_result = JobReturnValue::try_from(result).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::Invariant, e)
+        })?;
         let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
-            self.repo.update_in_op(op, &mut job).await?;
+            self.repo.update_in_op(op, &mut job).await.widen()?;
         }
         Ok(())
     }
 
     /// Attach or update this job's result value in its own transaction.
     pub async fn set_result(&self, result: &impl Serialize) -> Result<(), JobError> {
-        let job_result =
-            JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
+        let job_result = JobReturnValue::try_from(result).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::Invariant, e)
+        })?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
-            self.repo.update_in_op(&mut op, &mut job).await?;
+            self.repo.update_in_op(&mut op, &mut job).await.widen()?;
             op.commit().await?;
         }
         Ok(())
@@ -701,7 +709,7 @@ pub(crate) trait AnyBatchedJobRunner: Send + Sync + 'static {
         &self,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>>;
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 pub(crate) struct ErasedBatchedRunner<C> {
@@ -723,7 +731,7 @@ where
         &self,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let BatchRunCtx {
             pool,
             clock,
@@ -766,7 +774,7 @@ pub(crate) trait AnyBatchedJobInitializer: Send + Sync + 'static {
         router: Arc<crate::notification_router::JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<crate::notifier::JobEventNotifier>,
-    ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
@@ -776,7 +784,7 @@ impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
         router: Arc<crate::notification_router::JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<crate::notifier::JobEventNotifier>,
-    ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         // Always-empty POLLER handle: fan-out spawns from within a batch
         // runner take the ordinary insert path. The router is real, so a
         // handle returned by such a spawn can await.

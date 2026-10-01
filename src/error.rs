@@ -6,67 +6,41 @@ use super::entity::JobType;
 use super::repo::JobConstraintViolation;
 use crate::JobId;
 
-use es_entity::errlanes::Fail;
+use es_entity::errlanes;
+use es_entity::errlanes::{Fail, lanes};
 
-#[derive(Error, Debug)]
-/// Exhaustive list of failures the job service can report.
-pub enum JobError {
-    #[error("JobError - Sqlx: {0}")]
-    Sqlx(#[from] sqlx::Error),
-    /// A repository write failure. Rejected violations are lifted to the
-    /// duplicate variants below when they describe job-owned uniqueness.
-    #[error("JobError - Repo: {0}")]
-    Repo(#[source] es_entity::RepoWriteError<JobConstraintViolation>),
-    /// A repository read failure. Reads cannot produce a domain rejection.
-    #[error("JobError - Read: {0}")]
-    Read(#[source] es_entity::RepoReadError),
-    #[error("JobError - InvalidPollInterval: {0}")]
-    InvalidPollInterval(String),
-    #[error("JobError - InvalidJobType: expected '{0}' but initializer was '{1}'")]
-    JobTypeMismatch(JobType, JobType),
-    #[error("JobError - JobInitError: {0}")]
-    JobInitError(String),
-    #[error("JobError - BadState: {0}")]
-    CouldNotSerializeExecutionState(serde_json::Error),
-    #[error("JobError - BadState: {0}")]
-    CouldNotDeserializeExecutionState(serde_json::Error),
-    #[error("JobError - BadResult: {0}")]
-    CouldNotSerializeResult(serde_json::Error),
-    #[error("JobError - BadConfig: {0}")]
-    CouldNotSerializeConfig(serde_json::Error),
-    #[error("JobError - NoInitializerPresent")]
-    NoInitializerPresent,
-    #[error("JobError - JobExecutionError: {0}")]
-    JobExecutionError(String),
-    /// A runner error classified as pool congestion rather than a genuine
-    /// failure -- distinct from [`Self::JobExecutionError`] so the
-    /// dispatchers' fail paths can route it to a reschedule that skips the
-    /// retry policy's attempt escalation. Constructed only by
-    /// `Finalizer::maybe_reclassify` (see `finalizer.rs`).
-    #[error("JobError - PoolCongestion: {0}")]
-    PoolCongestion(String),
-    #[error("JobError - BatchOutcomeMismatch: {0}")]
-    BatchOutcomeMismatch(String),
-    #[error("JobError - DuplicateId: {0:?}")]
-    DuplicateId(Option<String>),
+#[derive(Error, Debug, errlanes::Rejection, errlanes::Lift)]
+// `JobConstraintViolation` carries a synthetic conventional-name variant per
+// column (`{table}_{column}_key`) in addition to the real constraints the
+// migrations define, so the mapping here is necessarily partial: only the
+// two constraints that actually exist (`jobs_pkey`,
+// `idx_jobs_job_type_resident`) map to a domain rejection; every other,
+// never-fired variant demotes to `Fatal(Invariant)` via the unmapped path.
+#[lift(JobConstraintViolation, unhandled = fatal)]
+/// Caller-correctable outcomes the job service can report. Everything else
+/// -- infrastructure failures, bugs, exhausted retries -- travels as
+/// `Transient`/`Fatal` in [`JobError`] instead of as a variant here.
+pub enum JobRejection {
+    #[error("duplicate job id")]
+    #[rejection(code = "JOB_DUPLICATE_ID")]
+    #[lift(JobConstraintViolation::Pkey)]
+    DuplicateId(es_entity::ConstraintConflict<JobId>),
     /// Returned when a resident job type already has a live job (#170).
-    #[error("JobError - DuplicateResident: {0:?}")]
-    DuplicateResident(Option<String>),
-    #[error("JobError - Config: {0}")]
-    Config(String),
-    #[error("JobError - Migration: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
-    #[error(
-        "JobError - AwaitCompletionShutdown: notification channel closed while awaiting job {0}"
-    )]
-    AwaitCompletionShutdown(JobId),
-    #[error(
-        "JobError - TimedOut: job {0} did not reach terminal state within the specified timeout"
-    )]
+    #[error("resident job of this type already exists")]
+    #[rejection(code = "JOB_DUPLICATE_RESIDENT")]
+    #[lift(JobConstraintViolation::IdxJobsJobTypeResident)]
+    DuplicateResident(es_entity::ConstraintConflict<JobType>),
+    #[error("job {0} did not reach a terminal state within the timeout")]
+    #[rejection(code = "JOB_AWAIT_TIMED_OUT")]
     TimedOut(JobId),
-    #[error("JobError - RouterNotStarted: await called before Jobs::start_poll")]
-    RouterNotStarted,
+    #[error("await of job {0} interrupted: notification channel closed")]
+    #[rejection(code = "JOB_AWAIT_INTERRUPTED")]
+    AwaitInterrupted(JobId),
 }
+
+/// Native errlanes error for the job service: a `Rejected` domain outcome,
+/// or a `Transient`/`Fatal` fault. Job never denies.
+pub type JobError = Fail<JobRejection, lanes!(Transient, Fatal)>;
 
 /// Total attempts a crate-owned bookkeeping transaction (batch seal / fail,
 /// congestion reschedule) gets when Postgres keeps ABORTING it as a
@@ -80,36 +54,3 @@ pub enum JobError {
 /// row lose, something is wrong beyond ordinary contention and the work is
 /// better off going through the rescue path than spinning here.
 pub(crate) const TX_ABORT_MAX_ATTEMPTS: u32 = 3;
-
-impl From<Box<dyn std::error::Error>> for JobError {
-    fn from(error: Box<dyn std::error::Error>) -> Self {
-        JobError::JobExecutionError(error.to_string())
-    }
-}
-
-impl From<es_entity::RepoWriteError<JobConstraintViolation>> for JobError {
-    fn from(error: es_entity::RepoWriteError<JobConstraintViolation>) -> Self {
-        match &error {
-            Fail::Rejected(JobConstraintViolation::Pkey(conflict)) => {
-                return Self::DuplicateId(conflict.attempted.map(|id| id.to_string()));
-            }
-            // This exact generated case represents the partial unique index
-            // on resident job types; other job-type constraints retain Repo.
-            Fail::Rejected(JobConstraintViolation::IdxJobsJobTypeResident(conflict)) => {
-                return Self::DuplicateResident(
-                    conflict
-                        .attempted
-                        .as_ref()
-                        .map(|job_type| job_type.to_string()),
-                );
-            }
-            _ => Self::Repo(error),
-        }
-    }
-}
-
-impl From<es_entity::RepoReadError> for JobError {
-    fn from(error: es_entity::RepoReadError) -> Self {
-        Self::Read(error)
-    }
-}

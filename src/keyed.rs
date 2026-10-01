@@ -31,6 +31,7 @@ use std::{
 };
 
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes::WidenResult;
 use tracing::instrument;
 
 use super::{
@@ -99,7 +100,7 @@ pub trait KeyedJobInitializer: Send + Sync + 'static {
         &self,
         job: &Job,
         spawner: KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Describes one keyed job to create as part of a bulk
@@ -570,7 +571,7 @@ where
         let new_jobs_created = new_jobs.len();
 
         if !new_jobs.is_empty() {
-            self.repo.create_all_in_op(op, new_jobs).await?;
+            self.repo.create_all_in_op(op, new_jobs).await.widen()?;
             self.insert_executions_in_op(op, &new_ids, &new_keys, &new_schedule_times)
                 .await?;
             self.carry_state_in_op(op, &new_ids, &new_keys).await?;

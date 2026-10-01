@@ -53,7 +53,7 @@ impl BatchedJobRunner for CongestionOnceRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<Cfg>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let attempts: Vec<u32> = current_batch.items().iter().map(|i| i.attempt()).collect();
         self.calls.lock().await.push(attempts);
 
@@ -94,7 +94,10 @@ impl BatchedJobInitializer for CongestionOnceInitializer {
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
+    ) -> Result<
+        Box<dyn BatchedJobRunner<Config = Self::Config>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         Ok(Box::new(CongestionOnceRunner {
             calls: Arc::clone(&self.calls),
             invocations: Arc::clone(&self.invocations),

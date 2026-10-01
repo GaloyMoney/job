@@ -6,7 +6,8 @@ use job::{
     ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobRunner,
     JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs,
     KeyedJobInitializer, KeyedJobSpawner, ResidentJobCompletion, ResidentJobInitializer,
-    ResidentJobRunner, RetrySettings, error::JobError,
+    ResidentJobRunner, RetrySettings,
+    error::{JobError, JobRejection},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,7 +36,7 @@ impl JobInitializer for TestJobInitializer {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: TestJobConfig = job.config()?;
         Ok(Box::new(TestJobRunner { config }))
     }
@@ -64,7 +65,7 @@ impl JobInitializer for NoShortCircuitJobInitializer {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: TestJobConfig = job.config()?;
         Ok(Box::new(TestJobRunner { config }))
     }
@@ -93,7 +94,7 @@ impl JobInitializer for NoSpawnCappedInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         unimplemented!("never spawned by these tests")
     }
 }
@@ -126,7 +127,7 @@ impl JobInitializer for NoShortCircuitCappedJobInitializer {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: TestJobConfig = job.config()?;
         Ok(Box::new(TestJobRunner { config }))
     }
@@ -141,7 +142,7 @@ impl JobRunner for TestJobRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Simulate some work
         tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
         Ok(JobCompletion::Complete)
@@ -163,7 +164,7 @@ impl KeyedJobInitializer for TestKeyedInitializer {
         &self,
         job: &Job,
         _: KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: TestJobConfig = job.config()?;
         Ok(Box::new(TestJobRunner { config }))
     }
@@ -180,7 +181,10 @@ impl ResidentJobInitializer for TestResidentInitializer {
         self.job_type.clone()
     }
 
-    fn init(&self, job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
+    fn init(
+        &self,
+        job: &Job,
+    ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: TestJobConfig = job.config()?;
         Ok(Box::new(TestResidentRunner { config }))
     }
@@ -195,7 +199,7 @@ impl ResidentJobRunner for TestResidentRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Simulate some work, then reschedule — a resident job never completes.
         tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
         Ok(ResidentJobCompletion::RescheduleIn(Duration::from_secs(60)))
@@ -274,7 +278,7 @@ impl JobInitializer for ScheduledJobInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(ScheduledJobRunner {
             recorded_time: Arc::clone(&self.recorded_time),
         }))
@@ -290,7 +294,7 @@ impl JobRunner for ScheduledJobRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Record the time from the clock when the job runs
         let now = current_job.clock().now();
         *self.recorded_time.lock().await = Some(now);
@@ -409,7 +413,7 @@ impl JobInitializer for QueueJobInitializer {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: QueueJobConfig = job.config()?;
         Ok(Box::new(QueueJobRunner {
             label: config.label,
@@ -432,7 +436,7 @@ impl JobRunner for QueueJobRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         self.started.lock().await.push(self.label.clone());
         self.release.notified().await;
         self.completed.lock().await.push(self.label.clone());
@@ -868,7 +872,10 @@ async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
 
     let result = spawner.spawn_all(specs).await;
     assert!(
-        matches!(result, Err(JobError::DuplicateId(_))),
+        matches!(
+            result,
+            Err(JobError::Rejected(JobRejection::DuplicateId(_)))
+        ),
         "Expected DuplicateId error, got err: {:?}",
         result.as_ref().err(),
     );
@@ -941,7 +948,7 @@ impl JobInitializer for FailingJobInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(FailingJobRunner))
     }
 }
@@ -953,7 +960,7 @@ impl JobRunner for FailingJobRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         Err("intentional failure".into())
     }
 }
@@ -980,7 +987,7 @@ impl KeyedJobInitializer for FailingKeyedInitializer {
         &self,
         _job: &Job,
         _: KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(FailingJobRunner))
     }
 }
@@ -1116,7 +1123,7 @@ impl JobInitializer for ResultJobInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(ResultJobRunner))
     }
 }
@@ -1128,7 +1135,7 @@ impl JobRunner for ResultJobRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Incremental updates — only the last value is persisted
         current_job.set_result(&MyResult { value: 1 }).await?;
         current_job.set_result(&MyResult { value: 42 }).await?;
@@ -1190,7 +1197,7 @@ impl JobInitializer for PartialResultThenErrorInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(PartialResultThenErrorRunner))
     }
 }
@@ -1202,7 +1209,7 @@ impl JobRunner for PartialResultThenErrorRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Simulate processing 50 items then failing — partial progress preserved
         current_job.set_result(&MyResult { value: 50 }).await?;
         current_job.set_result(&MyResult { value: 99 }).await?;
@@ -1255,7 +1262,7 @@ impl JobInitializer for NoResultJobInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(NoResultJobRunner))
     }
 }
@@ -1267,7 +1274,7 @@ impl JobRunner for NoResultJobRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         Ok(JobCompletion::Complete)
     }
 }
@@ -1326,7 +1333,7 @@ impl JobInitializer for IncrementalResultInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(IncrementalResultRunner))
     }
 }
@@ -1338,7 +1345,7 @@ impl JobRunner for IncrementalResultRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let total = 5;
         for i in 1..=total {
             current_job
@@ -1410,7 +1417,7 @@ impl JobInitializer for IncrementalResultThenErrorInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(IncrementalResultThenErrorRunner))
     }
 }
@@ -1422,7 +1429,7 @@ impl JobRunner for IncrementalResultThenErrorRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let total = 100;
         for i in 1..=50 {
             current_job
@@ -1558,7 +1565,7 @@ async fn test_await_completion_timeout() -> anyhow::Result<()> {
         .await;
 
     assert!(
-        matches!(result, Err(JobError::TimedOut(id)) if id == job_id),
+        matches!(result, Err(JobError::Rejected(JobRejection::TimedOut(id))) if id == job_id),
         "Expected TimedOut error, got: {:?}",
         result,
     );
@@ -1591,7 +1598,7 @@ impl JobInitializer for MultiDayJobInitializer {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(MultiDayJobRunner {
             job_id: job.id,
             execution_times: Arc::clone(&self.execution_times),
@@ -1609,7 +1616,7 @@ impl JobRunner for MultiDayJobRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let now = current_job.clock().now();
         self.execution_times.lock().await.insert(self.job_id, now);
         Ok(JobCompletion::Complete)
@@ -1940,7 +1947,7 @@ async fn test_await_all_timeout() -> anyhow::Result<()> {
         .await;
 
     assert!(
-        matches!(result, Err(JobError::TimedOut(_))),
+        matches!(result, Err(JobError::Rejected(JobRejection::TimedOut(_)))),
         "Expected TimedOut error, got: {:?}",
         result,
     );
@@ -2098,7 +2105,7 @@ impl JobInitializer for InfiniteListenerInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(InfiniteListenerRunner))
     }
 }
@@ -2110,7 +2117,7 @@ impl JobRunner for InfiniteListenerRunner {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Park until shutdown, like an outbox listener would.
         current_job.shutdown_requested().await;
         Ok(JobCompletion::Complete)
@@ -2609,7 +2616,7 @@ impl JobInitializer for TrackingJobInitializer {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: TrackingJobConfig = job.config()?;
         Ok(Box::new(TrackingJobRunner {
             config,
@@ -2628,7 +2635,7 @@ impl JobRunner for TrackingJobRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         self.completed.lock().await.push(self.config.label.clone());
         Ok(JobCompletion::Complete)
     }
@@ -2703,7 +2710,7 @@ impl JobInitializer for StateWritingInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(StateWritingRunner {
             wrote: Arc::clone(&self.wrote),
             release: Arc::clone(&self.release),
@@ -2721,7 +2728,7 @@ impl JobRunner for StateWritingRunner {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         self.release.notified().await;
         current_job
             .update_execution_state(CheckpointState { processed: 42 })
@@ -2871,7 +2878,7 @@ impl JobInitializer for StateWritingFailingInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(StateWritingFailingRunner {
             wrote: Arc::clone(&self.wrote),
         }))
@@ -2887,7 +2894,7 @@ impl JobRunner for StateWritingFailingRunner {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         current_job
             .update_execution_state(CheckpointState { processed: 7 })
             .await?;
@@ -2964,7 +2971,7 @@ impl JobInitializer for CheckpointThenFailOnceInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(CheckpointThenFailOnceRunner {
             seen_on_retry: Arc::clone(&self.seen_on_retry),
         }))
@@ -2980,7 +2987,7 @@ impl JobRunner for CheckpointThenFailOnceRunner {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         if current_job.attempt() == 1 {
             current_job
                 .update_execution_state(CheckpointState { processed: 99 })
@@ -3159,7 +3166,10 @@ async fn load_not_found_is_find_error() -> anyhow::Result<()> {
 
     let result = jobs.handle(JobId::new()).load().await;
     assert!(
-        matches!(result, Err(JobError::Read(_))),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::Invariant)
+        )),
         "expected Find error for a job that never existed, got Ok or wrong error",
     );
 
@@ -3188,7 +3198,7 @@ impl JobInitializer for OrderedResultInitializer {
         &self,
         job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: OrderedJobConfig = job.config()?;
         Ok(Box::new(OrderedResultRunner { config }))
     }
@@ -3203,7 +3213,7 @@ impl JobRunner for OrderedResultRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
         current_job
             .set_result(&MyResult {
@@ -3308,7 +3318,7 @@ async fn await_all_times_out_and_reawait_resolves() -> anyhow::Result<()> {
     // (the last-spawned job alone needs ≥100ms).
     let result = handles.await_all(Duration::from_millis(50)).await;
     assert!(
-        matches!(result, Err(JobError::TimedOut(id)) if id == ids[0]),
+        matches!(result, Err(JobError::Rejected(JobRejection::TimedOut(id))) if id == ids[0]),
         "expected TimedOut with the first handle's id, got: {result:?}"
     );
 
@@ -3345,14 +3355,20 @@ async fn await_before_start_poll_is_router_not_started_error() -> anyhow::Result
     let handle = jobs.handle(JobId::new());
     let result = handle.await_completion(Duration::from_millis(100)).await;
     assert!(
-        matches!(result, Err(JobError::RouterNotStarted)),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::Invariant)
+        )),
         "expected RouterNotStarted, got: {result:?}"
     );
 
     let handles = jobs.handles([JobId::new(), JobId::new()]);
     let result = handles.await_all(Duration::from_millis(100)).await;
     assert!(
-        matches!(result, Err(JobError::RouterNotStarted)),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::Invariant)
+        )),
         "expected RouterNotStarted, got: {result:?}"
     );
 
@@ -3381,7 +3397,10 @@ async fn handle_await_find_timeout_and_batch() -> anyhow::Result<()> {
         .await_completion(Duration::from_secs(1))
         .await;
     assert!(
-        matches!(result, Err(JobError::Read(_))),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::Invariant)
+        )),
         "expected Find error, got: {result:?}"
     );
 
@@ -3396,7 +3415,7 @@ async fn handle_await_find_timeout_and_batch() -> anyhow::Result<()> {
         .await_completion(Duration::from_millis(200))
         .await;
     assert!(
-        matches!(result, Err(JobError::TimedOut(id)) if id == pending_id),
+        matches!(result, Err(JobError::Rejected(JobRejection::TimedOut(id))) if id == pending_id),
         "expected TimedOut, got: {result:?}"
     );
 
@@ -3683,7 +3702,7 @@ impl JobInitializer for FailingWithRetriesInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(FailingJobRunner))
     }
 }
@@ -3821,7 +3840,10 @@ async fn execution_state_point_read() -> anyhow::Result<()> {
     // Decode mismatch ⇒ CouldNotDeserializeExecutionState (an object is not a String).
     let result = handle.execution_state::<String>().await;
     assert!(
-        matches!(result, Err(JobError::CouldNotDeserializeExecutionState(_))),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::CorruptState)
+        )),
         "expected CouldNotDeserializeExecutionState, got {result:?}"
     );
 
@@ -3861,7 +3883,7 @@ impl JobInitializer for ConcurrencyProbeInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(ConcurrencyProbeRunner {
             running: Arc::clone(&self.running),
             high_water: Arc::clone(&self.high_water),
@@ -3881,7 +3903,7 @@ impl JobRunner for ConcurrencyProbeRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let n = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.high_water.fetch_max(n, Ordering::SeqCst);
         while !self.release.load(Ordering::SeqCst) {
@@ -4358,7 +4380,7 @@ impl KeyedJobInitializer for KeyedCheckpointInitializer {
         &self,
         job: &Job,
         _: KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: KeyedCheckpointConfig = job.config()?;
         Ok(Box::new(KeyedCheckpointRunner {
             processed: config.processed,
@@ -4377,7 +4399,7 @@ impl JobRunner for KeyedCheckpointRunner {
     async fn run(
         &self,
         mut current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let observed: Option<CheckpointState> = current_job.execution_state()?;
         current_job.set_result(&observed).await?;
         current_job
@@ -4695,7 +4717,10 @@ impl ResidentJobInitializer for CountingResidentInitializer {
         self.job_type.clone()
     }
 
-    fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
+    fn init(
+        &self,
+        _job: &Job,
+    ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(CountingResidentRunner {
             runs: Arc::clone(&self.runs),
         }))
@@ -4711,7 +4736,7 @@ impl ResidentJobRunner for CountingResidentRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         self.runs.fetch_add(1, Ordering::SeqCst);
         Ok(ResidentJobCompletion::RescheduleIn(Duration::from_millis(
             20,
@@ -4761,7 +4786,10 @@ async fn resident_runner_keeps_rescheduling_and_stays_unique() -> anyhow::Result
         .handle(first_handle.id())
         .await_completion(Duration::from_millis(50))
         .await;
-    assert!(matches!(timed_out, Err(JobError::TimedOut(_))));
+    assert!(matches!(
+        timed_out,
+        Err(JobError::Rejected(JobRejection::TimedOut(_)))
+    ));
 
     // Still absolutely unique: `resident_handle` resolves to the same job.
     let resolved = jobs

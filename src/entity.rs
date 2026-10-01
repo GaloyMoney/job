@@ -133,6 +133,7 @@ pub(crate) struct RetryPolicy {
     pub max_backoff: Duration,
     pub backoff_jitter_pct: u8,
     pub attempt_reset_after_healthy_run: Option<Duration>,
+    pub retry_fatal: bool,
 }
 
 impl RetryPolicy {
@@ -396,6 +397,13 @@ impl Job {
         es_entity::Idempotent::Executed(())
     }
 
+    /// `terminal` is `RunFailure::is_terminal()` (`Fatal`/`Denied`) for the
+    /// error that ended this attempt. Such an error will not succeed on
+    /// retry, so it goes terminal on THIS attempt regardless of the
+    /// attempt-count budget -- unless `retry_policy.retry_fatal` opts back
+    /// into the ordinary attempt-count path, the migration escape hatch for
+    /// a type whose downstream still returns `Fatal` for a merely-not-yet-
+    /// visible row.
     pub(super) fn maybe_schedule_retry(
         &mut self,
         now: DateTime<Utc>,
@@ -403,6 +411,7 @@ impl Job {
         run_duration: Duration,
         retry_policy: &RetryPolicy,
         error: String,
+        terminal: bool,
     ) -> Option<(DateTime<Utc>, u32)> {
         let mut current_attempt = attempt.max(1);
         // Only a counter that has actually accumulated can be forgiven; every
@@ -412,6 +421,11 @@ impl Job {
         if current_attempt > 1 && retry_policy.should_reset_attempt_count(run_duration) {
             current_attempt = 1;
             self.events.push(JobEvent::AttemptCounterReset);
+        }
+
+        if terminal && !retry_policy.retry_fatal {
+            self.error_job(error);
+            return None;
         }
 
         let next_attempt = current_attempt.saturating_add(1);
@@ -491,8 +505,9 @@ impl NewJob {
 
 impl NewJobBuilder {
     pub fn config<C: serde::Serialize>(&mut self, config: C) -> Result<&mut Self, JobError> {
-        self.config =
-            Some(serde_json::to_value(config).map_err(JobError::CouldNotSerializeConfig)?);
+        self.config = Some(serde_json::to_value(config).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::Config, e)
+        })?);
         Ok(self)
     }
 }
@@ -632,6 +647,7 @@ mod tests {
                 max_backoff: Duration::from_secs(TEST_MAX_BACKOFF_SECS),
                 backoff_jitter_pct: 0,
                 attempt_reset_after_healthy_run,
+                retry_fatal: false,
             }
         }
 
@@ -663,6 +679,7 @@ mod tests {
                     SHORT_RUN,
                     &retry_policy,
                     "boom".to_string(),
+                    false,
                 )
                 .expect("retry expected");
 
@@ -704,6 +721,7 @@ mod tests {
                     SHORT_RUN,
                     &retry_policy,
                     "boom".to_string(),
+                    false,
                 )
                 .expect("retry expected when attempt starts at zero");
 
@@ -748,7 +766,8 @@ mod tests {
                     2,
                     SHORT_RUN,
                     &retry_policy,
-                    "boom".to_string()
+                    "boom".to_string(),
+                    false,
                 )
                 .is_none(),
                 "should stop retrying when attempts exhausted"
@@ -792,6 +811,7 @@ mod tests {
                     healthy_run(),
                     &retry_policy,
                     "boom".to_string(),
+                    false,
                 )
                 .expect("retry expected");
 
@@ -844,6 +864,7 @@ mod tests {
                     SHORT_RUN,
                     &retry_policy,
                     "second failure".to_string(),
+                    false,
                 )
                 .expect("final retry should still be scheduled");
 
@@ -891,6 +912,7 @@ mod tests {
                     healthy_run(),
                     &retry_policy,
                     "third failure".to_string(),
+                    false,
                 )
                 .expect("a healthy run should reset attempt even at limit");
 
@@ -939,6 +961,7 @@ mod tests {
                     SHORT_RUN,
                     &retry_policy,
                     "overflow".to_string(),
+                    false,
                 )
                 .expect("unbounded retries should permit another schedule");
 
@@ -1017,6 +1040,7 @@ mod tests {
                     Duration::from_secs(6 * 60 * 60),
                     &retry_policy,
                     "blip".to_string(),
+                    false,
                 )
                 .expect("retry expected");
 
@@ -1034,7 +1058,7 @@ mod tests {
             let now = Clock::now() + ChronoDuration::hours(24);
 
             let (_, next_attempt) = job
-                .maybe_schedule_retry(now, 5, SHORT_RUN, &retry_policy, "boom".to_string())
+                .maybe_schedule_retry(now, 5, SHORT_RUN, &retry_policy, "boom".to_string(), false)
                 .expect("retry expected");
 
             assert_eq!(next_attempt, 6, "the counter must keep climbing");
@@ -1061,6 +1085,7 @@ mod tests {
                     Duration::from_secs(6 * 60 * 60),
                     &retry_policy,
                     "boom".to_string(),
+                    false,
                 )
                 .expect("retry expected");
 
@@ -1084,6 +1109,7 @@ mod tests {
                     Duration::from_secs(6 * 60 * 60),
                     &retry_policy,
                     "boom".to_string(),
+                    false,
                 )
                 .expect("retry expected");
 
@@ -1103,6 +1129,7 @@ mod tests {
                     healthy_run(),
                     &retry_policy,
                     "boom".to_string(),
+                    false,
                 )
                 .expect("retry expected");
 
@@ -1186,6 +1213,7 @@ mod tests {
                     SHORT_RUN,
                     &retry_policy,
                     "boom".to_string(),
+                    false,
                 ) {
                     Some((reschedule_at, next_attempt)) => {
                         history.push((
@@ -1236,6 +1264,7 @@ mod tests {
                 max_backoff,
                 backoff_jitter_pct: jitter_pct,
                 attempt_reset_after_healthy_run: Some(Duration::from_secs(60 * 60)),
+                retry_fatal: false,
             }
         }
 
@@ -1363,6 +1392,7 @@ mod tests {
                 max_backoff: Duration::from_secs(600),
                 backoff_jitter_pct: 0,
                 attempt_reset_after_healthy_run: None,
+                retry_fatal: false,
             };
 
             assert!(
@@ -1382,6 +1412,7 @@ mod tests {
                 max_backoff: Duration::from_millis(huge),
                 backoff_jitter_pct: u8::MAX,
                 attempt_reset_after_healthy_run: None,
+                retry_fatal: false,
             };
             for _ in 0..256 {
                 let backoff = policy.calculate_backoff(1);

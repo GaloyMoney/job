@@ -1,6 +1,7 @@
 //! Execution-time helpers available to running jobs.
 
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes::WidenResult;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
@@ -68,8 +69,9 @@ impl CurrentJob {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)
-            .map_err(JobError::CouldNotSerializeExecutionState)?;
+        let execution_state_json = serde_json::to_value(execution_state).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::CorruptState, e)
+        })?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -89,8 +91,9 @@ impl CurrentJob {
         &mut self,
         execution_state: T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)
-            .map_err(JobError::CouldNotSerializeExecutionState)?;
+        let execution_state_json = serde_json::to_value(execution_state).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::CorruptState, e)
+        })?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -173,12 +176,13 @@ impl CurrentJob {
     /// can call `set_result` after each chunk so that partial progress is
     /// preserved even on failure.
     pub async fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
-        let job_result =
-            JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
+        let job_result = JobReturnValue::try_from(result).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::Invariant, e)
+        })?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
-            self.repo.update_in_op(&mut op, &mut job).await?;
+            self.repo.update_in_op(&mut op, &mut job).await.widen()?;
             op.commit().await?;
         }
         Ok(())
@@ -195,11 +199,12 @@ impl CurrentJob {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         result: &impl Serialize,
     ) -> Result<(), JobError> {
-        let job_result =
-            JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
+        let job_result = JobReturnValue::try_from(result).map_err(|e| {
+            es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::Invariant, e)
+        })?;
         let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
-            self.repo.update_in_op(op, &mut job).await?;
+            self.repo.update_in_op(op, &mut job).await.widen()?;
         }
         Ok(())
     }

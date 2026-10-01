@@ -367,9 +367,10 @@ impl JobRepo {
             // visible DELETE implies visible terminal events — surfaced rather
             // than silently returning a bogus snapshot.
             let Some(row) = row else {
-                return Err(JobError::JobExecutionError(format!(
+                return Err(es_entity::errlanes::Fatal::invariant(format!(
                     "job {id} has no execution row but its entity is not terminal"
-                )));
+                ))
+                .into());
             };
             let execution_state_json = row.execution_state_json.clone();
             (Some(row), execution_state_json)
@@ -382,7 +383,7 @@ impl JobRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::JobError;
+    use crate::error::{JobError, JobRejection};
 
     pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
         let pg_con = std::env::var("PG_CON").unwrap();
@@ -429,8 +430,11 @@ mod tests {
             .await
             .err()
             .expect("expected error")
-            .into();
-        assert!(matches!(err, JobError::DuplicateResident(_)));
+            .lift();
+        assert!(matches!(
+            err,
+            JobError::Rejected(JobRejection::DuplicateResident(_))
+        ));
 
         // Different type: ok, not a collision — the flag is per-type.
         let new_job = NewJob::builder()
@@ -527,8 +531,11 @@ mod tests {
             .await
             .err()
             .expect("expected error")
-            .into();
-        assert!(matches!(err, JobError::DuplicateId(_)));
+            .lift();
+        assert!(matches!(
+            err,
+            JobError::Rejected(JobRejection::DuplicateId(_))
+        ));
 
         // Different type, same key: ok — the key namespace is per-type.
         let new_job = NewJob::builder()
@@ -572,8 +579,11 @@ mod tests {
             .await
             .err()
             .expect("expected error")
-            .into();
-        assert!(matches!(err, JobError::DuplicateId(_)));
+            .lift();
+        assert!(matches!(
+            err,
+            JobError::Rejected(JobRejection::DuplicateId(_))
+        ));
 
         // -- `job_executions`-level liveness enforcement (the new invariant) --
         let type_d = JobType::from_owned(uuid::Uuid::now_v7().to_string());

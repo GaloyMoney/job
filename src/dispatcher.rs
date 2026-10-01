@@ -1,8 +1,10 @@
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes;
+use es_entity::errlanes::{Fatal, FatalKind};
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
-use tracing::{Span, instrument};
+use tracing::Span;
 
 use std::{
     panic::AssertUnwindSafe,
@@ -14,7 +16,7 @@ use super::{
     current::CurrentJob,
     entity::{Job, JobType},
     error::JobError,
-    finalizer::{ClaimDisposition, Disposition, Finalizer},
+    finalizer::{ClaimDisposition, Disposition, Finalizer, RunFailure},
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -170,9 +172,10 @@ impl JobDispatcher {
             .mark_finished_without_releasing_unit(&[self.id]);
     }
 
-    #[instrument(name = "job.execute_job", skip_all,
-        fields(job_id, job_type, attempt, error, error.level, error.message, conclusion, now,
-               claim_disposition)
+    #[errlanes::instrument(
+        name = "job.execute_job",
+        skip_all,
+        fields(job_id, job_type, attempt, conclusion, now, claim_disposition)
     )]
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_job(
@@ -219,14 +222,14 @@ impl JobDispatcher {
         // actually ran is the retry policy's evidence that the job had
         // recovered, and a domain-clock advance must not be able to forge it.
         let started = std::time::Instant::now();
-        let completion = Self::dispatch_job(&self.finalizer, runner, current_job).await;
+        let completion = Self::dispatch_job(runner, current_job).await;
         let run_duration = started.elapsed();
         let disposition: Result<(), JobError> = async {
             match completion {
                 Err(e) => {
                     span.record(
                         "conclusion",
-                        if matches!(e, JobError::PoolCongestion(_)) {
+                        if e.is_congestion() {
                             "Congestion"
                         } else {
                             "Error"
@@ -378,18 +381,20 @@ impl JobDispatcher {
     }
 
     async fn dispatch_job(
-        finalizer: &Finalizer,
         runner: Box<dyn JobRunner>,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, JobError> {
+    ) -> Result<JobCompletion, RunFailure> {
         match AssertUnwindSafe(runner.run(current_job))
             .catch_unwind()
             .await
         {
             Ok(Ok(completion)) => Ok(completion),
-            Ok(Err(e)) => Err(finalizer.maybe_reclassify(e)),
+            Ok(Err(e)) => {
+                let failure = RunFailure::classify(e);
+                failure.record(&Span::current());
+                Err(failure)
+            }
             Err(panic) => {
-                let span = Span::current();
                 let message = if let Some(s) = panic.downcast_ref::<&str>() {
                     s.to_string()
                 } else if let Some(s) = panic.downcast_ref::<String>() {
@@ -398,16 +403,6 @@ impl JobDispatcher {
                     "Unknown panic payload".to_string()
                 };
 
-                span.record("error", true);
-                span.record(
-                    "error.message",
-                    tracing::field::display(&format!("Panic: {message}")),
-                );
-                span.record(
-                    "error.level",
-                    tracing::field::display(tracing::Level::ERROR),
-                );
-
                 tracing::error!(
                     target: "job.panic",
                     panic_message = %message,
@@ -415,14 +410,14 @@ impl JobDispatcher {
                     "Job panicked during execution"
                 );
 
-                Err(JobError::JobExecutionError(format!(
-                    "Job panicked: {message}"
-                )))
+                let failure = RunFailure::Fatal(Fatal::new(FatalKind::Panic).with_context(message));
+                failure.record(&Span::current());
+                Err(failure)
             }
         }
     }
 
-    #[instrument(
+    #[errlanes::instrument(
         name = "job.fail_job",
         skip(self),
         fields(
@@ -430,17 +425,13 @@ impl JobDispatcher {
             job_type = tracing::field::Empty,
             poller_id = tracing::field::Empty,
             attempt,
-            will_retry = tracing::field::Empty,
-            error = tracing::field::Empty,
-            error.lane = tracing::field::Empty,
-            error.level = tracing::field::Empty,
-            error.message = tracing::field::Empty
+            will_retry = tracing::field::Empty
         )
     )]
     async fn fail_job(
         &mut self,
         id: JobId,
-        error: JobError,
+        error: RunFailure,
         attempt: u32,
         run_duration: std::time::Duration,
     ) -> Result<(), JobError> {
@@ -448,22 +439,18 @@ impl JobDispatcher {
         span.record("job_id", tracing::field::display(id));
         span.record("job_type", tracing::field::display(&self.job_type));
         span.record("poller_id", tracing::field::display(self.instance_id));
-        if let Some(lane) = es_entity::errlanes::lane_of(&error) {
-            span.record("error.lane", lane.as_str());
-        }
+        error.record(&span);
 
-        let error_str = match error {
-            JobError::PoolCongestion(message) => {
-                self.rescheduled = true;
-                return self
-                    .finalizer
-                    .reschedule_congested_one(id, attempt, message)
-                    .await;
-            }
-            other => other.to_string(),
-        };
-        span.record("error", true);
-        span.record("error.message", tracing::field::display(&error_str));
+        if error.is_congestion() {
+            self.rescheduled = true;
+            let message = error.message();
+            return self
+                .finalizer
+                .reschedule_congested_one(id, attempt, message)
+                .await;
+        }
+        let terminal = error.is_terminal();
+        let error_str = error.message();
 
         let items = [(
             id,
@@ -471,6 +458,7 @@ impl JobDispatcher {
                 error: error_str,
                 attempt,
                 run_duration,
+                terminal,
             },
         )];
         let finalizer = self.finalizer.clone();
@@ -543,7 +531,7 @@ impl JobDispatcher {
     /// oldest parked sibling, and emits the terminal notification; the
     /// freed unit recycles into an immediate same-type claim when the row
     /// was actually this instance's to delete.
-    #[instrument(name = "job.complete_job", skip(self, op), fields(id = %id))]
+    #[errlanes::instrument(name = "job.complete_job", skip(self, op), fields(id = %id))]
     async fn complete_job(
         &mut self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
@@ -561,7 +549,7 @@ impl JobDispatcher {
     /// caller's op: back to `pending` at `reschedule_at` with
     /// `attempt_index = 1` (an explicit reschedule has no notion of "which
     /// attempt"), plus the finalizer's invariant-B promote registration.
-    #[instrument(name = "job.reschedule_job", skip(self, op), fields(id = %id, reschedule_at = %reschedule_at, attempt = 1))]
+    #[errlanes::instrument(name = "job.reschedule_job", skip(self, op), fields(id = %id, reschedule_at = %reschedule_at, attempt = 1))]
     async fn reschedule_job(
         &mut self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
