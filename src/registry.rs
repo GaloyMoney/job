@@ -224,8 +224,16 @@ impl JobRegistry {
         initializer: I,
     ) -> JobType {
         let job_type = initializer.job_type();
+        // `retry_fatal: true` alongside `n_attempts: None` for the same
+        // reason: a resident job can never be exhausted into a terminal
+        // error, and `maybe_schedule_retry`'s `terminal` branch (a runner
+        // classified as Fatal/Denied) terminates on the attempt that
+        // produced it UNLESS `retry_fatal` opts back into the ordinary
+        // attempt-count path -- which residents must always do, since they
+        // have no terminal state to go to (see `ResidentJobCompletion`).
         let retry_settings = RetrySettings {
             n_attempts: None,
+            retry_fatal: true,
             ..initializer.retry_on_error_settings()
         };
         self.initializers.insert(
