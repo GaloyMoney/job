@@ -61,7 +61,7 @@ use std::sync::Arc;
 use super::{
     JobId,
     entity::{Job, JobType},
-    error::JobError,
+    error::{CouldNotSerialize, JobError},
     outcome::JobReturnValue,
     repo::JobRepo,
     runner::RetrySettings,
@@ -275,7 +275,8 @@ impl<C> BatchedJobItem<C> {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)?;
+        let execution_state_json =
+            serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -296,7 +297,8 @@ impl<C> BatchedJobItem<C> {
         &mut self,
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)?;
+        let execution_state_json =
+            serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -320,7 +322,8 @@ impl<C> BatchedJobItem<C> {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         result: &impl Serialize,
     ) -> Result<(), JobError> {
-        let job_result = JobReturnValue::try_from(result)?;
+        let job_result =
+            JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
             self.repo.update_in_op(op, &mut job).await.widen()?;
@@ -330,7 +333,8 @@ impl<C> BatchedJobItem<C> {
 
     /// Attach or update this job's result value in its own transaction.
     pub async fn set_result(&self, result: &impl Serialize) -> Result<(), JobError> {
-        let job_result = JobReturnValue::try_from(result)?;
+        let job_result =
+            JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {

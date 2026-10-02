@@ -39,7 +39,7 @@ doc = false
 # KEEP THE FOUR REVS IDENTICAL TO THE ROOT `Cargo.toml`. Temporary, like the
 # root's: both blocks go when es-entity #246 is released.
 [patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "90d2ebadd00c0222b677fc3412f2857a9fa736a2" }
-es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "90d2ebadd00c0222b677fc3412f2857a9fa736a2" }
-errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "90d2ebadd00c0222b677fc3412f2857a9fa736a2" }
-errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "90d2ebadd00c0222b677fc3412f2857a9fa736a2" }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
+errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
+errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }

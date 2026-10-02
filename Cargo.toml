@@ -30,7 +30,6 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 sqlx = { workspace = true }
-thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
@@ -57,7 +56,6 @@ sqlx = { version = "0.8", features = ["macros", "runtime-tokio-rustls", "postgre
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3.19"
-thiserror = "2.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1.23", features = ["serde", "v7"] }
 futures = "0.3"
@@ -66,7 +64,7 @@ schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"]
 
 # Temporary pre-release validation pin; remove when es-entity #246 is released.
 [patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "90d2ebadd00c0222b677fc3412f2857a9fa736a2" }
-es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "90d2ebadd00c0222b677fc3412f2857a9fa736a2" }
-errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "90d2ebadd00c0222b677fc3412f2857a9fa736a2" }
-errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "90d2ebadd00c0222b677fc3412f2857a9fa736a2" }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
+es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
+errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
+errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }

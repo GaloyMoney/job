@@ -8,7 +8,13 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::instrument;
 
-use super::{JobId, entity::JobType, error::JobError, outcome::JobReturnValue, repo::JobRepo};
+use super::{
+    JobId,
+    entity::JobType,
+    error::{CouldNotSerialize, JobError},
+    outcome::JobReturnValue,
+    repo::JobRepo,
+};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
@@ -69,7 +75,8 @@ impl CurrentJob {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)?;
+        let execution_state_json =
+            serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -89,7 +96,8 @@ impl CurrentJob {
         &mut self,
         execution_state: T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)?;
+        let execution_state_json =
+            serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -173,7 +181,8 @@ impl CurrentJob {
     /// can call `set_result` after each chunk so that partial progress is
     /// preserved even on failure.
     pub async fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
-        let job_result = JobReturnValue::try_from(result)?;
+        let job_result =
+            JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
@@ -194,7 +203,8 @@ impl CurrentJob {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         result: &impl Serialize,
     ) -> Result<(), JobError> {
-        let job_result = JobReturnValue::try_from(result)?;
+        let job_result =
+            JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
             self.repo.update_in_op(op, &mut job).await.widen()?;

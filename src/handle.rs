@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     JobId, JobType,
-    error::JobError,
+    error::{CouldNotDeserializeExecutionState, JobError},
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     outcome::JobOutcome,
@@ -293,7 +293,9 @@ impl JobHandle {
     )]
     pub async fn execution_state<S: DeserializeOwned>(&self) -> Result<Option<S>, JobError> {
         match self.repo.execution_state_json_by_id(self.id).await? {
-            Some(json) => Ok(Some(serde_json::from_value(json)?)),
+            Some(json) => Ok(Some(
+                serde_json::from_value(json).map_err(CouldNotDeserializeExecutionState)?,
+            )),
             None => Ok(None),
         }
     }
