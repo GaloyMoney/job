@@ -8,3 +8,20 @@ test-group = 'db-serial'
 [[profile.default.overrides]]
 filter = 'package(job) & (binary_id(job::await_all_cross_process) | binary_id(job::await_all_wide_fanout) | binary_id(job::batched_job))'
 test-group = 'db-serial'
+
+# Postgres makes the backend that DETECTS a deadlock its victim, and this test
+# needs that backend to be the finalizer: its contestant takes the first row,
+# then gives the finalizer a 300ms head start into the lock wait so the
+# finalizer's `deadlock_timeout` is the one that expires first. Competing with
+# the rest of the suite for a runner thread and a pool connection eats that
+# head start, so reserve every thread and let the test run alone. A test group
+# would not do: it caps concurrency within the group, while the competition
+# here is every other test.
+#
+# This REDUCES the failure rate rather than removing it -- measured locally at
+# 3 of 4 full-suite runs failing before, 1 of 3 after. The test is racy by
+# construction (its own panic message says as much) and passes reliably when
+# run on its own.
+[[profile.default.overrides]]
+filter = 'package(job) & kind(lib) & test(/^finalizer::deadlock_regression_tests::/)'
+threads-required = 'num-cpus'
