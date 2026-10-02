@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [workspace.dependencies]
 
-es-entity = "=0.14.4-dev"
+es-entity = "0.15.0"
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -62,9 +62,3 @@ futures = "0.3"
 rand = "0.10"
 schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"] }
 
-# Temporary pre-release validation pin; remove when es-entity #246 is released.
-[patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
-es-entity-macros = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
-errlanes = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }
-errlanes-derive = { git = "https://github.com/GaloyMoney/es-entity", rev = "3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b" }

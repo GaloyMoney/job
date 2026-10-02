@@ -481,8 +481,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errlanes"
-version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b#3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9f2be882f35a14c366140de290400eb412a2bcb6c0eea1be50af11edbbbcde2"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -492,8 +493,9 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b#3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c75eb0d0408b92e603961995b0c37d088ef613764cdd652040ac6726cfdd3cbe"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
@@ -505,8 +507,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b#3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b275590790d21e52c0744d6756441d60c55f7c18f6f65333586cd2cd3e4b31f4"
 dependencies = [
  "async-stream",
  "chrono",
@@ -531,8 +534,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b#3a19f9a41a7de7c1d1808b5068ee5e3354f6ae2b"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c6edf816eaca2a6516d622fc3b2d5b13ac285a837aeb87ea31ff453938b83ab"
 dependencies = [
  "convert_case",
  "darling 0.24.1",
