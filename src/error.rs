@@ -79,7 +79,7 @@ pub struct CouldNotDeserializeExecutionState(#[source] pub(crate) serde_json::Er
 #[derive(Debug, errlanes::Classify)]
 #[error("job service migration failed")]
 #[classify(fatal(Config), from)]
-pub(crate) struct Migrate(sqlx::migrate::MigrateError);
+pub(crate) struct Migrate(#[source] sqlx::migrate::MigrateError);
 
 /// Total attempts a crate-owned bookkeeping transaction (batch seal / fail,
 /// congestion reschedule) gets when Postgres keeps ABORTING it as a
@@ -106,6 +106,32 @@ mod tests {
         let mut unencodable = HashMap::new();
         unencodable.insert((1u8, 2u8), 3u8);
         serde_json::to_value(&unencodable).expect_err("non-string map key must not encode")
+    }
+
+    /// Same chain contract as the serde wrappers, on the one wrapper whose
+    /// payload is a driver error rather than a `serde_json::Error`: the
+    /// wrapper names the stage that failed and the `MigrateError` below it
+    /// says what actually went wrong. Without that second hop a failed
+    /// `Jobs::init` reports only "job service migration failed", which
+    /// names no migration and no SQL.
+    #[test]
+    fn a_migration_failure_is_fatal_config_keeping_the_driver_error() {
+        let err: JobError = Migrate(sqlx::migrate::MigrateError::VersionMissing(7)).into();
+        match err {
+            Fail::Fatal(fatal) => {
+                assert_eq!(fatal.kind, FatalKind::Config);
+                let wrapper = fatal.source().expect("the wrapper is the Fatal's source");
+                assert_eq!(wrapper.to_string(), "job service migration failed");
+                let driver = wrapper
+                    .source()
+                    .expect("the MigrateError is the wrapper's source");
+                assert!(
+                    driver.to_string().contains("migration 7"),
+                    "driver error lost from the chain, got {driver}"
+                );
+            }
+            other => panic!("expected Fatal(Config), got {other:?}"),
+        }
     }
 
     /// The reason these variants exist instead of a bare `?`: the operator's
