@@ -25,6 +25,15 @@
   N attempts:` instead of being just the last attempt's transient text -- the entity narrows the
   failure into `Fatal(Exhausted)` before persisting it, so the stored string itself says the job was
   retried to exhaustion.
+- [**breaking**] `CurrentBatchedJob::run_isolated` / `run_bisected` / `run_bisected_with` now
+  return their outer `Err` as `errlanes::Fault<errlanes::lanes!(Transient, Fatal)>` instead of the
+  caller's own error type `E`. `run_bisected` / `run_bisected_with` no longer require
+  `E: From<errlanes::Fatal>` -- `E` only needs `std::error::Error + 'static` (or `Display` for
+  `run_bisected_with`), since the search's own failures (a dead connection, or the transient
+  allowance running out) are never attributed to the caller's type. A deadlock or serialization
+  failure during bisection is now recognised through `Fault::classify(..).is_contention()` instead
+  of a literal SQLSTATE match, so it is found even several layers inside a caller's own wrapped
+  error, not just a raw `sqlx::Error`.
 
 ### Features
 
@@ -37,6 +46,20 @@
   borrows the error and clones the lane out, so no existing `impl JobRunner` needs to change.
 - Congestion detection moved to errlanes' own `TransientKind::is_congestion` /
   `Fault::is_congestion`, dropping job's own `finalizer::is_congestion` predicate.
+- `Finalizer::finalize`'s own commit-abort retry guard now recognises a server-confirmed deadlock
+  or serialization failure through `Fault::classify(&e).is_contention()` instead of a hand-rolled
+  SQLSTATE match, dropping `finalizer::is_safe_commit_abort[_code]`.
+- Encoding a value job itself produced (config, execution state, a runner's return value) now goes
+  through a new local `error::Encode` wrapper (`#[derive(errlanes::Classify)] #[classify(fatal(
+  Invariant), from)]`) instead of a hand-rolled `map_err`, so these sites are `?`/`.classify::<
+  Encode>()?` instead of a closure. Decoding stored bytes (`JobHandle::execution_state`,
+  `CurrentJob`/`CurrentBatchedJob::execution_state`) is unaffected and still reports
+  `Fatal(CorruptState)` -- now via es-entity's always-on `classify-serde-json` feature. The one
+  behaviour change: `NewJobBuilder::config`'s encode failure is now `Fatal(Invariant)`, not
+  `Fatal(Config)` -- a config value that does not serialize is a bug in the type, not a
+  configuration problem.
+- `Jobs::init`'s embedded-migration failure goes through a new local `error::Migrate` wrapper the
+  same way, via `.classify::<Migrate>()?`.
 
 ### Bug Fixes
 
