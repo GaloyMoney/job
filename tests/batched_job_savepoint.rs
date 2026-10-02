@@ -2,13 +2,13 @@
 //! `SAVEPOINT` isolation inside a shared batch transaction (es-entity
 //! 0.12.8's `DbOp::with_savepoint`).
 //!
-//! The contract under test: a per-item **DB** error no longer poisons the
-//! whole batch transaction. Before this, any error surfacing from a
-//! statement run directly against a batch's `op` aborted the entire shared
-//! transaction — every item in the batch, including ones that had nothing to
-//! do with the failure, went through the whole-batch retry path. With
-//! `run_isolated`, a failing item's writes unwind to its own savepoint and
-//! the rest of the batch still commits in the same transaction.
+//! The contract under test: a per-item **DB** error does not poison the
+//! whole batch transaction. An error surfacing from a statement run directly
+//! against a batch's `op` aborts the entire shared transaction, taking every
+//! item in the batch — including ones with nothing to do with the failure —
+//! through the whole-batch retry path. With `run_isolated`, a failing item's
+//! writes unwind to its own savepoint and the rest of the batch still commits
+//! in the same transaction.
 #![cfg(feature = "es-entity")]
 
 mod helpers;

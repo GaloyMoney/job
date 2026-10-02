@@ -496,10 +496,10 @@ impl<C> CurrentBatchedJob<C> {
     ///
     /// The counterpart of [`run_isolated`](Self::run_isolated) for **true
     /// batch** implementations: a batch-load/mutate/batch-persist runner has
-    /// no per-item loop for `run_isolated` to wrap, so its only failure
-    /// shape was previously "every item fails, all N retry solo". `f` here
-    /// takes a *slice* of items — probe them with one statement, the same
-    /// shape a true batch already uses.
+    /// no per-item loop for `run_isolated` to wrap, and without a slice
+    /// probe its only failure shape is "every item fails, all N retry
+    /// solo". `f` here takes a *slice* of items — probe them with one
+    /// statement, the same shape a true batch already uses.
     ///
     /// Equivalent to [`run_bisected_with`](Self::run_bisected_with) with
     /// [`BisectBudget::default()`] (`Auto`).

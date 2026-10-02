@@ -580,8 +580,8 @@ mod tests {
 
         /// Timestamps for one scheduled attempt in a replayed history: when
         /// the preceding failure was recorded, and when the retry was
-        /// scheduled to run. Purely history scaffolding now — the retry
-        /// policy no longer reads any of it.
+        /// scheduled to run. Purely history scaffolding — the retry
+        /// policy reads none of it.
         #[derive(Clone, Copy)]
         struct ScheduleWindow {
             failure_recorded_at: DateTime<Utc>,

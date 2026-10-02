@@ -220,11 +220,11 @@ async fn fatal_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Re
 
 /// A plain, unlaned string error (no errlanes payload anywhere in its
 /// chain) gets `Fault::classify`'s `Fatal(Dependency)` default -- reported as
-/// fatal on the span, so it is visible -- and still takes the pre-errlanes
-/// behaviour of an ordinary attempt-count retry, because `terminal_on_fatal`
-/// is off. Reporting the lane and acting on it are separate.
+/// fatal on the span, so it is visible -- and still takes an ordinary
+/// attempt-count retry, because `terminal_on_fatal` is off. Reporting the
+/// lane and acting on it are separate.
 #[tokio::test]
-async fn unclassified_string_error_retries_like_before() -> anyhow::Result<()> {
+async fn unclassified_string_error_retries_per_policy() -> anyhow::Result<()> {
     let (mut jobs, _pool, job_type) = start("lanes-unclassified-retries").await?;
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let spawner = jobs.add_initializer(AlwaysFailsInitializer {
@@ -252,7 +252,7 @@ async fn unclassified_string_error_retries_like_before() -> anyhow::Result<()> {
     assert_eq!(
         seen,
         vec![1, 2, 3],
-        "an unclassified error must retry like any pre-errlanes failure, got {seen:?}"
+        "an unclassified error must retry on the ordinary attempt budget, got {seen:?}"
     );
 
     jobs.shutdown().await?;
@@ -263,8 +263,7 @@ async fn unclassified_string_error_retries_like_before() -> anyhow::Result<()> {
 /// `JobDispatcher::dispatch_job`), so the span says `error.lane = fatal`,
 /// `error.code = panic` straight away -- but like any other `Fatal` it is
 /// gated by `terminal_on_fatal`, which is off here. So the job spends its
-/// retry budget and errors only when that runs out, which is exactly what
-/// pre-errlanes job did with a panic (`JobError::JobExecutionError`).
+/// retry budget and errors only when that runs out.
 #[tokio::test]
 async fn panicking_runner_errors_after_spending_its_retry_budget() -> anyhow::Result<()> {
     struct PanicInitializer {

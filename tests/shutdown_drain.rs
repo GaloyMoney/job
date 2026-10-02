@@ -3,15 +3,15 @@
 //! mid-flight.
 //!
 //! The hazard is the poll loop, not the monitors. A `poll_and_dispatch()` in
-//! flight when shutdown starts used to keep claiming and dispatching rows; a
+//! flight when shutdown starts must not keep claiming and dispatching rows: a
 //! generation created that late subscribes to the shutdown broadcast *after*
 //! the `send`, and `tokio::sync::broadcast` never delivers to late subscribers
-//! — so it never acked, was never waited for, and got force-aborted by
-//! `kill_remaining_jobs` while its future was still live. Both writes then
-//! landed on the same `Job` aggregate and one of them lost with
-//! `ConcurrentModification`: either the execution's own completion (its work
-//! silently discarded) or the kill itself (the error escaping
-//! `Jobs::shutdown()`, as seen in lana PR #8282).
+//! — so it would never ack, would never be waited for, and would be
+//! force-aborted by `kill_remaining_jobs` while its future was still live.
+//! Both writes would then land on the same `Job` aggregate and one of them
+//! would lose with `ConcurrentModification`: either the execution's own
+//! completion (its work silently discarded) or the kill itself (the error
+//! escaping `Jobs::shutdown()`, as seen in lana PR #8282).
 //!
 //! Self-rescheduling jobs make that window easy to hit: they hand a row back to
 //! `pending` and notify, so the loop is polling essentially continuously.

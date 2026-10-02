@@ -1959,11 +1959,11 @@ async fn test_await_all_timeout() -> anyhow::Result<()> {
 /// Preconditions are reproduced deterministically: a size-1 terminal broadcast
 /// buffer so a completion burst overflows it and those notifications are lost
 /// (they are never redelivered), leaving the periodic reconciliation sweep as
-/// the sole resolution path. Previously that sweep was the lowest-priority arm
-/// of a `biased` select and could be starved indefinitely by a terminal
-/// firehose, wedging `await_completions(None)` until the process restarted. With
-/// the sweep polled first, a bounded `sweep_interval` caps resolution regardless
-/// of load — so this must complete well within the timeout.
+/// the sole resolution path. As the lowest-priority arm of a `biased` select
+/// that sweep can be starved indefinitely by a terminal firehose, wedging
+/// `await_completions(None)` until the process restarts; polled first, a
+/// bounded `sweep_interval` caps resolution regardless of load — so this must
+/// complete well within the timeout.
 #[tokio::test]
 async fn test_await_all_resolves_when_notifications_dropped() -> anyhow::Result<()> {
     use job::JobPollerConfig;
@@ -2125,10 +2125,10 @@ impl JobRunner for InfiniteListenerRunner {
 /// reclaimed by the lost-handler, because the keep-alive handler keeps its
 /// `alive_at` fresh.
 ///
-/// The lost-handler no longer special-cases its own instance (that exclusion is
-/// what allowed a lost terminal write to zombie forever). What protects a
-/// running row from reclaim is now *liveness*, not ownership: the keep-alive
-/// handler heartbeats only jobs that still have a live future, so a live job's
+/// The lost-handler does not special-case its own instance: such an exclusion
+/// is what lets a lost terminal write zombie forever. What protects a running
+/// row from reclaim is *liveness*, not ownership: the keep-alive handler
+/// heartbeats only jobs that still have a live future, so a live job's
 /// `alive_at` (a wall-clock heartbeat) never crosses the staleness threshold.
 #[tokio::test]
 async fn test_keep_alive_protects_live_own_instance_jobs() -> anyhow::Result<()> {
@@ -2308,7 +2308,7 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
             "orphan from another instance must be rescued"
         );
     }
-    let _ = controller; // silence unused-warning; clock no longer drives this loop
+    let _ = controller; // silence unused-warning; clock does not drive this loop
 
     jobs.shutdown().await?;
     Ok(())
@@ -4946,9 +4946,8 @@ async fn keyed_terminal_state_retained_when_inherited() -> anyhow::Result<()> {
     );
 
     // Also readable through the snapshot/`load()` path (`keyed_handles(...)
-    // .load_all()`'s "caught up?" pattern) — this is the path that
-    // previously silently discarded a terminal job's execution state
-    // regardless of flavor.
+    // .load_all()`'s "caught up?" pattern) — the path where a terminal job's
+    // execution state is easiest to silently discard, regardless of flavor.
     let snapshot = jobs.handle(gen1.id()).load().await?;
     let snapshot_state: Option<CheckpointState> = snapshot.execution_state()?;
     assert_eq!(

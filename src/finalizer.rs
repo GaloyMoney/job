@@ -152,8 +152,8 @@ mod run_failure_tests {
     /// A runner that knows nothing of errlanes gets `Fault::classify`'s
     /// `Fatal(Dependency)` safety default rather than vanishing -- but it
     /// is NOT terminal on its own: `terminal_on_fatal` is `false` by
-    /// default, so this still retries per policy, as it did pre-errlanes.
-    /// See `tests/lanes.rs::unclassified_string_error_retries_like_before`.
+    /// default, so it retries per policy. See
+    /// `tests/lanes.rs::unclassified_string_error_retries_per_policy`.
     #[test]
     fn classifies_a_bare_string_as_fatal_dependency_carrying_its_message() {
         let e = boxed(std::io::Error::other("boom"));
@@ -167,13 +167,11 @@ mod run_failure_tests {
         }
     }
 
-    /// Regression: a runner not built on errlanes at all returns a raw,
-    /// never-laned `sqlx::Error::PoolTimedOut` directly. The pre-errlanes
-    /// `is_pool_congestion` downcast the chain for exactly this shape, and
-    /// a laned-payload-only walk would drop it, regressing a runner
-    /// returning `Err(Box::new(sqlx::Error::PoolTimedOut))` back to
-    /// spending an ordinary retry attempt instead of taking the congestion
-    /// path. `Fault::classify`'s second rule covers it, using errlanes' own
+    /// A runner not built on errlanes at all returns a raw, never-laned
+    /// `sqlx::Error::PoolTimedOut` directly, and it must still reach the
+    /// congestion path rather than spend an ordinary retry attempt: a walk
+    /// that looked only for an already-laned payload would drop it.
+    /// `Fault::classify`'s second rule covers the shape, using errlanes' own
     /// sqlx table -- job keeps no second copy. See
     /// `tests/pool_congestion.rs::congestion_reschedule_keeps_job_batchable`
     /// for the end-to-end sibling.
@@ -277,13 +275,12 @@ mod run_failure_tests {
         assert!(!failure.is_congestion());
     }
 
-    /// Regression for the pre-errlanes bug: `is_pool_congestion` only ever
-    /// matched a raw `sqlx::Error::PoolTimedOut` by downcasting the error
-    /// chain, so a runner returning an already-laned
-    /// `Transient::new(TransientKind::PoolTimeout)` with no `sqlx::Error`
-    /// source attached (exactly what a runner built on the errlanes
-    /// boundary returns) never matched, and every such pool timeout spent a
-    /// `RetryPolicy` attempt instead of taking the congestion path.
+    /// An already-laned `Transient::new(TransientKind::PoolTimeout)` with no
+    /// `sqlx::Error` source attached -- exactly what a runner built on the
+    /// errlanes boundary returns -- takes the congestion path. Matching only
+    /// a raw `sqlx::Error::PoolTimedOut` by downcasting the chain would miss
+    /// it, and every such pool timeout would spend a `RetryPolicy` attempt
+    /// instead.
     #[test]
     fn classify_detects_congestion_from_a_bare_laned_transient_with_no_sqlx_source() {
         let e = boxed(Transient::new(TransientKind::PoolTimeout));
@@ -389,9 +386,8 @@ pub(crate) enum Disposition {
 /// fields and flag updates. `retried` carries each retry's NEXT
 /// `attempt_index` (for warn-threshold escalation); `errored_terminal`
 /// counts `Fail` DECISIONS that went terminal (whether or not the row was
-/// still this instance's to delete), mirroring the batch's historical
-/// `n_errored` accounting; `completed` counts only rows this instance
-/// actually deleted.
+/// still this instance's to delete), mirroring the batch's `n_errored`
+/// accounting; `completed` counts only rows this instance actually deleted.
 #[derive(Default)]
 pub(crate) struct FinalizeOutcome {
     pub(crate) completed: Vec<JobId>,
@@ -426,7 +422,7 @@ pub(crate) enum ClaimDisposition {
     AlreadyDisposed,
     /// The rescue itself failed. Rows stay `running` under this instance
     /// and only the lost-handler will recover them, one `job_lost_interval`
-    /// later. This is the case that used to be silent.
+    /// later.
     Leaked,
 }
 
@@ -1149,15 +1145,13 @@ impl Finalizer {
     }
 }
 
-/// End-to-end regression for the dead abort-retry bug: before errlanes
-/// adoption, `JobError` was a `thiserror` enum whose `Sqlx` variant wrapped
-/// a raw `sqlx::Error` opaquely, so `Lane::of`/`e.is_transient()` could never
-/// classify a deadlock/serialization abort on the finalizer's OWN
-/// disposition write, and `Finalizer::finalize`'s abort-retry guard
-/// (`finalize`, phase 1b) never fired. Now `sqlx::Error` converts through
-/// errlanes' blanket `From` into a proper `Transient`, so a real deadlock
-/// injected on the write must be retried up to `TX_ABORT_MAX_ATTEMPTS`
-/// instead of propagating.
+/// End-to-end cover for `Finalizer::finalize`'s abort-retry guard
+/// (`finalize`, phase 1b): a deadlock or serialization abort on the
+/// finalizer's OWN disposition write arrives as a `Transient`, through
+/// errlanes' blanket `From` for `sqlx::Error`, so a real deadlock injected
+/// on that write is retried up to `TX_ABORT_MAX_ATTEMPTS` rather than
+/// propagating. An opaque error type here would classify as neither, and
+/// the guard would never fire.
 ///
 /// Needs a live Postgres (`PG_CON`); not run as part of `cargo test --lib`
 /// without one, same as every other DB-backed unit test in this crate.

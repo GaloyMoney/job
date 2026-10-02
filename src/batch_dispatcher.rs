@@ -36,9 +36,9 @@ use super::{
 
 /// Renders a batch's ids as a comma-separated list for one log field.
 ///
-/// The `batch dispatcher error` log used to carry only the error, which is
-/// why two production runs of lost-job bursts went undiagnosed: there was no
-/// way to tie an error line to the jobs it stranded.
+/// The `batch dispatcher error` log carries these alongside the error: an
+/// error line that names no jobs cannot be tied to the work it stranded,
+/// which is what makes a burst of lost jobs undiagnosable.
 struct DisplayIds<'a>(&'a [JobId]);
 
 impl std::fmt::Display for DisplayIds<'_> {
@@ -321,12 +321,10 @@ impl BatchDispatcher {
         if let Err(e) = outcome {
             let disposition = self.rescue_claimed_rows().await;
             span.record("claim_disposition", tracing::field::display(disposition));
-            // Emitted here rather than in the poller's spawn wrapper, which
-            // is where it used to live: only this scope knows WHICH jobs were
-            // affected and what became of them. The old log carried the error
-            // alone, which is why two production runs of lost-job bursts went
-            // undiagnosed -- nothing tied an error line to the jobs it
-            // stranded.
+            // Emitted here rather than in the poller's spawn wrapper: only
+            // this scope knows WHICH jobs were affected and what became of
+            // them, and an error line that names no jobs cannot be tied to
+            // the work it stranded.
             tracing::error!(
                 job_type = %self.job_type,
                 job_ids = %DisplayIds(&self.ids),
