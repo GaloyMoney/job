@@ -436,6 +436,7 @@ mod waiters;
 
 pub mod error;
 
+use es_entity::errlanes::ClassifyResult;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
@@ -511,9 +512,10 @@ impl Jobs {
         };
 
         if config.exec_migrations {
-            sqlx::migrate!().run(&pool).await.map_err(|e| {
-                es_entity::errlanes::Fatal::from_error(es_entity::errlanes::FatalKind::Config, e)
-            })?;
+            sqlx::migrate!()
+                .run(&pool)
+                .await
+                .classify::<error::Migrate>()?;
         }
 
         let repo = Arc::new(JobRepo::new(&pool));

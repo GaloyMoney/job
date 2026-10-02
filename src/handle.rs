@@ -293,13 +293,7 @@ impl JobHandle {
     )]
     pub async fn execution_state<S: DeserializeOwned>(&self) -> Result<Option<S>, JobError> {
         match self.repo.execution_state_json_by_id(self.id).await? {
-            Some(json) => serde_json::from_value(json).map(Some).map_err(|e| {
-                es_entity::errlanes::Fatal::from_error(
-                    es_entity::errlanes::FatalKind::CorruptState,
-                    e,
-                )
-                .into()
-            }),
+            Some(json) => Ok(Some(serde_json::from_value(json)?)),
             None => Ok(None),
         }
     }

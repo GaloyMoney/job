@@ -42,6 +42,22 @@ pub enum JobRejection {
 /// or a `Transient`/`Fatal` fault. Job never denies.
 pub type JobError = Fail<JobRejection, lanes!(Transient, Fatal)>;
 
+/// A `serde_json::Error` raised encoding a value job itself produced
+/// (config, execution state, a return value) rather than decoding stored
+/// bytes. Deliberately `Fatal(Invariant)`, not the `classify-serde-json`
+/// default of `Fatal(CorruptState)`: a value we built that fails to
+/// serialize is a bug in the type, not corrupt persisted state.
+#[derive(Debug, Error, errlanes::Classify)]
+#[error("failed to encode value as JSON: {0}")]
+#[classify(fatal(Invariant), from)]
+pub struct Encode(#[source] serde_json::Error);
+
+/// The embedded-migration failure from [`Jobs::init`](crate::Jobs::init).
+#[derive(Debug, Error, errlanes::Classify)]
+#[error("job service migration failed: {0}")]
+#[classify(fatal(Config), from)]
+pub(crate) struct Migrate(#[source] sqlx::migrate::MigrateError);
+
 /// Total attempts a crate-owned bookkeeping transaction (batch seal / fail,
 /// congestion reschedule) gets when Postgres keeps ABORTING it as a
 /// deadlock victim or serialization failure --
