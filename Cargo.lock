@@ -486,9 +486,10 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "errlanes"
 version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=0bf6295cce069a84f5786d7ca4c24b30af5653b3#0bf6295cce069a84f5786d7ca4c24b30af5653b3"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=90d2ebadd00c0222b677fc3412f2857a9fa736a2#90d2ebadd00c0222b677fc3412f2857a9fa736a2"
 dependencies = [
  "errlanes-derive",
+ "serde_json",
  "sqlx",
  "tracing",
 ]
@@ -496,7 +497,7 @@ dependencies = [
 [[package]]
 name = "errlanes-derive"
 version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=0bf6295cce069a84f5786d7ca4c24b30af5653b3#0bf6295cce069a84f5786d7ca4c24b30af5653b3"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=90d2ebadd00c0222b677fc3412f2857a9fa736a2#90d2ebadd00c0222b677fc3412f2857a9fa736a2"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -509,7 +510,7 @@ dependencies = [
 [[package]]
 name = "es-entity"
 version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=0bf6295cce069a84f5786d7ca4c24b30af5653b3#0bf6295cce069a84f5786d7ca4c24b30af5653b3"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=90d2ebadd00c0222b677fc3412f2857a9fa736a2#90d2ebadd00c0222b677fc3412f2857a9fa736a2"
 dependencies = [
  "async-stream",
  "chrono",
@@ -537,7 +538,7 @@ dependencies = [
 [[package]]
 name = "es-entity-macros"
 version = "0.14.4-dev"
-source = "git+https://github.com/GaloyMoney/es-entity?rev=0bf6295cce069a84f5786d7ca4c24b30af5653b3#0bf6295cce069a84f5786d7ca4c24b30af5653b3"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=90d2ebadd00c0222b677fc3412f2857a9fa736a2#90d2ebadd00c0222b677fc3412f2857a9fa736a2"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
