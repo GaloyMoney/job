@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use std::{borrow::Cow, time::Duration};
 
-use es_entity::{context::TracingContext, errlanes::ClassifyResult, *};
+use es_entity::{context::TracingContext, *};
 
 use crate::{
     JobId,
-    error::{Encode, JobError},
+    error::JobError,
     finalizer::RunFailure,
     outcome::{JobReturnValue, JobTerminalState},
 };
@@ -513,7 +513,7 @@ impl NewJob {
 
 impl NewJobBuilder {
     pub fn config<C: serde::Serialize>(&mut self, config: C) -> Result<&mut Self, JobError> {
-        self.config = Some(serde_json::to_value(config).classify::<Encode>()?);
+        self.config = Some(serde_json::to_value(config)?);
         Ok(self)
     }
 }

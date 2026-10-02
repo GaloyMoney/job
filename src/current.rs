@@ -1,16 +1,14 @@
 //! Execution-time helpers available to running jobs.
 
 use es_entity::clock::ClockHandle;
-use es_entity::errlanes::{ClassifyResult, WidenResult};
+use es_entity::errlanes::WidenResult;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
 use std::sync::Arc;
 use tracing::instrument;
 
-use super::{
-    JobId, entity::JobType, error::Encode, error::JobError, outcome::JobReturnValue, repo::JobRepo,
-};
+use super::{JobId, entity::JobType, error::JobError, outcome::JobReturnValue, repo::JobRepo};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
@@ -71,7 +69,7 @@ impl CurrentJob {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state).classify::<Encode>()?;
+        let execution_state_json = serde_json::to_value(execution_state)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -91,7 +89,7 @@ impl CurrentJob {
         &mut self,
         execution_state: T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state).classify::<Encode>()?;
+        let execution_state_json = serde_json::to_value(execution_state)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)

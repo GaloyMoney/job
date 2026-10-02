@@ -29,7 +29,7 @@ impl JobReturnValue {
     }
 
     /// Serialize a value into a `JobReturnValue`.
-    pub fn try_from<T: Serialize>(value: &T) -> Result<Self, crate::error::Encode> {
+    pub fn try_from<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> {
         Ok(Self(serde_json::to_value(value)?))
     }
 }

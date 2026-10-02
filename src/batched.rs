@@ -51,7 +51,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
-use es_entity::errlanes::{ClassifyResult, WidenResult};
+use es_entity::errlanes::WidenResult;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
@@ -61,7 +61,7 @@ use std::sync::Arc;
 use super::{
     JobId,
     entity::{Job, JobType},
-    error::{Encode, JobError},
+    error::JobError,
     outcome::JobReturnValue,
     repo::JobRepo,
     runner::RetrySettings,
@@ -275,7 +275,7 @@ impl<C> BatchedJobItem<C> {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state).classify::<Encode>()?;
+        let execution_state_json = serde_json::to_value(execution_state)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -296,7 +296,7 @@ impl<C> BatchedJobItem<C> {
         &mut self,
         execution_state: &T,
     ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state).classify::<Encode>()?;
+        let execution_state_json = serde_json::to_value(execution_state)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)

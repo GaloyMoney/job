@@ -49,17 +49,16 @@
 - `Finalizer::finalize`'s own commit-abort retry guard now recognises a server-confirmed deadlock
   or serialization failure through `Fault::classify(&e).is_contention()` instead of a hand-rolled
   SQLSTATE match, dropping `finalizer::is_safe_commit_abort[_code]`.
-- Encoding a value job itself produced (config, execution state, a runner's return value) now goes
-  through a new local `error::Encode` wrapper (`#[derive(errlanes::Classify)] #[classify(fatal(
-  Invariant), from)]`) instead of a hand-rolled `map_err`, so these sites are `?`/`.classify::<
-  Encode>()?` instead of a closure. Decoding stored bytes (`JobHandle::execution_state`,
-  `CurrentJob`/`CurrentBatchedJob::execution_state`) is unaffected and still reports
-  `Fatal(CorruptState)` -- now via es-entity's always-on `classify-serde-json` feature. The one
-  behaviour change: `NewJobBuilder::config`'s encode failure is now `Fatal(Invariant)`, not
-  `Fatal(Config)` -- a config value that does not serialize is a bug in the type, not a
-  configuration problem.
-- `Jobs::init`'s embedded-migration failure goes through a new local `error::Migrate` wrapper the
-  same way, via `.classify::<Migrate>()?`.
+- Every `serde_json` failure -- encoding a config, an execution state or a runner's return value,
+  and decoding stored bytes in `JobHandle::execution_state` -- now reaches `JobError` by bare `?`
+  through es-entity's always-on `classify-serde-json` feature, dropping the hand-rolled
+  `map_err(Fatal::from_error(..))` closures. All of them land on errlanes' one serde lane,
+  `Fatal(CorruptState)`. Two kinds change as a result: `NewJobBuilder::config` was
+  `Fatal(Config)` and `CurrentJob`/`CurrentBatchedJob::set_result[_in_op]` was `Fatal(Invariant)`.
+  Decode-side public signatures (`Job::config`, `*::execution_state`, `JobReturnValue::deserialize`)
+  still return the bare `serde_json::Error`.
+- `Jobs::init`'s embedded-migration failure goes through a new local `error::Migrate` wrapper
+  (`#[derive(errlanes::Classify)] #[classify(fatal(Config), from)]`), via `.classify::<Migrate>()?`.
 
 ### Bug Fixes
 
