@@ -17,7 +17,10 @@ struct Idle;
 
 #[async_trait]
 impl job::JobRunner for Idle {
-    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         Ok(JobCompletion::Complete)
     }
 }
@@ -37,7 +40,7 @@ impl KeyedJobInitializer for KeyedInit {
         &self,
         _: &Job,
         _: KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn job::JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(Idle))
     }
 }

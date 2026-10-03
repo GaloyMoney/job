@@ -71,7 +71,7 @@ pub trait JobInitializer: Send + Sync + 'static {
         &self,
         job: &Job,
         spawner: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Result returned by [`JobRunner::run`] describing how to progress the job.
@@ -116,7 +116,7 @@ pub trait JobRunner: Send + Sync + 'static {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>>;
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Debug, Clone)]

@@ -390,8 +390,9 @@ impl JobDispatcher {
         {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
-                // Classified here, while the box is still borrowable and
-                // before the next `.await`.
+                // Classified by reference: a lane payload anywhere in the
+                // chain is cloned out intact; an un-laned error is folded
+                // into the `Fatal`'s context by `Display` chain.
                 let failure: JobFault = Fault::classify(&*e).narrow_denied();
                 failure.record(&Span::current());
                 Err(failure)

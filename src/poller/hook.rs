@@ -957,7 +957,7 @@ mod tests {
             _: crate::JobSpawner<Self::Config>,
         ) -> Result<
             Box<dyn crate::BatchedJobRunner<Config = Self::Config>>,
-            Box<dyn std::error::Error>,
+            Box<dyn std::error::Error + Send + Sync>,
         > {
             unimplemented!("never invoked by this test")
         }

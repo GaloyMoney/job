@@ -37,7 +37,7 @@ impl JobRunner for HoldableRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let attempt = self.attempts_so_far.fetch_add(1, Ordering::SeqCst) + 1;
         self.started.notify_one();
         if attempt <= self.fail_first_n {
@@ -72,7 +72,7 @@ impl JobInitializer for HoldableInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(HoldableRunner {
             started: Arc::clone(&self.started),
             release: Arc::clone(&self.release),

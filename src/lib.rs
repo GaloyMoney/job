@@ -70,7 +70,7 @@
 //!         JobType::new("my-job")
 //!     }
 //!
-//!     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+//!     fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
 //!         let config: MyConfig = job.config()?;
 //!         Ok(Box::new(MyRunner { value: config.value }))
 //!     }
@@ -86,7 +86,7 @@
 //!     async fn run(
 //!         &self,
 //!         _current_job: CurrentJob,
-//!     ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+//!     ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
 //!         println!("Processing value: {}", self.value);
 //!         Ok(JobCompletion::Complete)
 //!     }
@@ -94,7 +94,7 @@
 //!
 //! // 4. Wire it up
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //!     let config = JobSvcConfig::builder()
 //!         .pg_con("postgres://user:pass@localhost/db")
 //!         .build()?;
@@ -157,7 +157,7 @@
 //!     fn max_batch_size(&self) -> usize { 25 }
 //!
 //!     fn init(&self, _: JobSpawner<Self::Config>)
-//!         -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn Error>>
+//!         -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn Error + Send + Sync>>
 //!     {
 //!         Ok(Box::new(RevalueRunner { accounts: self.accounts.clone() }))
 //!     }
@@ -168,7 +168,7 @@
 //!     type Config = RevalueConfig;
 //!
 //!     async fn run_batch(&self, batch: CurrentBatchedJob<RevalueConfig>)
-//!         -> Result<JobBatchCompletion, Box<dyn Error>>
+//!         -> Result<JobBatchCompletion, Box<dyn Error + Send + Sync>>
 //!     {
 //!         let mut op = batch.begin_op().await?;
 //!         for item in batch.items() {
@@ -606,7 +606,7 @@ impl Jobs {
     ///         JobType::new("example")
     ///     }
     ///
-    ///     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    ///     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error + Send + Sync>> {
     ///         Ok(Box::new(MyRunner))
     ///     }
     /// }
@@ -618,7 +618,7 @@ impl Jobs {
     ///     async fn run(
     ///         &self,
     ///         _current_job: CurrentJob,
-    ///     ) -> Result<JobCompletion, Box<dyn Error>> {
+    ///     ) -> Result<JobCompletion, Box<dyn Error + Send + Sync>> {
     ///         Ok(JobCompletion::Complete)
     ///     }
     /// }
@@ -669,7 +669,7 @@ impl Jobs {
     ///         JobType::new("example")
     ///     }
     ///
-    ///     fn init(&self, _job: &Job, _spawner: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    ///     fn init(&self, _job: &Job, _spawner: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error + Send + Sync>> {
     ///         Ok(Box::new(MyRunner))
     ///     }
     /// }
@@ -681,7 +681,7 @@ impl Jobs {
     ///     async fn run(
     ///         &self,
     ///         _current_job: CurrentJob,
-    ///     ) -> Result<JobCompletion, Box<dyn Error>> {
+    ///     ) -> Result<JobCompletion, Box<dyn Error + Send + Sync>> {
     ///         Ok(JobCompletion::Complete)
     ///     }
     /// }
@@ -991,14 +991,14 @@ impl Jobs {
     /// # impl JobInitializer for MyInitializer {
     /// #     type Config = MyConfig;
     /// #     fn job_type(&self) -> JobType { JobType::new("example") }
-    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error + Send + Sync>> {
     /// #         Ok(Box::new(MyRunner))
     /// #     }
     /// # }
     /// # struct MyRunner;
     /// # #[async_trait]
     /// # impl JobRunner for MyRunner {
-    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error>> {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error + Send + Sync>> {
     /// #         Ok(JobCompletion::Complete)
     /// #     }
     /// # }
@@ -1056,14 +1056,14 @@ impl Jobs {
     /// # impl JobInitializer for MyInitializer {
     /// #     type Config = MyConfig;
     /// #     fn job_type(&self) -> JobType { JobType::new("example") }
-    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error>> {
+    /// #     fn init(&self, _job: &Job, _: JobSpawner<Self::Config>) -> Result<Box<dyn JobRunner>, Box<dyn Error + Send + Sync>> {
     /// #         Ok(Box::new(MyRunner))
     /// #     }
     /// # }
     /// # struct MyRunner;
     /// # #[async_trait]
     /// # impl JobRunner for MyRunner {
-    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error>> {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<JobCompletion, Box<dyn Error + Send + Sync>> {
     /// #         Ok(JobCompletion::Complete)
     /// #     }
     /// # }
@@ -1128,14 +1128,14 @@ impl Jobs {
     /// # impl ResidentJobInitializer for MyInitializer {
     /// #     type Config = MyConfig;
     /// #     fn job_type(&self) -> JobType { JobType::new("cleanup") }
-    /// #     fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn Error>> {
+    /// #     fn init(&self, _job: &Job) -> Result<Box<dyn ResidentJobRunner>, Box<dyn Error + Send + Sync>> {
     /// #         Ok(Box::new(MyRunner))
     /// #     }
     /// # }
     /// # struct MyRunner;
     /// # #[async_trait]
     /// # impl ResidentJobRunner for MyRunner {
-    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<ResidentJobCompletion, Box<dyn Error>> {
+    /// #     async fn run(&self, _current_job: CurrentJob) -> Result<ResidentJobCompletion, Box<dyn Error + Send + Sync>> {
     /// #         Ok(ResidentJobCompletion::RescheduleIn(Duration::from_secs(60)))
     /// #     }
     /// # }

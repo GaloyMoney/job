@@ -1172,7 +1172,7 @@ mod deadlock_regression_tests {
 #[cfg(test)]
 mod runner_failure_classification_tests {
     use super::*;
-    use es_entity::errlanes::{Denied, Fatal, FatalKind, Lane, Transient, TransientKind};
+    use es_entity::errlanes::{Denied, Fatal, FatalKind, Transient, TransientKind};
     use std::error::Error;
 
     #[derive(Debug)]
@@ -1188,10 +1188,8 @@ mod runner_failure_classification_tests {
         }
     }
 
-    /// Boxes as the runner traits do -- `Box<dyn Error>`, with no
-    /// `Send + Sync`. If this ever needs those bounds to compile, the
-    /// boundary has regressed back to the widened trait signature.
-    fn boxed<E: Error + 'static>(e: E) -> Box<dyn Error> {
+    /// Boxes as the runner traits do -- `Box<dyn Error + Send + Sync>`.
+    fn boxed<E: Error + Send + Sync + 'static>(e: E) -> Box<dyn Error + Send + Sync> {
         Box::new(e)
     }
 
@@ -1317,7 +1315,7 @@ mod runner_failure_classification_tests {
         let fail: AwaitError = AwaitError::Rejected(AwaitTimeout {
             pending: vec![crate::JobId::new()],
         });
-        let e: Box<dyn Error> = Box::new(fail);
+        let e: Box<dyn Error + Send + Sync> = Box::new(fail);
         let failure: JobFault = Fault::classify(&*e).narrow_denied();
         assert!(matches!(failure, Fault::Fatal(_)));
         assert!(!failure.is_congestion());
@@ -1336,27 +1334,38 @@ mod runner_failure_classification_tests {
         assert!(failure.is_congestion());
     }
 
-    /// The contract this whole boundary exists to keep: a runner error that
-    /// is NOT `Send` (the runner traits do not require it) classifies by
-    /// reference, and the resulting `Fault` crosses a thread boundary --
-    /// which is what the dispatcher does with it, across the `.await` that
-    /// writes the disposition. If this stops compiling, the `Send + Sync`
-    /// bound has crept back onto the runner traits.
+    /// The contract the widened boundary keeps: a runner's boxed error is
+    /// `Send + Sync`, so it can be moved across a `spawn` directly -- no
+    /// classify-by-reference detour is required to get it off the thread
+    /// that produced it. If this ever needs `boxed`'s `Send + Sync` bound
+    /// relaxed to compile, the runner traits have narrowed back to a plain
+    /// `Box<dyn Error>`.
     #[test]
-    fn a_non_send_runner_error_classifies_and_its_fault_crosses_a_spawn() {
-        #[derive(Debug)]
-        struct NotSend(#[allow(dead_code)] std::rc::Rc<()>);
-        impl std::fmt::Display for NotSend {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "not send")
-            }
-        }
-        impl Error for NotSend {}
+    fn a_runner_error_box_itself_crosses_a_spawn() {
+        let e: Box<dyn Error + Send + Sync> = boxed(std::io::Error::other("boom"));
+        let failure: JobFault = std::thread::spawn(move || Fault::classify(&*e).narrow_denied())
+            .join()
+            .unwrap();
+        assert!(matches!(failure, Fault::Fatal(_)));
+    }
 
-        let e: Box<dyn Error> = Box::new(NotSend(std::rc::Rc::new(())));
-        let failure: JobFault = Fault::classify(&*e).narrow_denied();
-        drop(e);
-        let lane = std::thread::spawn(move || failure.lane()).join().unwrap();
-        assert_eq!(lane, Lane::Fatal);
+    /// `Fatal::from_boxed` keeps the initializer's own error as `source`
+    /// instead of folding it into `context` -- the registry's `init_job`
+    /// path for `JobInitializer::init`'s error, now that the box is
+    /// `Send + Sync` and can become a lane payload's `Arc` source. A
+    /// handler or test can still `downcast_ref` the original error, which
+    /// `Fault::classify`'s by-reference `Fatal(Dependency)` default cannot
+    /// offer.
+    #[test]
+    fn an_initializer_error_kept_as_fatal_source_survives_downcast() {
+        let e: Box<dyn Error + Send + Sync> = boxed(std::io::Error::other("bad config"));
+        let fatal = Fatal::from_boxed(FatalKind::Config, e);
+        assert!(
+            fatal
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .is_some()
+        );
     }
 }

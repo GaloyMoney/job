@@ -59,7 +59,10 @@ struct HoldThenComplete {
 
 #[async_trait]
 impl JobRunner for HoldThenComplete {
-    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let n = self.n.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.ran.send(Utc::now());
         if n == 1 {
@@ -78,7 +81,10 @@ struct AlwaysFails {
 
 #[async_trait]
 impl JobRunner for AlwaysFails {
-    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let _ = self.ran.send(Utc::now());
         Err("deliberate failure".into())
     }
@@ -90,7 +96,10 @@ struct Idle;
 
 #[async_trait]
 impl JobRunner for Idle {
-    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         Ok(JobCompletion::Complete)
     }
 }
@@ -146,7 +155,7 @@ impl KeyedJobInitializer for Init {
         &self,
         _: &Job,
         _: KeyedJobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(match self.behaviour {
             Behaviour::HoldThenComplete => Box::new(HoldThenComplete {
                 ran: self.ran.clone(),

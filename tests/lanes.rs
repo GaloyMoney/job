@@ -41,12 +41,12 @@ struct AlwaysFailsRunner<F> {
 #[async_trait]
 impl<F> JobRunner for AlwaysFailsRunner<F>
 where
-    F: Fn() -> Box<dyn std::error::Error> + Send + Sync + 'static,
+    F: Fn() -> Box<dyn std::error::Error + Send + Sync> + Send + Sync + 'static,
 {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         self.attempts.lock().await.push(current_job.attempt());
         Err((self.build_error)())
     }
@@ -61,7 +61,7 @@ struct AlwaysFailsInitializer<F> {
 
 impl<F> JobInitializer for AlwaysFailsInitializer<F>
 where
-    F: Fn() -> Box<dyn std::error::Error> + Send + Sync + Clone + 'static,
+    F: Fn() -> Box<dyn std::error::Error + Send + Sync> + Send + Sync + Clone + 'static,
 {
     type Config = Cfg;
 
@@ -77,7 +77,7 @@ where
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(AlwaysFailsRunner {
             attempts: Arc::clone(&self.attempts),
             build_error: self.build_error.clone(),
@@ -110,7 +110,8 @@ async fn transient_runner_error_retries_with_attempt_plus_one() -> anyhow::Resul
         },
         attempts: Arc::clone(&attempts),
         build_error: || {
-            Box::new(Transient::new(TransientKind::Other)) as Box<dyn std::error::Error>
+            Box::new(Transient::new(TransientKind::Other))
+                as Box<dyn std::error::Error + Send + Sync>
         },
     });
     jobs.start_poll().await?;
@@ -153,7 +154,9 @@ async fn fatal_runner_error_retries_by_default() -> anyhow::Result<()> {
             ..Default::default()
         },
         attempts: Arc::clone(&attempts),
-        build_error: || Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error>,
+        build_error: || {
+            Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error + Send + Sync>
+        },
     });
     jobs.start_poll().await?;
 
@@ -194,7 +197,9 @@ async fn fatal_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Re
             ..Default::default()
         },
         attempts: Arc::clone(&attempts),
-        build_error: || Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error>,
+        build_error: || {
+            Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error + Send + Sync>
+        },
     });
     jobs.start_poll().await?;
 
@@ -289,7 +294,7 @@ async fn panicking_runner_errors_after_spending_its_retry_budget() -> anyhow::Re
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Box::new(PanicRunner))
         }
     }
@@ -299,7 +304,7 @@ async fn panicking_runner_errors_after_spending_its_retry_budget() -> anyhow::Re
         async fn run(
             &self,
             _current_job: CurrentJob,
-        ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
             panic!("intentional test panic");
         }
     }
@@ -343,7 +348,7 @@ async fn denied_runner_error_retries_by_default() -> anyhow::Result<()> {
             ..Default::default()
         },
         attempts: Arc::clone(&attempts),
-        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error>,
+        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error + Send + Sync>,
     });
     jobs.start_poll().await?;
 
@@ -384,7 +389,7 @@ async fn denied_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::R
             ..Default::default()
         },
         attempts: Arc::clone(&attempts),
-        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error>,
+        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error + Send + Sync>,
     });
     jobs.start_poll().await?;
 
@@ -435,7 +440,7 @@ async fn resident_job_returning_fatal_is_rescheduled_not_terminated() -> anyhow:
         fn init(
             &self,
             _job: &Job,
-        ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error>> {
+        ) -> Result<Box<dyn ResidentJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Box::new(AlwaysFatalResidentRunner {
                 invocations: Arc::clone(&self.invocations),
             }))
@@ -449,7 +454,7 @@ async fn resident_job_returning_fatal_is_rescheduled_not_terminated() -> anyhow:
         async fn run(
             &self,
             _current_job: CurrentJob,
-        ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error>> {
+        ) -> Result<ResidentJobCompletion, Box<dyn std::error::Error + Send + Sync>> {
             self.invocations.fetch_add(1, Ordering::SeqCst);
             Err(Box::new(Fatal::new(FatalKind::Invariant)))
         }
@@ -541,7 +546,7 @@ async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Box::new(CongestionOnceRunner {
                 attempts: Arc::clone(&self.attempts),
                 invocations: Arc::clone(&self.invocations),
@@ -557,7 +562,7 @@ async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to
         async fn run(
             &self,
             current_job: CurrentJob,
-        ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+        ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
             self.attempts.lock().await.push(current_job.attempt());
             if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(Box::new(Transient::new(TransientKind::PoolTimeout)));
@@ -617,7 +622,8 @@ async fn exhausted_transient_is_persisted_as_fatal_exhausted() -> anyhow::Result
         },
         attempts: Arc::new(Mutex::new(Vec::new())),
         build_error: || {
-            Box::new(Transient::new(TransientKind::Other)) as Box<dyn std::error::Error>
+            Box::new(Transient::new(TransientKind::Other))
+                as Box<dyn std::error::Error + Send + Sync>
         },
     });
     jobs.start_poll().await?;
@@ -661,7 +667,9 @@ async fn fatal_runner_error_is_persisted_as_its_own_message() -> anyhow::Result<
             ..Default::default()
         },
         attempts: Arc::new(Mutex::new(Vec::new())),
-        build_error: || Box::new(Fatal::invariant("bad")) as Box<dyn std::error::Error>,
+        build_error: || {
+            Box::new(Fatal::invariant("bad")) as Box<dyn std::error::Error + Send + Sync>
+        },
     });
     jobs.start_poll().await?;
 

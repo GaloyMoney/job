@@ -48,7 +48,7 @@ impl JobInitializer for MyJobInitializer {
         JobType::new("my_job")
     }
 
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: MyJobConfig = job.config()?;
         Ok(Box::new(MyJobRunner { config }))
     }
@@ -64,7 +64,7 @@ impl JobRunner for MyJobRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         // Simulate some work
         tokio::time::sleep(tokio::time::Duration::from_millis(self.config.delay_ms)).await;
         println!("Job completed!");
@@ -160,7 +160,7 @@ impl JobInitializer for TenantJobInitializer {
         self.job_type.clone()  // From instance, not hardcoded
     }
 
-    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    fn init(&self, job: &Job) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         // ...
     }
 }

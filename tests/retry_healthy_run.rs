@@ -63,7 +63,10 @@ struct RunsLongThenFails {
 
 #[async_trait]
 impl JobRunner for RunsLongThenFails {
-    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let _ = self.ran.send(Utc::now());
         tokio::time::sleep(RUN_FOR).await;
         Err("blip after a healthy stretch".into())
@@ -78,7 +81,10 @@ struct FailsFast {
 
 #[async_trait]
 impl JobRunner for FailsFast {
-    async fn run(&self, _: CurrentJob) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let _ = self.ran.send(Utc::now());
         Err("deterministic failure".into())
     }
@@ -111,7 +117,7 @@ impl JobInitializer for Init {
         &self,
         _: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(match self.behaviour {
             Behaviour::RunsLongThenFails => Box::new(RunsLongThenFails {
                 ran: self.ran.clone(),

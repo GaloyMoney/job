@@ -45,7 +45,7 @@ impl JobRunner for AlwaysDeniedRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         self.attempts.lock().await.push(current_job.attempt());
         Err(Box::new(Denied::default()))
     }
@@ -82,7 +82,7 @@ impl JobInitializer for AlwaysDeniedInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(AlwaysDeniedRunner {
             attempts: Arc::clone(&self.attempts),
         }))
