@@ -19,14 +19,6 @@
 //! - Library code never inspects a `Fatal`'s payload and never asks callers
 //!   to. Where a caller needs to know, the API offers a value instead (see
 //!   [`JobHandle::maybe_load`](crate::JobHandle::maybe_load)).
-//! - Every index column is `update(persist = false)`, so es_entity types
-//!   `update_in_op` / `update_all_in_op` as
-//!   [`RepoFault`](es_entity::RepoFault) and those sites are a plain `?`.
-//!   The two creates that generate their own ids (the keyed
-//!   `create_all_in_op`, and the resident `create_in_op` once it has
-//!   absorbed its one real collision) see a
-//!   `Fail<JobConstraintViolation, ..>` nobody can correct, and
-//!   `narrow_rejected()` it into `Fatal(Invariant)`.
 
 use super::repo::JobConstraintViolation;
 use crate::JobId;

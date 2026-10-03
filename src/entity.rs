@@ -400,7 +400,7 @@ impl Job {
     /// `failure` is the classified [`JobFault`] that ended this attempt --
     /// `failure.is_fatal()` is errlanes' claim that it will not succeed on
     /// retry (a `Denied` was already narrowed to `Fatal(Denied)` at the job
-    /// boundary; see "Classifying a runner's failure" in `finalizer.rs`). Job acts on that claim only when the
+    /// boundary). Job acts on that claim only when the
     /// type opts in with `retry_policy.terminal_on_fatal`, in which case the
     /// job ends on THIS attempt regardless of the attempt-count budget. By
     /// default the lane is reported but not acted on, and the error takes

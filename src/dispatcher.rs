@@ -391,7 +391,7 @@ impl JobDispatcher {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
                 // Classified here, while the box is still borrowable and
-                // before the next `.await`: see "Classifying a runner's failure" in `finalizer.rs`.
+                // before the next `.await`.
                 let failure: JobFault = Fault::classify(&*e).narrow_denied();
                 failure.record(&Span::current());
                 Err(failure)

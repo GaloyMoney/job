@@ -64,43 +64,6 @@
 //! - **A `CongestionRescheduled` entity event**, not `ExecutionErrored`
 //!   (see [`Job::reschedule_congestion`]), which is also how the
 //!   consecutive-congestion streak is counted for the stuck-forever WARN.
-//!
-//! # Classifying a runner's failure
-//!
-//! A runner's failure reaches job as a [`JobFault`], classified at the boundary.
-//!
-//! The runner traits return a plain `Box<dyn Error>` (not `Send + Sync` --
-//! see the es-entity addendum). `Fault::classify` borrows it, so the box
-//! is classified before the next `.await` and dropped there; the `Fault`
-//! is `Send + Sync` by construction. Job is not an authorization boundary,
-//! so a `Denied` found in the chain is narrowed to `Fatal(Denied)` here:
-//! nobody is on the other end of a job to be told no.
-//!
-//! So: classify at the boundary, before the next `.await`, and let the box
-//! drop there. See `dispatcher.rs::dispatch_job` and
-//! `batch_dispatcher.rs::dispatch_batch`.
-//!
-//! Classification never comes back empty. `Fault::classify` falls back to
-//! `Fatal(Dependency)` carrying the error's whole `Display` chain as
-//! context, so a runner that knows nothing of errlanes still arrives as
-//! something an operator can page on -- see `JobFault::is_fatal` (via
-//! `Laned`/the inherent method) for why that does not, by itself, end the
-//! job.
-//!
-//! **Job does not act on `is_fatal` by default.**
-//! [`RetrySettings::terminal_on_fatal`] defaults to `false`, so a `Fatal`
-//! runner error (including a narrowed `Denied`) is retried on the ordinary
-//! attempt-count policy exactly like a `Transient` one -- while still being
-//! *reported* as fatal on the span (`error.lane`, `error.code`,
-//! `exception.message`, written by `Laned::record` the moment it is
-//! classified).
-//!
-//! The split is deliberate: observability should reflect what the runner
-//! said immediately, but acting on it ends a job after one attempt, and we
-//! have no live experience yet with how faithfully the crates upstream of
-//! job lane their errors. A `Fatal` that is really transient would turn a
-//! blip into a dead job. Until that confidence exists, trusting the lane
-//! that far is opt-in per job type.
 
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
