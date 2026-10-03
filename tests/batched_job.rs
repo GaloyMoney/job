@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use job::{
     BatchItemOutcome, BatchOutcomes, BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob,
     JobBatchCompletion, JobId, JobPollerConfig, JobSpawner, JobSpec, JobSvcConfig,
-    JobTerminalState, JobType, Jobs, RetrySettings, error::JobError,
+    JobTerminalState, JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -1238,6 +1238,10 @@ async fn missing_initializer_surfaces_for_unregistered_batched_type() -> anyhow:
     let config = JobSvcConfig::builder().pool(pool).build().unwrap();
     let jobs = Jobs::init(config).await?;
     let missing = jobs.handle(JobId::new()).load().await;
-    assert!(matches!(missing, Err(JobError::Find(_))));
+    let err = missing.err().expect("missing job should error");
+    assert_eq!(
+        err.as_fatal().map(|f| f.kind),
+        Some(es_entity::errlanes::FatalKind::Invariant)
+    );
     Ok(())
 }

@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes::ResultExt;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -307,7 +308,7 @@ where
         }
         let new_job = builder.build().expect("Could not build new job");
 
-        let job = self.repo.create_in_op(op, new_job).await?;
+        let job = self.repo.create_in_op(op, new_job).await.widen()?;
         if let Some(waiter) = spec.waiter {
             self.handle_ops
                 .waiters
@@ -668,7 +669,7 @@ where
             dedup_keys.push(spec.dedup_key);
         }
 
-        let jobs = self.repo.create_all_in_op(op, new_jobs).await?;
+        let jobs = self.repo.create_all_in_op(op, new_jobs).await.widen()?;
 
         let rows: Vec<NewExecutionRow> = jobs
             .iter()

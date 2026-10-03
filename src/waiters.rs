@@ -8,7 +8,7 @@
 
 use sqlx::PgPool;
 
-use crate::{JobId, entity::JobType, error::JobError};
+use crate::{JobId, entity::JobType, error::JobFault};
 
 /// One wait to register: `waiter` is to be woken when `callee` reaches a
 /// terminal state. Every batch registration in this module -- and every
@@ -68,7 +68,7 @@ impl JobWaiters {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         if waits.is_empty() {
             return Ok(());
         }
@@ -119,7 +119,7 @@ impl JobWaiters {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
-    ) -> Result<Vec<JobId>, JobError> {
+    ) -> Result<Vec<JobId>, JobFault> {
         if waits.is_empty() {
             return Ok(Vec::new());
         }
@@ -167,7 +167,7 @@ impl JobWaiters {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
-    ) -> Result<Vec<JobId>, JobError> {
+    ) -> Result<Vec<JobId>, JobFault> {
         let pending = crate::execution_hooks::ExecutionInsertHook::pending_ids(op);
         let (mut same_op, mut live): (Vec<Wait>, Vec<Wait>) = (Vec::new(), Vec::new());
         for wait in waits {
@@ -215,7 +215,7 @@ impl JobWaiters {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         terminal: &[JobId],
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<(JobId, JobType)>, JobError> {
+    ) -> Result<Vec<(JobId, JobType)>, JobFault> {
         if terminal.is_empty() {
             return Ok(Vec::new());
         }
@@ -267,7 +267,7 @@ impl JobWaiters {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         ids: &[JobId],
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -297,7 +297,7 @@ impl JobWaiters {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         ids: &[JobId],
         target: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<(JobId, JobType)>, JobError> {
+    ) -> Result<Vec<(JobId, JobType)>, JobFault> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }

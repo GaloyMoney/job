@@ -436,6 +436,7 @@ mod waiters;
 
 pub mod error;
 
+use es_entity::errlanes::ResultExt;
 use tracing::instrument;
 
 use std::sync::{Arc, Mutex};
@@ -448,7 +449,9 @@ pub use batched::{
 pub use config::*;
 pub use current::*;
 pub use entity::{Job, JobEvent, JobType};
-pub use error::JobError;
+pub use error::{
+    AwaitError, AwaitInterrupted, AwaitTimeout, InvalidConfig, JobError, JobFault, JobRejection,
+};
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use handle::{JobHandle, JobHandles};
 pub use job_execution::JobStatus;
@@ -492,7 +495,7 @@ pub struct Jobs {
 
 impl Jobs {
     /// Initialize the service using a [`JobSvcConfig`] for connection and runtime settings.
-    pub async fn init(config: JobSvcConfig) -> Result<Self, JobError> {
+    pub async fn init(config: JobSvcConfig) -> Result<Self, JobFault> {
         let pool = match (config.pool.clone(), config.pg_con.clone()) {
             (Some(pool), None) => pool,
             (None, Some(pg_con)) => {
@@ -503,14 +506,18 @@ impl Jobs {
                 pool_opts.connect(&pg_con).await?
             }
             _ => {
-                return Err(JobError::Config(
-                    "One of pg_con or pool must be set".to_string(),
-                ));
+                return Err(es_entity::errlanes::Fatal::invariant(
+                    "One of pg_con or pool must be set",
+                )
+                .into());
             }
         };
 
         if config.exec_migrations {
-            sqlx::migrate!().run(&pool).await?;
+            sqlx::migrate!()
+                .run(&pool)
+                .await
+                .classify::<error::Migrate>()?;
         }
 
         let repo = Arc::new(JobRepo::new(&pool));
@@ -561,8 +568,9 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Sqlx`] if the poller cannot initialise its database listeners or
-    /// supporting tasks.
+    /// Returns a `Transient` or `Fatal` lane -- classified from the underlying
+    /// `sqlx::Error` -- if the poller cannot initialise its database listeners
+    /// or supporting tasks.
     ///
     /// # Panics
     ///
@@ -697,7 +705,7 @@ impl Jobs {
     /// # }
     /// # tokio::runtime::Runtime::new().unwrap().block_on(double_start()).unwrap();
     /// ```
-    pub async fn start_poll(&mut self) -> Result<(), JobError> {
+    pub async fn start_poll(&mut self) -> Result<(), JobFault> {
         let registry = self
             .registry
             .lock()
@@ -900,7 +908,7 @@ impl Jobs {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: impl Into<JobId>,
         at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool, JobError> {
+    ) -> Result<bool, JobFault> {
         let id: JobId = id.into();
         tracing::Span::current().record("id", tracing::field::display(id));
         let moved = self.waiters.pull_forward_ids_in_op(op, &[id], at).await?;
@@ -942,7 +950,7 @@ impl Jobs {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         callee: impl Into<JobId>,
         waiter: impl Into<JobId>,
-    ) -> Result<bool, JobError> {
+    ) -> Result<bool, JobFault> {
         let (callee, waiter): (JobId, JobId) = (callee.into(), waiter.into());
         let span = tracing::Span::current();
         span.record("callee", tracing::field::display(callee));
@@ -959,7 +967,8 @@ impl Jobs {
     /// No I/O happens until a method on the handle is called; handles hold no
     /// cached state, so every read is a live committed read. The id does not
     /// need to belong to an existing job: [`JobHandle::load`] and the
-    /// awaits return [`JobError::Find`] if it never existed.
+    /// awaits return a `Fatal` carrying an [`es_entity::NotFound`] source if
+    /// it never existed.
     ///
     /// See [`Jobs::handles`] for the batch mint and the
     /// persist-ids → re-mint → await pattern.
@@ -971,7 +980,6 @@ impl Jobs {
     /// #     Jobs, JobSvcConfig, Job, JobId, JobInitializer, JobRunner, JobType, JobCompletion,
     /// #     CurrentJob, JobSpawner,
     /// # };
-    /// # use job::error::JobError;
     /// # use async_trait::async_trait;
     /// # use serde::{Serialize, Deserialize};
     /// # use sqlx::postgres::PgPoolOptions;
@@ -994,7 +1002,7 @@ impl Jobs {
     /// #         Ok(JobCompletion::Complete)
     /// #     }
     /// # }
-    /// # async fn example() -> Result<(), JobError> {
+    /// # async fn example() -> anyhow::Result<()> {
     /// # let pool = PgPoolOptions::new()
     /// #     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
     /// # let config = JobSvcConfig::builder().pool(pool).build().unwrap();
@@ -1037,7 +1045,6 @@ impl Jobs {
     /// #     Jobs, JobSvcConfig, Job, JobId, JobInitializer, JobRunner, JobType, JobCompletion,
     /// #     CurrentJob, JobSpawner, JobOutcomes,
     /// # };
-    /// # use job::error::JobError;
     /// # use async_trait::async_trait;
     /// # use serde::{Serialize, Deserialize};
     /// # use sqlx::postgres::PgPoolOptions;
@@ -1060,7 +1067,7 @@ impl Jobs {
     /// #         Ok(JobCompletion::Complete)
     /// #     }
     /// # }
-    /// # async fn example() -> Result<(), JobError> {
+    /// # async fn example() -> anyhow::Result<()> {
     /// # let pool = PgPoolOptions::new()
     /// #     .connect_lazy("postgres://postgres:password@localhost/postgres")?;
     /// # let config = JobSvcConfig::builder().pool(pool).build().unwrap();
@@ -1099,7 +1106,8 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     ///
     /// # Examples
     ///
@@ -1150,7 +1158,7 @@ impl Jobs {
     pub async fn resident_handle(
         &self,
         job_type: impl Into<JobType> + std::fmt::Debug,
-    ) -> Result<Option<JobHandle>, JobError> {
+    ) -> Result<Option<JobHandle>, JobFault> {
         let id = self.repo.find_resident_id(&job_type.into()).await?;
         Ok(id.map(|id| self.handle(id)))
     }
@@ -1165,19 +1173,20 @@ impl Jobs {
     /// Passed an in-flight operation, the returned handle is only as good as
     /// that operation's eventual commit: it names a row this read saw
     /// uncommitted, and if the operation rolls back instead, the id was
-    /// never really live. Awaiting or loading such a handle then answers
-    /// [`JobError::Find`] -- the same trap as awaiting a handle minted for an
-    /// id a caller later decided not to keep.
+    /// never really live. Awaiting or loading such a handle then answers a
+    /// `Fatal` with an [`es_entity::NotFound`] source -- the same trap as
+    /// awaiting a handle minted for an id a caller later decided not to keep.
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.resident_handle_in_op", skip(self, op))]
     pub async fn resident_handle_in_op(
         &self,
         op: impl es_entity::IntoOneTimeExecutor<'_>,
         job_type: impl Into<JobType> + std::fmt::Debug,
-    ) -> Result<Option<JobHandle>, JobError> {
+    ) -> Result<Option<JobHandle>, JobFault> {
         let id = self
             .repo
             .find_resident_id_in_op(op, &job_type.into())
@@ -1192,13 +1201,14 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.keyed_handle", skip(self))]
     pub async fn keyed_handle(
         &self,
         job_type: impl Into<JobType> + std::fmt::Debug,
         key: impl AsRef<str> + std::fmt::Debug,
-    ) -> Result<Option<JobHandle>, JobError> {
+    ) -> Result<Option<JobHandle>, JobFault> {
         let job = self.repo.find_keyed(&job_type.into(), key.as_ref()).await?;
         Ok(job.map(|job| self.handle(job.id)))
     }
@@ -1211,14 +1221,15 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.keyed_handle_in_op", skip(self, op))]
     pub async fn keyed_handle_in_op(
         &self,
         op: impl es_entity::IntoOneTimeExecutor<'_>,
         job_type: impl Into<JobType> + std::fmt::Debug,
         key: impl AsRef<str> + std::fmt::Debug,
-    ) -> Result<Option<JobHandle>, JobError> {
+    ) -> Result<Option<JobHandle>, JobFault> {
         let job = self
             .repo
             .find_keyed_in_op(op, &job_type.into(), key.as_ref())
@@ -1241,12 +1252,13 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.keyed_handles", skip(self))]
     pub async fn keyed_handles(
         &self,
         job_type: impl Into<JobType> + std::fmt::Debug,
-    ) -> Result<JobHandles, JobError> {
+    ) -> Result<JobHandles, JobFault> {
         let ids = self
             .repo
             .list_keyed_ids_by_job_type(&job_type.into())
@@ -1262,13 +1274,14 @@ impl Jobs {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the lookup fails.
+    /// Returns a `Transient` or `Fatal` lane if the lookup fails -- a `Fatal`
+    /// carrying an [`es_entity::NotFound`] source when there is no such row.
     #[instrument(name = "job.keyed_handles_in_op", skip(self, op))]
     pub async fn keyed_handles_in_op(
         &self,
         op: impl es_entity::IntoOneTimeExecutor<'_>,
         job_type: impl Into<JobType> + std::fmt::Debug,
-    ) -> Result<JobHandles, JobError> {
+    ) -> Result<JobHandles, JobFault> {
         let ids = self
             .repo
             .list_keyed_ids_by_job_type_in_op(op, &job_type.into())
@@ -1290,7 +1303,7 @@ impl Jobs {
     /// If not called manually, shutdown will be automatically triggered when the
     /// Jobs instance is dropped.
     #[instrument(name = "job.shutdown", skip(self))]
-    pub async fn shutdown(&self) -> Result<(), JobError> {
+    pub async fn shutdown(&self) -> Result<(), JobFault> {
         if let Some(handle) = &self.poller_handle {
             handle.shutdown().await?;
         }

@@ -627,13 +627,13 @@ async fn spawn_yields_to_an_older_pending_row_of_the_same_type() -> anyhow::Resu
     // dispatching itself past older backlog -- necessarily leaves `old_id`
     // `pending`, so it cannot hide behind a passing assertion here.
     //
-    // What is deliberately NOT asserted is `new_state == "pending"`. That
-    // used to be here and was the source of this test's flakiness, without
-    // fairness ever having broken: having correctly claimed the older row,
-    // the spawn's commit legitimately emits `execution_ready` for the type
-    // (`new_id` was added and NOT claimed), the poll loop wakes on it, and
-    // claims `new_id` on a later pass. Both rows end up `running` and the
-    // old assertion read red on a system that did exactly the right thing.
+    // What is deliberately NOT asserted is `new_state == "pending"`.
+    // Asserting it would make this test flaky without fairness ever having
+    // broken: having correctly claimed the older row, the spawn's commit
+    // legitimately emits `execution_ready` for the type (`new_id` was added
+    // and NOT claimed), the poll loop wakes on it, and claims `new_id` on a
+    // later pass. Both rows end up `running`, and such an assertion would
+    // read red on a system that did exactly the right thing.
     // Capping the type's concurrency does not close the window either --
     // units are counted at DISPATCH, after the claiming transaction commits,
     // so a poll landing in between still sees a free slot.

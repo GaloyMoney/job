@@ -1,8 +1,8 @@
-//! Regression tests for Fix 3 of the sb-max8 handoff: `ExecutionInsertHook`
-//! used to notify every type that landed a `pending` row unconditionally,
-//! even when the SAME transaction's head-swap `ClaimHook` immediately
-//! self-claimed it -- a redundant wake for work already stolen, measured at
-//! 19-23% of all DB exec time in production. The `NotifierHook` instance
+//! Coverage for `ExecutionInsertHook`'s notification suppression (Fix 3 of
+//! the sb-max8 handoff). Notifying every type that landed a `pending` row
+//! unconditionally wakes work the SAME transaction's head-swap `ClaimHook`
+//! already self-claimed -- a redundant wake for work already stolen, measured
+//! at 19-23% of all DB exec time in production. The `NotifierHook` instance
 //! those two stage into (via `JobEventNotifier::register_execution_ready_in_op`)
 //! compares each type's `added` and `claimed` ROW IDS (not counts) and only
 //! fires a notification when some `added` id wasn't itself claimed (or the

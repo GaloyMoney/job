@@ -60,7 +60,7 @@ use std::sync::Arc;
 use super::{
     JobId,
     entity::{Job, JobType},
-    error::JobError,
+    error::{CouldNotSerialize, JobFault},
     outcome::JobReturnValue,
     repo::JobRepo,
     runner::RetrySettings,
@@ -273,9 +273,9 @@ impl<C> BatchedJobItem<C> {
         &mut self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
-    ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)
-            .map_err(JobError::CouldNotSerializeExecutionState)?;
+    ) -> Result<(), JobFault> {
+        let execution_state_json =
+            serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -295,9 +295,9 @@ impl<C> BatchedJobItem<C> {
     pub async fn update_execution_state<T: Serialize>(
         &mut self,
         execution_state: &T,
-    ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)
-            .map_err(JobError::CouldNotSerializeExecutionState)?;
+    ) -> Result<(), JobFault> {
+        let execution_state_json =
+            serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -320,9 +320,9 @@ impl<C> BatchedJobItem<C> {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         result: &impl Serialize,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let job_result =
-            JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
+            JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
             self.repo.update_in_op(op, &mut job).await?;
@@ -331,9 +331,9 @@ impl<C> BatchedJobItem<C> {
     }
 
     /// Attach or update this job's result value in its own transaction.
-    pub async fn set_result(&self, result: &impl Serialize) -> Result<(), JobError> {
+    pub async fn set_result(&self, result: &impl Serialize) -> Result<(), JobFault> {
         let job_result =
-            JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
+            JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
@@ -402,7 +402,7 @@ impl<C> CurrentBatchedJob<C> {
 
     /// Begin a new database operation using the job service's clock.
     #[cfg(feature = "es-entity")]
-    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobError> {
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobFault> {
         Ok(es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?)
     }
 
@@ -440,7 +440,10 @@ impl<C> CurrentBatchedJob<C> {
     /// machinery itself failed (e.g. a dead connection), not any one item's
     /// domain logic. That failure isn't attributable to a single item —
     /// propagate it with `?` and let the whole batch retry, exactly like a
-    /// whole-batch `Err` returned from `run_batch` today.
+    /// whole-batch `Err` returned from `run_batch` today. It is classified
+    /// by errlanes' sqlx lane table: a lost connection or a deadlock on the
+    /// savepoint statement itself arrives as `Transient`, anything else as
+    /// `Fatal`.
     ///
     /// Use only `*_in_op` methods against the savepoint inside `f`. The
     /// pool-backed [`BatchedJobItem::update_execution_state`] /
@@ -461,7 +464,7 @@ impl<C> CurrentBatchedJob<C> {
         ) -> Result<BatchItemOutcome, E>
         + Clone
         + Sync,
-    ) -> Result<BatchOutcomes, sqlx::Error>
+    ) -> Result<BatchOutcomes, JobFault>
     where
         E: std::fmt::Display,
     {
@@ -489,10 +492,10 @@ impl<C> CurrentBatchedJob<C> {
     ///
     /// The counterpart of [`run_isolated`](Self::run_isolated) for **true
     /// batch** implementations: a batch-load/mutate/batch-persist runner has
-    /// no per-item loop for `run_isolated` to wrap, so its only failure
-    /// shape was previously "every item fails, all N retry solo". `f` here
-    /// takes a *slice* of items — probe them with one statement, the same
-    /// shape a true batch already uses.
+    /// no per-item loop for `run_isolated` to wrap, and without a slice
+    /// probe its only failure shape is "every item fails, all N retry
+    /// solo". `f` here takes a *slice* of items — probe them with one
+    /// statement, the same shape a true batch already uses.
     ///
     /// Equivalent to [`run_bisected_with`](Self::run_bisected_with) with
     /// [`BisectBudget::default()`] (`Auto`).
@@ -542,8 +545,10 @@ impl<C> CurrentBatchedJob<C> {
     ///
     /// An outer `Err` means the batch could not be dispositioned here at all:
     /// either the savepoint machinery itself failed (a dead connection), or
-    /// probes kept losing lock conflicts. Propagate it with `?` and let the
-    /// whole batch retry, exactly like [`run_isolated`](Self::run_isolated).
+    /// the search's transient allowance ran out before anything could be
+    /// attributed to a range (`Fatal(Exhausted)`). Propagate it with `?` and
+    /// let the whole batch retry, exactly like
+    /// [`run_isolated`](Self::run_isolated); it is classified the same way.
     ///
     /// A `40P01` deadlock or `40001` serialization failure never drives the
     /// search. It is not attributable to any item, so splitting on one cannot
@@ -572,7 +577,7 @@ impl<C> CurrentBatchedJob<C> {
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>
         + Clone
         + Sync,
-    ) -> Result<BatchOutcomes, sqlx::Error>
+    ) -> Result<BatchOutcomes, JobFault>
     where
         E: std::error::Error + 'static,
     {
@@ -597,7 +602,7 @@ impl<C> CurrentBatchedJob<C> {
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>
         + Clone
         + Sync,
-    ) -> Result<BatchOutcomes, sqlx::Error>
+    ) -> Result<BatchOutcomes, JobFault>
     where
         E: std::error::Error + 'static,
     {

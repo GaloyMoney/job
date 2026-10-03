@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::{
     batched::{AnyBatchedJobInitializer, AnyBatchedJobRunner, BatchedJobInitializer},
     entity::*,
-    error::JobError,
+    error::JobFault,
     keyed::{KeyedJobInitializer, KeyedJobSpawner},
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
@@ -224,8 +224,17 @@ impl JobRegistry {
         initializer: I,
     ) -> JobType {
         let job_type = initializer.job_type();
+        // `terminal_on_fatal: false` alongside `n_attempts: None` for the
+        // same reason: a resident job can never be exhausted into a
+        // terminal error, and `maybe_schedule_retry`'s `terminal` branch (a
+        // runner classified as Fatal/Denied) would end the job on the
+        // attempt that produced it. Forced rather than merely defaulted:
+        // the type's own `retry_on_error_settings()` could turn it on, and
+        // a resident has no terminal state to go to (see
+        // `ResidentJobCompletion`).
         let retry_settings = RetrySettings {
             n_attempts: None,
+            terminal_on_fatal: false,
             ..initializer.retry_on_error_settings()
         };
         self.initializers.insert(
@@ -262,12 +271,27 @@ impl JobRegistry {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, JobError> {
+    ) -> Result<Box<dyn JobRunner>, JobFault> {
         self.initializers
             .get(&job.job_type)
-            .ok_or(JobError::NoInitializerPresent)?
+            .ok_or_else(|| {
+                JobFault::from(es_entity::errlanes::Fatal::invariant(format!(
+                    "no initializer registered for job type {}",
+                    job.job_type
+                )))
+            })?
             .init(job, repo, router, clock, notifier)
-            .map_err(|e| JobError::JobInitError(e.to_string()))
+            // An initializer's error cannot become this `Fatal`'s source
+            // (`init` returns a plain `Box<dyn Error>`, which is not
+            // `Send + Sync`), so its whole `Display` chain is folded into
+            // the context instead -- the same trade `Fault::classify` makes
+            // at the runner boundary. `Config` is right here: an initializer
+            // that cannot build its runner from the job's config is a
+            // configuration failure, not a narrowed lane.
+            .map_err(|e| {
+                es_entity::errlanes::Fatal::from_dyn(es_entity::errlanes::FatalKind::Config, &*e)
+                    .into()
+            })
     }
 
     /// Whether this type keeps its execution state past terminal. True only
@@ -301,12 +325,26 @@ impl JobRegistry {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn AnyBatchedJobRunner>, JobError> {
+    ) -> Result<Box<dyn AnyBatchedJobRunner>, JobFault> {
         self.batched_initializers
             .get(job_type)
-            .ok_or(JobError::NoInitializerPresent)?
+            .ok_or_else(|| {
+                JobFault::from(es_entity::errlanes::Fatal::invariant(format!(
+                    "no initializer registered for job type {job_type}"
+                )))
+            })?
             .init_erased(repo, router, clock, notifier)
-            .map_err(|e| JobError::JobInitError(e.to_string()))
+            // An initializer's error cannot become this `Fatal`'s source
+            // (`init` returns a plain `Box<dyn Error>`, which is not
+            // `Send + Sync`), so its whole `Display` chain is folded into
+            // the context instead -- the same trade `Fault::classify` makes
+            // at the runner boundary. `Config` is right here: an initializer
+            // that cannot build its runner from the job's config is a
+            // configuration failure, not a narrowed lane.
+            .map_err(|e| {
+                es_entity::errlanes::Fatal::from_dyn(es_entity::errlanes::FatalKind::Config, &*e)
+                    .into()
+            })
     }
 
     /// Retrieve retry settings for a given job type.

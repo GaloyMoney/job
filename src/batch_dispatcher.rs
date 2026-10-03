@@ -9,8 +9,10 @@
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes;
+use es_entity::errlanes::{Fatal, FatalKind, Fault, Laned, Transient, TransientKind};
 use futures::FutureExt;
-use tracing::{Span, instrument};
+use tracing::Span;
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
@@ -23,7 +25,7 @@ use super::{
         RawBatchItem, ShutdownRx,
     },
     entity::JobType,
-    error::JobError,
+    error::JobFault,
     finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer},
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -34,9 +36,9 @@ use super::{
 
 /// Renders a batch's ids as a comma-separated list for one log field.
 ///
-/// The `batch dispatcher error` log used to carry only the error, which is
-/// why two production runs of lost-job bursts went undiagnosed: there was no
-/// way to tie an error line to the jobs it stranded.
+/// The `batch dispatcher error` log carries these alongside the error: an
+/// error line that names no jobs cannot be tied to the work it stranded,
+/// which is what makes a burst of lost jobs undiagnosable.
 struct DisplayIds<'a>(&'a [JobId]);
 
 impl std::fmt::Display for DisplayIds<'_> {
@@ -234,16 +236,17 @@ impl BatchDispatcher {
         poller.register_claim_recycle(op, &self.job_type, reservation);
     }
 
-    #[instrument(name = "job.execute_batch", skip_all,
-        fields(job_type, n_items, poller_id, error, error.level, error.message, conclusion, now,
-               claim_disposition)
+    #[errlanes::instrument(
+        name = "job.execute_batch",
+        skip_all,
+        fields(job_type, n_items, poller_id, conclusion, now, claim_disposition)
     )]
     #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_batch(
         mut self,
         items: Vec<RawBatchItem>,
         shutdown_rx: ShutdownRx,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let span = Span::current();
         span.record("job_type", tracing::field::display(&self.job_type));
         span.record("n_items", items.len());
@@ -282,7 +285,7 @@ impl BatchDispatcher {
         let runner = self.runner.take().expect("runner");
         // Monotonic, deliberately not `self.clock` -- see `Self::run_duration`.
         let started = std::time::Instant::now();
-        let batch_result = Self::run_batch(&self.finalizer, runner, items, ctx).await;
+        let batch_result = Self::run_batch(runner, items, ctx).await;
         self.run_duration = started.elapsed();
         let outcome = match batch_result {
             Ok(completion) => self.apply(completion).await,
@@ -293,7 +296,7 @@ impl BatchDispatcher {
                 // field.
                 span.record(
                     "conclusion",
-                    if matches!(e, JobError::PoolCongestion(_)) {
+                    if e.is_congestion() {
                         "Congestion"
                     } else {
                         "Error"
@@ -318,12 +321,10 @@ impl BatchDispatcher {
         if let Err(e) = outcome {
             let disposition = self.rescue_claimed_rows().await;
             span.record("claim_disposition", tracing::field::display(disposition));
-            // Emitted here rather than in the poller's spawn wrapper, which
-            // is where it used to live: only this scope knows WHICH jobs were
-            // affected and what became of them. The old log carried the error
-            // alone, which is why two production runs of lost-job bursts went
-            // undiagnosed -- nothing tied an error line to the jobs it
-            // stranded.
+            // Emitted here rather than in the poller's spawn wrapper: only
+            // this scope knows WHICH jobs were affected and what became of
+            // them, and an error line that names no jobs cannot be tied to
+            // the work it stranded.
             tracing::error!(
                 job_type = %self.job_type,
                 job_ids = %DisplayIds(&self.ids),
@@ -394,19 +395,23 @@ impl BatchDispatcher {
     }
 
     async fn run_batch(
-        finalizer: &Finalizer,
         runner: Box<dyn AnyBatchedJobRunner>,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
-    ) -> Result<JobBatchCompletion, JobError> {
+    ) -> Result<JobBatchCompletion, JobFault> {
         match AssertUnwindSafe(runner.run_batch_erased(items, ctx))
             .catch_unwind()
             .await
         {
             Ok(Ok(completion)) => Ok(completion),
-            Ok(Err(e)) => Err(finalizer.maybe_reclassify(e)),
+            Ok(Err(e)) => {
+                // Classified here, while the box is still borrowable and
+                // before the next `.await`.
+                let failure: JobFault = Fault::classify(&*e).narrow_denied();
+                failure.record(&Span::current());
+                Err(failure)
+            }
             Err(panic) => {
-                let span = Span::current();
                 let message = if let Some(s) = panic.downcast_ref::<&str>() {
                     s.to_string()
                 } else if let Some(s) = panic.downcast_ref::<String>() {
@@ -415,16 +420,6 @@ impl BatchDispatcher {
                     "Unknown panic payload".to_string()
                 };
 
-                span.record("error", true);
-                span.record(
-                    "error.message",
-                    tracing::field::display(&format!("Panic: {message}")),
-                );
-                span.record(
-                    "error.level",
-                    tracing::field::display(tracing::Level::ERROR),
-                );
-
                 tracing::error!(
                     target: "job.panic",
                     panic_message = %message,
@@ -432,14 +427,14 @@ impl BatchDispatcher {
                     "Batched job panicked during execution"
                 );
 
-                Err(JobError::JobExecutionError(format!(
-                    "Job panicked: {message}"
-                )))
+                let failure: JobFault = Fatal::new(FatalKind::Panic).with_context(message).into();
+                failure.record(&Span::current());
+                Err(failure)
             }
         }
     }
 
-    async fn apply(&mut self, completion: JobBatchCompletion) -> Result<(), JobError> {
+    async fn apply(&mut self, completion: JobBatchCompletion) -> Result<(), JobFault> {
         let span = Span::current();
         match completion {
             JobBatchCompletion::CompleteAll => {
@@ -503,20 +498,26 @@ impl BatchDispatcher {
 
     /// Every job in the batch must be dispositioned exactly once. A runner that
     /// breaks this contract has an unclear intent for the jobs it left out, so
-    /// nothing is guessed: the batch is rolled back and retried.
-    fn validate(&self, outcomes: &BatchOutcomes) -> Result<(), JobError> {
+    /// nothing is guessed: the batch is rolled back and retried. A mismatch is
+    /// a bug in the runner, not evidence about any particular job, so it is
+    /// always `Fatal` -- the dispatcher's own contract check states the lane
+    /// itself rather than inferring one from whatever the runner returned.
+    /// Whether a `Fatal` ends the job is then the type's
+    /// `RetrySettings::terminal_on_fatal` decision, like any other fatal.
+    fn validate(&self, outcomes: &BatchOutcomes) -> Result<(), JobFault> {
         let expected: HashSet<JobId> = self.ids.iter().copied().collect();
         let mut seen: HashSet<JobId> = HashSet::with_capacity(outcomes.len());
         for (id, _) in outcomes {
             if !expected.contains(id) {
-                return Err(JobError::BatchOutcomeMismatch(format!(
+                return Err(Fatal::invariant(format!(
                     "outcome returned for job {id}, which is not part of the batch"
-                )));
+                ))
+                .into());
             }
             if !seen.insert(*id) {
-                return Err(JobError::BatchOutcomeMismatch(format!(
-                    "duplicate outcome returned for job {id}"
-                )));
+                return Err(
+                    Fatal::invariant(format!("duplicate outcome returned for job {id}")).into(),
+                );
             }
         }
         if seen.len() != expected.len() {
@@ -525,10 +526,11 @@ impl BatchDispatcher {
                 .map(|id| id.to_string())
                 .collect();
             missing.sort();
-            return Err(JobError::BatchOutcomeMismatch(format!(
+            return Err(Fatal::invariant(format!(
                 "no outcome returned for job(s): {}",
                 missing.join(", ")
-            )));
+            ))
+            .into());
         }
         Ok(())
     }
@@ -544,7 +546,7 @@ impl BatchDispatcher {
     /// destroys work this dispatcher cannot recreate. Those fall through to
     /// the rescue in `execute_batch`, which hands the rows back so the
     /// runner runs again.
-    async fn seal_in_own_op(&mut self, outcomes: BatchOutcomes) -> Result<(), JobError> {
+    async fn seal_in_own_op(&mut self, outcomes: BatchOutcomes) -> Result<(), JobFault> {
         let items = self.disposition_items(outcomes, self.clock.now());
         let finalizer = self.finalizer.clone();
         let outcome = finalizer
@@ -561,7 +563,7 @@ impl BatchDispatcher {
         &mut self,
         op: &mut (impl AtomicOperation + ?Sized),
         outcomes: BatchOutcomes,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
         let items = self.disposition_items(outcomes, now);
         let outcome = self.finalizer.finalize_in_op(op, &items).await?;
@@ -586,8 +588,16 @@ impl BatchDispatcher {
                     BatchItemOutcome::Complete => Disposition::Complete,
                     BatchItemOutcome::RescheduleIn(d) => Disposition::Fresh { at: now + d },
                     BatchItemOutcome::RescheduleAt(t) => Disposition::Fresh { at: t },
+                    // A per-item `BatchItemOutcome::Fail` is a plain string
+                    // the runner chose to report -- no lane payload travels
+                    // with it, so it is laned as `Transient(Other)` so it can
+                    // never be terminal on its own regardless of
+                    // `terminal_on_fatal`; it goes through the ordinary
+                    // attempt-count retry path.
                     BatchItemOutcome::Fail(reason) => Disposition::Fail {
-                        error: reason,
+                        failure: Transient::new(TransientKind::Other)
+                            .with_context(reason)
+                            .into(),
                         attempt: self.attempts.get(&id).copied().unwrap_or(1),
                         run_duration: self.run_duration,
                     },
@@ -613,8 +623,8 @@ impl BatchDispatcher {
     /// rescheduled for another attempt while others exhaust their attempts
     /// and become terminal, all in the same transaction.
     ///
-    /// A `PoolCongestion` error is routed to the finalizer's congestion
-    /// reschedule instead of the retry-policy path: congestion carries no
+    /// A `failure.is_congestion()` error is routed to the finalizer's
+    /// congestion reschedule instead of the retry-policy path: congestion carries no
     /// evidence any of these jobs is broken, so applying `RetryPolicy`'s
     /// attempt escalation to it would walk perfectly good jobs toward
     /// `max_attempts` termination for a condition they didn't cause. The
@@ -625,22 +635,21 @@ impl BatchDispatcher {
     /// the congestion delay's cool-off, so the unit releases through the
     /// ORDINARY path (`Drop`'s `batch_completed`) and the backlog is picked
     /// back up by the next pool-aware poll instead.
-    #[instrument(name = "job.fail_batch", skip_all,
-        fields(job_type = %self.job_type, n_items = self.ids.len(), error = true,
-               error.message = %error,
+    #[errlanes::instrument(name = "job.fail_batch", skip_all,
+        fields(job_type = %self.job_type, n_items = self.ids.len(),
                n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
     )]
-    async fn fail_batch(&mut self, error: JobError) -> Result<(), JobError> {
-        let message = match error {
-            JobError::PoolCongestion(message) => {
-                self.rescheduled = true;
-                return self
-                    .finalizer
-                    .reschedule_congested(&self.ids, &self.attempts, message)
-                    .await;
-            }
-            other => other.to_string(),
-        };
+    async fn fail_batch(&mut self, failure: JobFault) -> Result<(), JobFault> {
+        let span = tracing::Span::current();
+        failure.record(&span);
+        if failure.is_congestion() {
+            self.rescheduled = true;
+            let message = failure.message();
+            return self
+                .finalizer
+                .reschedule_congested(&self.ids, &self.attempts, message)
+                .await;
+        }
         let items: Vec<(JobId, Disposition)> = self
             .ids
             .iter()
@@ -648,7 +657,7 @@ impl BatchDispatcher {
                 (
                     *id,
                     Disposition::Fail {
-                        error: message.clone(),
+                        failure: failure.clone(),
                         attempt: self.attempts.get(id).copied().unwrap_or(1),
                         run_duration: self.run_duration,
                     },
@@ -659,6 +668,14 @@ impl BatchDispatcher {
         let outcome = finalizer
             .finalize(&items, |op, _| self.try_recycle_own_type(op))
             .await?;
+        span.record(
+            "error.level",
+            tracing::field::display(if outcome.retried.is_empty() {
+                tracing::Level::ERROR
+            } else {
+                tracing::Level::WARN
+            }),
+        );
         self.record_seal_outcome(&outcome);
         Ok(())
     }

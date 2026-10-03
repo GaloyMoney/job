@@ -200,6 +200,7 @@ async fn a_long_running_execution_is_forgiven_and_never_terminates() -> anyhow::
             max_backoff: Duration::from_millis(10),
             backoff_jitter_pct: 0,
             attempt_reset_after_healthy_run: Some(HEALTHY_RUN),
+            terminal_on_fatal: false,
         },
     });
     jobs.start_poll().await?;
@@ -260,6 +261,7 @@ async fn a_fast_failure_terminates_at_max_attempts_despite_clock_jumps() -> anyh
             backoff_jitter_pct: 0,
             // Far longer than any run this job will ever manage.
             attempt_reset_after_healthy_run: Some(Duration::from_secs(60 * 60)),
+            terminal_on_fatal: false,
         },
     });
     jobs.start_poll().await?;
@@ -337,6 +339,7 @@ async fn a_reclaimed_attempt_is_forgiven_by_the_next_healthy_run() -> anyhow::Re
             max_backoff: Duration::from_secs(60),
             backoff_jitter_pct: 0,
             attempt_reset_after_healthy_run: Some(HEALTHY_RUN),
+            terminal_on_fatal: false,
         },
     });
     jobs.start_poll().await?;

@@ -156,6 +156,25 @@ pub struct RetrySettings {
     /// Pick a value comfortably longer than a *failing* run of this job type: a deterministic
     /// failure must not clear it, or the job can never reach `n_attempts`.
     pub attempt_reset_after_healthy_run: Option<std::time::Duration>,
+    /// When `true`, a runner error classified as `Fatal` (a `Denied` is
+    /// narrowed into `Fatal(Denied)` at the job boundary -- job is not an
+    /// authorization boundary) ends the job on the attempt that produced
+    /// it, instead of going through this policy's ordinary attempt-count
+    /// retry.
+    ///
+    /// Defaults to `false`: the lane is *reported* on the span the moment
+    /// it is classified (`error.lane`, `error.code`, `exception.message`),
+    /// but it does not change what job does. errlanes semantics say a
+    /// `Fatal` will not succeed on retry -- and once that is trusted, this
+    /// is the right behaviour -- but job has no live experience yet with
+    /// how faithfully the crates upstream of it lane their errors, and a
+    /// `Fatal` that is really transient would turn a blip into a dead job.
+    /// Turn this on per job type as that confidence is earned; the
+    /// telemetry to earn it on is there from the start.
+    ///
+    /// Has no effect on resident types, which have no terminal state to go
+    /// to (see `ResidentJobCompletion`) and force it back off.
+    pub terminal_on_fatal: bool,
 }
 
 impl RetrySettings {
@@ -179,6 +198,7 @@ impl Default for RetrySettings {
             // Matches `max_backoff`: a job that cannot stay up for the longest
             // backoff we would ever impose is not healthy.
             attempt_reset_after_healthy_run: Some(std::time::Duration::from_secs(SECS_IN_ONE_HOUR)),
+            terminal_on_fatal: false,
         }
     }
 }
@@ -191,6 +211,7 @@ impl From<&RetrySettings> for RetryPolicy {
             max_backoff: settings.max_backoff,
             backoff_jitter_pct: settings.backoff_jitter_pct,
             attempt_reset_after_healthy_run: settings.attempt_reset_after_healthy_run,
+            terminal_on_fatal: settings.terminal_on_fatal,
         }
     }
 }

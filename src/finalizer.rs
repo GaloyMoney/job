@@ -68,6 +68,8 @@
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
+use es_entity::errlanes;
+use es_entity::errlanes::Fault;
 use rand::{RngExt, rng};
 use tracing::{Span, instrument};
 
@@ -77,7 +79,7 @@ use std::sync::{Arc, Weak};
 use super::{
     JobId,
     entity::{Job, JobType, RetryPolicy},
-    error::{JobError, TX_ABORT_MAX_ATTEMPTS, is_retryable_conflict},
+    error::{JobFault, TX_ABORT_MAX_ATTEMPTS},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::{JobPoller, pool_connection_headroom},
@@ -125,9 +127,9 @@ const SHARED_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub(crate) enum Disposition {
     /// The job ran to completion: execution row deleted, completion event.
     Complete,
-    /// The job failed with `error` on its `attempt`-th attempt: the type's
-    /// `RetryPolicy` decides between a backoff retry (next `attempt_index`)
-    /// and terminal deletion.
+    /// The job failed with `failure` on its `attempt`-th attempt: the
+    /// type's `RetryPolicy` decides between a backoff retry (next
+    /// `attempt_index`) and terminal deletion.
     ///
     /// `run_duration` is how long the failing execution actually ran, on a
     /// monotonic clock. The retry policy forgives the accumulated attempt
@@ -135,7 +137,9 @@ pub(crate) enum Disposition {
     /// stayed up that long is evidence the job had recovered, whether or not
     /// it ever returned a completion.
     Fail {
-        error: String,
+        /// The classified failure. The entity reads its lane for the
+        /// `terminal_on_fatal` decision and narrows it on exhaustion.
+        failure: JobFault,
         attempt: u32,
         run_duration: std::time::Duration,
     },
@@ -156,9 +160,8 @@ pub(crate) enum Disposition {
 /// fields and flag updates. `retried` carries each retry's NEXT
 /// `attempt_index` (for warn-threshold escalation); `errored_terminal`
 /// counts `Fail` DECISIONS that went terminal (whether or not the row was
-/// still this instance's to delete), mirroring the batch's historical
-/// `n_errored` accounting; `completed` counts only rows this instance
-/// actually deleted.
+/// still this instance's to delete), mirroring the batch's `n_errored`
+/// accounting; `completed` counts only rows this instance actually deleted.
 #[derive(Default)]
 pub(crate) struct FinalizeOutcome {
     pub(crate) completed: Vec<JobId>,
@@ -193,7 +196,7 @@ pub(crate) enum ClaimDisposition {
     AlreadyDisposed,
     /// The rescue itself failed. Rows stay `running` under this instance
     /// and only the lost-handler will recover them, one `job_lost_interval`
-    /// later. This is the case that used to be silent.
+    /// later.
     Leaked,
 }
 
@@ -262,39 +265,7 @@ impl Finalizer {
         }
     }
 
-    /// Classify a runner's error and convert it into the right `JobError`,
-    /// recording the `error`/`error.message`/`error.level` fields on the
-    /// CURRENT span. Classification happens BEFORE stringifying: `error` is
-    /// the runner's own boxed error, the only point where an underlying
-    /// `sqlx::Error::PoolTimedOut` still has its structure to downcast --
-    /// `.to_string()` is a one-way trip into `JobExecutionError(String)`,
-    /// and a plain `String` has no `.source()` chain for
-    /// [`Self::is_pool_congestion`] to walk afterward.
-    ///
-    /// Congestion logs at INFO -- it is the expected, non-punitive signal
-    /// this module exists for (see the module doc) -- real errors at WARN.
-    pub(crate) fn maybe_reclassify(&self, error: Box<dyn std::error::Error>) -> JobError {
-        let span = Span::current();
-        let congestion = Self::is_pool_congestion(error.as_ref());
-        let error = error.to_string();
-        span.record("error", true);
-        span.record("error.message", tracing::field::display(&error));
-        span.record(
-            "error.level",
-            tracing::field::display(if congestion {
-                tracing::Level::INFO
-            } else {
-                tracing::Level::WARN
-            }),
-        );
-        if congestion {
-            JobError::PoolCongestion(error)
-        } else {
-            JobError::JobExecutionError(error)
-        }
-    }
-
-    /// Reschedule `ids` after a `PoolCongestion` classification: every row
+    /// Reschedule `ids` after a congestion classification: every row
     /// goes back to `pending` at now + [`CONGESTION_DELAY_MS`] +/-
     /// [`CONGESTION_JITTER_MS`], `attempt_index` untouched, on a fresh
     /// `CongestionRescheduled` entity event -- one [`Disposition::Congestion`]
@@ -303,7 +274,7 @@ impl Finalizer {
     /// `attempts` maps each id to its in-flight attempt number, recorded
     /// unchanged on the entity's next `ExecutionScheduled` event; an id
     /// missing from the map defaults to attempt 1.
-    #[instrument(name = "job.congestion_reschedule", skip_all,
+    #[errlanes::instrument(name = "job.congestion_reschedule", skip_all,
         fields(n_jobs = ids.len(), congestion_streak)
     )]
     pub(crate) async fn reschedule_congested(
@@ -311,7 +282,7 @@ impl Finalizer {
         ids: &[JobId],
         attempts: &HashMap<JobId, u32>,
         message: String,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let jitter_ms = rng().random_range(-CONGESTION_JITTER_MS..=CONGESTION_JITTER_MS);
         let at = self.clock.now() + chrono::Duration::milliseconds(CONGESTION_DELAY_MS + jitter_ms);
         let items: Vec<(JobId, Disposition)> = ids
@@ -346,7 +317,7 @@ impl Finalizer {
         id: JobId,
         attempt: u32,
         message: String,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let attempts = HashMap::from([(id, attempt)]);
         self.reschedule_congested(&[id], &attempts, message).await
     }
@@ -356,7 +327,7 @@ impl Finalizer {
     /// module doc: first attempt on the shared pool when it has headroom,
     /// any first-attempt failure there switches to the internal pool, and
     /// internal-pool attempts retry transient aborts
-    /// ([`is_retryable_conflict`]) up to [`TX_ABORT_MAX_ATTEMPTS`].
+    /// (transient aborts) up to [`TX_ABORT_MAX_ATTEMPTS`].
     /// Retrying is sound because the transaction is the finalizer's own:
     /// it holds nothing but this job end's bookkeeping, an abort rolled all
     /// of it back, and `items` is plain data that re-applies identically.
@@ -374,7 +345,7 @@ impl Finalizer {
         &self,
         items: &[(JobId, Disposition)],
         mut after_write: impl FnMut(&mut es_entity::DbOp<'static>, &FinalizeOutcome),
-    ) -> Result<FinalizeOutcome, JobError> {
+    ) -> Result<FinalizeOutcome, JobFault> {
         let mut attempt_no = 1;
         let mut use_internal = !self.shared_pool_has_headroom();
         loop {
@@ -436,7 +407,7 @@ impl Finalizer {
                     use_internal = true;
                     continue;
                 }
-                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && e.is_transient() => {
                     tracing::warn!(
                         job_ids = %Self::display_ids_of(items),
                         attempt_no,
@@ -450,7 +421,7 @@ impl Finalizer {
             };
 
             // Phase 2 -- the commit, uncapped and retried ONLY on a
-            // server-reported abort (`is_retryable_conflict`: deadlock
+            // server-reported abort (deadlock
             // victim / serialization failure), which guarantees the
             // transaction rolled back. Every other commit error is
             // AMBIGUOUS -- the server may have committed before the
@@ -461,7 +432,10 @@ impl Finalizer {
             // later rescue of an actually-committed attempt a no-op).
             match op.commit().await {
                 Ok(()) => return Ok(outcome),
-                Err(e) if attempt_no < TX_ABORT_MAX_ATTEMPTS && is_retryable_conflict(&e) => {
+                Err(e)
+                    if attempt_no < TX_ABORT_MAX_ATTEMPTS
+                        && Fault::classify(&e).is_contention() =>
+                {
                     tracing::warn!(
                         job_ids = %Self::display_ids_of(items),
                         attempt_no,
@@ -488,7 +462,7 @@ impl Finalizer {
         &self,
         op: &mut (impl AtomicOperation + ?Sized),
         items: &[(JobId, Disposition)],
-    ) -> Result<FinalizeOutcome, JobError> {
+    ) -> Result<FinalizeOutcome, JobFault> {
         let mut outcome = FinalizeOutcome::default();
         if items.is_empty() {
             return Ok(outcome);
@@ -553,7 +527,7 @@ impl Finalizer {
                     congestion_streaks.insert(*id, streak);
                 }
                 Disposition::Fail {
-                    error,
+                    failure,
                     attempt,
                     run_duration,
                 } => {
@@ -562,7 +536,7 @@ impl Finalizer {
                         *attempt,
                         *run_duration,
                         &retry_policy,
-                        error.clone(),
+                        failure,
                     ) {
                         Some((reschedule_at, next_attempt)) => {
                             retry_uuids.push(uuid::Uuid::from(*id));
@@ -850,7 +824,7 @@ impl Finalizer {
         op: &mut (impl AtomicOperation + ?Sized),
         terminal: &[JobId],
         now: DateTime<Utc>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         self.waiters.delete_waits_of_in_op(op, terminal).await?;
         let moved = self.waiters.wake_in_op(op, terminal, now).await?;
         Span::current().record("n_moved", moved.len());
@@ -866,7 +840,7 @@ impl Finalizer {
         &self,
         op: &mut (impl AtomicOperation + ?Sized),
         moved: Vec<(JobId, JobType)>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         if moved.is_empty() {
             return Ok(());
         }
@@ -925,29 +899,6 @@ impl Finalizer {
         pool_connection_headroom(self.repo.pool()) > 0
     }
 
-    /// Whether this error (or anything it wraps) is
-    /// `sqlx::Error::PoolTimedOut` -- the shared pool had no connection to
-    /// hand out within its acquire timeout. This carries no evidence the
-    /// job is broken: it says the pool was busy, not that the work is
-    /// wrong.
-    ///
-    /// Walks the `source()` chain because a runner's error crosses an
-    /// object-erasure boundary (`run`/`run_batch_erased` return
-    /// `Box<dyn std::error::Error>`) before it reaches this crate's own
-    /// error handling, so the check has to happen on the *original* error
-    /// -- [`Self::maybe_reclassify`], the only caller, does exactly that
-    /// before stringifying.
-    fn is_pool_congestion(err: &(dyn std::error::Error + 'static)) -> bool {
-        let mut source = Some(err);
-        while let Some(e) = source {
-            if let Some(sqlx::Error::PoolTimedOut) = e.downcast_ref::<sqlx::Error>() {
-                return true;
-            }
-            source = e.source();
-        }
-        false
-    }
-
     /// Renders ids as a comma-separated list for one log field, so a warn
     /// line can be tied to the jobs it concerns.
     fn display_ids(ids: &[JobId]) -> String {
@@ -965,5 +916,447 @@ impl Finalizer {
     fn display_ids_of(items: &[(JobId, Disposition)]) -> String {
         let ids: Vec<JobId> = items.iter().map(|(id, _)| *id).collect();
         Self::display_ids(&ids)
+    }
+}
+
+/// End-to-end cover for `Finalizer::finalize`'s abort-retry guard
+/// (`finalize`, phase 1b): a deadlock or serialization abort on the
+/// finalizer's OWN disposition write arrives as a `Transient`, through
+/// errlanes' blanket `From` for `sqlx::Error`, so a real deadlock injected
+/// on that write is retried up to `TX_ABORT_MAX_ATTEMPTS` rather than
+/// propagating. An opaque error type here would classify as neither, and
+/// the guard would never fire.
+///
+/// Needs a live Postgres (`PG_CON`); not run as part of `cargo test --lib`
+/// without one, same as every other DB-backed unit test in this crate.
+#[cfg(test)]
+mod deadlock_regression_tests {
+    use super::*;
+    use crate::{
+        entity::NewJob, notification_router::JobNotificationRouter, notifier::JobEventNotifier,
+        repo::JobRepo, tracker::JobTracker,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    async fn init_pool() -> sqlx::PgPool {
+        let pg_con = std::env::var("PG_CON").expect("PG_CON must be set for this test");
+        sqlx::PgPool::connect(&pg_con).await.expect("connect")
+    }
+
+    /// Observes whether `Finalizer::finalize`'s own
+    /// "disposition write lost a lock conflict; retrying" warning fired --
+    /// the one direct signal, short of parsing logs, that the abort-retry
+    /// branch was actually taken rather than the write simply succeeding
+    /// because no conflict ever materialised.
+    struct RetryWarnObserved(Arc<AtomicBool>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RetryWarnObserved {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Finder(bool);
+            impl tracing::field::Visit for Finder {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" && format!("{value:?}").contains("lock conflict") {
+                        self.0 = true;
+                    }
+                }
+            }
+            let mut finder = Finder(false);
+            event.record(&mut finder);
+            if finder.0 {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// One row of a job that actually exists (a `jobs` entity plus its
+    /// `job_executions` row, "claimed" by `instance_id`) so
+    /// `Finalizer::finalize_in_op`'s entity load and row writes both find
+    /// something real to work with.
+    async fn seed_claimed_job(
+        repo: &JobRepo,
+        job_type: &JobType,
+        queue_id: &str,
+        instance_id: uuid::Uuid,
+    ) -> JobId {
+        let id = JobId::new();
+        let mut op = repo
+            .begin_op_with_clock(&ClockHandle::realtime())
+            .await
+            .unwrap();
+        let new_job = NewJob::builder()
+            .id(id)
+            .job_type(job_type.clone())
+            .config(serde_json::json!({}))
+            .unwrap()
+            .queue_id(Some(queue_id.to_string()))
+            .schedule_at(chrono::Utc::now())
+            .build()
+            .expect("build NewJob");
+        repo.create_in_op(&mut op, new_job)
+            .await
+            .expect("create job");
+        op.commit().await.expect("commit job create");
+
+        sqlx::query(
+            "INSERT INTO job_executions \
+             (id, job_type, queue_id, poller_instance_id, attempt_index, state, alive_at, created_at) \
+             VALUES ($1, $2, $3, $4, 1, 'running', NOW(), NOW())",
+        )
+        .bind(uuid::Uuid::from(id))
+        .bind(job_type.as_str())
+        .bind(queue_id)
+        .bind(instance_id)
+        .execute(repo.pool())
+        .await
+        .expect("insert job_executions row");
+        id
+    }
+
+    /// Holds a `FOR UPDATE` lock on `first`, signals, waits, then tries to
+    /// lock `second` -- the reverse of the order `Finalizer::finalize`'s own
+    /// CTE takes (`ORDER BY queue_id, id`), so a cycle forms once the
+    /// finalizer's write is also mid-flight. Retries the whole attempt if
+    /// IT is the deadlock victim, so the loop always converges once the
+    /// finalizer (if it was instead the victim) has released and retried.
+    /// One contestant in the reverse-order lock dance: holds `first`, waits
+    /// for the finalizer to be mid-flight, then tries `second`. On a
+    /// deadlock loss it just ends (dropping the transaction rolls back and
+    /// releases `first`) rather than retrying its own attempt from scratch
+    /// -- several of these are spawned PRE-QUEUED on `first` instead (see
+    /// the caller), so the next contestant in Postgres's own lock wait
+    /// queue takes over with no re-acquisition latency, which is what lets
+    /// the deadlock recur on the finalizer's later (`use_internal = true`,
+    /// attempt-counted) tries and not just its first (shared-pool,
+    /// uncounted-fallback) one.
+    async fn contest_once(
+        pool: sqlx::PgPool,
+        first: uuid::Uuid,
+        second: uuid::Uuid,
+        on_holding_first: Option<Arc<tokio::sync::Notify>>,
+    ) {
+        let Ok(mut tx) = pool.begin().await else {
+            return;
+        };
+        if sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR UPDATE")
+            .bind(first)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Some(ready) = on_holding_first {
+            ready.notify_one();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR UPDATE")
+            .bind(second)
+            .execute(&mut *tx)
+            .await;
+        // Releases `first` (and `second`, if won) either way: these probes
+        // never write anything, so a rollback is exactly as good as a
+        // commit for the purpose of freeing the locks.
+        let _ = tx.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn finalize_retries_a_server_confirmed_deadlock_on_its_own_disposition_write() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let subscriber =
+            tracing_subscriber::registry().with(RetryWarnObserved(Arc::clone(&observed)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let pool = init_pool().await;
+        let repo = Arc::new(JobRepo::new(&pool));
+        let tracker = Arc::new(JobTracker::new(1, 1));
+        let router = Arc::new(JobNotificationRouter::new(
+            &pool,
+            Arc::clone(&repo),
+            16,
+            std::time::Duration::from_secs(60),
+        ));
+        let notifier =
+            JobEventNotifier::spawn(&pool, Arc::clone(&tracker), router.terminal_sender());
+        let instance_id = uuid::Uuid::now_v7();
+        let job_type = JobType::new(Box::leak(
+            format!("deadlock-regression-{}", uuid::Uuid::now_v7()).into_boxed_str(),
+        ));
+
+        // Bounded attempts at reproducing the cycle: Postgres's victim
+        // choice between two symmetric waiters isn't guaranteed to pick the
+        // finalizer every round, so retry the whole scenario with fresh
+        // rows until the retry warning is actually observed (or give up
+        // with a clear failure rather than flake silently).
+        for round in 0..8 {
+            if observed.load(Ordering::SeqCst) {
+                break;
+            }
+            // `idx_job_executions_queue_active` is a unique index on
+            // `queue_id` for any `pending`/`running` row, so each round
+            // needs its own queue ids -- the "a-"/"z-" prefixes are what
+            // matters (guarantees `ORDER BY queue_id` sorts A before B),
+            // the suffix just keeps rounds from colliding.
+            let suffix = uuid::Uuid::now_v7();
+            let id_a =
+                seed_claimed_job(&repo, &job_type, &format!("a-queue-{suffix}"), instance_id).await;
+            let id_b =
+                seed_claimed_job(&repo, &job_type, &format!("z-queue-{suffix}"), instance_id).await;
+
+            let finalizer = Finalizer::new(
+                Weak::new(),
+                Arc::clone(&repo),
+                Arc::clone(&notifier),
+                RetrySettings::default(),
+                false,
+                instance_id,
+                ClockHandle::realtime(),
+            );
+
+            // Several contestants, pre-queued on `first` (= B) before
+            // `finalize()` even starts: once the leader releases (deadlock
+            // loss or a clean win), the next one in Postgres's own lock
+            // wait queue takes over with no re-acquisition latency, so a
+            // fresh contestant is already in position for whichever
+            // finalizer attempt (shared-pool first, or an internal-pool
+            // retry after it) comes next.
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let contestants: Vec<_> = (0..4)
+                .map(|i| {
+                    tokio::spawn(contest_once(
+                        pool.clone(),
+                        uuid::Uuid::from(id_b),
+                        uuid::Uuid::from(id_a),
+                        (i == 0).then(|| Arc::clone(&ready)),
+                    ))
+                })
+                .collect();
+            ready.notified().await;
+
+            let now = chrono::Utc::now();
+            let items = [
+                (id_a, Disposition::Fresh { at: now }),
+                (id_b, Disposition::Fresh { at: now }),
+            ];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                finalizer.finalize(&items, |_, _| {}),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: finalize() did not return within 15s"));
+            result.unwrap_or_else(|e| {
+                panic!("round {round}: finalize() should retry a server-confirmed deadlock and succeed, got: {e}")
+            });
+
+            for c in contestants {
+                let _ = c.await;
+            }
+        }
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "finalize() never hit its own abort-retry warning across 8 rounds of a genuine \
+             two-row deadlock -- either the retry path regressed, or this environment's \
+             deadlock detector never picked the finalizer as victim in any round"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runner_failure_classification_tests {
+    use super::*;
+    use es_entity::errlanes::{Denied, Fatal, FatalKind, Lane, Transient, TransientKind};
+    use std::error::Error;
+
+    #[derive(Debug)]
+    struct Wrapped<E>(E);
+    impl<E: std::fmt::Display> std::fmt::Display for Wrapped<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "wrapped: {}", self.0)
+        }
+    }
+    impl<E: Error + 'static> Error for Wrapped<E> {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// Boxes as the runner traits do -- `Box<dyn Error>`, with no
+    /// `Send + Sync`. If this ever needs those bounds to compile, the
+    /// boundary has regressed back to the widened trait signature.
+    fn boxed<E: Error + 'static>(e: E) -> Box<dyn Error> {
+        Box::new(e)
+    }
+
+    /// A runner that knows nothing of errlanes gets `Fault::classify`'s
+    /// `Fatal(Dependency)` safety default rather than vanishing -- but it
+    /// is NOT terminal on its own: `terminal_on_fatal` is `false` by
+    /// default, so it retries per policy. See
+    /// `tests/lanes.rs::unclassified_string_error_retries_per_policy`.
+    #[test]
+    fn classifies_a_bare_string_as_fatal_dependency_carrying_its_message() {
+        let e = boxed(std::io::Error::other("boom"));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => {
+                assert_eq!(f.kind, FatalKind::Dependency);
+                assert_eq!(f.context.as_deref(), Some("boom"));
+            }
+            _ => panic!("expected Fatal(Dependency)"),
+        }
+    }
+
+    /// A runner not built on errlanes at all returns a raw, never-laned
+    /// `sqlx::Error::PoolTimedOut` directly, and it must still reach the
+    /// congestion path rather than spend an ordinary retry attempt: a walk
+    /// that looked only for an already-laned payload would drop it.
+    /// `Fault::classify`'s second rule covers the shape, using errlanes' own
+    /// sqlx table -- job keeps no second copy. See
+    /// `tests/pool_congestion.rs::congestion_reschedule_keeps_job_batchable`
+    /// for the end-to-end sibling.
+    #[test]
+    fn classify_detects_congestion_from_a_raw_unlaned_sqlx_pool_timed_out() {
+        let e = boxed(sqlx::Error::PoolTimedOut);
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        assert!(failure.is_congestion());
+    }
+
+    /// The same raw-chain walk classifies the rest of the sqlx table too,
+    /// not just `PoolTimedOut` -- the general form, not only the one kind
+    /// the regression above pins.
+    #[test]
+    fn classify_reads_the_rest_of_the_raw_sqlx_table() {
+        let connection_lost = boxed(sqlx::Error::Io(std::io::Error::other("conn reset")));
+        let failure: JobFault = Fault::classify(&*connection_lost).narrow_denied();
+        match failure {
+            Fault::Transient(t) => assert_eq!(t.kind, TransientKind::ConnectionLost),
+            _ => panic!("expected Transient(ConnectionLost)"),
+        }
+
+        let protocol = boxed(sqlx::Error::Protocol("synthesized".into()));
+        let failure: JobFault = Fault::classify(&*protocol).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Dependency),
+            _ => panic!("expected Fatal(Dependency)"),
+        }
+    }
+
+    /// A laned payload elsewhere in the chain wins over an incidental raw
+    /// `sqlx::Error` deeper in the same chain -- the errlanes-based
+    /// classification takes precedence, not merely whichever happens to sit
+    /// nearer the top.
+    #[test]
+    fn a_laned_fatal_outranks_a_raw_sqlx_error_in_its_own_source_chain() {
+        // `Fatal::from_error` attaches the sqlx error as this Fatal's own
+        // source -- a raw `sqlx::Error::PoolTimedOut` genuinely further
+        // down the same chain, which must not flip the classification to
+        // congestion once the laned walk has already found the Fatal.
+        let e = boxed(Fatal::from_error(
+            FatalKind::Invariant,
+            sqlx::Error::PoolTimedOut,
+        ));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Invariant),
+            _ => panic!("expected the laned Fatal to win over the raw sqlx::Error in its source"),
+        }
+    }
+
+    #[test]
+    fn classifies_a_transient_three_hops_deep() {
+        let e = boxed(Wrapped(Wrapped(Transient::new(TransientKind::Deadlock))));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Transient(t) => assert_eq!(t.kind, TransientKind::Deadlock),
+            _ => panic!("expected Transient, got a different classification"),
+        }
+    }
+
+    #[test]
+    fn classifies_a_fatal() {
+        let e = boxed(Fatal::new(FatalKind::CorruptState));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::CorruptState),
+            _ => panic!("expected Fatal"),
+        }
+    }
+
+    /// A `Denied` anywhere in the chain is narrowed at the job boundary:
+    /// job is not an authorization boundary, so there is nobody left to
+    /// tell no. It becomes `Fatal(Denied)`, with the `Denied` as its
+    /// source.
+    #[test]
+    fn classifies_a_denied_narrowed_to_fatal_denied() {
+        let e = boxed(Denied::default());
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => {
+                assert_eq!(f.kind, FatalKind::Denied);
+                assert!(f.source().unwrap().downcast_ref::<Denied>().is_some());
+            }
+            _ => panic!("expected Fatal(Denied)"),
+        }
+    }
+
+    /// A boxed `Fail::Rejected(_)` carries no marker type that survives
+    /// erasure, so there is nothing for the lane walk to find. It must land
+    /// on the `Fatal(Dependency)` default -- reported, retried per policy,
+    /// and above all never silently read as congestion (which would skip
+    /// the attempt counter) or as a `Denied`.
+    #[test]
+    fn a_boxed_rejected_fail_falls_back_to_the_default_not_a_guessed_lane() {
+        use crate::error::{AwaitError, AwaitTimeout};
+        let fail: AwaitError = AwaitError::Rejected(AwaitTimeout {
+            pending: vec![crate::JobId::new()],
+        });
+        let e: Box<dyn Error> = Box::new(fail);
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        assert!(matches!(failure, Fault::Fatal(_)));
+        assert!(!failure.is_congestion());
+    }
+
+    /// An already-laned `Transient::new(TransientKind::PoolTimeout)` with no
+    /// `sqlx::Error` source attached -- exactly what a runner built on the
+    /// errlanes boundary returns -- takes the congestion path. Matching only
+    /// a raw `sqlx::Error::PoolTimedOut` by downcasting the chain would miss
+    /// it, and every such pool timeout would spend a `RetryPolicy` attempt
+    /// instead.
+    #[test]
+    fn classify_detects_congestion_from_a_bare_laned_transient_with_no_sqlx_source() {
+        let e = boxed(Transient::new(TransientKind::PoolTimeout));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        assert!(failure.is_congestion());
+    }
+
+    /// The contract this whole boundary exists to keep: a runner error that
+    /// is NOT `Send` (the runner traits do not require it) classifies by
+    /// reference, and the resulting `Fault` crosses a thread boundary --
+    /// which is what the dispatcher does with it, across the `.await` that
+    /// writes the disposition. If this stops compiling, the `Send + Sync`
+    /// bound has crept back onto the runner traits.
+    #[test]
+    fn a_non_send_runner_error_classifies_and_its_fault_crosses_a_spawn() {
+        #[derive(Debug)]
+        struct NotSend(#[allow(dead_code)] std::rc::Rc<()>);
+        impl std::fmt::Display for NotSend {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "not send")
+            }
+        }
+        impl Error for NotSend {}
+
+        let e: Box<dyn Error> = Box::new(NotSend(std::rc::Rc::new(())));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        drop(e);
+        let lane = std::thread::spawn(move || failure.lane()).join().unwrap();
+        assert_eq!(lane, Lane::Fatal);
     }
 }

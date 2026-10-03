@@ -394,6 +394,7 @@ async fn dedup_key_survives_a_retry() -> anyhow::Result<()> {
             // The test drives a deliberate failure and asserts on the
             // resulting attempt counter, so forgiveness must stay off.
             attempt_reset_after_healthy_run: None,
+            terminal_on_fatal: false,
         },
     });
     jobs.start_poll().await?;

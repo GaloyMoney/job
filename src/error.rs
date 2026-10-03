@@ -1,109 +1,140 @@
-//! Error type returned by the job service and helpers.
+//! Error types returned by the job service.
+//!
+//! Lanes, carriers, lifting and narrowing are `errlanes` vocabulary; this
+//! module only applies it. For the model itself see the
+//! [errlanes README](https://github.com/GaloyMoney/es-entity/blob/main/errlanes/README.md).
+//!
+//! How job adopts it:
+//!
+//! - Rejections are scoped to the methods that can produce them, never
+//!   pooled service-wide. Only the id-choosing `JobSpawner` methods can
+//!   reject (a caller-chosen duplicate id), so only they return
+//!   [`JobError`]; the awaits return [`AwaitError`] for their timeout;
+//!   everything else cannot reject and returns [`JobFault`].
+//! - Foreign error types stay raw on a `pub fn` when they are the only
+//!   error that site can produce (the serde accessors on
+//!   [`JobOutcome`](crate::JobOutcome), [`JobSnapshot`](crate::JobSnapshot)
+//!   and [`CurrentJob`](crate::CurrentJob)). They get a laned wrapper only
+//!   where they are folded into a laned result.
+//! - Library code never inspects a `Fatal`'s payload and never asks callers
+//!   to. Where a caller needs to know, the API offers a value instead (see
+//!   [`JobHandle::maybe_load`](crate::JobHandle::maybe_load)).
 
-use thiserror::Error;
-
-use super::entity::JobType;
-use super::repo::{JobCreateError, JobFindError, JobModifyError, JobQueryError};
+use super::repo::JobConstraintViolation;
 use crate::JobId;
 
-#[derive(Error, Debug)]
-/// Exhaustive list of failures the job service can report.
-pub enum JobError {
-    #[error("JobError - Sqlx: {0}")]
-    Sqlx(#[from] sqlx::Error),
-    #[error("JobError - Create: {0}")]
-    Create(JobCreateError),
-    #[error("JobError - Modify: {0}")]
-    Modify(#[from] JobModifyError),
-    #[error("JobError - Find: {0}")]
-    Find(#[from] JobFindError),
-    #[error("JobError - Query: {0}")]
-    Query(#[from] JobQueryError),
-    #[error("JobError - InvalidPollInterval: {0}")]
-    InvalidPollInterval(String),
-    #[error("JobError - InvalidJobType: expected '{0}' but initializer was '{1}'")]
-    JobTypeMismatch(JobType, JobType),
-    #[error("JobError - JobInitError: {0}")]
-    JobInitError(String),
-    #[error("JobError - BadState: {0}")]
-    CouldNotSerializeExecutionState(serde_json::Error),
-    #[error("JobError - BadState: {0}")]
-    CouldNotDeserializeExecutionState(serde_json::Error),
-    #[error("JobError - BadResult: {0}")]
-    CouldNotSerializeResult(serde_json::Error),
-    #[error("JobError - BadConfig: {0}")]
-    CouldNotSerializeConfig(serde_json::Error),
-    #[error("JobError - NoInitializerPresent")]
-    NoInitializerPresent,
-    #[error("JobError - JobExecutionError: {0}")]
-    JobExecutionError(String),
-    /// A runner error classified as pool congestion rather than a genuine
-    /// failure -- distinct from [`Self::JobExecutionError`] so the
-    /// dispatchers' fail paths can route it to a reschedule that skips the
-    /// retry policy's attempt escalation. Constructed only by
-    /// `Finalizer::maybe_reclassify` (see `finalizer.rs`).
-    #[error("JobError - PoolCongestion: {0}")]
-    PoolCongestion(String),
-    #[error("JobError - BatchOutcomeMismatch: {0}")]
-    BatchOutcomeMismatch(String),
-    #[error("JobError - DuplicateId: {0:?}")]
-    DuplicateId(Option<String>),
-    /// Returned when a resident job type already has a live job (#170).
-    #[error("JobError - DuplicateResident: {0:?}")]
-    DuplicateResident(Option<String>),
-    #[error("JobError - Config: {0}")]
-    Config(String),
-    #[error("JobError - Migration: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
-    #[error(
-        "JobError - AwaitCompletionShutdown: notification channel closed while awaiting job {0}"
-    )]
-    AwaitCompletionShutdown(JobId),
-    #[error(
-        "JobError - TimedOut: job {0} did not reach terminal state within the specified timeout"
-    )]
-    TimedOut(JobId),
-    #[error("JobError - RouterNotStarted: await called before Jobs::start_poll")]
-    RouterNotStarted,
+use es_entity::errlanes;
+use es_entity::errlanes::{Fail, Fault, lanes};
+
+/// The carrier for every method that cannot reject: lifecycle, handles,
+/// awaits' faults, writes from inside a runner, keyed and resident spawns.
+pub type JobFault = Fault<lanes!(Transient, Fatal)>;
+
+/// The carrier for the id-choosing spawn paths on
+/// [`JobSpawner`](crate::JobSpawner), the only methods that can reject.
+pub type JobError = Fail<JobRejection, lanes!(Transient, Fatal)>;
+
+/// The carrier for [`JobHandle::await_completion`](crate::JobHandle::await_completion)
+/// and [`JobHandles::await_all`](crate::JobHandles::await_all).
+pub type AwaitError = Fail<AwaitTimeout, lanes!(Transient, Fatal)>;
+
+#[derive(Debug, errlanes::Rejection, errlanes::Lift)]
+// `JobConstraintViolation` carries a synthetic conventional-name variant per
+// column (`{table}_{column}_key`) in addition to the real constraints the
+// migrations define, so the mapping here is necessarily partial: only
+// `jobs_pkey` maps to a domain rejection; every other, never-fired variant
+// demotes to `Fatal(Invariant)` via the unmapped path -- including
+// `idx_jobs_job_type_resident`, which `ResidentJobSpawner::spawn`
+// (`src/resident.rs`) always absorbs by resolving to the existing job before
+// a violation could ever reach here.
+#[lift(JobConstraintViolation, unhandled = fatal)]
+/// Caller-correctable outcomes the job service can report. Everything else
+/// -- infrastructure failures, bugs, exhausted retries -- travels as
+/// `Transient`/`Fatal` in [`JobError`] instead of as a variant here.
+pub enum JobRejection {
+    #[error("duplicate job id")]
+    #[rejection(code = "JOB_DUPLICATE_ID")]
+    // The id is projected straight out of es_entity's `IdConflict`, which
+    // attributes it on every create path (single and batch), so the
+    // rejection carries the caller's own id and nothing of the driver's.
+    #[lift(JobConstraintViolation::Pkey, field = attempted)]
+    DuplicateId(JobId),
 }
 
-/// The SQLSTATE, if this error (or anything it wraps) is a Postgres abort that
-/// is retryable by definition: `40P01` deadlock detected, `40001` serialization
-/// failure. The victim did nothing wrong -- the server picked it to break a
-/// cycle -- so the work is worth re-attempting rather than blaming on the job.
+/// The await's deadline passed before every awaited job went terminal.
+/// `pending` is exactly the set still running; one element for
+/// [`JobHandle::await_completion`](crate::JobHandle::await_completion).
+#[derive(Debug, errlanes::Rejection)]
+#[rejection(code = "JOB_AWAIT_TIMED_OUT")]
+#[error("await timed out; still pending: {pending:?}")]
+pub struct AwaitTimeout {
+    pub pending: Vec<JobId>,
+}
+
+/// The waiter's notification channel closed before delivering a terminal
+/// state. The only producer is the job service stopping
+/// ([`Jobs::shutdown`](crate::Jobs::shutdown) or drop) while a handle was
+/// awaited.
+#[derive(Debug, errlanes::Classify)]
+#[error("await of job {id} interrupted: the job service stopped")]
+#[classify(fatal(Invariant))]
+pub struct AwaitInterrupted {
+    pub id: JobId,
+}
+
+/// [`JobSvcConfigBuilder::build`](crate::JobSvcConfigBuilder::build)
+/// validation failure.
+#[derive(Debug, errlanes::Classify)]
+#[error("invalid job service config: {message}")]
+#[classify(fatal(Config))]
+pub struct InvalidConfig {
+    pub message: String,
+}
+
+/// A value the job service was asked to persist did not serialize. Named
+/// per payload rather than delegating to `serde_json::Error`'s own
+/// classification, so the operator-facing chain says *which* value failed:
+/// the whole variant is the `Fatal`'s source and the `serde_json::Error` is
+/// the variant's, which keeps the serde detail exactly once.
 ///
-/// Walks the source chain rather than matching one variant: the same abort
-/// surfaces as a bare [`sqlx::Error`] from raw statements, wrapped in a repo
-/// error from es-entity's own writes, and wrapped again in whatever error type
-/// a caller's closure returns.
-pub(crate) fn retryable_conflict_code(
-    err: &(dyn std::error::Error + 'static),
-) -> Option<&'static str> {
-    let mut source = Some(err);
-    while let Some(e) = source {
-        if let Some(db) = e
-            .downcast_ref::<sqlx::Error>()
-            .and_then(|e| e.as_database_error())
-        {
-            match db.code().as_deref() {
-                Some("40P01") => return Some("40P01"),
-                Some("40001") => return Some("40001"),
-                _ => {}
-            }
-        }
-        source = e.source();
-    }
-    None
+/// `Fatal(Invariant)` because `to_value` fails on properties of the type the
+/// job implementor wrote -- a map with non-string keys, a `Serialize` impl
+/// that errors -- which no caller can correct and no retry can fix.
+#[derive(Debug, errlanes::Classify)]
+pub enum CouldNotSerialize {
+    #[error("could not serialize job config")]
+    #[classify(fatal(Invariant))]
+    Config(#[source] serde_json::Error),
+    #[error("could not serialize job execution state")]
+    #[classify(fatal(Invariant))]
+    ExecutionState(#[source] serde_json::Error),
+    #[error("could not serialize job return value")]
+    #[classify(fatal(Invariant))]
+    ReturnValue(#[source] serde_json::Error),
 }
 
-/// [`retryable_conflict_code`] as a predicate.
-pub(crate) fn is_retryable_conflict(err: &(dyn std::error::Error + 'static)) -> bool {
-    retryable_conflict_code(err).is_some()
-}
+/// Persisted execution state that no longer decodes into the type
+/// [`JobHandle::execution_state`](crate::JobHandle::execution_state) was
+/// asked for.
+///
+/// Pins `Fatal(CorruptState)` instead of taking `serde_json::Error`'s
+/// `Fatal(Invariant)` default: these bytes came out of the store, so an
+/// operator needs to look at the row, not at the code. The same call
+/// errlanes' own hydration path makes for a persisted event or snapshot.
+#[derive(Debug, errlanes::Classify)]
+#[error("could not deserialize job execution state")]
+#[classify(fatal(CorruptState))]
+pub struct CouldNotDeserializeExecutionState(#[source] pub(crate) serde_json::Error);
+
+/// The embedded-migration failure from [`Jobs::init`](crate::Jobs::init).
+#[derive(Debug, errlanes::Classify)]
+#[error("job service migration failed")]
+#[classify(fatal(Config), from)]
+pub(crate) struct Migrate(#[source] sqlx::migrate::MigrateError);
 
 /// Total attempts a crate-owned bookkeeping transaction (batch seal / fail,
 /// congestion reschedule) gets when Postgres keeps ABORTING it as a
-/// deadlock victim or serialization failure ([`is_retryable_conflict`]) --
+/// deadlock victim or serialization failure --
 /// transient aborts where the transaction lost to a concurrent partner and
 /// is safe to simply re-run. Counted as attempts, not retries: `3` means
 /// the original try plus two re-runs.
@@ -114,32 +145,88 @@ pub(crate) fn is_retryable_conflict(err: &(dyn std::error::Error + 'static)) -> 
 /// better off going through the rescue path than spinning here.
 pub(crate) const TX_ABORT_MAX_ATTEMPTS: u32 = 3;
 
-impl From<Box<dyn std::error::Error>> for JobError {
-    fn from(error: Box<dyn std::error::Error>) -> Self {
-        JobError::JobExecutionError(error.to_string())
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use es_entity::errlanes::{FatalKind, Fault};
+    use std::{collections::HashMap, error::Error as _};
 
-impl From<JobCreateError> for JobError {
-    fn from(error: JobCreateError) -> Self {
-        match error {
-            JobCreateError::ConstraintViolation {
-                column: Some(super::repo::JobColumn::Id),
-                value,
-                ..
-            } => Self::DuplicateId(value),
-            // `idx_jobs_job_type_resident` (the absolutely-unique
-            // `ResidentJobSpawner::spawn` enforcement,
-            // migrations/20250904065521_job_setup.sql) is a single-column
-            // index on `job_type` — its partial predicate (`WHERE
-            // resident`) isn't itself an indexed column, so es_entity
-            // attributes the violation deterministically to `JobType`.
-            JobCreateError::ConstraintViolation {
-                column: Some(super::repo::JobColumn::JobType),
-                value,
-                ..
-            } => Self::DuplicateResident(value),
-            other => Self::Create(other),
+    /// A `to_value` failure that depends on nothing but the type: a map
+    /// whose key is not a string.
+    fn encode_failure() -> serde_json::Error {
+        let mut unencodable = HashMap::new();
+        unencodable.insert((1u8, 2u8), 3u8);
+        serde_json::to_value(&unencodable).expect_err("non-string map key must not encode")
+    }
+
+    /// Same chain contract as the serde wrappers, on the one wrapper whose
+    /// payload is a driver error rather than a `serde_json::Error`: the
+    /// wrapper names the stage that failed and the `MigrateError` below it
+    /// says what actually went wrong. Without that second hop a failed
+    /// `Jobs::init` reports only "job service migration failed", which
+    /// names no migration and no SQL.
+    #[test]
+    fn a_migration_failure_is_fatal_config_keeping_the_driver_error() {
+        let err: JobFault = Migrate(sqlx::migrate::MigrateError::VersionMissing(7)).into();
+        match err {
+            Fault::Fatal(fatal) => {
+                assert_eq!(fatal.kind, FatalKind::Config);
+                let wrapper = fatal.source().expect("the wrapper is the Fatal's source");
+                assert_eq!(wrapper.to_string(), "job service migration failed");
+                let driver = wrapper
+                    .source()
+                    .expect("the MigrateError is the wrapper's source");
+                assert!(
+                    driver.to_string().contains("migration 7"),
+                    "driver error lost from the chain, got {driver}"
+                );
+            }
+            other => panic!("expected Fatal(Config), got {other:?}"),
+        }
+    }
+
+    /// The reason these variants exist instead of a bare `?`: the operator's
+    /// chain names the payload, and the serde detail appears exactly once
+    /// below it.
+    #[test]
+    fn a_serialize_failure_is_fatal_invariant_naming_its_payload() {
+        let err: JobFault = CouldNotSerialize::ExecutionState(encode_failure()).into();
+        match err {
+            Fault::Fatal(fatal) => {
+                assert_eq!(fatal.kind, FatalKind::Invariant);
+                let wrapper = fatal.source().expect("the variant is the Fatal's source");
+                assert_eq!(
+                    wrapper.to_string(),
+                    "could not serialize job execution state"
+                );
+                let serde = wrapper
+                    .source()
+                    .expect("serde error is the variant's source");
+                assert!(serde.to_string().contains("key must be a string"));
+            }
+            other => panic!("expected Fatal(Invariant), got {other:?}"),
+        }
+    }
+
+    /// A persisted row that no longer decodes is stored-data corruption, not
+    /// a code-level invariant -- the one place job overrides errlanes' serde
+    /// default, which classifies every decode failure as `Invariant`.
+    #[test]
+    fn a_persisted_state_decode_failure_is_fatal_corrupt_state() {
+        let decode_failure =
+            serde_json::from_value::<String>(serde_json::json!({})).expect_err("object is not str");
+        let err: JobFault = CouldNotDeserializeExecutionState(decode_failure).into();
+        match err {
+            Fault::Fatal(fatal) => {
+                assert_eq!(fatal.kind, FatalKind::CorruptState);
+                let wrapper = fatal.source().expect("the wrapper is the Fatal's source");
+                assert_eq!(
+                    wrapper.to_string(),
+                    "could not deserialize job execution state"
+                );
+                assert!(wrapper.source().is_some(), "serde error stays in the chain");
+            }
+            other => panic!("expected Fatal(CorruptState), got {other:?}"),
         }
     }
 }

@@ -6,7 +6,8 @@ use job::{
     ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobRunner,
     JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs,
     KeyedJobInitializer, KeyedJobSpawner, ResidentJobCompletion, ResidentJobInitializer,
-    ResidentJobRunner, RetrySettings, error::JobError,
+    ResidentJobRunner, RetrySettings,
+    error::{AwaitError, AwaitTimeout, JobError, JobRejection},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -867,9 +868,15 @@ async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
     ];
 
     let result = spawner.spawn_all(specs).await;
+    // The rejection names the colliding id even on the batch path, where
+    // es_entity attributes it by matching Postgres' reported key against
+    // the batch's own ids.
     assert!(
-        matches!(result, Err(JobError::DuplicateId(_))),
-        "Expected DuplicateId error, got err: {:?}",
+        matches!(
+            &result,
+            Err(JobError::Rejected(JobRejection::DuplicateId(id))) if *id == duplicate_id
+        ),
+        "Expected DuplicateId({duplicate_id}), got err: {:?}",
         result.as_ref().err(),
     );
 
@@ -878,6 +885,43 @@ async fn test_bulk_spawn_rolls_back_on_duplicate_id() -> anyhow::Result<()> {
     assert!(
         load_result.is_err(),
         "No jobs should be persisted after rollback"
+    );
+
+    Ok(())
+}
+
+/// The single-spawn counterpart of `test_bulk_spawn_rolls_back_on_duplicate_id`:
+/// a caller-chosen id that already exists is the one `JobSpawner` rejection,
+/// and it carries that id.
+#[tokio::test]
+async fn test_spawn_rejects_duplicate_id_with_the_attempted_id() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: helpers::job_type("spawn-dup-job"),
+    });
+
+    jobs.start_poll()
+        .await
+        .expect("Failed to start job polling");
+
+    let id = JobId::new();
+    spawner.spawn(id, TestJobConfig { delay_ms: 10 }).await?;
+
+    let result = spawner.spawn(id, TestJobConfig { delay_ms: 10 }).await;
+    assert!(
+        matches!(
+            &result,
+            Err(JobError::Rejected(JobRejection::DuplicateId(got))) if *got == id
+        ),
+        "Expected DuplicateId({id}), got: {:?}",
+        result.as_ref().err(),
     );
 
     Ok(())
@@ -1558,8 +1602,8 @@ async fn test_await_completion_timeout() -> anyhow::Result<()> {
         .await;
 
     assert!(
-        matches!(result, Err(JobError::TimedOut(id)) if id == job_id),
-        "Expected TimedOut error, got: {:?}",
+        matches!(&result, Err(AwaitError::Rejected(AwaitTimeout { pending })) if pending == &[job_id]),
+        "Expected AwaitTimeout error, got: {:?}",
         result,
     );
 
@@ -1940,8 +1984,8 @@ async fn test_await_all_timeout() -> anyhow::Result<()> {
         .await;
 
     assert!(
-        matches!(result, Err(JobError::TimedOut(_))),
-        "Expected TimedOut error, got: {:?}",
+        matches!(result, Err(AwaitError::Rejected(AwaitTimeout { .. }))),
+        "Expected AwaitTimeout error, got: {:?}",
         result,
     );
 
@@ -1955,11 +1999,11 @@ async fn test_await_all_timeout() -> anyhow::Result<()> {
 /// Preconditions are reproduced deterministically: a size-1 terminal broadcast
 /// buffer so a completion burst overflows it and those notifications are lost
 /// (they are never redelivered), leaving the periodic reconciliation sweep as
-/// the sole resolution path. Previously that sweep was the lowest-priority arm
-/// of a `biased` select and could be starved indefinitely by a terminal
-/// firehose, wedging `await_completions(None)` until the process restarted. With
-/// the sweep polled first, a bounded `sweep_interval` caps resolution regardless
-/// of load — so this must complete well within the timeout.
+/// the sole resolution path. As the lowest-priority arm of a `biased` select
+/// that sweep can be starved indefinitely by a terminal firehose, wedging
+/// `await_completions(None)` until the process restarts; polled first, a
+/// bounded `sweep_interval` caps resolution regardless of load — so this must
+/// complete well within the timeout.
 #[tokio::test]
 async fn test_await_all_resolves_when_notifications_dropped() -> anyhow::Result<()> {
     use job::JobPollerConfig;
@@ -2121,10 +2165,10 @@ impl JobRunner for InfiniteListenerRunner {
 /// reclaimed by the lost-handler, because the keep-alive handler keeps its
 /// `alive_at` fresh.
 ///
-/// The lost-handler no longer special-cases its own instance (that exclusion is
-/// what allowed a lost terminal write to zombie forever). What protects a
-/// running row from reclaim is now *liveness*, not ownership: the keep-alive
-/// handler heartbeats only jobs that still have a live future, so a live job's
+/// The lost-handler does not special-case its own instance: such an exclusion
+/// is what lets a lost terminal write zombie forever. What protects a running
+/// row from reclaim is *liveness*, not ownership: the keep-alive handler
+/// heartbeats only jobs that still have a live future, so a live job's
 /// `alive_at` (a wall-clock heartbeat) never crosses the staleness threshold.
 #[tokio::test]
 async fn test_keep_alive_protects_live_own_instance_jobs() -> anyhow::Result<()> {
@@ -2304,7 +2348,7 @@ async fn test_lost_handler_rescues_other_instance_jobs() -> anyhow::Result<()> {
             "orphan from another instance must be rescued"
         );
     }
-    let _ = controller; // silence unused-warning; clock no longer drives this loop
+    let _ = controller; // silence unused-warning; clock does not drive this loop
 
     jobs.shutdown().await?;
     Ok(())
@@ -3159,7 +3203,10 @@ async fn load_not_found_is_find_error() -> anyhow::Result<()> {
 
     let result = jobs.handle(JobId::new()).load().await;
     assert!(
-        matches!(result, Err(JobError::Find(_))),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::Invariant)
+        )),
         "expected Find error for a job that never existed, got Ok or wrong error",
     );
 
@@ -3296,20 +3343,25 @@ async fn await_all_times_out_and_reawait_resolves() -> anyhow::Result<()> {
     });
     jobs.start_poll().await?;
 
-    // A burst of jobs whose completions race the registrations below.
+    // A burst of jobs whose completions race the registrations below. The
+    // first finishes almost immediately; the rest are held well past the
+    // timeout below, so `AwaitTimeout::pending` is a STRICT SUBSET of `ids`
+    // -- proving the shared deadline reports the exact set still
+    // outstanding, not just the first handle (the pre-`AwaitTimeout` bug).
     let ids: Vec<JobId> = (0..40).map(|_| JobId::new()).collect();
-    for id in &ids {
-        spawner.spawn(*id, TestJobConfig { delay_ms: 100 }).await?;
+    spawner.spawn(ids[0], TestJobConfig { delay_ms: 0 }).await?;
+    for id in &ids[1..] {
+        spawner.spawn(*id, TestJobConfig { delay_ms: 2000 }).await?;
     }
 
     let handles = jobs.handles(ids.clone());
 
-    // The bounded timeout fires: the batch cannot fully resolve this fast
-    // (the last-spawned job alone needs ≥100ms).
-    let result = handles.await_all(Duration::from_millis(50)).await;
+    // The bounded timeout fires before the held-back 39 can resolve, but
+    // comfortably after the immediate one does.
+    let result = handles.await_all(Duration::from_millis(300)).await;
     assert!(
-        matches!(result, Err(JobError::TimedOut(id)) if id == ids[0]),
-        "expected TimedOut with the first handle's id, got: {result:?}"
+        matches!(&result, Err(AwaitError::Rejected(AwaitTimeout { pending })) if pending == &ids[1..]),
+        "expected AwaitTimeout with every id but the first still pending, got: {result:?}"
     );
 
     // The timed-out call dropped its waiters (select! loser). A FRESH
@@ -3345,16 +3397,75 @@ async fn await_before_start_poll_is_router_not_started_error() -> anyhow::Result
     let handle = jobs.handle(JobId::new());
     let result = handle.await_completion(Duration::from_millis(100)).await;
     assert!(
-        matches!(result, Err(JobError::RouterNotStarted)),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::Invariant)
+        )),
         "expected RouterNotStarted, got: {result:?}"
     );
 
     let handles = jobs.handles([JobId::new(), JobId::new()]);
     let result = handles.await_all(Duration::from_millis(100)).await;
     assert!(
-        matches!(result, Err(JobError::RouterNotStarted)),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::Invariant)
+        )),
         "expected RouterNotStarted, got: {result:?}"
     );
+
+    Ok(())
+}
+
+/// The other half of `await_before_start_poll_is_router_not_started_error`:
+/// once the service HAS started, dropping every `Jobs`/spawner handle tears
+/// down the router's waiter-manager task (`OwnedTaskHandle::drop` aborts
+/// it), closing the oneshot sender behind any in-flight await. That is
+/// `AwaitInterrupted`, not a mere timeout -- a fault wins because the thing
+/// being awaited on no longer exists, not because time ran out.
+#[tokio::test]
+async fn await_interrupted_by_service_drop_is_fatal_invariant() -> anyhow::Result<()> {
+    use std::error::Error as _;
+
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(TestJobInitializer {
+        job_type: helpers::job_type("await-interrupted-by-drop"),
+    });
+    jobs.start_poll().await?;
+
+    let job_id = JobId::new();
+    let schedule_at = chrono::Utc::now() + chrono::Duration::hours(24);
+    spawner
+        .spawn_at(job_id, TestJobConfig { delay_ms: 10 }, schedule_at)
+        .await?;
+    let handle = jobs.handle(job_id);
+
+    let awaiting =
+        tokio::spawn(async move { handle.await_completion(Duration::from_secs(30)).await });
+
+    // Give the spawned task time to register its waiter before the service
+    // underneath it goes away.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(spawner);
+    drop(jobs);
+
+    let result = awaiting.await?;
+    match result {
+        Err(AwaitError::Fatal(f)) => {
+            assert_eq!(f.kind, es_entity::errlanes::FatalKind::Invariant);
+            assert!(
+                f.source()
+                    .is_some_and(|s| s.downcast_ref::<job::AwaitInterrupted>().is_some()),
+                "expected an AwaitInterrupted source, got: {f:?}"
+            );
+        }
+        other => panic!("expected Fatal(Invariant) carrying AwaitInterrupted, got: {other:?}"),
+    }
 
     Ok(())
 }
@@ -3381,7 +3492,10 @@ async fn handle_await_find_timeout_and_batch() -> anyhow::Result<()> {
         .await_completion(Duration::from_secs(1))
         .await;
     assert!(
-        matches!(result, Err(JobError::Find(_))),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::Invariant)
+        )),
         "expected Find error, got: {result:?}"
     );
 
@@ -3396,8 +3510,8 @@ async fn handle_await_find_timeout_and_batch() -> anyhow::Result<()> {
         .await_completion(Duration::from_millis(200))
         .await;
     assert!(
-        matches!(result, Err(JobError::TimedOut(id)) if id == pending_id),
-        "expected TimedOut, got: {result:?}"
+        matches!(&result, Err(AwaitError::Rejected(AwaitTimeout { pending })) if pending == &[pending_id]),
+        "expected AwaitTimeout, got: {result:?}"
     );
 
     // await_all: batch resolves with positional outcomes.
@@ -3821,7 +3935,10 @@ async fn execution_state_point_read() -> anyhow::Result<()> {
     // Decode mismatch ⇒ CouldNotDeserializeExecutionState (an object is not a String).
     let result = handle.execution_state::<String>().await;
     assert!(
-        matches!(result, Err(JobError::CouldNotDeserializeExecutionState(_))),
+        result.as_ref().is_err_and(|e| matches!(
+            e.as_fatal().map(|f| f.kind),
+            Some(es_entity::errlanes::FatalKind::CorruptState)
+        )),
         "expected CouldNotDeserializeExecutionState, got {result:?}"
     );
 
@@ -4761,7 +4878,10 @@ async fn resident_runner_keeps_rescheduling_and_stays_unique() -> anyhow::Result
         .handle(first_handle.id())
         .await_completion(Duration::from_millis(50))
         .await;
-    assert!(matches!(timed_out, Err(JobError::TimedOut(_))));
+    assert!(matches!(
+        timed_out,
+        Err(AwaitError::Rejected(AwaitTimeout { .. }))
+    ));
 
     // Still absolutely unique: `resident_handle` resolves to the same job.
     let resolved = jobs
@@ -4924,9 +5044,8 @@ async fn keyed_terminal_state_retained_when_inherited() -> anyhow::Result<()> {
     );
 
     // Also readable through the snapshot/`load()` path (`keyed_handles(...)
-    // .load_all()`'s "caught up?" pattern) — this is the path that
-    // previously silently discarded a terminal job's execution state
-    // regardless of flavor.
+    // .load_all()`'s "caught up?" pattern) — the path where a terminal job's
+    // execution state is easiest to silently discard, regardless of flavor.
     let snapshot = jobs.handle(gen1.id()).load().await?;
     let snapshot_state: Option<CheckpointState> = snapshot.execution_state()?;
     assert_eq!(

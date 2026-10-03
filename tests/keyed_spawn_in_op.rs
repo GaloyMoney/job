@@ -152,7 +152,7 @@ async fn spawn_in_op_commits_with_the_caller() -> anyhow::Result<()> {
     assert!(spawned.created(), "a free key must report created");
     op.commit().await?;
 
-    // `spawned` no longer carries the key it was spawned for; read it back
+    // `spawned` does not carry the key it was spawned for; read it back
     // from the persisted row it names instead.
     let (unique_key,): (String,) = sqlx::query_as("SELECT unique_key FROM jobs WHERE id = $1")
         .bind(uuid::Uuid::from(spawned.id()))
@@ -311,7 +311,7 @@ async fn spawn_all_returns_one_outcome_per_spec_in_order() -> anyhow::Result<()>
         .await?;
 
     assert_eq!(spawned.len(), keys.len());
-    // `JobHandle` no longer carries the key it was spawned for; positions in
+    // `JobHandle` does not carry the key it was spawned for; positions in
     // `spawned` line up with `keys` by contract, but verifying "in input
     // order, not key order" means checking against something spawn_all did
     // not itself hand back — the persisted row each handle names.

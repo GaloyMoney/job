@@ -7,7 +7,13 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::instrument;
 
-use super::{JobId, entity::JobType, error::JobError, outcome::JobReturnValue, repo::JobRepo};
+use super::{
+    JobId,
+    entity::JobType,
+    error::{CouldNotSerialize, JobFault},
+    outcome::JobReturnValue,
+    repo::JobRepo,
+};
 
 /// Context provided to a [`JobRunner`](crate::JobRunner) while a job is executing.
 pub struct CurrentJob {
@@ -67,9 +73,9 @@ impl CurrentJob {
         &mut self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
-    ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)
-            .map_err(JobError::CouldNotSerializeExecutionState)?;
+    ) -> Result<(), JobFault> {
+        let execution_state_json =
+            serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -88,9 +94,9 @@ impl CurrentJob {
     pub async fn update_execution_state<T: Serialize>(
         &mut self,
         execution_state: T,
-    ) -> Result<(), JobError> {
-        let execution_state_json = serde_json::to_value(execution_state)
-            .map_err(JobError::CouldNotSerializeExecutionState)?;
+    ) -> Result<(), JobFault> {
+        let execution_state_json =
+            serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
             r#"
           INSERT INTO job_execution_states (id, execution_state_json)
@@ -123,13 +129,14 @@ impl CurrentJob {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Query`] if the write fails.
+    /// Returns a `Transient` lane if the write loses a race it can retry
+    /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(name = "job.current.wait_for_in_op", skip(self, op, handles), fields(id = %self.id))]
     pub async fn wait_for_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         handles: &crate::JobHandles,
-    ) -> Result<Vec<JobId>, JobError> {
+    ) -> Result<Vec<JobId>, JobFault> {
         handles.register_waiter_in_op(op, self.id).await
     }
 
@@ -158,7 +165,7 @@ impl CurrentJob {
     /// The returned `DbOp` will use the same clock as the job service,
     /// ensuring consistent time handling in tests with artificial clocks.
     #[cfg(feature = "es-entity")]
-    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobError> {
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobFault> {
         let ret = es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?;
         Ok(ret)
     }
@@ -172,9 +179,9 @@ impl CurrentJob {
     /// see. This allows incremental progress updates; for example, a batch job
     /// can call `set_result` after each chunk so that partial progress is
     /// preserved even on failure.
-    pub async fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobError> {
+    pub async fn set_result<T: Serialize>(&self, result: &T) -> Result<(), JobFault> {
         let job_result =
-            JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
+            JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
@@ -194,9 +201,9 @@ impl CurrentJob {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         result: &impl Serialize,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let job_result =
-            JobReturnValue::try_from(result).map_err(JobError::CouldNotSerializeResult)?;
+            JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
             self.repo.update_in_op(op, &mut job).await?;

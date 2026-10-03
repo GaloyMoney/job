@@ -20,13 +20,13 @@ use super::{
     Job, JobId,
     current::CurrentJob,
     entity::{JobType, NewJob},
-    error::JobError,
+    error::JobFault,
     execution_hooks::{ExecutionInsertHook, NewExecutionRow},
     handle::JobHandle,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     poller::PollerHandle,
-    repo::{JobCreateError, JobRepo},
+    repo::{JobConstraintViolation, JobRepo},
     runner::{JobCompletion, JobRunner, RetrySettings},
 };
 
@@ -213,14 +213,15 @@ where
     ///
     /// Note: a resident job never completes (see [`ResidentJobCompletion`]),
     /// so [`JobHandle::await_completion`] on the returned handle only ever
-    /// times out — use [`JobHandle::load`]/[`JobHandle::execution_state`] to
-    /// observe it instead.
+    /// resolves to `Err(AwaitError::Rejected(AwaitTimeout { .. }))` — use
+    /// [`JobHandle::load`]/[`JobHandle::execution_state`] to observe it
+    /// instead.
     #[instrument(
         name = "resident_job_spawner.spawn",
         skip(self, config),
         fields(job_type = %self.job_type)
     )]
-    pub async fn spawn(self, config: Config) -> Result<JobHandle, JobError> {
+    pub async fn spawn(self, config: Config) -> Result<JobHandle, JobFault> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let schedule_at = op.maybe_now().unwrap_or_else(|| self.clock.now());
         let new_job = NewJob::builder()
@@ -262,18 +263,31 @@ where
             // deterministically to that column (see `error.rs`). Resolve
             // the persisted job by lookup; the violation poisons the
             // transaction, so drop (roll back) the op before reading.
-            Err(JobCreateError::ConstraintViolation { .. }) => {
+            Err(e)
+                if matches!(
+                    &e,
+                    es_entity::errlanes::Fail::Rejected(
+                        JobConstraintViolation::IdxJobsJobTypeResident(_)
+                    )
+                ) =>
+            {
                 drop(op);
+                // `jobs` rows are never deleted and the resident collision
+                // just fired, so exactly one row exists; a missing one is a
+                // bug, not something a caller can correct.
                 let existing = self
                     .repo
                     .find_resident_id(&self.job_type)
                     .await?
-                    // `jobs` rows are never deleted and the resident
-                    // collision just fired, so exactly one row exists.
-                    .expect("resident collision guarantees the row exists");
+                    .ok_or_else(|| {
+                        es_entity::errlanes::Fatal::invariant(format!(
+                            "resident collision fired for {} but no resident row is visible",
+                            self.job_type
+                        ))
+                    })?;
                 Ok(self.handle(existing).with_created(false))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e.narrow_rejected()),
         }
     }
 
