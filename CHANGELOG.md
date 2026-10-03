@@ -1,3 +1,11 @@
+# [job release v0.18.0](https://github.com/GaloyMoney/job/releases/tag/0.18.0)
+
+
+
+### Refactor
+
+- [**breaking**] Widen runner error bounds to Send + Sync (#231)
+
 # [job release v0.17.0](https://github.com/GaloyMoney/job/releases/tag/0.17.0)
 
 
