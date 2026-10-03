@@ -1,5 +1,5 @@
 //! Live-PG coverage for the lane-driven disposition matrix the errlanes
-//! full-adoption refactor introduced (`finalizer::RunFailure`,
+//! full-adoption refactor introduced (`finalizer.rs`'s runner-failure classification,
 //! `JobDispatcher::fail_job`, `Job::maybe_schedule_retry`'s `terminal`
 //! parameter): what a runner's classified error does to the job, per
 //! `job-dev/handoff-errlanes-full-adoption.md` §3.7.

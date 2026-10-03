@@ -26,7 +26,7 @@ use super::{
     },
     entity::JobType,
     error::JobFault,
-    finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer, RunFailure},
+    finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer},
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -398,7 +398,7 @@ impl BatchDispatcher {
         runner: Box<dyn AnyBatchedJobRunner>,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
-    ) -> Result<JobBatchCompletion, RunFailure> {
+    ) -> Result<JobBatchCompletion, JobFault> {
         match AssertUnwindSafe(runner.run_batch_erased(items, ctx))
             .catch_unwind()
             .await
@@ -406,8 +406,8 @@ impl BatchDispatcher {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
                 // Classified here, while the box is still borrowable and
-                // before the next `.await`: see `RunFailure`.
-                let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+                // before the next `.await`: see "Classifying a runner's failure" in `finalizer.rs`.
+                let failure: JobFault = Fault::classify(&*e).narrow_denied();
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -427,7 +427,7 @@ impl BatchDispatcher {
                     "Batched job panicked during execution"
                 );
 
-                let failure: RunFailure = Fatal::new(FatalKind::Panic).with_context(message).into();
+                let failure: JobFault = Fatal::new(FatalKind::Panic).with_context(message).into();
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -504,7 +504,7 @@ impl BatchDispatcher {
     /// itself rather than inferring one from whatever the runner returned.
     /// Whether a `Fatal` ends the job is then the type's
     /// `RetrySettings::terminal_on_fatal` decision, like any other fatal.
-    fn validate(&self, outcomes: &BatchOutcomes) -> Result<(), RunFailure> {
+    fn validate(&self, outcomes: &BatchOutcomes) -> Result<(), JobFault> {
         let expected: HashSet<JobId> = self.ids.iter().copied().collect();
         let mut seen: HashSet<JobId> = HashSet::with_capacity(outcomes.len());
         for (id, _) in outcomes {
@@ -639,7 +639,7 @@ impl BatchDispatcher {
         fields(job_type = %self.job_type, n_items = self.ids.len(),
                n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
     )]
-    async fn fail_batch(&mut self, failure: RunFailure) -> Result<(), JobFault> {
+    async fn fail_batch(&mut self, failure: JobFault) -> Result<(), JobFault> {
         let span = tracing::Span::current();
         failure.record(&span);
         if failure.is_congestion() {

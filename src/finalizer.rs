@@ -64,6 +64,43 @@
 //! - **A `CongestionRescheduled` entity event**, not `ExecutionErrored`
 //!   (see [`Job::reschedule_congestion`]), which is also how the
 //!   consecutive-congestion streak is counted for the stuck-forever WARN.
+//!
+//! # Classifying a runner's failure
+//!
+//! A runner's failure reaches job as a [`JobFault`], classified at the boundary.
+//!
+//! The runner traits return a plain `Box<dyn Error>` (not `Send + Sync` --
+//! see the es-entity addendum). `Fault::classify` borrows it, so the box
+//! is classified before the next `.await` and dropped there; the `Fault`
+//! is `Send + Sync` by construction. Job is not an authorization boundary,
+//! so a `Denied` found in the chain is narrowed to `Fatal(Denied)` here:
+//! nobody is on the other end of a job to be told no.
+//!
+//! So: classify at the boundary, before the next `.await`, and let the box
+//! drop there. See `dispatcher.rs::dispatch_job` and
+//! `batch_dispatcher.rs::dispatch_batch`.
+//!
+//! Classification never comes back empty. `Fault::classify` falls back to
+//! `Fatal(Dependency)` carrying the error's whole `Display` chain as
+//! context, so a runner that knows nothing of errlanes still arrives as
+//! something an operator can page on -- see `JobFault::is_fatal` (via
+//! `Laned`/the inherent method) for why that does not, by itself, end the
+//! job.
+//!
+//! **Job does not act on `is_fatal` by default.**
+//! [`RetrySettings::terminal_on_fatal`] defaults to `false`, so a `Fatal`
+//! runner error (including a narrowed `Denied`) is retried on the ordinary
+//! attempt-count policy exactly like a `Transient` one -- while still being
+//! *reported* as fatal on the span (`error.lane`, `error.code`,
+//! `exception.message`, written by `Laned::record` the moment it is
+//! classified).
+//!
+//! The split is deliberate: observability should reflect what the runner
+//! said immediately, but acting on it ends a job after one attempt, and we
+//! have no live experience yet with how faithfully the crates upstream of
+//! job lane their errors. A `Fatal` that is really transient would turn a
+//! blip into a dead job. Until that confidence exists, trusting the lane
+//! that far is opt-in per job type.
 
 use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
@@ -86,234 +123,6 @@ use super::{
     repo::JobRepo,
     runner::RetrySettings,
 };
-
-/// A runner's failure, classified at the job boundary.
-///
-/// The runner traits return a plain `Box<dyn Error>` (not `Send + Sync` --
-/// see the es-entity addendum). `Fault::classify` borrows it, so the box
-/// is classified before the next `.await` and dropped there; the `Fault`
-/// is `Send + Sync` by construction. Job is not an authorization boundary,
-/// so a `Denied` found in the chain is narrowed to `Fatal(Denied)` here:
-/// nobody is on the other end of a job to be told no.
-///
-/// So: classify at the boundary, before the next `.await`, and let the box
-/// drop there. See `dispatcher.rs::dispatch_job` and
-/// `batch_dispatcher.rs::dispatch_batch`.
-///
-/// Classification never comes back empty. `Fault::classify` falls back to
-/// `Fatal(Dependency)` carrying the error's whole `Display` chain as
-/// context, so a runner that knows nothing of errlanes still arrives as
-/// something an operator can page on -- see `RunFailure::is_fatal` (via
-/// `Laned`/the inherent method) for why that does not, by itself, end the
-/// job.
-///
-/// **Job does not act on `is_fatal` by default.**
-/// [`RetrySettings::terminal_on_fatal`] defaults to `false`, so a `Fatal`
-/// runner error (including a narrowed `Denied`) is retried on the ordinary
-/// attempt-count policy exactly like a `Transient` one -- while still being
-/// *reported* as fatal on the span (`error.lane`, `error.code`,
-/// `exception.message`, written by `Laned::record` the moment it is
-/// classified).
-///
-/// The split is deliberate: observability should reflect what the runner
-/// said immediately, but acting on it ends a job after one attempt, and we
-/// have no live experience yet with how faithfully the crates upstream of
-/// job lane their errors. A `Fatal` that is really transient would turn a
-/// blip into a dead job. Until that confidence exists, trusting the lane
-/// that far is opt-in per job type.
-pub(crate) type RunFailure = JobFault;
-
-#[cfg(test)]
-mod run_failure_tests {
-    use super::*;
-    use es_entity::errlanes::{Denied, Fatal, FatalKind, Lane, Transient, TransientKind};
-    use std::error::Error;
-
-    #[derive(Debug)]
-    struct Wrapped<E>(E);
-    impl<E: std::fmt::Display> std::fmt::Display for Wrapped<E> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "wrapped: {}", self.0)
-        }
-    }
-    impl<E: Error + 'static> Error for Wrapped<E> {
-        fn source(&self) -> Option<&(dyn Error + 'static)> {
-            Some(&self.0)
-        }
-    }
-
-    /// Boxes as the runner traits do -- `Box<dyn Error>`, with no
-    /// `Send + Sync`. If this ever needs those bounds to compile, the
-    /// boundary has regressed back to the widened trait signature.
-    fn boxed<E: Error + 'static>(e: E) -> Box<dyn Error> {
-        Box::new(e)
-    }
-
-    /// A runner that knows nothing of errlanes gets `Fault::classify`'s
-    /// `Fatal(Dependency)` safety default rather than vanishing -- but it
-    /// is NOT terminal on its own: `terminal_on_fatal` is `false` by
-    /// default, so it retries per policy. See
-    /// `tests/lanes.rs::unclassified_string_error_retries_per_policy`.
-    #[test]
-    fn classifies_a_bare_string_as_fatal_dependency_carrying_its_message() {
-        let e = boxed(std::io::Error::other("boom"));
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        match failure {
-            Fault::Fatal(f) => {
-                assert_eq!(f.kind, FatalKind::Dependency);
-                assert_eq!(f.context.as_deref(), Some("boom"));
-            }
-            _ => panic!("expected Fatal(Dependency)"),
-        }
-    }
-
-    /// A runner not built on errlanes at all returns a raw, never-laned
-    /// `sqlx::Error::PoolTimedOut` directly, and it must still reach the
-    /// congestion path rather than spend an ordinary retry attempt: a walk
-    /// that looked only for an already-laned payload would drop it.
-    /// `Fault::classify`'s second rule covers the shape, using errlanes' own
-    /// sqlx table -- job keeps no second copy. See
-    /// `tests/pool_congestion.rs::congestion_reschedule_keeps_job_batchable`
-    /// for the end-to-end sibling.
-    #[test]
-    fn classify_detects_congestion_from_a_raw_unlaned_sqlx_pool_timed_out() {
-        let e = boxed(sqlx::Error::PoolTimedOut);
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        assert!(failure.is_congestion());
-    }
-
-    /// The same raw-chain walk classifies the rest of the sqlx table too,
-    /// not just `PoolTimedOut` -- the general form, not only the one kind
-    /// the regression above pins.
-    #[test]
-    fn classify_reads_the_rest_of_the_raw_sqlx_table() {
-        let connection_lost = boxed(sqlx::Error::Io(std::io::Error::other("conn reset")));
-        let failure: RunFailure = Fault::classify(&*connection_lost).narrow_denied();
-        match failure {
-            Fault::Transient(t) => assert_eq!(t.kind, TransientKind::ConnectionLost),
-            _ => panic!("expected Transient(ConnectionLost)"),
-        }
-
-        let protocol = boxed(sqlx::Error::Protocol("synthesized".into()));
-        let failure: RunFailure = Fault::classify(&*protocol).narrow_denied();
-        match failure {
-            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Dependency),
-            _ => panic!("expected Fatal(Dependency)"),
-        }
-    }
-
-    /// A laned payload elsewhere in the chain wins over an incidental raw
-    /// `sqlx::Error` deeper in the same chain -- the errlanes-based
-    /// classification takes precedence, not merely whichever happens to sit
-    /// nearer the top.
-    #[test]
-    fn a_laned_fatal_outranks_a_raw_sqlx_error_in_its_own_source_chain() {
-        // `Fatal::from_error` attaches the sqlx error as this Fatal's own
-        // source -- a raw `sqlx::Error::PoolTimedOut` genuinely further
-        // down the same chain, which must not flip the classification to
-        // congestion once the laned walk has already found the Fatal.
-        let e = boxed(Fatal::from_error(
-            FatalKind::Invariant,
-            sqlx::Error::PoolTimedOut,
-        ));
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        match failure {
-            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Invariant),
-            _ => panic!("expected the laned Fatal to win over the raw sqlx::Error in its source"),
-        }
-    }
-
-    #[test]
-    fn classifies_a_transient_three_hops_deep() {
-        let e = boxed(Wrapped(Wrapped(Transient::new(TransientKind::Deadlock))));
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        match failure {
-            Fault::Transient(t) => assert_eq!(t.kind, TransientKind::Deadlock),
-            _ => panic!("expected Transient, got a different classification"),
-        }
-    }
-
-    #[test]
-    fn classifies_a_fatal() {
-        let e = boxed(Fatal::new(FatalKind::CorruptState));
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        match failure {
-            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::CorruptState),
-            _ => panic!("expected Fatal"),
-        }
-    }
-
-    /// A `Denied` anywhere in the chain is narrowed at the job boundary:
-    /// job is not an authorization boundary, so there is nobody left to
-    /// tell no. It becomes `Fatal(Denied)`, with the `Denied` as its
-    /// source.
-    #[test]
-    fn classifies_a_denied_narrowed_to_fatal_denied() {
-        let e = boxed(Denied::default());
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        match failure {
-            Fault::Fatal(f) => {
-                assert_eq!(f.kind, FatalKind::Denied);
-                assert!(f.source().unwrap().downcast_ref::<Denied>().is_some());
-            }
-            _ => panic!("expected Fatal(Denied)"),
-        }
-    }
-
-    /// A boxed `Fail::Rejected(_)` carries no marker type that survives
-    /// erasure, so there is nothing for the lane walk to find. It must land
-    /// on the `Fatal(Dependency)` default -- reported, retried per policy,
-    /// and above all never silently read as congestion (which would skip
-    /// the attempt counter) or as a `Denied`.
-    #[test]
-    fn a_boxed_rejected_fail_falls_back_to_the_default_not_a_guessed_lane() {
-        use crate::error::{AwaitError, AwaitTimeout};
-        let fail: AwaitError = AwaitError::Rejected(AwaitTimeout {
-            pending: vec![crate::JobId::new()],
-        });
-        let e: Box<dyn Error> = Box::new(fail);
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        assert!(matches!(failure, Fault::Fatal(_)));
-        assert!(!failure.is_congestion());
-    }
-
-    /// An already-laned `Transient::new(TransientKind::PoolTimeout)` with no
-    /// `sqlx::Error` source attached -- exactly what a runner built on the
-    /// errlanes boundary returns -- takes the congestion path. Matching only
-    /// a raw `sqlx::Error::PoolTimedOut` by downcasting the chain would miss
-    /// it, and every such pool timeout would spend a `RetryPolicy` attempt
-    /// instead.
-    #[test]
-    fn classify_detects_congestion_from_a_bare_laned_transient_with_no_sqlx_source() {
-        let e = boxed(Transient::new(TransientKind::PoolTimeout));
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        assert!(failure.is_congestion());
-    }
-
-    /// The contract this whole boundary exists to keep: a runner error that
-    /// is NOT `Send` (the runner traits do not require it) classifies by
-    /// reference, and the resulting `Fault` crosses a thread boundary --
-    /// which is what the dispatcher does with it, across the `.await` that
-    /// writes the disposition. If this stops compiling, the `Send + Sync`
-    /// bound has crept back onto the runner traits.
-    #[test]
-    fn a_non_send_runner_error_classifies_and_its_fault_crosses_a_spawn() {
-        #[derive(Debug)]
-        struct NotSend(#[allow(dead_code)] std::rc::Rc<()>);
-        impl std::fmt::Display for NotSend {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "not send")
-            }
-        }
-        impl Error for NotSend {}
-
-        let e: Box<dyn Error> = Box::new(NotSend(std::rc::Rc::new(())));
-        let failure: RunFailure = Fault::classify(&*e).narrow_denied();
-        drop(e);
-        let lane = std::thread::spawn(move || failure.lane()).join().unwrap();
-        assert_eq!(lane, Lane::Fatal);
-    }
-}
 
 /// Base delay before a pool-congestion reschedule becomes due again. Fixed
 /// and short, not the type's exponential `RetryPolicy` schedule: congestion
@@ -367,7 +176,7 @@ pub(crate) enum Disposition {
     Fail {
         /// The classified failure. The entity reads its lane for the
         /// `terminal_on_fatal` decision and narrows it on exhaustion.
-        failure: RunFailure,
+        failure: JobFault,
         attempt: u32,
         run_duration: std::time::Duration,
     },
@@ -1394,5 +1203,197 @@ mod deadlock_regression_tests {
              two-row deadlock -- either the retry path regressed, or this environment's \
              deadlock detector never picked the finalizer as victim in any round"
         );
+    }
+}
+
+#[cfg(test)]
+mod runner_failure_classification_tests {
+    use super::*;
+    use es_entity::errlanes::{Denied, Fatal, FatalKind, Lane, Transient, TransientKind};
+    use std::error::Error;
+
+    #[derive(Debug)]
+    struct Wrapped<E>(E);
+    impl<E: std::fmt::Display> std::fmt::Display for Wrapped<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "wrapped: {}", self.0)
+        }
+    }
+    impl<E: Error + 'static> Error for Wrapped<E> {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// Boxes as the runner traits do -- `Box<dyn Error>`, with no
+    /// `Send + Sync`. If this ever needs those bounds to compile, the
+    /// boundary has regressed back to the widened trait signature.
+    fn boxed<E: Error + 'static>(e: E) -> Box<dyn Error> {
+        Box::new(e)
+    }
+
+    /// A runner that knows nothing of errlanes gets `Fault::classify`'s
+    /// `Fatal(Dependency)` safety default rather than vanishing -- but it
+    /// is NOT terminal on its own: `terminal_on_fatal` is `false` by
+    /// default, so it retries per policy. See
+    /// `tests/lanes.rs::unclassified_string_error_retries_per_policy`.
+    #[test]
+    fn classifies_a_bare_string_as_fatal_dependency_carrying_its_message() {
+        let e = boxed(std::io::Error::other("boom"));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => {
+                assert_eq!(f.kind, FatalKind::Dependency);
+                assert_eq!(f.context.as_deref(), Some("boom"));
+            }
+            _ => panic!("expected Fatal(Dependency)"),
+        }
+    }
+
+    /// A runner not built on errlanes at all returns a raw, never-laned
+    /// `sqlx::Error::PoolTimedOut` directly, and it must still reach the
+    /// congestion path rather than spend an ordinary retry attempt: a walk
+    /// that looked only for an already-laned payload would drop it.
+    /// `Fault::classify`'s second rule covers the shape, using errlanes' own
+    /// sqlx table -- job keeps no second copy. See
+    /// `tests/pool_congestion.rs::congestion_reschedule_keeps_job_batchable`
+    /// for the end-to-end sibling.
+    #[test]
+    fn classify_detects_congestion_from_a_raw_unlaned_sqlx_pool_timed_out() {
+        let e = boxed(sqlx::Error::PoolTimedOut);
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        assert!(failure.is_congestion());
+    }
+
+    /// The same raw-chain walk classifies the rest of the sqlx table too,
+    /// not just `PoolTimedOut` -- the general form, not only the one kind
+    /// the regression above pins.
+    #[test]
+    fn classify_reads_the_rest_of_the_raw_sqlx_table() {
+        let connection_lost = boxed(sqlx::Error::Io(std::io::Error::other("conn reset")));
+        let failure: JobFault = Fault::classify(&*connection_lost).narrow_denied();
+        match failure {
+            Fault::Transient(t) => assert_eq!(t.kind, TransientKind::ConnectionLost),
+            _ => panic!("expected Transient(ConnectionLost)"),
+        }
+
+        let protocol = boxed(sqlx::Error::Protocol("synthesized".into()));
+        let failure: JobFault = Fault::classify(&*protocol).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Dependency),
+            _ => panic!("expected Fatal(Dependency)"),
+        }
+    }
+
+    /// A laned payload elsewhere in the chain wins over an incidental raw
+    /// `sqlx::Error` deeper in the same chain -- the errlanes-based
+    /// classification takes precedence, not merely whichever happens to sit
+    /// nearer the top.
+    #[test]
+    fn a_laned_fatal_outranks_a_raw_sqlx_error_in_its_own_source_chain() {
+        // `Fatal::from_error` attaches the sqlx error as this Fatal's own
+        // source -- a raw `sqlx::Error::PoolTimedOut` genuinely further
+        // down the same chain, which must not flip the classification to
+        // congestion once the laned walk has already found the Fatal.
+        let e = boxed(Fatal::from_error(
+            FatalKind::Invariant,
+            sqlx::Error::PoolTimedOut,
+        ));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Invariant),
+            _ => panic!("expected the laned Fatal to win over the raw sqlx::Error in its source"),
+        }
+    }
+
+    #[test]
+    fn classifies_a_transient_three_hops_deep() {
+        let e = boxed(Wrapped(Wrapped(Transient::new(TransientKind::Deadlock))));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Transient(t) => assert_eq!(t.kind, TransientKind::Deadlock),
+            _ => panic!("expected Transient, got a different classification"),
+        }
+    }
+
+    #[test]
+    fn classifies_a_fatal() {
+        let e = boxed(Fatal::new(FatalKind::CorruptState));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::CorruptState),
+            _ => panic!("expected Fatal"),
+        }
+    }
+
+    /// A `Denied` anywhere in the chain is narrowed at the job boundary:
+    /// job is not an authorization boundary, so there is nobody left to
+    /// tell no. It becomes `Fatal(Denied)`, with the `Denied` as its
+    /// source.
+    #[test]
+    fn classifies_a_denied_narrowed_to_fatal_denied() {
+        let e = boxed(Denied::default());
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        match failure {
+            Fault::Fatal(f) => {
+                assert_eq!(f.kind, FatalKind::Denied);
+                assert!(f.source().unwrap().downcast_ref::<Denied>().is_some());
+            }
+            _ => panic!("expected Fatal(Denied)"),
+        }
+    }
+
+    /// A boxed `Fail::Rejected(_)` carries no marker type that survives
+    /// erasure, so there is nothing for the lane walk to find. It must land
+    /// on the `Fatal(Dependency)` default -- reported, retried per policy,
+    /// and above all never silently read as congestion (which would skip
+    /// the attempt counter) or as a `Denied`.
+    #[test]
+    fn a_boxed_rejected_fail_falls_back_to_the_default_not_a_guessed_lane() {
+        use crate::error::{AwaitError, AwaitTimeout};
+        let fail: AwaitError = AwaitError::Rejected(AwaitTimeout {
+            pending: vec![crate::JobId::new()],
+        });
+        let e: Box<dyn Error> = Box::new(fail);
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        assert!(matches!(failure, Fault::Fatal(_)));
+        assert!(!failure.is_congestion());
+    }
+
+    /// An already-laned `Transient::new(TransientKind::PoolTimeout)` with no
+    /// `sqlx::Error` source attached -- exactly what a runner built on the
+    /// errlanes boundary returns -- takes the congestion path. Matching only
+    /// a raw `sqlx::Error::PoolTimedOut` by downcasting the chain would miss
+    /// it, and every such pool timeout would spend a `RetryPolicy` attempt
+    /// instead.
+    #[test]
+    fn classify_detects_congestion_from_a_bare_laned_transient_with_no_sqlx_source() {
+        let e = boxed(Transient::new(TransientKind::PoolTimeout));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        assert!(failure.is_congestion());
+    }
+
+    /// The contract this whole boundary exists to keep: a runner error that
+    /// is NOT `Send` (the runner traits do not require it) classifies by
+    /// reference, and the resulting `Fault` crosses a thread boundary --
+    /// which is what the dispatcher does with it, across the `.await` that
+    /// writes the disposition. If this stops compiling, the `Send + Sync`
+    /// bound has crept back onto the runner traits.
+    #[test]
+    fn a_non_send_runner_error_classifies_and_its_fault_crosses_a_spawn() {
+        #[derive(Debug)]
+        struct NotSend(#[allow(dead_code)] std::rc::Rc<()>);
+        impl std::fmt::Display for NotSend {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "not send")
+            }
+        }
+        impl Error for NotSend {}
+
+        let e: Box<dyn Error> = Box::new(NotSend(std::rc::Rc::new(())));
+        let failure: JobFault = Fault::classify(&*e).narrow_denied();
+        drop(e);
+        let lane = std::thread::spawn(move || failure.lane()).join().unwrap();
+        assert_eq!(lane, Lane::Fatal);
     }
 }

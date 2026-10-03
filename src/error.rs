@@ -1,41 +1,32 @@
-//! Error types returned by the job service and helpers.
+//! Error types returned by the job service.
 //!
-//! The rule, from `errlanes`' own doctrine (`Rejected` is "a pure,
-//! caller-correctable domain outcome"; "which carrier a function returns is
-//! itself information"):
+//! Lanes, carriers, lifting and narrowing are `errlanes` vocabulary; this
+//! module only applies it. For the model itself see the
+//! [errlanes README](https://github.com/GaloyMoney/es-entity/blob/main/errlanes/README.md).
 //!
-//! 1. A rejection exists only where a caller can branch on it in code and do
-//!    something different. Rejections are scoped to the methods that can
-//!    produce them, not pooled in one service-wide enum.
-//! 2. A method that can never reject returns [`JobFault`], not a `Fail`.
-//! 3. Foreign error types stay raw on a `pub fn` when they are the only
-//!    error that site can produce (the serde accessors on
-//!    [`JobOutcome`](crate::JobOutcome)/[`JobSnapshot`](crate::JobSnapshot)/
-//!    [`CurrentJob`](crate::CurrentJob) and friends). They get a laned
-//!    wrapper only where they are folded into a laned result.
-//! 4. Library code never inspects a `Fatal`'s payload and never asks callers
-//!    to. If a caller needs to know, the API offers a value (see
-//!    [`JobHandle::maybe_load`](crate::JobHandle::maybe_load)).
+//! How job adopts it:
 //!
-//! Three carriers follow from that: [`JobFault`] on every method that cannot
-//! reject (lifecycle, handles, writes from inside a runner, keyed and
-//! resident spawns -- those always absorb their collision into the existing
-//! job), [`JobError`] on the `JobSpawner` methods that can reject a
-//! caller-chosen id, and [`AwaitError`] on
-//! [`JobHandle::await_completion`](crate::JobHandle::await_completion) and
-//! [`JobHandles::await_all`](crate::JobHandles::await_all).
-//!
-//! Every index column is `update(persist = false)`, so an UPDATE touches
-//! only the events table and es_entity types `update_in_op` /
-//! `update_all_in_op` as [`RepoFault`](es_entity::RepoFault): those sites
-//! are a plain `?`. Only the two creates that generate their own ids -- the
-//! keyed `create_all_in_op` and the resident `create_in_op` (which absorbs
-//! its one real collision before the fold) -- still see a
-//! `Fail<JobConstraintViolation, ..>` whose rejection has no caller to
-//! correct it. They narrow with
-//! [`ResultExt::narrow_rejected`](es_entity::errlanes::ResultExt::narrow_rejected),
-//! which turns it into `Fatal(Invariant)` with the constraint as its source
-//! -- the same rule a partial lift applies.
+//! - Rejections are scoped to the methods that can produce them, never
+//!   pooled service-wide. Only the id-choosing `JobSpawner` methods can
+//!   reject (a caller-chosen duplicate id), so only they return
+//!   [`JobError`]; the awaits return [`AwaitError`] for their timeout;
+//!   everything else cannot reject and returns [`JobFault`].
+//! - Foreign error types stay raw on a `pub fn` when they are the only
+//!   error that site can produce (the serde accessors on
+//!   [`JobOutcome`](crate::JobOutcome), [`JobSnapshot`](crate::JobSnapshot)
+//!   and [`CurrentJob`](crate::CurrentJob)). They get a laned wrapper only
+//!   where they are folded into a laned result.
+//! - Library code never inspects a `Fatal`'s payload and never asks callers
+//!   to. Where a caller needs to know, the API offers a value instead (see
+//!   [`JobHandle::maybe_load`](crate::JobHandle::maybe_load)).
+//! - Every index column is `update(persist = false)`, so es_entity types
+//!   `update_in_op` / `update_all_in_op` as
+//!   [`RepoFault`](es_entity::RepoFault) and those sites are a plain `?`.
+//!   The two creates that generate their own ids (the keyed
+//!   `create_all_in_op`, and the resident `create_in_op` once it has
+//!   absorbed its one real collision) see a
+//!   `Fail<JobConstraintViolation, ..>` nobody can correct, and
+//!   `narrow_rejected()` it into `Fatal(Invariant)`.
 
 use super::repo::JobConstraintViolation;
 use crate::JobId;

@@ -16,7 +16,7 @@ use super::{
     current::CurrentJob,
     entity::{Job, JobType},
     error::JobFault,
-    finalizer::{ClaimDisposition, Disposition, Finalizer, RunFailure},
+    finalizer::{ClaimDisposition, Disposition, Finalizer},
     notifier::JobEventNotifier,
     poller::JobPoller,
     repo::JobRepo,
@@ -383,7 +383,7 @@ impl JobDispatcher {
     async fn dispatch_job(
         runner: Box<dyn JobRunner>,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, RunFailure> {
+    ) -> Result<JobCompletion, JobFault> {
         match AssertUnwindSafe(runner.run(current_job))
             .catch_unwind()
             .await
@@ -391,8 +391,8 @@ impl JobDispatcher {
             Ok(Ok(completion)) => Ok(completion),
             Ok(Err(e)) => {
                 // Classified here, while the box is still borrowable and
-                // before the next `.await`: see `RunFailure`.
-                let failure: RunFailure = Fault::classify(&*e).narrow_denied();
+                // before the next `.await`: see "Classifying a runner's failure" in `finalizer.rs`.
+                let failure: JobFault = Fault::classify(&*e).narrow_denied();
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -412,7 +412,7 @@ impl JobDispatcher {
                     "Job panicked during execution"
                 );
 
-                let failure: RunFailure = Fatal::new(FatalKind::Panic).with_context(message).into();
+                let failure: JobFault = Fatal::new(FatalKind::Panic).with_context(message).into();
                 failure.record(&Span::current());
                 Err(failure)
             }
@@ -433,7 +433,7 @@ impl JobDispatcher {
     async fn fail_job(
         &mut self,
         id: JobId,
-        failure: RunFailure,
+        failure: JobFault,
         attempt: u32,
         run_duration: std::time::Duration,
     ) -> Result<(), JobFault> {

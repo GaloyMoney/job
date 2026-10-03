@@ -12,7 +12,6 @@ use es_entity::{context::TracingContext, *};
 use crate::{
     JobId,
     error::{CouldNotSerialize, JobFault},
-    finalizer::RunFailure,
     outcome::{JobReturnValue, JobTerminalState},
 };
 
@@ -326,7 +325,7 @@ impl Job {
     }
 
     /// Reschedule after a pool-congestion classification
-    /// (`RunFailure::is_congestion`, `finalizer.rs`): same shape
+    /// (`JobFault::is_congestion`, `finalizer.rs`): same shape
     /// as [`Self::schedule_retry`]
     /// but at the SAME `attempt` rather than the next one, and via
     /// `CongestionRescheduled` rather than `ExecutionErrored` -- congestion
@@ -398,10 +397,10 @@ impl Job {
         es_entity::Idempotent::Executed(())
     }
 
-    /// `failure` is the classified `RunFailure` that ended this attempt --
+    /// `failure` is the classified [`JobFault`] that ended this attempt --
     /// `failure.is_fatal()` is errlanes' claim that it will not succeed on
     /// retry (a `Denied` was already narrowed to `Fatal(Denied)` at the job
-    /// boundary; see `RunFailure`). Job acts on that claim only when the
+    /// boundary; see "Classifying a runner's failure" in `finalizer.rs`). Job acts on that claim only when the
     /// type opts in with `retry_policy.terminal_on_fatal`, in which case the
     /// job ends on THIS attempt regardless of the attempt-count budget. By
     /// default the lane is reported but not acted on, and the error takes
@@ -416,7 +415,7 @@ impl Job {
         attempt: u32,
         run_duration: Duration,
         retry_policy: &RetryPolicy,
-        failure: &RunFailure,
+        failure: &JobFault,
     ) -> Option<(DateTime<Utc>, u32)> {
         let mut current_attempt = attempt.max(1);
         // Only a counter that has actually accumulated can be forgiven; every
@@ -565,7 +564,7 @@ mod tests {
         /// `Fatal`. None of these tests assert on the message text, only on
         /// the attempt-count machinery, so one bare `Transient` stands in for
         /// every call site.
-        fn retry_failure() -> RunFailure {
+        fn retry_failure() -> JobFault {
             Transient::new(TransientKind::Other).into()
         }
 
