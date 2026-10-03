@@ -146,7 +146,10 @@ pub trait BatchedJobInitializer: Send + Sync + 'static {
     fn init(
         &self,
         spawner: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>>;
+    ) -> Result<
+        Box<dyn BatchedJobRunner<Config = Self::Config>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
 }
 
 /// Implemented by executors that process many jobs of one type together.
@@ -159,7 +162,7 @@ pub trait BatchedJobRunner: Send + Sync + 'static {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<Self::Config>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>>;
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// How a single job within a batch should be progressed.
@@ -706,7 +709,7 @@ pub(crate) trait AnyBatchedJobRunner: Send + Sync + 'static {
         &self,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>>;
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 pub(crate) struct ErasedBatchedRunner<C> {
@@ -728,7 +731,7 @@ where
         &self,
         items: Vec<RawBatchItem>,
         ctx: BatchRunCtx,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let BatchRunCtx {
             pool,
             clock,
@@ -771,7 +774,7 @@ pub(crate) trait AnyBatchedJobInitializer: Send + Sync + 'static {
         router: Arc<crate::notification_router::JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<crate::notifier::JobEventNotifier>,
-    ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
@@ -781,7 +784,7 @@ impl<T: BatchedJobInitializer> AnyBatchedJobInitializer for T {
         router: Arc<crate::notification_router::JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<crate::notifier::JobEventNotifier>,
-    ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn AnyBatchedJobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         // Always-empty POLLER handle: fan-out spawns from within a batch
         // runner take the ordinary insert path. The router is real, so a
         // handle returned by such a spawn can await.

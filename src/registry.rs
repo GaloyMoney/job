@@ -28,7 +28,7 @@ pub(crate) trait AnyJobInitializer: Send + Sync + 'static {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 impl<T: JobInitializer> AnyJobInitializer for T {
@@ -39,7 +39,7 @@ impl<T: JobInitializer> AnyJobInitializer for T {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         // Fan-out spawns made from WITHIN a running job's own runner take
         // the ordinary insert path: this handle is never populated, since
         // `dispatch_job` has no `Arc<JobPoller>` to hand it here. The router
@@ -92,7 +92,7 @@ impl<I: KeyedJobInitializer> AnyJobInitializer for ErasedKeyedInitializer<I> {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         // Always-empty handle: fan-out spawns of further generations made
         // from WITHIN a running keyed job's own runner take the ordinary
         // insert path, same as the plain and batched fan-out cases above.
@@ -127,7 +127,7 @@ impl<I: ResidentJobInitializer> AnyJobInitializer for ErasedResidentInitializer<
         _router: Arc<JobNotificationRouter>,
         _clock: ClockHandle,
         _notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let runner = ResidentJobInitializer::init(&self.0, job)?;
         Ok(Box::new(ResidentRunnerAdapter(runner)))
     }
@@ -281,15 +281,13 @@ impl JobRegistry {
                 )))
             })?
             .init(job, repo, router, clock, notifier)
-            // An initializer's error cannot become this `Fatal`'s source
-            // (`init` returns a plain `Box<dyn Error>`, which is not
-            // `Send + Sync`), so its whole `Display` chain is folded into
-            // the context instead -- the same trade `Fault::classify` makes
-            // at the runner boundary. `Config` is right here: an initializer
-            // that cannot build its runner from the job's config is a
-            // configuration failure, not a narrowed lane.
+            // The initializer's error is kept intact as this `Fatal`'s
+            // source: `exception.message` carries its whole chain and a
+            // handler or test can still `downcast_ref` it. `Config` is right
+            // here: an initializer that cannot build its runner from the
+            // job's config is a configuration failure, not a narrowed lane.
             .map_err(|e| {
-                es_entity::errlanes::Fatal::from_dyn(es_entity::errlanes::FatalKind::Config, &*e)
+                es_entity::errlanes::Fatal::from_boxed(es_entity::errlanes::FatalKind::Config, e)
                     .into()
             })
     }
@@ -334,15 +332,13 @@ impl JobRegistry {
                 )))
             })?
             .init_erased(repo, router, clock, notifier)
-            // An initializer's error cannot become this `Fatal`'s source
-            // (`init` returns a plain `Box<dyn Error>`, which is not
-            // `Send + Sync`), so its whole `Display` chain is folded into
-            // the context instead -- the same trade `Fault::classify` makes
-            // at the runner boundary. `Config` is right here: an initializer
-            // that cannot build its runner from the job's config is a
-            // configuration failure, not a narrowed lane.
+            // The initializer's error is kept intact as this `Fatal`'s
+            // source: `exception.message` carries its whole chain and a
+            // handler or test can still `downcast_ref` it. `Config` is right
+            // here: an initializer that cannot build its runner from the
+            // job's config is a configuration failure, not a narrowed lane.
             .map_err(|e| {
-                es_entity::errlanes::Fatal::from_dyn(es_entity::errlanes::FatalKind::Config, &*e)
+                es_entity::errlanes::Fatal::from_boxed(es_entity::errlanes::FatalKind::Config, e)
                     .into()
             })
     }
@@ -414,7 +410,7 @@ mod tests {
             &self,
             _job: &Job,
             _: JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+        ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
             unimplemented!("never invoked by this test")
         }
     }
@@ -443,7 +439,7 @@ mod tests {
             _: JobSpawner<Self::Config>,
         ) -> Result<
             Box<dyn crate::BatchedJobRunner<Config = Self::Config>>,
-            Box<dyn std::error::Error>,
+            Box<dyn std::error::Error + Send + Sync>,
         > {
             unimplemented!("never invoked by this test")
         }

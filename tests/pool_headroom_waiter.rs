@@ -39,7 +39,7 @@ impl JobRunner for CountingRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         self.runs.fetch_add(1, Ordering::SeqCst);
         Ok(JobCompletion::Complete)
     }
@@ -61,7 +61,7 @@ impl JobInitializer for CountingInitializer {
         &self,
         _job: &job::Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(CountingRunner {
             runs: Arc::clone(&self.runs),
         }))

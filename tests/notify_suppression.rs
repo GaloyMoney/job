@@ -60,7 +60,7 @@ impl JobRunner for NoopRunner {
     async fn run(
         &self,
         _current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(gate) = &self.gate {
             let _permit = gate.acquire().await?;
         }
@@ -96,7 +96,7 @@ impl JobInitializer for NoopInitializer {
         &self,
         _job: &Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(NoopRunner {
             gate: self.gate.clone(),
         }))

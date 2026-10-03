@@ -29,7 +29,7 @@ impl JobRunner for ResultRunner {
     async fn run(
         &self,
         current_job: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(release) = &self.release {
             let mut release = release.clone();
             while !*release.borrow() {
@@ -59,7 +59,7 @@ impl JobInitializer for ResultInitializer {
         &self,
         job: &job::Job,
         _: JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
         let config: Cfg = job.config()?;
         Ok(Box::new(ResultRunner {
             index: config.index,

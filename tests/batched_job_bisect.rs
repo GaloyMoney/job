@@ -57,7 +57,7 @@ impl BatchedJobRunner for BisectRunner {
     async fn run_batch(
         &self,
         current_batch: CurrentBatchedJob<BisectConfig>,
-    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
         let mut op = current_batch.begin_op().await?;
         let probes = Arc::clone(&self.probes);
         let table = self.table.clone();
@@ -109,7 +109,10 @@ impl BatchedJobInitializer for BisectInitializer {
     fn init(
         &self,
         _: job::JobSpawner<Self::Config>,
-    ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>> {
+    ) -> Result<
+        Box<dyn BatchedJobRunner<Config = Self::Config>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         Ok(Box::new(BisectRunner {
             table: self.table.clone(),
             budget: self.budget,
@@ -470,7 +473,7 @@ async fn domain_error_isolates_without_touching_the_db() -> anyhow::Result<()> {
         async fn run_batch(
             &self,
             current_batch: CurrentBatchedJob<FlagConfig>,
-        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
             let mut op = current_batch.begin_op().await?;
             let probes = Arc::clone(&self.probes);
             let outcomes = current_batch
@@ -511,8 +514,10 @@ async fn domain_error_isolates_without_touching_the_db() -> anyhow::Result<()> {
         fn init(
             &self,
             _: job::JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>>
-        {
+        ) -> Result<
+            Box<dyn BatchedJobRunner<Config = Self::Config>>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
             Ok(Box::new(FlagRunner {
                 probes: Arc::clone(&self.probes),
             }))
@@ -765,7 +770,7 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
         async fn run_batch(
             &self,
             current_batch: CurrentBatchedJob<DlConfig>,
-        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
             let mut op = current_batch.begin_op().await?;
             let probes = Arc::clone(&self.probes);
             let helper_ready = Arc::clone(&self.helper_ready);
@@ -814,8 +819,10 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
         fn init(
             &self,
             _: job::JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>>
-        {
+        ) -> Result<
+            Box<dyn BatchedJobRunner<Config = Self::Config>>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
             Ok(Box::new(DlRunner {
                 table: self.table.clone(),
                 probes: Arc::clone(&self.probes),
@@ -954,7 +961,7 @@ async fn a_conflict_retry_is_not_charged_to_the_probe_budget() -> anyhow::Result
         async fn run_batch(
             &self,
             current_batch: CurrentBatchedJob<CbConfig>,
-        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error>> {
+        ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
             let mut op = current_batch.begin_op().await?;
             let probes = Arc::clone(&self.probes);
             let helper_ready = Arc::clone(&self.helper_ready);
@@ -1006,8 +1013,10 @@ async fn a_conflict_retry_is_not_charged_to_the_probe_budget() -> anyhow::Result
         fn init(
             &self,
             _: job::JobSpawner<Self::Config>,
-        ) -> Result<Box<dyn BatchedJobRunner<Config = Self::Config>>, Box<dyn std::error::Error>>
-        {
+        ) -> Result<
+            Box<dyn BatchedJobRunner<Config = Self::Config>>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
             Ok(Box::new(CbRunner {
                 table: self.table.clone(),
                 probes: Arc::clone(&self.probes),
