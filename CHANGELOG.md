@@ -1,3 +1,11 @@
+# [job release v0.17.0](https://github.com/GaloyMoney/job/releases/tag/0.17.0)
+
+
+
+### Refactor
+
+- [**breaking**] Adopt errlanes job contracts (#228)
+
 # [job release v0.16.1](https://github.com/GaloyMoney/job/releases/tag/0.16.1)
 
 
