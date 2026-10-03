@@ -1,19 +1,69 @@
-//! Error type returned by the job service and helpers.
+//! Error types returned by the job service and helpers.
+//!
+//! The rule, from `errlanes`' own doctrine (`Rejected` is "a pure,
+//! caller-correctable domain outcome"; "which carrier a function returns is
+//! itself information"):
+//!
+//! 1. A rejection exists only where a caller can branch on it in code and do
+//!    something different. Rejections are scoped to the methods that can
+//!    produce them, not pooled in one service-wide enum.
+//! 2. A method that can never reject returns [`JobFault`], not a `Fail`.
+//! 3. Foreign error types stay raw on a `pub fn` when they are the only
+//!    error that site can produce (the serde accessors on
+//!    [`JobOutcome`](crate::JobOutcome)/[`JobSnapshot`](crate::JobSnapshot)/
+//!    [`CurrentJob`](crate::CurrentJob) and friends). They get a laned
+//!    wrapper only where they are folded into a laned result.
+//! 4. Library code never inspects a `Fatal`'s payload and never asks callers
+//!    to. If a caller needs to know, the API offers a value (see
+//!    [`JobHandle::maybe_load`](crate::JobHandle::maybe_load)).
+//!
+//! Three carriers follow from that: [`JobFault`] on every method that cannot
+//! reject (lifecycle, handles, writes from inside a runner, keyed and
+//! resident spawns -- those always absorb their collision into the existing
+//! job), [`JobError`] on the `JobSpawner` methods that can reject a
+//! caller-chosen id, and [`AwaitError`] on
+//! [`JobHandle::await_completion`](crate::JobHandle::await_completion) and
+//! [`JobHandles::await_all`](crate::JobHandles::await_all).
+//!
+//! Every index column is `update(persist = false)`, so an UPDATE touches
+//! only the events table and es_entity types `update_in_op` /
+//! `update_all_in_op` as [`RepoFault`](es_entity::RepoFault): those sites
+//! are a plain `?`. Only the two creates that generate their own ids -- the
+//! keyed `create_all_in_op` and the resident `create_in_op` (which absorbs
+//! its one real collision before the fold) -- still see a
+//! `Fail<JobConstraintViolation, ..>` whose rejection has no caller to
+//! correct it. They narrow with
+//! [`ResultExt::narrow_rejected`](es_entity::errlanes::ResultExt::narrow_rejected),
+//! which turns it into `Fatal(Invariant)` with the constraint as its source
+//! -- the same rule a partial lift applies.
 
-use super::entity::JobType;
 use super::repo::JobConstraintViolation;
 use crate::JobId;
 
 use es_entity::errlanes;
-use es_entity::errlanes::{Fail, lanes};
+use es_entity::errlanes::{Fail, Fault, lanes};
+
+/// The carrier for every method that cannot reject: lifecycle, handles,
+/// awaits' faults, writes from inside a runner, keyed and resident spawns.
+pub type JobFault = Fault<lanes!(Transient, Fatal)>;
+
+/// The carrier for the id-choosing spawn paths on
+/// [`JobSpawner`](crate::JobSpawner), the only methods that can reject.
+pub type JobError = Fail<JobRejection, lanes!(Transient, Fatal)>;
+
+/// The carrier for [`JobHandle::await_completion`](crate::JobHandle::await_completion)
+/// and [`JobHandles::await_all`](crate::JobHandles::await_all).
+pub type AwaitError = Fail<AwaitTimeout, lanes!(Transient, Fatal)>;
 
 #[derive(Debug, errlanes::Rejection, errlanes::Lift)]
 // `JobConstraintViolation` carries a synthetic conventional-name variant per
 // column (`{table}_{column}_key`) in addition to the real constraints the
-// migrations define, so the mapping here is necessarily partial: only the
-// two constraints that actually exist (`jobs_pkey`,
-// `idx_jobs_job_type_resident`) map to a domain rejection; every other,
-// never-fired variant demotes to `Fatal(Invariant)` via the unmapped path.
+// migrations define, so the mapping here is necessarily partial: only
+// `jobs_pkey` maps to a domain rejection; every other, never-fired variant
+// demotes to `Fatal(Invariant)` via the unmapped path -- including
+// `idx_jobs_job_type_resident`, which `ResidentJobSpawner::spawn`
+// (`src/resident.rs`) always absorbs by resolving to the existing job before
+// a violation could ever reach here.
 #[lift(JobConstraintViolation, unhandled = fatal)]
 /// Caller-correctable outcomes the job service can report. Everything else
 /// -- infrastructure failures, bugs, exhausted retries -- travels as
@@ -21,24 +71,42 @@ use es_entity::errlanes::{Fail, lanes};
 pub enum JobRejection {
     #[error("duplicate job id")]
     #[rejection(code = "JOB_DUPLICATE_ID")]
-    #[lift(JobConstraintViolation::Pkey)]
-    DuplicateId(es_entity::ConstraintConflict<JobId>),
-    /// Returned when a resident job type already has a live job (#170).
-    #[error("resident job of this type already exists")]
-    #[rejection(code = "JOB_DUPLICATE_RESIDENT")]
-    #[lift(JobConstraintViolation::IdxJobsJobTypeResident)]
-    DuplicateResident(es_entity::ConstraintConflict<JobType>),
-    #[error("job {0} did not reach a terminal state within the timeout")]
-    #[rejection(code = "JOB_AWAIT_TIMED_OUT")]
-    TimedOut(JobId),
-    #[error("await of job {0} interrupted: notification channel closed")]
-    #[rejection(code = "JOB_AWAIT_INTERRUPTED")]
-    AwaitInterrupted(JobId),
+    // The id is projected straight out of es_entity's `IdConflict`, which
+    // attributes it on every create path (single and batch), so the
+    // rejection carries the caller's own id and nothing of the driver's.
+    #[lift(JobConstraintViolation::Pkey, field = attempted)]
+    DuplicateId(JobId),
 }
 
-/// Native errlanes error for the job service: a `Rejected` domain outcome,
-/// or a `Transient`/`Fatal` fault. Job never denies.
-pub type JobError = Fail<JobRejection, lanes!(Transient, Fatal)>;
+/// The await's deadline passed before every awaited job went terminal.
+/// `pending` is exactly the set still running; one element for
+/// [`JobHandle::await_completion`](crate::JobHandle::await_completion).
+#[derive(Debug, errlanes::Rejection)]
+#[rejection(code = "JOB_AWAIT_TIMED_OUT")]
+#[error("await timed out; still pending: {pending:?}")]
+pub struct AwaitTimeout {
+    pub pending: Vec<JobId>,
+}
+
+/// The waiter's notification channel closed before delivering a terminal
+/// state. The only producer is the job service stopping
+/// ([`Jobs::shutdown`](crate::Jobs::shutdown) or drop) while a handle was
+/// awaited.
+#[derive(Debug, errlanes::Classify)]
+#[error("await of job {id} interrupted: the job service stopped")]
+#[classify(fatal(Invariant))]
+pub struct AwaitInterrupted {
+    pub id: JobId,
+}
+
+/// [`JobSvcConfigBuilder::build`](crate::JobSvcConfigBuilder::build)
+/// validation failure.
+#[derive(Debug, errlanes::Classify)]
+#[error("invalid job service config: {message}")]
+#[classify(fatal(Config))]
+pub struct InvalidConfig {
+    pub message: String,
+}
 
 /// A value the job service was asked to persist did not serialize. Named
 /// per payload rather than delegating to `serde_json::Error`'s own
@@ -97,7 +165,7 @@ pub(crate) const TX_ABORT_MAX_ATTEMPTS: u32 = 3;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use es_entity::errlanes::{Fail, FatalKind};
+    use es_entity::errlanes::{FatalKind, Fault};
     use std::{collections::HashMap, error::Error as _};
 
     /// A `to_value` failure that depends on nothing but the type: a map
@@ -116,9 +184,9 @@ mod tests {
     /// names no migration and no SQL.
     #[test]
     fn a_migration_failure_is_fatal_config_keeping_the_driver_error() {
-        let err: JobError = Migrate(sqlx::migrate::MigrateError::VersionMissing(7)).into();
+        let err: JobFault = Migrate(sqlx::migrate::MigrateError::VersionMissing(7)).into();
         match err {
-            Fail::Fatal(fatal) => {
+            Fault::Fatal(fatal) => {
                 assert_eq!(fatal.kind, FatalKind::Config);
                 let wrapper = fatal.source().expect("the wrapper is the Fatal's source");
                 assert_eq!(wrapper.to_string(), "job service migration failed");
@@ -139,9 +207,9 @@ mod tests {
     /// below it.
     #[test]
     fn a_serialize_failure_is_fatal_invariant_naming_its_payload() {
-        let err: JobError = CouldNotSerialize::ExecutionState(encode_failure()).into();
+        let err: JobFault = CouldNotSerialize::ExecutionState(encode_failure()).into();
         match err {
-            Fail::Fatal(fatal) => {
+            Fault::Fatal(fatal) => {
                 assert_eq!(fatal.kind, FatalKind::Invariant);
                 let wrapper = fatal.source().expect("the variant is the Fatal's source");
                 assert_eq!(
@@ -164,9 +232,9 @@ mod tests {
     fn a_persisted_state_decode_failure_is_fatal_corrupt_state() {
         let decode_failure =
             serde_json::from_value::<String>(serde_json::json!({})).expect_err("object is not str");
-        let err: JobError = CouldNotDeserializeExecutionState(decode_failure).into();
+        let err: JobFault = CouldNotDeserializeExecutionState(decode_failure).into();
         match err {
-            Fail::Fatal(fatal) => {
+            Fault::Fatal(fatal) => {
                 assert_eq!(fatal.kind, FatalKind::CorruptState);
                 let wrapper = fatal.source().expect("the wrapper is the Fatal's source");
                 assert_eq!(

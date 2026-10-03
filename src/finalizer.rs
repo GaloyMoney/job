@@ -69,7 +69,7 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use es_entity::errlanes;
-use es_entity::errlanes::{Fault, WidenResult, lanes};
+use es_entity::errlanes::Fault;
 use rand::{RngExt, rng};
 use tracing::{Span, instrument};
 
@@ -79,7 +79,7 @@ use std::sync::{Arc, Weak};
 use super::{
     JobId,
     entity::{Job, JobType, RetryPolicy},
-    error::{JobError, TX_ABORT_MAX_ATTEMPTS},
+    error::{JobFault, TX_ABORT_MAX_ATTEMPTS},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
     poller::{JobPoller, pool_connection_headroom},
@@ -121,7 +121,7 @@ use super::{
 /// job lane their errors. A `Fatal` that is really transient would turn a
 /// blip into a dead job. Until that confidence exists, trusting the lane
 /// that far is opt-in per job type.
-pub(crate) type RunFailure = Fault<lanes!(Transient, Fatal)>;
+pub(crate) type RunFailure = JobFault;
 
 #[cfg(test)]
 mod run_failure_tests {
@@ -267,8 +267,10 @@ mod run_failure_tests {
     /// the attempt counter) or as a `Denied`.
     #[test]
     fn a_boxed_rejected_fail_falls_back_to_the_default_not_a_guessed_lane() {
-        use crate::error::{JobError, JobRejection};
-        let fail: JobError = JobError::Rejected(JobRejection::TimedOut(crate::JobId::new()));
+        use crate::error::{AwaitError, AwaitTimeout};
+        let fail: AwaitError = AwaitError::Rejected(AwaitTimeout {
+            pending: vec![crate::JobId::new()],
+        });
         let e: Box<dyn Error> = Box::new(fail);
         let failure: RunFailure = Fault::classify(&*e).narrow_denied();
         assert!(matches!(failure, Fault::Fatal(_)));
@@ -508,7 +510,7 @@ impl Finalizer {
         ids: &[JobId],
         attempts: &HashMap<JobId, u32>,
         message: String,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let jitter_ms = rng().random_range(-CONGESTION_JITTER_MS..=CONGESTION_JITTER_MS);
         let at = self.clock.now() + chrono::Duration::milliseconds(CONGESTION_DELAY_MS + jitter_ms);
         let items: Vec<(JobId, Disposition)> = ids
@@ -543,7 +545,7 @@ impl Finalizer {
         id: JobId,
         attempt: u32,
         message: String,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let attempts = HashMap::from([(id, attempt)]);
         self.reschedule_congested(&[id], &attempts, message).await
     }
@@ -571,7 +573,7 @@ impl Finalizer {
         &self,
         items: &[(JobId, Disposition)],
         mut after_write: impl FnMut(&mut es_entity::DbOp<'static>, &FinalizeOutcome),
-    ) -> Result<FinalizeOutcome, JobError> {
+    ) -> Result<FinalizeOutcome, JobFault> {
         let mut attempt_no = 1;
         let mut use_internal = !self.shared_pool_has_headroom();
         loop {
@@ -688,7 +690,7 @@ impl Finalizer {
         &self,
         op: &mut (impl AtomicOperation + ?Sized),
         items: &[(JobId, Disposition)],
-    ) -> Result<FinalizeOutcome, JobError> {
+    ) -> Result<FinalizeOutcome, JobFault> {
         let mut outcome = FinalizeOutcome::default();
         if items.is_empty() {
             return Ok(outcome);
@@ -1025,7 +1027,7 @@ impl Finalizer {
         // performed -- staged events for unapplied ids are discarded with
         // their entities.
         let mut jobs: Vec<Job> = applied.iter().filter_map(|id| staged.remove(id)).collect();
-        self.repo.update_all_in_op(op, &mut jobs).await.widen()?;
+        self.repo.update_all_in_op(op, &mut jobs).await?;
         Ok(outcome)
     }
 
@@ -1050,7 +1052,7 @@ impl Finalizer {
         op: &mut (impl AtomicOperation + ?Sized),
         terminal: &[JobId],
         now: DateTime<Utc>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         self.waiters.delete_waits_of_in_op(op, terminal).await?;
         let moved = self.waiters.wake_in_op(op, terminal, now).await?;
         Span::current().record("n_moved", moved.len());
@@ -1066,7 +1068,7 @@ impl Finalizer {
         &self,
         op: &mut (impl AtomicOperation + ?Sized),
         moved: Vec<(JobId, JobType)>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         if moved.is_empty() {
             return Ok(());
         }

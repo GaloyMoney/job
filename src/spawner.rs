@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
-use es_entity::errlanes::WidenResult;
+use es_entity::errlanes::ResultExt;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},

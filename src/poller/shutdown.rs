@@ -22,7 +22,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use crate::{error::JobError, repo::JobRepo};
+use crate::{error::JobFault, repo::JobRepo};
 
 use super::{JobId, JobPollerHandle};
 
@@ -41,7 +41,7 @@ pub(super) struct ShutdownCoordinator {
 }
 
 impl JobPollerHandle {
-    pub async fn shutdown(&self) -> Result<(), JobError> {
+    pub async fn shutdown(&self) -> Result<(), JobFault> {
         self.shutdown.perform().await
     }
 }
@@ -66,7 +66,7 @@ impl ShutdownCoordinator {
             n_responses
         )
     )]
-    pub(super) async fn perform(&self) -> Result<(), JobError> {
+    pub(super) async fn perform(&self) -> Result<(), JobFault> {
         if self
             .shutdown_called
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -175,7 +175,7 @@ async fn kill_remaining_jobs(
     repo: Arc<JobRepo>,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
-) -> Result<(), JobError> {
+) -> Result<(), JobFault> {
     let mut op = repo.begin_op_with_clock(&clock).await?;
     let now = clock.now();
     let rows = sqlx::query!(

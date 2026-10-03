@@ -25,7 +25,7 @@ use super::{
         RawBatchItem, ShutdownRx,
     },
     entity::JobType,
-    error::JobError,
+    error::JobFault,
     finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer, RunFailure},
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -246,7 +246,7 @@ impl BatchDispatcher {
         mut self,
         items: Vec<RawBatchItem>,
         shutdown_rx: ShutdownRx,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let span = Span::current();
         span.record("job_type", tracing::field::display(&self.job_type));
         span.record("n_items", items.len());
@@ -434,7 +434,7 @@ impl BatchDispatcher {
         }
     }
 
-    async fn apply(&mut self, completion: JobBatchCompletion) -> Result<(), JobError> {
+    async fn apply(&mut self, completion: JobBatchCompletion) -> Result<(), JobFault> {
         let span = Span::current();
         match completion {
             JobBatchCompletion::CompleteAll => {
@@ -546,7 +546,7 @@ impl BatchDispatcher {
     /// destroys work this dispatcher cannot recreate. Those fall through to
     /// the rescue in `execute_batch`, which hands the rows back so the
     /// runner runs again.
-    async fn seal_in_own_op(&mut self, outcomes: BatchOutcomes) -> Result<(), JobError> {
+    async fn seal_in_own_op(&mut self, outcomes: BatchOutcomes) -> Result<(), JobFault> {
         let items = self.disposition_items(outcomes, self.clock.now());
         let finalizer = self.finalizer.clone();
         let outcome = finalizer
@@ -563,7 +563,7 @@ impl BatchDispatcher {
         &mut self,
         op: &mut (impl AtomicOperation + ?Sized),
         outcomes: BatchOutcomes,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
         let items = self.disposition_items(outcomes, now);
         let outcome = self.finalizer.finalize_in_op(op, &items).await?;
@@ -639,7 +639,7 @@ impl BatchDispatcher {
         fields(job_type = %self.job_type, n_items = self.ids.len(),
                n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
     )]
-    async fn fail_batch(&mut self, failure: RunFailure) -> Result<(), JobError> {
+    async fn fail_batch(&mut self, failure: RunFailure) -> Result<(), JobFault> {
         let span = tracing::Span::current();
         failure.record(&span);
         if failure.is_congestion() {

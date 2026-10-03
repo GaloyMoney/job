@@ -7,7 +7,7 @@ use es_entity::*;
 use super::entity::*;
 use crate::{
     JobId,
-    error::JobError,
+    error::JobFault,
     job_execution::{JobExecutionRow, JobExecutionState},
     snapshot::JobSnapshot,
 };
@@ -119,7 +119,7 @@ impl JobRepo {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         job_type: &JobType,
         keys: &[String],
-    ) -> Result<HashMap<String, JobId>, JobError> {
+    ) -> Result<HashMap<String, JobId>, JobFault> {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
@@ -163,15 +163,15 @@ impl JobRepo {
         &self,
         job_type: &JobType,
         key: &str,
-    ) -> Result<Option<Job>, JobError> {
+    ) -> Result<Option<Job>, JobFault> {
         // Concrete executor, not the `_in_op` twin: unspawnable (rust-lang/rust#100013).
-        Ok(es_query!(
+        es_query!(
             "SELECT id, created_at FROM jobs WHERE job_type = $1 AND unique_key = $2 ORDER BY created_at DESC, id DESC LIMIT 1",
             job_type as &JobType,
             key,
         )
         .fetch_optional(&self.pool)
-        .await?)
+        .await
     }
 
     /// `_in_op` twin of [`Self::find_keyed`]: a single round trip, so it
@@ -184,14 +184,14 @@ impl JobRepo {
         op: impl es_entity::IntoOneTimeExecutor<'_>,
         job_type: &JobType,
         key: &str,
-    ) -> Result<Option<Job>, JobError> {
-        Ok(es_query!(
+    ) -> Result<Option<Job>, JobFault> {
+        es_query!(
             "SELECT id, created_at FROM jobs WHERE job_type = $1 AND unique_key = $2 ORDER BY created_at DESC, id DESC LIMIT 1",
             job_type as &JobType,
             key,
         )
         .fetch_optional(op.into_executor())
-        .await?)
+        .await
     }
 
     /// Resolve the id of the resident job of `job_type`, if one exists.
@@ -202,7 +202,7 @@ impl JobRepo {
     pub(super) async fn find_resident_id(
         &self,
         job_type: &JobType,
-    ) -> Result<Option<JobId>, JobError> {
+    ) -> Result<Option<JobId>, JobFault> {
         // Concrete executor, not the `_in_op` twin — see `find_keyed`.
         let id = sqlx::query_scalar!(
             r#"SELECT id AS "id: JobId" FROM jobs WHERE job_type = $1 AND resident"#,
@@ -220,7 +220,7 @@ impl JobRepo {
         &self,
         op: impl es_entity::IntoOneTimeExecutor<'_>,
         job_type: &JobType,
-    ) -> Result<Option<JobId>, JobError> {
+    ) -> Result<Option<JobId>, JobFault> {
         let id = sqlx::query_scalar!(
             r#"SELECT id AS "id: JobId" FROM jobs WHERE job_type = $1 AND resident"#,
             job_type as &JobType,
@@ -241,7 +241,7 @@ impl JobRepo {
     pub(super) async fn list_keyed_ids_by_job_type(
         &self,
         job_type: &JobType,
-    ) -> Result<Vec<(String, JobId)>, JobError> {
+    ) -> Result<Vec<(String, JobId)>, JobFault> {
         // Concrete executor, not the `_in_op` twin — see `find_keyed`.
         let rows = sqlx::query!(
             r#"
@@ -265,7 +265,7 @@ impl JobRepo {
         &self,
         op: impl es_entity::IntoOneTimeExecutor<'_>,
         job_type: &JobType,
-    ) -> Result<Vec<(String, JobId)>, JobError> {
+    ) -> Result<Vec<(String, JobId)>, JobFault> {
         let rows = sqlx::query!(
             r#"
             SELECT DISTINCT ON (unique_key)
@@ -290,7 +290,7 @@ impl JobRepo {
     pub(super) async fn execution_state_json_by_id(
         &self,
         id: JobId,
-    ) -> Result<Option<serde_json::Value>, JobError> {
+    ) -> Result<Option<serde_json::Value>, JobFault> {
         let row = sqlx::query!(
             r#"SELECT execution_state_json FROM job_execution_states WHERE id = $1"#,
             id as JobId,
@@ -320,7 +320,19 @@ impl JobRepo {
     /// than reusing the (now stale/absent) value the row's join produced —
     /// otherwise a terminal keyed job's retained state would be
     /// unreachable through this path, even though it is still in the DB.
-    pub(super) async fn load_snapshot_by_id(&self, id: JobId) -> Result<JobSnapshot, JobError> {
+    pub(super) async fn load_snapshot_by_id(&self, id: JobId) -> Result<JobSnapshot, JobFault> {
+        self.maybe_load_snapshot_by_id(id)
+            .await?
+            .ok_or_else(|| es_entity::NotFound::new("Job", Some("id"), id.to_string()).into())
+    }
+
+    /// The counterpart of [`Self::load_snapshot_by_id`] for a caller that
+    /// tolerates absence: `Ok(None)` rather than a `Fatal`-wrapped
+    /// [`es_entity::NotFound`] when `id` names no job.
+    pub(super) async fn maybe_load_snapshot_by_id(
+        &self,
+        id: JobId,
+    ) -> Result<Option<JobSnapshot>, JobFault> {
         // Read-only op, created internally; dropped (rolled back) without a commit.
         let mut op = self.begin_op().await?;
 
@@ -345,7 +357,9 @@ impl JobRepo {
         .fetch_optional(op.as_executor())
         .await?;
 
-        let job = self.find_by_id_in_op(&mut op, id).await?;
+        let Some(job) = self.maybe_find_by_id_in_op(&mut op, id).await? else {
+            return Ok(None);
+        };
 
         let (row, execution_state_json) = if job.terminal_state().is_some() {
             // Terminal entity ⇒ the execution row is logically gone. Discard any
@@ -376,7 +390,11 @@ impl JobRepo {
             (Some(row), execution_state_json)
         };
 
-        Ok(JobSnapshot::from_parts(job, row, execution_state_json))
+        Ok(Some(JobSnapshot::from_parts(
+            job,
+            row,
+            execution_state_json,
+        )))
     }
 }
 
@@ -384,6 +402,7 @@ impl JobRepo {
 mod tests {
     use super::*;
     use crate::error::{JobError, JobRejection};
+    use es_entity::errlanes::{Fail, FatalKind};
 
     pub async fn init_pool() -> anyhow::Result<sqlx::PgPool> {
         let pg_con = std::env::var("PG_CON").unwrap();
@@ -425,16 +444,20 @@ mod tests {
             .schedule_at(chrono::Utc::now())
             .build()
             .expect("Could not build new job");
-        let err: JobError = repo
-            .create(new_job)
-            .await
-            .err()
-            .expect("expected error")
-            .lift();
+        let raw = repo.create(new_job).await.err().expect("expected error");
         assert!(matches!(
-            err,
-            JobError::Rejected(JobRejection::DuplicateResident(_))
+            &raw,
+            Fail::Rejected(JobConstraintViolation::IdxJobsJobTypeResident(_))
         ));
+        // The resident spawner absorbs this before it ever lifts into
+        // `JobError` -- see `ResidentJobSpawner::spawn` -- so a caller
+        // reaching this instead never gets a rejection: it demotes to
+        // `Fatal(Invariant)` via `JobRejection`'s `unhandled = fatal`.
+        let lifted: JobError = raw.widen();
+        match lifted {
+            JobError::Fatal(f) => assert_eq!(f.kind, FatalKind::Invariant),
+            other => panic!("expected Fatal(Invariant), got {other:?}"),
+        }
 
         // Different type: ok, not a collision — the flag is per-type.
         let new_job = NewJob::builder()
@@ -531,7 +554,7 @@ mod tests {
             .await
             .err()
             .expect("expected error")
-            .lift();
+            .widen();
         assert!(matches!(
             err,
             JobError::Rejected(JobRejection::DuplicateId(_))
@@ -579,7 +602,7 @@ mod tests {
             .await
             .err()
             .expect("expected error")
-            .lift();
+            .widen();
         assert!(matches!(
             err,
             JobError::Rejected(JobRejection::DuplicateId(_))

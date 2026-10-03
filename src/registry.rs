@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::{
     batched::{AnyBatchedJobInitializer, AnyBatchedJobRunner, BatchedJobInitializer},
     entity::*,
-    error::JobError,
+    error::JobFault,
     keyed::{KeyedJobInitializer, KeyedJobSpawner},
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
@@ -271,11 +271,11 @@ impl JobRegistry {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn JobRunner>, JobError> {
+    ) -> Result<Box<dyn JobRunner>, JobFault> {
         self.initializers
             .get(&job.job_type)
             .ok_or_else(|| {
-                JobError::from(es_entity::errlanes::Fatal::invariant(format!(
+                JobFault::from(es_entity::errlanes::Fatal::invariant(format!(
                     "no initializer registered for job type {}",
                     job.job_type
                 )))
@@ -325,11 +325,11 @@ impl JobRegistry {
         router: Arc<JobNotificationRouter>,
         clock: ClockHandle,
         notifier: Arc<JobEventNotifier>,
-    ) -> Result<Box<dyn AnyBatchedJobRunner>, JobError> {
+    ) -> Result<Box<dyn AnyBatchedJobRunner>, JobFault> {
         self.batched_initializers
             .get(job_type)
             .ok_or_else(|| {
-                JobError::from(es_entity::errlanes::Fatal::invariant(format!(
+                JobFault::from(es_entity::errlanes::Fatal::invariant(format!(
                     "no initializer registered for job type {job_type}"
                 )))
             })?

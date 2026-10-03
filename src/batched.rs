@@ -51,7 +51,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
-use es_entity::errlanes::WidenResult;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
@@ -61,7 +60,7 @@ use std::sync::Arc;
 use super::{
     JobId,
     entity::{Job, JobType},
-    error::{CouldNotSerialize, JobError},
+    error::{CouldNotSerialize, JobFault},
     outcome::JobReturnValue,
     repo::JobRepo,
     runner::RetrySettings,
@@ -274,7 +273,7 @@ impl<C> BatchedJobItem<C> {
         &mut self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         execution_state: &T,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let execution_state_json =
             serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
@@ -296,7 +295,7 @@ impl<C> BatchedJobItem<C> {
     pub async fn update_execution_state<T: Serialize>(
         &mut self,
         execution_state: &T,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let execution_state_json =
             serde_json::to_value(execution_state).map_err(CouldNotSerialize::ExecutionState)?;
         sqlx::query!(
@@ -321,24 +320,24 @@ impl<C> BatchedJobItem<C> {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         result: &impl Serialize,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let job_result =
             JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut job = self.repo.find_by_id_in_op(&mut *op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
-            self.repo.update_in_op(op, &mut job).await.widen()?;
+            self.repo.update_in_op(op, &mut job).await?;
         }
         Ok(())
     }
 
     /// Attach or update this job's result value in its own transaction.
-    pub async fn set_result(&self, result: &impl Serialize) -> Result<(), JobError> {
+    pub async fn set_result(&self, result: &impl Serialize) -> Result<(), JobFault> {
         let job_result =
             JobReturnValue::try_from(result).map_err(CouldNotSerialize::ReturnValue)?;
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let mut job = self.repo.find_by_id_in_op(&mut op, self.id).await?;
         if job.update_return_value(job_result).did_execute() {
-            self.repo.update_in_op(&mut op, &mut job).await.widen()?;
+            self.repo.update_in_op(&mut op, &mut job).await?;
             op.commit().await?;
         }
         Ok(())
@@ -403,7 +402,7 @@ impl<C> CurrentBatchedJob<C> {
 
     /// Begin a new database operation using the job service's clock.
     #[cfg(feature = "es-entity")]
-    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobError> {
+    pub async fn begin_op(&self) -> Result<es_entity::DbOp<'static>, JobFault> {
         Ok(es_entity::DbOp::init_with_clock(&self.pool, &self.clock).await?)
     }
 
@@ -465,10 +464,7 @@ impl<C> CurrentBatchedJob<C> {
         ) -> Result<BatchItemOutcome, E>
         + Clone
         + Sync,
-    ) -> Result<
-        BatchOutcomes,
-        es_entity::errlanes::Fault<es_entity::errlanes::lanes!(Transient, Fatal)>,
-    >
+    ) -> Result<BatchOutcomes, JobFault>
     where
         E: std::fmt::Display,
     {
@@ -581,10 +577,7 @@ impl<C> CurrentBatchedJob<C> {
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>
         + Clone
         + Sync,
-    ) -> Result<
-        BatchOutcomes,
-        es_entity::errlanes::Fault<es_entity::errlanes::lanes!(Transient, Fatal)>,
-    >
+    ) -> Result<BatchOutcomes, JobFault>
     where
         E: std::error::Error + 'static,
     {
@@ -609,10 +602,7 @@ impl<C> CurrentBatchedJob<C> {
         f: impl AsyncFn(&mut es_entity::SavepointOp<'_>, &[BatchedJobItem<C>]) -> Result<(), E>
         + Clone
         + Sync,
-    ) -> Result<
-        BatchOutcomes,
-        es_entity::errlanes::Fault<es_entity::errlanes::lanes!(Transient, Fatal)>,
-    >
+    ) -> Result<BatchOutcomes, JobFault>
     where
         E: std::error::Error + 'static,
     {

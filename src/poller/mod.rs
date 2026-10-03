@@ -46,7 +46,7 @@ use super::{
     config::JobPollerConfig,
     dispatcher::*,
     entity::{Job, JobType},
-    error::JobError,
+    error::JobFault,
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     registry::JobRegistry,
@@ -330,7 +330,7 @@ impl JobPoller {
             n_claim_clamped_by_pool
         )
     )]
-    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobError> {
+    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobFault> {
         let span = Span::current();
         span.record("poller_id", tracing::field::display(self.instance_id));
         let Some(n_jobs_to_poll) = self.tracker.next_batch_size() else {
@@ -399,7 +399,7 @@ impl JobPoller {
     async fn load_and_dispatch_claimed(
         self: &Arc<Self>,
         rows: Vec<PolledJob>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
         let mut entities = self.repo.find_all::<Job>(&ids).await?;
         let mut batched: HashMap<JobType, Vec<RawBatchItem>> = HashMap::new();
@@ -440,7 +440,7 @@ impl JobPoller {
         self: &Arc<Self>,
         job_type: JobType,
         mut items: Vec<RawBatchItem>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let span = Span::current();
         let max_batch_size = self.registry.max_batch_size(&job_type);
         span.record("max_batch_size", max_batch_size);
@@ -481,7 +481,7 @@ impl JobPoller {
         self: &Arc<Self>,
         job_type: JobType,
         items: Vec<RawBatchItem>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         if items.is_empty() {
             return Ok(());
         }
@@ -601,7 +601,7 @@ impl JobPoller {
         self: &Arc<Self>,
         job: Job,
         polled_job: PolledJob,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let span = Span::current();
         span.record("attempt", polled_job.attempt);
         span.record("job_id", tracing::field::display(job.id));
@@ -644,7 +644,7 @@ impl JobPoller {
         reservation: UnitReservation,
         row: ClaimedRow,
         subs: ShutdownSubs,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let job = self.repo.find_by_id(row.id).await?;
         let polled_job = PolledJob {
             id: row.id,
@@ -685,7 +685,7 @@ impl JobPoller {
         job_type: JobType,
         rows: Vec<ClaimedRow>,
         subs: ShutdownSubs,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
         let mut entities = self.repo.find_all::<Job>(&ids).await?;
         let mut items: Vec<RawBatchItem> = Vec::with_capacity(rows.len());

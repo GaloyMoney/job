@@ -11,7 +11,9 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     JobId, JobType,
-    error::{CouldNotDeserializeExecutionState, JobError},
+    error::{
+        AwaitError, AwaitInterrupted, AwaitTimeout, CouldNotDeserializeExecutionState, JobFault,
+    },
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
     outcome::JobOutcome,
@@ -135,7 +137,7 @@ impl JobHandle {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool, JobError> {
+    ) -> Result<bool, JobFault> {
         let moved = self
             .ops
             .waiters
@@ -168,7 +170,7 @@ impl JobHandle {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waiter: impl Into<JobId>,
-    ) -> Result<bool, JobError> {
+    ) -> Result<bool, JobFault> {
         let waiter: JobId = waiter.into();
         tracing::Span::current().record("waiter", tracing::field::display(waiter));
         Ok(!self
@@ -194,7 +196,7 @@ impl JobHandle {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         job_type: JobType,
         at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         self.ops
             .notifier
             .execution_ready_in_op(op, &job_type)
@@ -263,11 +265,23 @@ impl JobHandle {
     /// # Errors
     ///
     /// Returns a `Fatal` carrying an [`es_entity::NotFound`] source if the
-    /// job never existed -- test for it with
-    /// [`es_entity::fatal_is_not_found`].
+    /// job never existed -- use [`maybe_load`](Self::maybe_load) if the id
+    /// may not exist.
     #[instrument(name = "job.handle.load", skip(self), fields(id = %self.id))]
-    pub async fn load(&self) -> Result<JobSnapshot, JobError> {
+    pub async fn load(&self) -> Result<JobSnapshot, JobFault> {
         self.repo.load_snapshot_by_id(self.id).await
+    }
+
+    /// Load the snapshot, or `Ok(None)` if no job with this id exists.
+    ///
+    /// The counterpart of [`load`](Self::load) for a caller that tolerates
+    /// absence, such as an API resolving a caller-supplied id. There is no
+    /// honest-absence counterpart for [`await_completion`](Self::await_completion):
+    /// you can only await a job you spawned or looked up, and an unknown id
+    /// stays a `Fatal` there regardless.
+    #[instrument(name = "job.handle.maybe_load", skip(self), fields(id = %self.id))]
+    pub async fn maybe_load(&self) -> Result<Option<JobSnapshot>, JobFault> {
+        self.repo.maybe_load_snapshot_by_id(self.id).await
     }
 
     /// Read back only the committed execution state, decoded as `S`.
@@ -291,7 +305,7 @@ impl JobHandle {
         skip(self),
         fields(id = %self.id)
     )]
-    pub async fn execution_state<S: DeserializeOwned>(&self) -> Result<Option<S>, JobError> {
+    pub async fn execution_state<S: DeserializeOwned>(&self) -> Result<Option<S>, JobFault> {
         match self.repo.execution_state_json_by_id(self.id).await? {
             Some(json) => Ok(Some(
                 serde_json::from_value(json).map_err(CouldNotDeserializeExecutionState)?,
@@ -305,33 +319,48 @@ impl JobHandle {
     /// attached via [`CurrentJob::set_result`](crate::CurrentJob::set_result).
     ///
     /// The timeout is REQUIRED: the await is structurally bounded.
-    /// Wait-forever is expressed only by an explicit caller loop that
-    /// re-awaits on [`JobRejection::TimedOut`](crate::JobRejection::TimedOut)
-    /// — each re-await re-registers a
-    /// fresh waiter, which is also what makes a lost in-memory notification
-    /// self-heal instead of wedging.
+    /// Wait-forever is an explicit caller loop that re-awaits on
+    /// [`AwaitTimeout`]:
+    ///
+    /// ```no_run
+    /// # use job::{JobHandle, AwaitError};
+    /// # use std::time::Duration;
+    /// # async fn wait_forever(handle: &JobHandle, step: Duration) -> Result<job::JobOutcome, AwaitError> {
+    /// loop {
+    ///     match handle.await_completion(step).await {
+    ///         Ok(outcome) => break Ok(outcome),
+    ///         Err(e) if e.as_rejected().is_some() => continue,
+    ///         Err(e) => break Err(e.narrow_rejected().into()),
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// Each re-await re-registers a fresh waiter, which is also what makes a
+    /// lost in-memory notification self-heal instead of wedging.
     ///
     /// # Errors
     ///
+    /// Returns [`AwaitTimeout`] if the timeout elapses before the job
+    /// reaches a terminal state.
     /// Returns a `Fatal(Invariant)` if called before
-    /// [`Jobs::start_poll`](crate::Jobs::start_poll).
-    /// Returns a `Fatal` carrying an [`es_entity::NotFound`] source if the job
-    /// does not exist.
-    /// Returns [`JobRejection::TimedOut`](crate::JobRejection::TimedOut) if the
-    /// timeout elapses first.
-    /// Returns
-    /// [`JobRejection::AwaitInterrupted`](crate::JobRejection::AwaitInterrupted)
-    /// if the notification channel is dropped (e.g., during shutdown) before
-    /// delivering the terminal state.
+    /// [`Jobs::start_poll`](crate::Jobs::start_poll), if the job does not
+    /// exist, or if the notification channel is dropped (e.g., during
+    /// shutdown) before delivering the terminal state (see
+    /// [`AwaitInterrupted`]).
     #[instrument(
         name = "job.handle.await_completion",
         skip(self),
         fields(id = %self.id)
     )]
-    pub async fn await_completion(&self, timeout: Duration) -> Result<JobOutcome, JobError> {
-        tokio::time::timeout(timeout, self.wait_for_outcome())
-            .await
-            .map_err(|_| JobError::Rejected(crate::error::JobRejection::TimedOut(self.id)))?
+    pub async fn await_completion(&self, timeout: Duration) -> Result<JobOutcome, AwaitError> {
+        match tokio::time::timeout(timeout, self.wait_for_outcome()).await {
+            Ok(result) => Ok(result?),
+            Err(_elapsed) => Err(AwaitTimeout {
+                pending: vec![self.id],
+            }
+            .into()),
+        }
     }
 
     /// Unbounded wait shared by [`Self::await_completion`] and
@@ -340,13 +369,13 @@ impl JobHandle {
     /// Cancel-safe (contract 3): dropping this future drops the oneshot
     /// receiver, which unsubscribes the waiter (the router's sweep prunes
     /// closed senders); a later re-registered wait resolves normally.
-    pub(crate) async fn wait_for_outcome(&self) -> Result<JobOutcome, JobError> {
+    pub(crate) async fn wait_for_outcome(&self) -> Result<JobOutcome, JobFault> {
         // Router-started check FIRST (before the fail-fast find) so awaiting
         // before `Jobs::start_poll` is a `RouterNotStarted` error, not a
         // panic. Registering before the find is race-free: the waiter
         // manager checks the DB for already-terminal jobs at registration.
         let rx = self.router.try_wait_for_terminal(self.id).ok_or_else(|| {
-            JobError::from(es_entity::errlanes::Fatal::invariant(
+            JobFault::from(es_entity::errlanes::Fatal::invariant(
                 "await called before Jobs::start_poll",
             ))
         })?;
@@ -354,7 +383,7 @@ impl JobHandle {
         // waiter manager for a JobId that will never resolve.
         self.repo.find_by_id(self.id).await?;
         rx.await
-            .map_err(|_| JobError::Rejected(crate::error::JobRejection::AwaitInterrupted(self.id)))
+            .map_err(|_| AwaitInterrupted { id: self.id }.into())
     }
 }
 
@@ -410,7 +439,7 @@ impl JobHandles {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waiter: impl Into<JobId>,
-    ) -> Result<Vec<JobId>, JobError> {
+    ) -> Result<Vec<JobId>, JobFault> {
         let waiter: JobId = waiter.into();
         tracing::Span::current().record("waiter", tracing::field::display(waiter));
         if self.0.is_empty() {
@@ -435,28 +464,27 @@ impl JobHandles {
     /// outcomes, positionally aligned with the handles (contract 2).
     ///
     /// Each job is awaited concurrently; the call resolves once **all** jobs
-    /// have finished. An empty collection returns an empty `Vec` immediately.
-    /// The timeout is REQUIRED and bounds the whole batch; on expiry the
-    /// error carries the first handle's id.
+    /// have finished. An empty collection returns an empty `Vec`
+    /// immediately. The timeout is REQUIRED and bounds the whole batch,
+    /// applied as one shared deadline across every handle; on expiry
+    /// [`AwaitTimeout::pending`] is exactly the set of ids that had not yet
+    /// gone terminal -- not merely the first handle's id.
     ///
     /// # Errors
     ///
+    /// Returns [`AwaitTimeout`] if the deadline passes before every job
+    /// reaches a terminal state.
     /// Returns a `Fatal(Invariant)` if called before
-    /// [`Jobs::start_poll`](crate::Jobs::start_poll).
-    /// Returns a `Fatal` carrying an [`es_entity::NotFound`] source if any job
-    /// in the batch does not exist.
-    /// Returns [`JobRejection::TimedOut`](crate::JobRejection::TimedOut) if the
-    /// timeout elapses before every job reaches a terminal state.
-    /// Returns
-    /// [`JobRejection::AwaitInterrupted`](crate::JobRejection::AwaitInterrupted)
-    /// if the notification channel is dropped (e.g., during shutdown) before
-    /// all jobs resolve.
+    /// [`Jobs::start_poll`](crate::Jobs::start_poll), if any job in the
+    /// batch does not exist, or if the notification channel is dropped
+    /// (e.g., during shutdown) before delivering a terminal state (see
+    /// [`AwaitInterrupted`]) -- a fault wins over a mere deadline for the
+    /// handles still outstanding.
     #[instrument(name = "job.handles.await_all", skip(self), fields(count = self.0.len()))]
-    pub async fn await_all(&self, timeout: Duration) -> Result<Vec<JobOutcome>, JobError> {
+    pub async fn await_all(&self, timeout: Duration) -> Result<Vec<JobOutcome>, AwaitError> {
         if self.0.is_empty() {
             return Ok(Vec::new());
         }
-        let first_id = self.0[0].id;
         let repo = &self.0[0].repo;
         let router = &self.0[0].router;
         let ids: Vec<JobId> = self.0.iter().map(|h| h.id).collect();
@@ -464,7 +492,7 @@ impl JobHandles {
         let mut rxs = Vec::with_capacity(ids.len());
         for id in &ids {
             rxs.push(router.try_wait_for_terminal(*id).ok_or_else(|| {
-                JobError::from(es_entity::errlanes::Fatal::invariant(
+                AwaitError::from(es_entity::errlanes::Fatal::invariant(
                     "await called before Jobs::start_poll",
                 ))
             })?);
@@ -481,22 +509,44 @@ impl JobHandles {
             }
         }
 
-        let received = tokio::time::timeout(timeout, futures::future::join_all(rxs))
-            .await
-            .map_err(|_| JobError::Rejected(crate::error::JobRejection::TimedOut(first_id)))?;
-        ids.iter()
-            .zip(received)
-            .map(|(id, r): (&JobId, _)| {
-                r.map_err(|_| JobError::Rejected(crate::error::JobRejection::AwaitInterrupted(*id)))
-            })
-            .collect()
+        let deadline = tokio::time::Instant::now() + timeout;
+        let received = futures::future::join_all(
+            rxs.into_iter()
+                .map(|rx| tokio::time::timeout_at(deadline, rx)),
+        )
+        .await;
+
+        let mut outcomes = Vec::with_capacity(ids.len());
+        let mut pending = Vec::new();
+        for (id, r) in ids.iter().zip(received) {
+            match r {
+                Ok(Ok(outcome)) => outcomes.push(outcome),
+                // The service stopped: fatal wins over a mere deadline.
+                Ok(Err(_closed)) => return Err(AwaitInterrupted { id: *id }.into()),
+                Err(_elapsed) => pending.push(*id),
+            }
+        }
+        if !pending.is_empty() {
+            return Err(AwaitTimeout { pending }.into());
+        }
+        Ok(outcomes)
     }
 
     /// Load a [`JobSnapshot`] for every job, positionally aligned with the
     /// handles (contract 2). Loads run concurrently.
     #[instrument(name = "job.handles.load_all", skip(self), fields(count = self.0.len()))]
-    pub async fn load_all(&self) -> Result<Vec<JobSnapshot>, JobError> {
+    pub async fn load_all(&self) -> Result<Vec<JobSnapshot>, JobFault> {
         let futs: Vec<_> = self.0.iter().map(|h| h.load()).collect();
+        futures::future::join_all(futs).await.into_iter().collect()
+    }
+
+    /// Load a [`JobSnapshot`] for every job, or `None` for one that no
+    /// longer (or never did) resolve to a job. Positionally aligned with the
+    /// handles (contract 2); the [`JobHandles`] counterpart of
+    /// [`JobHandle::maybe_load`]. Loads run concurrently.
+    #[instrument(name = "job.handles.maybe_load_all", skip(self), fields(count = self.0.len()))]
+    pub async fn maybe_load_all(&self) -> Result<Vec<Option<JobSnapshot>>, JobFault> {
+        let futs: Vec<_> = self.0.iter().map(|h| h.maybe_load()).collect();
         futures::future::join_all(futs).await.into_iter().collect()
     }
 }

@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [workspace.dependencies]
 
-es-entity = "0.15.0"
+es-entity = "0.16.1"
 
 anyhow = "1.0"
 async-trait = "0.1"

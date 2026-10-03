@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
 
+use crate::error::InvalidConfig;
+
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Controls how the background poller balances work across processes.
@@ -154,13 +156,19 @@ impl JobSvcConfig {
 
 impl JobSvcConfigBuilder {
     /// Validate and construct a [`JobSvcConfig`], ensuring either `pg_con` or `pool` is set.
-    pub fn build(&mut self) -> Result<JobSvcConfig, String> {
+    pub fn build(&mut self) -> Result<JobSvcConfig, InvalidConfig> {
         // Validate configuration
         match (self.pg_con.as_ref(), self.pool.as_ref()) {
             (None, None) | (Some(None), None) | (None, Some(None)) => {
-                return Err("One of pg_con or pool must be set".to_string());
+                return Err(InvalidConfig {
+                    message: "One of pg_con or pool must be set".to_string(),
+                });
             }
-            (Some(_), Some(_)) => return Err("Only one of pg_con or pool must be set".to_string()),
+            (Some(_), Some(_)) => {
+                return Err(InvalidConfig {
+                    message: "Only one of pg_con or pool must be set".to_string(),
+                });
+            }
             _ => (),
         }
 
@@ -177,9 +185,11 @@ impl JobSvcConfigBuilder {
             // workload prices a single dispatch at more than a few
             // connections.
             if !(factor.is_finite() && factor > 0.0 && factor <= 100.0) {
-                return Err(format!(
-                    "connections_per_job must be a finite value in (0.0, 100.0], got {factor}"
-                ));
+                return Err(InvalidConfig {
+                    message: format!(
+                        "connections_per_job must be a finite value in (0.0, 100.0], got {factor}"
+                    ),
+                });
             }
         }
 
@@ -232,6 +242,23 @@ fn default_connections_per_job() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::JobFault;
+    use es_entity::errlanes::{FatalKind, Fault};
+
+    /// Neither `pg_con` nor `pool` set is the one validation failure every
+    /// caller can hit without opting into anything -- and the carrier a
+    /// caller `?`s it into classifies it as `Fatal(Config)`, not a domain
+    /// outcome: a missing connection target is an operator mistake, not
+    /// something the running process can correct.
+    #[test]
+    fn missing_pg_con_and_pool_is_fatal_config() {
+        let err = JobSvcConfig::builder().build().unwrap_err();
+        let fault: JobFault = err.into();
+        match fault {
+            Fault::Fatal(f) => assert_eq!(f.kind, FatalKind::Config),
+            other => panic!("expected Fatal(Config), got {other:?}"),
+        }
+    }
 
     /// Existing configs (no `connections_per_job` key) must keep working
     /// untouched: the field is additive with a serde default of 1.0.

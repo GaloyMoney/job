@@ -30,14 +30,14 @@ use std::{
     sync::Arc,
 };
 
+use es_entity::ResultExt;
 use es_entity::clock::ClockHandle;
-use es_entity::errlanes::WidenResult;
 use tracing::instrument;
 
 use super::{
     Job, JobId,
     entity::{JobType, NewJob},
-    error::JobError,
+    error::JobFault,
     handle::{JobHandle, JobHandles},
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
@@ -273,7 +273,7 @@ where
         &self,
         key: impl Into<String> + Send + Debug,
         config: Config,
-    ) -> Result<JobHandle, JobError> {
+    ) -> Result<JobHandle, JobFault> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let spawned = self.spawn_in_op(&mut op, key, config).await?;
         op.commit().await?;
@@ -302,7 +302,7 @@ where
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         key: impl Into<String> + Send + Debug,
         config: Config,
-    ) -> Result<JobHandle, JobError> {
+    ) -> Result<JobHandle, JobFault> {
         let spawned = self
             .spawn_all_in_op(op, vec![KeyedJobSpec::new(key, config)])
             .await?;
@@ -327,7 +327,7 @@ where
     pub async fn spawn_all(
         &self,
         specs: Vec<KeyedJobSpec<Config>>,
-    ) -> Result<JobHandles, JobError> {
+    ) -> Result<JobHandles, JobFault> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         let spawned = self.spawn_all_in_op(&mut op, specs).await?;
         op.commit().await?;
@@ -412,7 +412,7 @@ where
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         specs: Vec<KeyedJobSpec<Config>>,
-    ) -> Result<JobHandles, JobError> {
+    ) -> Result<JobHandles, JobFault> {
         tracing::Span::current().record("count", specs.len());
         if specs.is_empty() {
             return Ok(JobHandles::default());
@@ -571,7 +571,10 @@ where
         let new_jobs_created = new_jobs.len();
 
         if !new_jobs.is_empty() {
-            self.repo.create_all_in_op(op, new_jobs).await.widen()?;
+            self.repo
+                .create_all_in_op(op, new_jobs)
+                .await
+                .narrow_rejected()?;
             self.insert_executions_in_op(op, &new_ids, &new_keys, &new_schedule_times)
                 .await?;
             self.carry_state_in_op(op, &new_ids, &new_keys).await?;
@@ -692,7 +695,7 @@ where
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         keys: &[String],
         targets: &[DateTime<Utc>],
-    ) -> Result<HashMap<String, DateTime<Utc>>, JobError> {
+    ) -> Result<HashMap<String, DateTime<Utc>>, JobFault> {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
@@ -733,7 +736,7 @@ where
         ids: &[JobId],
         keys: &[String],
         schedule_times: &[DateTime<Utc>],
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         sqlx::query!(
             r#"
             INSERT INTO job_executions
@@ -792,7 +795,7 @@ where
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         ids: &[JobId],
         keys: &[String],
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         sqlx::query!(
             r#"
             WITH input AS (

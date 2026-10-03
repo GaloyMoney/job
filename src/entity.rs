@@ -11,7 +11,7 @@ use es_entity::{context::TracingContext, *};
 
 use crate::{
     JobId,
-    error::{CouldNotSerialize, JobError},
+    error::{CouldNotSerialize, JobFault},
     finalizer::RunFailure,
     outcome::{JobReturnValue, JobTerminalState},
 };
@@ -512,7 +512,7 @@ impl NewJob {
 }
 
 impl NewJobBuilder {
-    pub fn config<C: serde::Serialize>(&mut self, config: C) -> Result<&mut Self, JobError> {
+    pub fn config<C: serde::Serialize>(&mut self, config: C) -> Result<&mut Self, JobFault> {
         self.config = Some(serde_json::to_value(config).map_err(CouldNotSerialize::Config)?);
         Ok(self)
     }

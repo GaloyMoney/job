@@ -15,7 +15,7 @@ use super::{
     JobId,
     current::CurrentJob,
     entity::{Job, JobType},
-    error::JobError,
+    error::JobFault,
     finalizer::{ClaimDisposition, Disposition, Finalizer, RunFailure},
     notifier::JobEventNotifier,
     poller::JobPoller,
@@ -157,7 +157,7 @@ impl JobDispatcher {
 
     /// A job-end transaction this dispatcher owns (shared pool), with
     /// `Finalizer::pin_index_plans` applied.
-    async fn begin_own_op(&self) -> Result<es_entity::DbOp<'static>, JobError> {
+    async fn begin_own_op(&self) -> Result<es_entity::DbOp<'static>, JobFault> {
         let mut op = self.repo.begin_op_with_clock(&self.clock).await?;
         super::finalizer::Finalizer::pin_index_plans(&mut op, false).await?;
         Ok(op)
@@ -185,7 +185,7 @@ impl JobDispatcher {
         shutdown_rx: tokio::sync::broadcast::Receiver<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
         >,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let span = Span::current();
         span.record("job_id", tracing::field::display(job.id));
         span.record("job_type", tracing::field::display(&job.job_type));
@@ -224,7 +224,7 @@ impl JobDispatcher {
         let started = std::time::Instant::now();
         let completion = Self::dispatch_job(runner, current_job).await;
         let run_duration = started.elapsed();
-        let disposition: Result<(), JobError> = async {
+        let disposition: Result<(), JobFault> = async {
             match completion {
                 Err(e) => {
                     span.record(
@@ -436,7 +436,7 @@ impl JobDispatcher {
         failure: RunFailure,
         attempt: u32,
         run_duration: std::time::Duration,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let span = Span::current();
         span.record("job_id", tracing::field::display(id));
         span.record("job_type", tracing::field::display(&self.job_type));
@@ -535,7 +535,7 @@ impl JobDispatcher {
         &mut self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: JobId,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         let items = [(id, Disposition::Complete)];
         let outcome = self.finalizer.finalize_in_op(op, &items).await?;
         if !outcome.completed.is_empty() {
@@ -554,7 +554,7 @@ impl JobDispatcher {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         id: JobId,
         reschedule_at: DateTime<Utc>,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), JobFault> {
         self.rescheduled = true;
         let items = [(id, Disposition::Fresh { at: reschedule_at })];
         self.finalizer.finalize_in_op(op, &items).await?;
