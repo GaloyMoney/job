@@ -59,6 +59,42 @@ pub trait JobInitializer: Send + Sync + 'static {
     /// Defaults to `true`. Override to `false` for a type that would rather
     /// never pay the extra claim statement and always go through the
     /// ordinary poll instead.
+    ///
+    /// # What this costs a batched type
+    ///
+    /// With `short_circuit` on and spare capacity, **each spawned item
+    /// dispatches as its own single-item batch**: the spawn reserves a slot
+    /// and claims the moment it commits, so the next spawn finds nothing left
+    /// to batch with. At 2 items with 2 free slots,
+    /// [`run_batch`](crate::BatchedJobRunner::run_batch) never sees `N > 1`.
+    /// (Confirmed with instrumentation on lana PR #8414, and pinned here by
+    /// `separately_committed_spawns_each_dispatch_as_their_own_batch`.)
+    ///
+    /// This is the intended trade: latency now, at the cost of the batching
+    /// that only pays off when work is actually queueing. Under sustained
+    /// load the slots are busy, spawns stop short-circuiting, and the backlog
+    /// batches normally.
+    ///
+    /// # Getting `N > 1` in a test
+    ///
+    /// Batch formation is governed by the **transaction boundary**, not by
+    /// this flag: items that become due in one transaction are claimed by one
+    /// claim statement and handed to one `run_batch` call. So spawn them
+    /// together — [`JobSpawner::spawn_all`](crate::JobSpawner::spawn_all), or
+    /// several [`spawn_in_op`](crate::JobSpawner::spawn_in_op) calls sharing
+    /// one `op` — and the batch forms on the short-circuit path itself, with
+    /// the production configuration untouched and the poller running with
+    /// spare capacity. It is deterministic by construction: the claim is a
+    /// later statement in the same transaction as the inserts, so no other
+    /// claimant can observe the rows unclaimed. Pinned by
+    /// `one_transaction_forms_one_batch_despite_spare_capacity`.
+    ///
+    /// Setting `short_circuit()` to `false` in a test-only initializer does
+    /// **not** help, and is not the lever it looks like: separate spawns each
+    /// wake the poller through the ordinary notify path and still arrive one
+    /// per batch. Worse, the flag is read once at registration
+    /// (`JobRegistry::add_*_initializer`), so a test that flips it exercises a
+    /// different configuration than production for no gain.
     fn short_circuit(&self) -> bool {
         true
     }
