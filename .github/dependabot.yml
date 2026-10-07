@@ -15,3 +15,5 @@ updates:
     all-dependencies:
       patterns:
         - "*"
+  ignore:
+    - dependency-name: "es-entity*"
