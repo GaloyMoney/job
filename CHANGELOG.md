@@ -1,3 +1,11 @@
+# [job release v0.18.1](https://github.com/GaloyMoney/job/releases/tag/0.18.1)
+
+
+
+### Miscellaneous Tasks
+
+- Es-entity 0.17 (#232)
+
 # [job release v0.18.0](https://github.com/GaloyMoney/job/releases/tag/0.18.0)
 
 
