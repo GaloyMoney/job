@@ -453,7 +453,7 @@ mod tests {
         // `JobError` -- see `ResidentJobSpawner::spawn` -- so a caller
         // reaching this instead never gets a rejection: it demotes to
         // `Fatal(Invariant)` via `JobRejection`'s `unhandled = fatal`.
-        let lifted: JobError = raw.widen();
+        let lifted: JobError = raw.lift();
         match lifted {
             JobError::Fatal(f) => assert_eq!(f.kind, FatalKind::Invariant),
             other => panic!("expected Fatal(Invariant), got {other:?}"),
@@ -554,7 +554,7 @@ mod tests {
             .await
             .err()
             .expect("expected error")
-            .widen();
+            .lift();
         assert!(matches!(
             err,
             JobError::Rejected(JobRejection::DuplicateId(_))
@@ -602,7 +602,7 @@ mod tests {
             .await
             .err()
             .expect("expected error")
-            .widen();
+            .lift();
         assert!(matches!(
             err,
             JobError::Rejected(JobRejection::DuplicateId(_))

@@ -308,7 +308,7 @@ where
         }
         let new_job = builder.build().expect("Could not build new job");
 
-        let job = self.repo.create_in_op(op, new_job).await.widen()?;
+        let job = self.repo.create_in_op(op, new_job).await.lift()?;
         if let Some(waiter) = spec.waiter {
             self.handle_ops
                 .waiters
@@ -669,7 +669,7 @@ where
             dedup_keys.push(spec.dedup_key);
         }
 
-        let jobs = self.repo.create_all_in_op(op, new_jobs).await.widen()?;
+        let jobs = self.repo.create_all_in_op(op, new_jobs).await.lift()?;
 
         let rows: Vec<NewExecutionRow> = jobs
             .iter()
