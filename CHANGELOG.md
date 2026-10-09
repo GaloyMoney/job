@@ -1,3 +1,12 @@
+# [job release v0.18.2](https://github.com/GaloyMoney/job/releases/tag/0.18.2)
+
+
+
+### Miscellaneous Tasks
+
+- Upgrade es-entity to 0.18.0 (#234)
+- Bump the all-dependencies group across 1 directory with 2 updates (#233)
+
 # [job release v0.18.1](https://github.com/GaloyMoney/job/releases/tag/0.18.1)
 
 
