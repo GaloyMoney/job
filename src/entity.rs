@@ -518,8 +518,13 @@ impl NewJobBuilder {
 }
 
 impl IntoEvents<JobEvent> for NewJob {
-    fn into_events(self) -> EntityEvents<JobEvent> {
-        EntityEvents::init(
+    type IdSource = FromCaller;
+
+    fn into_events(
+        self,
+        builder: EntityEventsBuilder<JobEvent, FromCaller>,
+    ) -> EntityEvents<JobEvent> {
+        builder.initial_events(
             self.id,
             [
                 JobEvent::Initialized {
