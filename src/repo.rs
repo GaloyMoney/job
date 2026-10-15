@@ -17,8 +17,6 @@ const DEDUP_KEY_LOCK_CLASS: i32 = 1;
 #[derive(EsRepo, Clone)]
 #[es_repo(
     entity = "Job",
-    // Callers of `Jobs::spawn*` choose the job id (and keyed/dedup spawns
-    // resolve to an existing id), so the repo must not mint one.
     id(source = caller),
     columns(
         job_type(ty = "JobType", update(persist = false)),
