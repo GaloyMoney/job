@@ -17,6 +17,7 @@ const DEDUP_KEY_LOCK_CLASS: i32 = 1;
 #[derive(EsRepo, Clone)]
 #[es_repo(
     entity = "Job",
+    id(source = caller),
     columns(
         job_type(ty = "JobType", update(persist = false)),
         unique_key(ty = "Option<String>", update(persist = false)),
