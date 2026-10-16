@@ -1,3 +1,11 @@
+# [job release v0.18.4](https://github.com/GaloyMoney/job/releases/tag/0.18.4)
+
+
+
+### Bug Fixes
+
+- Re-poll when a row_limit truncates the claim; deflake CI tests (#237)
+
 # [job release v0.18.3](https://github.com/GaloyMoney/job/releases/tag/0.18.3)
 
 
