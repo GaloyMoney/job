@@ -197,6 +197,9 @@ pub(super) async fn poll_jobs(
         ),
         poll_status AS (
             SELECT ((SELECT COUNT(*) FROM locked) >= $1
+                 -- Locked but cut by a type's row_limit: due, claimable
+                 -- rows left behind with no future deadline to wake on.
+                 OR (SELECT COUNT(*) FROM locked) > (SELECT COUNT(*) FROM selected_jobs)
                  OR (EXISTS (
                         SELECT 1 FROM window_counts wc
                         JOIN limits t ON t.job_type = wc.job_type
@@ -376,6 +379,51 @@ mod tests {
                     "A is capped at 1 and must claim exactly one row"
                 );
                 assert_eq!(claimed.len(), 2, "one row per type, both claimed");
+            }
+            other => panic!("expected a Jobs claim, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    /// A pool-clamped poll (`row_limit` below both the backlog and
+    /// `n_jobs_to_poll`) that leaves due rows behind must report
+    /// `may_have_more`: there is no future deadline to sleep until, so
+    /// without it the poller parks for `MAX_WAIT` on a drainable backlog.
+    #[tokio::test]
+    async fn row_limit_truncated_claim_reports_may_have_more() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let instance_id = uuid::Uuid::now_v7();
+        let job_type = format!("row-limit-left-behind-{}", uuid::Uuid::now_v7());
+
+        let base = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        for i in 0..7i64 {
+            seed_pending_job(&pool, &job_type, base + chrono::Duration::seconds(i)).await?;
+        }
+
+        let n_jobs_to_poll = 37usize;
+        let row_limit = 4;
+        let result = poll_jobs(
+            &pool,
+            n_jobs_to_poll,
+            instance_id,
+            &[JobType::from_owned(job_type.clone())],
+            &[],
+            &[row_limit],
+            CONTENTION_HEADROOM,
+            &ClockHandle::realtime(),
+        )
+        .await?;
+
+        match result {
+            JobPollResult::Jobs { jobs, window } => {
+                assert_eq!(jobs.len(), row_limit as usize);
+                assert_eq!(
+                    window.sleep_for(chrono::Utc::now()),
+                    Duration::ZERO,
+                    "3 due rows were left behind by the row_limit: the poll \
+                     must re-poll, not sleep until a deadline that does not exist"
+                );
             }
             other => panic!("expected a Jobs claim, got {other:?}"),
         }
