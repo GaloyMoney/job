@@ -3353,9 +3353,17 @@ async fn await_all_times_out_and_reawait_resolves() -> anyhow::Result<()> {
     // outstanding, not just the first handle (the pre-`AwaitTimeout` bug).
     let ids: Vec<JobId> = (0..40).map(|_| JobId::new()).collect();
     spawner.spawn(ids[0], TestJobConfig { delay_ms: 0 }).await?;
-    for id in &ids[1..] {
-        spawner.spawn(*id, TestJobConfig { delay_ms: 2000 }).await?;
-    }
+    // One round-trip for the held-back batch: spawning them serially lets a
+    // slow CI database stretch the loop past `delay_ms`, so the earliest
+    // ones complete inside the 300ms window and drop out of `pending`.
+    spawner
+        .spawn_all(
+            ids[1..]
+                .iter()
+                .map(|id| JobSpec::new(*id, TestJobConfig { delay_ms: 2000 }))
+                .collect(),
+        )
+        .await?;
 
     let handles = jobs.handles(ids.clone());
 

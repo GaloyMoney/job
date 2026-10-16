@@ -1020,32 +1020,34 @@ mod deadlock_regression_tests {
         id
     }
 
-    /// Holds a `FOR UPDATE` lock on `first`, signals, waits, then tries to
-    /// lock `second` -- the reverse of the order `Finalizer::finalize`'s own
-    /// CTE takes (`ORDER BY queue_id, id`), so a cycle forms once the
-    /// finalizer's write is also mid-flight. Retries the whole attempt if
-    /// IT is the deadlock victim, so the loop always converges once the
-    /// finalizer (if it was instead the victim) has released and retried.
-    /// One contestant in the reverse-order lock dance: holds `first`, waits
-    /// for the finalizer to be mid-flight, then tries `second`. On a
-    /// deadlock loss it just ends (dropping the transaction rolls back and
-    /// releases `first`) rather than retrying its own attempt from scratch
-    /// -- several of these are spawned PRE-QUEUED on `first` instead (see
-    /// the caller), so the next contestant in Postgres's own lock wait
-    /// queue takes over with no re-acquisition latency, which is what lets
-    /// the deadlock recur on the finalizer's later (`use_internal = true`,
-    /// attempt-counted) tries and not just its first (shared-pool,
-    /// uncounted-fallback) one.
-    async fn contest_once(
+    /// The other side of the reverse-order lock dance: holds a `FOR UPDATE`
+    /// lock on `first` for its whole life and, `deadlocks` times, waits
+    /// until the finalizer is BLOCKED on it before locking `second` -- the
+    /// reverse of the order `Finalizer::finalize`'s own CTE takes
+    /// (`ORDER BY queue_id, id`), closing the cycle.
+    ///
+    /// Waiting for the finalizer to actually block (rather than sleeping a
+    /// fixed interval) is what makes the finalizer the victim every time:
+    /// Postgres runs the deadlock check in whichever waiter's
+    /// `deadlock_timeout` fires first, and that waiter aborts itself -- so
+    /// the finalizer must start waiting first. A single contestant matters
+    /// too: a second one queued on `first` ahead of the finalizer joins the
+    /// cycle with the OLDEST wait and gets picked as victim instead.
+    ///
+    /// `second` is taken under a savepoint and rolled back to it once won,
+    /// so `first` stays held and the finalizer's retry blocks on it again.
+    async fn contest(
         pool: sqlx::PgPool,
         first: uuid::Uuid,
         second: uuid::Uuid,
-        on_holding_first: Option<Arc<tokio::sync::Notify>>,
+        deadlocks: usize,
+        on_holding_first: Arc<tokio::sync::Notify>,
     ) {
+        const LOCK_ROW: &str = "SELECT id FROM job_executions WHERE id = $1 FOR UPDATE";
         let Ok(mut tx) = pool.begin().await else {
             return;
         };
-        if sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR UPDATE")
+        if sqlx::query(LOCK_ROW)
             .bind(first)
             .execute(&mut *tx)
             .await
@@ -1053,17 +1055,46 @@ mod deadlock_regression_tests {
         {
             return;
         }
-        if let Some(ready) = on_holding_first {
-            ready.notify_one();
+        let Ok(my_pid) = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+        else {
+            return;
+        };
+        on_holding_first.notify_one();
+
+        for _ in 0..deadlocks {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                // Polled on the pool, not `tx`: `pg_stat_activity` is
+                // snapshotted once per transaction.
+                let finalizer_blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(my_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+                if finalizer_blocked {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    // The finalizer never blocked on us (it finished, or
+                    // is gone): close no cycle, just release.
+                    let _ = tx.rollback().await;
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let _ = sqlx::query("SAVEPOINT contest").execute(&mut *tx).await;
+            let _ = sqlx::query(LOCK_ROW).bind(second).execute(&mut *tx).await;
+            let _ = sqlx::query("ROLLBACK TO SAVEPOINT contest")
+                .execute(&mut *tx)
+                .await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let _ = sqlx::query("SELECT id FROM job_executions WHERE id = $1 FOR UPDATE")
-            .bind(second)
-            .execute(&mut *tx)
-            .await;
-        // Releases `first` (and `second`, if won) either way: these probes
-        // never write anything, so a rollback is exactly as good as a
-        // commit for the purpose of freeing the locks.
+        // These probes never write anything, so a rollback is exactly as
+        // good as a commit for the purpose of freeing the locks.
         let _ = tx.rollback().await;
     }
 
@@ -1090,11 +1121,11 @@ mod deadlock_regression_tests {
             format!("deadlock-regression-{}", uuid::Uuid::now_v7()).into_boxed_str(),
         ));
 
-        // Bounded attempts at reproducing the cycle: Postgres's victim
-        // choice between two symmetric waiters isn't guaranteed to pick the
-        // finalizer every round, so retry the whole scenario with fresh
-        // rows until the retry warning is actually observed (or give up
-        // with a clear failure rather than flake silently).
+        // Bounded attempts at reproducing the cycle: the contestants'
+        // handshake makes the finalizer the victim deterministically, but
+        // retry the whole scenario with fresh rows until the retry warning
+        // is actually observed (or give up with a clear failure rather than
+        // flake silently).
         for round in 0..8 {
             if observed.load(Ordering::SeqCst) {
                 break;
@@ -1120,24 +1151,21 @@ mod deadlock_regression_tests {
                 ClockHandle::realtime(),
             );
 
-            // Several contestants, pre-queued on `first` (= B) before
-            // `finalize()` even starts: once the leader releases (deadlock
-            // loss or a clean win), the next one in Postgres's own lock
-            // wait queue takes over with no re-acquisition latency, so a
-            // fresh contestant is already in position for whichever
-            // finalizer attempt (shared-pool first, or an internal-pool
-            // retry after it) comes next.
+            // The contestant holds B before `finalize()` even starts and
+            // forces exactly two deadlock losses on the finalizer: the
+            // shared-pool attempt's uncounted fallback, then the
+            // attempt-counted internal retry this test is after (or two
+            // counted retries, if the shared pool had no headroom). Two
+            // keeps the finalizer within `TX_ABORT_MAX_ATTEMPTS`, so its
+            // next attempt succeeds.
             let ready = Arc::new(tokio::sync::Notify::new());
-            let contestants: Vec<_> = (0..4)
-                .map(|i| {
-                    tokio::spawn(contest_once(
-                        pool.clone(),
-                        uuid::Uuid::from(id_b),
-                        uuid::Uuid::from(id_a),
-                        (i == 0).then(|| Arc::clone(&ready)),
-                    ))
-                })
-                .collect();
+            let contestant = tokio::spawn(contest(
+                pool.clone(),
+                uuid::Uuid::from(id_b),
+                uuid::Uuid::from(id_a),
+                2,
+                Arc::clone(&ready),
+            ));
             ready.notified().await;
 
             let now = chrono::Utc::now();
@@ -1155,9 +1183,7 @@ mod deadlock_regression_tests {
                 panic!("round {round}: finalize() should retry a server-confirmed deadlock and succeed, got: {e}")
             });
 
-            for c in contestants {
-                let _ = c.await;
-            }
+            let _ = contestant.await;
         }
 
         assert!(

@@ -180,11 +180,18 @@ whose connections carry `plan_cache_mode = force_generic_plan`,
 
 `may_have_more` decides whether the poll loop re-polls immediately or sleeps
 until `next_due_at`. It is exact rather than heuristic: a poll re-polls
-immediately only when it filled its budget, or when some type's own window
-came back full while the poll still yielded at least one candidate (rows past
-that type's window are unseen and already due). A window that came back short
-for every type means every claimable due row was examined — nothing can be
-discarded from the window after the fact, so there is nothing left to miss.
+immediately only when it filled its budget, when it locked more rows than a
+type's `row_limit` let it claim (the surplus is due, claimable, and has no
+future deadline to wake on), or when some type's own window came back full
+while the poll still yielded at least one candidate (rows past that type's
+window are unseen and already due). Otherwise every claimable due row was
+examined and claimed, so there is nothing left to miss.
+
+The `row_limit` case is the pool-clamped one: a poll admitted a partial
+budget, claimed it, and left due rows behind. Its zero-sleep re-poll either
+claims more or finds the budget at zero, which arms the headroom waiter —
+without it the poller slept `MAX_WAIT` on a drainable backlog, since
+completions below `min_jobs_per_process` do not wake the poll loop.
 
 Sleeping accurately only works if every transition that creates a claimable
 row wakes a poller that covers that row's **type**, and type is the subtle
