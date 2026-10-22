@@ -1,3 +1,13 @@
+# [job release v0.18.5](https://github.com/GaloyMoney/job/releases/tag/0.18.5)
+
+
+
+### Miscellaneous Tasks
+
+- Es-entity 0.20.0; bon replaces derive_builder (#241)
+- Bump the all-dependencies group across 1 directory with 4 updates (#238)
+- Ignore release-chain crates in dependabot (#107)
+
 # [job release v0.18.4](https://github.com/GaloyMoney/job/releases/tag/0.18.4)
 
 
