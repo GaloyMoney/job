@@ -231,11 +231,10 @@ where
             .id(JobId::new())
             .resident(true)
             .job_type(self.job_type.clone())
-            .config(config)?
-            .tracing_context(es_entity::context::TracingContext::current())
+            .config(config)
+            .maybe_tracing_context(es_entity::context::TracingContext::current())
             .schedule_at(schedule_at)
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         match self.repo.create_in_op(&mut op, new_job).await {
             Ok(job) => {
                 // At most one job of this type ever exists, so there is no

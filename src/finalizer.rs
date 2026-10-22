@@ -995,8 +995,7 @@ mod deadlock_regression_tests {
             .id(id)
             .job_type(job_type.clone())
             .config(serde_json::json!({}))
-            .unwrap()
-            .queue_id(Some(queue_id.to_string()))
+            .queue_id(queue_id.to_string())
             .schedule_at(chrono::Utc::now())
             .build()
             .expect("build NewJob");

@@ -138,6 +138,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "bon"
+version = "3.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a602c73c7b0148ec6d12af6fd5cc7a46e2eacc8878271a999abac56eed12f561"
+dependencies = [
+ "bon-macros",
+ "rustversion",
+]
+
+[[package]]
+name = "bon-macros"
+version = "3.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
+dependencies = [
+ "darling 0.20.11",
+ "ident_case",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -403,37 +428,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive_builder"
-version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "507dfb09ea8b7fa618fcf76e953f4f5e192547945816d5358edffe39f6f94947"
-dependencies = [
- "derive_builder_macro",
-]
-
-[[package]]
-name = "derive_builder_core"
-version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d5bcf7b024d6835cfb3d473887cd966994907effbe9227e8c8219824d06c4e8"
-dependencies = [
- "darling 0.20.11",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "derive_builder_macro"
-version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
-dependencies = [
- "derive_builder_core",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -485,9 +479,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errlanes"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2268d61fd695dc63c7022accc35b3b228ff156197ef56585610efae1b3b7e02"
+checksum = "6f2d5680bfa2d1007b8023dae0d14b821bfd2edba0164b7dbddf209c984365cc"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -497,9 +491,9 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a17e325ae35ef21860e9be5b20666338d980e249ac2fa23adb718d9f85d6ea6"
+checksum = "34a2bd7dc97d0b8f78bdf6e27dfd38eb7f222ead4109ee0ac2171d9f5bcacd01"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -511,13 +505,12 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58746d618007272aeac5a33a487b962ba86e0d9674bae3ef7520244fd994f062"
+checksum = "6ad45d42c5bfc77b1e22f995b2cbd931bcfdc07e77008f55923978f6c79df94e"
 dependencies = [
  "async-stream",
  "chrono",
- "derive_builder",
  "errlanes",
  "es-entity-macros",
  "futures-core",
@@ -539,9 +532,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b099b43435cf64513654f33fb18cc1d4b4fb12c4c1a9affe7f1f74ad2ddd1c3"
+checksum = "3233edc9906cbeecadaed6f0c5bde2be46f57010af00ea005142da37b8bb57dd"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -1063,8 +1056,8 @@ version = "0.18.5-dev"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bon",
  "chrono",
- "derive_builder",
  "es-entity",
  "futures",
  "rand 0.10.3",
@@ -1429,6 +1422,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "prettyplease"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
 ]
 
 [[package]]

@@ -1,6 +1,5 @@
 //! Service and poller configuration types.
 
-use derive_builder::Builder;
 use es_entity::clock::{Clock, ClockHandle};
 use serde::{Deserialize, Serialize};
 
@@ -76,8 +75,7 @@ impl Default for JobPollerConfig {
     }
 }
 
-#[derive(Builder, Debug, Clone)]
-#[builder(build_fn(skip))]
+#[derive(Debug, Clone)]
 /// Configuration consumed by [`Jobs::init`](crate::Jobs::init).
 /// Build with [`JobSvcConfig::builder`](Self::builder).
 ///
@@ -126,40 +124,35 @@ impl Default for JobPollerConfig {
 /// # tokio::runtime::Runtime::new().unwrap().block_on(run()).unwrap();
 /// ```
 pub struct JobSvcConfig {
-    #[builder(setter(into, strip_option), default)]
     /// Provide a Postgres connection string used to build an internal pool. Mutually exclusive with `pool`. When set, `exec_migrations` defaults to `true` unless overridden.
     pub(super) pg_con: Option<String>,
-    #[builder(setter(into, strip_option), default)]
     /// Override the maximum number of connections the internally managed pool may open. Ignored when `pool` is supplied.
     pub(super) max_connections: Option<u32>,
-    #[builder(default)]
     /// Set to `true` to have `Jobs::init` run the embedded database migrations during startup. Defaults to `false`, unless `pg_con` is supplied without an explicit value.
     pub(super) exec_migrations: bool,
-    #[builder(setter(into, strip_option), default)]
     /// Inject an existing `sqlx::PgPool` instead of letting the job service build one. Mutually exclusive with `pg_con`.
     pub(super) pool: Option<sqlx::PgPool>,
-    #[builder(default)]
     /// Override the defaults that control how the background poller distributes work across processes.
     pub poller_config: JobPollerConfig,
-    #[builder(setter(into), default = "Clock::handle()")]
     /// Clock handle for time operations. Defaults to the global clock.
     /// The global clock is realtime unless an artificial clock was installed.
     pub clock: ClockHandle,
 }
 
+#[bon::bon]
 impl JobSvcConfig {
-    /// Create a [`JobSvcConfigBuilder`] with defaults for all optional settings.
-    pub fn builder() -> JobSvcConfigBuilder {
-        JobSvcConfigBuilder::default()
-    }
-}
-
-impl JobSvcConfigBuilder {
     /// Validate and construct a [`JobSvcConfig`], ensuring either `pg_con` or `pool` is set.
-    pub fn build(&mut self) -> Result<JobSvcConfig, InvalidConfig> {
-        // Validate configuration
-        match (self.pg_con.as_ref(), self.pool.as_ref()) {
-            (None, None) | (Some(None), None) | (None, Some(None)) => {
+    #[builder(builder_type = JobSvcConfigBuilder, on(String, into))]
+    pub fn new(
+        pg_con: Option<String>,
+        #[builder(into)] max_connections: Option<u32>,
+        exec_migrations: Option<bool>,
+        #[builder(into)] pool: Option<sqlx::PgPool>,
+        #[builder(default)] poller_config: JobPollerConfig,
+        #[builder(into, default = Clock::handle().clone())] clock: ClockHandle,
+    ) -> Result<Self, InvalidConfig> {
+        match (pg_con.as_ref(), pool.as_ref()) {
+            (None, None) => {
                 return Err(InvalidConfig {
                     message: "One of pg_con or pool must be set".to_string(),
                 });
@@ -172,37 +165,29 @@ impl JobSvcConfigBuilder {
             _ => (),
         }
 
-        // If pg_con is provided and exec_migrations is not explicitly set, default to true
-        if matches!(self.pg_con.as_ref(), Some(Some(_))) && self.exec_migrations.is_none() {
-            self.exec_migrations = Some(true);
+        let exec_migrations = exec_migrations.unwrap_or(pg_con.is_some());
+
+        let factor = poller_config.connections_per_job;
+        // Zero/negative would turn the admission division into a claim
+        // -everything (or NaN) hazard; the upper bound is a typo guard
+        // (e.g. a value written in "milli-connections") -- no real
+        // workload prices a single dispatch at more than a few
+        // connections.
+        if !(factor.is_finite() && factor > 0.0 && factor <= 100.0) {
+            return Err(InvalidConfig {
+                message: format!(
+                    "connections_per_job must be a finite value in (0.0, 100.0], got {factor}"
+                ),
+            });
         }
 
-        if let Some(poller_config) = self.poller_config.as_ref() {
-            let factor = poller_config.connections_per_job;
-            // Zero/negative would turn the admission division into a claim
-            // -everything (or NaN) hazard; the upper bound is a typo guard
-            // (e.g. a value written in "milli-connections") -- no real
-            // workload prices a single dispatch at more than a few
-            // connections.
-            if !(factor.is_finite() && factor > 0.0 && factor <= 100.0) {
-                return Err(InvalidConfig {
-                    message: format!(
-                        "connections_per_job must be a finite value in (0.0, 100.0], got {factor}"
-                    ),
-                });
-            }
-        }
-
-        Ok(JobSvcConfig {
-            pg_con: self.pg_con.clone().flatten(),
-            max_connections: self.max_connections.flatten(),
-            exec_migrations: self.exec_migrations.unwrap_or(false),
-            pool: self.pool.clone().flatten(),
-            poller_config: self.poller_config.clone().unwrap_or_default(),
-            clock: self
-                .clock
-                .clone()
-                .unwrap_or_else(|| Clock::handle().clone()),
+        Ok(Self {
+            pg_con,
+            max_connections,
+            exec_migrations,
+            pool,
+            poller_config,
+            clock,
         })
     }
 }

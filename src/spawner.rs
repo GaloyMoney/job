@@ -295,18 +295,15 @@ where
             }
         }
 
-        let mut builder = NewJob::builder();
-        builder
+        let new_job = NewJob::builder()
             .id(spec.id)
             .job_type(self.job_type.clone())
-            .config(spec.config)?
-            .tracing_context(es_entity::context::TracingContext::current())
-            .queue_id(spec.queue_id.clone())
-            .schedule_at(schedule_at);
-        if let Some(key) = spec.dedup_key.clone() {
-            builder.unique_key(key);
-        }
-        let new_job = builder.build().expect("Could not build new job");
+            .config(spec.config)
+            .maybe_tracing_context(es_entity::context::TracingContext::current())
+            .maybe_queue_id(spec.queue_id.clone())
+            .maybe_unique_key(spec.dedup_key.clone())
+            .schedule_at(schedule_at)
+            .build()?;
 
         let job = self.repo.create_in_op(op, new_job).await.lift()?;
         if let Some(waiter) = spec.waiter {
@@ -652,18 +649,15 @@ where
             let schedule_at = spec.schedule_at.unwrap_or(default_schedule_at);
             schedule_times.push(schedule_at);
 
-            let mut builder = NewJob::builder();
-            builder
+            let new_job = NewJob::builder()
                 .id(spec.id)
                 .job_type(self.job_type.clone())
-                .config(spec.config)?
-                .tracing_context(es_entity::context::TracingContext::current())
-                .queue_id(spec.queue_id.clone())
-                .schedule_at(schedule_at);
-            if let Some(key) = spec.dedup_key.clone() {
-                builder.unique_key(key);
-            }
-            let new_job = builder.build().expect("Could not build new job");
+                .config(spec.config)
+                .maybe_tracing_context(es_entity::context::TracingContext::current())
+                .maybe_queue_id(spec.queue_id.clone())
+                .maybe_unique_key(spec.dedup_key.clone())
+                .schedule_at(schedule_at)
+                .build()?;
             new_jobs.push(new_job);
             queue_ids.push(spec.queue_id);
             dedup_keys.push(spec.dedup_key);

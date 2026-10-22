@@ -25,7 +25,7 @@ tokio-task-names = ["tokio/tracing"]
 es-entity = { workspace = true, features = ["tracing-context", "errlanes-tracing"] }
 
 async-trait = { workspace = true }
-derive_builder = { workspace = true }
+bon = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
@@ -45,12 +45,12 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [workspace.dependencies]
 
-es-entity = "0.19.0"
+es-entity = "0.20.0"
 
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
-derive_builder = "0.20"
+bon = "3"
 tracing = { version = "0.1" }
 sqlx = { version = "0.8", features = ["macros", "runtime-tokio-rustls", "postgres", "uuid", "chrono", "json" ] }
 serde = { version = "1.0", features = ["derive"] }
