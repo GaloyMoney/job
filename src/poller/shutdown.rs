@@ -263,7 +263,7 @@ mod tests {
         let new_job = crate::entity::NewJob::builder()
             .id(id)
             .job_type(JobType::from_owned(job_type.to_string()))
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
             .build()
             .expect("build NewJob");

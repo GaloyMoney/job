@@ -430,10 +430,9 @@ mod tests {
             .id(a_id)
             .resident(true)
             .job_type(type_a.clone())
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
 
         // Same type, resident again: conflicts, even with a different id.
@@ -441,10 +440,9 @@ mod tests {
             .id(JobId::new())
             .resident(true)
             .job_type(type_a.clone())
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         let raw = repo.create(new_job).await.err().expect("expected error");
         assert!(matches!(
             &raw,
@@ -465,10 +463,9 @@ mod tests {
             .id(JobId::new())
             .resident(true)
             .job_type(type_b)
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
 
         // A non-resident job of the same type never collides with the
@@ -476,10 +473,9 @@ mod tests {
         let new_job = NewJob::builder()
             .id(JobId::new())
             .job_type(type_a)
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
 
         Ok(())
@@ -511,10 +507,9 @@ mod tests {
             .id(a_id)
             .unique_key("k1")
             .job_type(type_a.clone())
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
 
         // Same type, same key: `jobs` itself no longer conflicts — a second
@@ -523,10 +518,9 @@ mod tests {
             .id(JobId::new())
             .unique_key("k1")
             .job_type(type_a.clone())
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
 
         // Same type, different key: ok, not a collision.
@@ -534,10 +528,9 @@ mod tests {
             .id(JobId::new())
             .unique_key("k2")
             .job_type(type_a.clone())
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
 
         // Same id (regardless of key/type): a primary-key collision, not a
@@ -546,10 +539,9 @@ mod tests {
             .id(a_id)
             .unique_key("k3")
             .job_type(type_a.clone())
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         let err: JobError = repo
             .create(new_job)
             .await
@@ -566,10 +558,9 @@ mod tests {
             .id(JobId::new())
             .unique_key("k1")
             .job_type(type_b)
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
 
         // Keyless jobs of one type: never collide with each other or with a
@@ -578,26 +569,23 @@ mod tests {
         let new_job = NewJob::builder()
             .id(JobId::new())
             .job_type(type_c.clone())
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
         let new_job = NewJob::builder()
             .id(JobId::new())
             .job_type(type_c.clone())
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         repo.create(new_job).await?;
         let new_job = NewJob::builder()
             .id(a_id)
             .job_type(type_c)
-            .config(serde_json::json!({}))?
+            .config(serde_json::json!({}))
             .schedule_at(chrono::Utc::now())
-            .build()
-            .expect("Could not build new job");
+            .build()?;
         let err: JobError = repo
             .create(new_job)
             .await

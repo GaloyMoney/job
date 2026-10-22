@@ -1,7 +1,6 @@
 //! Core job entities and events persisted in Postgres.
 
 use chrono::{DateTime, Utc};
-use derive_builder::Builder;
 use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
 
@@ -186,8 +185,7 @@ impl RetryPolicy {
     }
 }
 
-#[derive(EsEntity, Builder)]
-#[builder(pattern = "owned", build_fn(error = "EntityHydrationError"))]
+#[derive(EsEntity)]
 /// Entity capturing immutable job metadata and lifecycle events.
 pub struct Job {
     pub id: JobId,
@@ -450,7 +448,7 @@ impl Job {
 
 impl TryFromEvents<JobEvent> for Job {
     fn try_from_events(events: EntityEvents<JobEvent>) -> Result<Self, EntityHydrationError> {
-        let mut builder = JobBuilder::default();
+        let mut h = Job::hydrator();
         for event in events.iter_all() {
             match event {
                 JobEvent::Initialized {
@@ -461,12 +459,11 @@ impl TryFromEvents<JobEvent> for Job {
                     unique_key,
                     ..
                 } => {
-                    builder = builder
-                        .id(*id)
+                    h.id(*id)
                         .job_type(job_type.clone())
-                        .queue_id(queue_id.clone())
-                        .unique_key(unique_key.clone())
-                        .config(config.clone())
+                        .maybe_queue_id(queue_id.clone())
+                        .maybe_unique_key(unique_key.clone())
+                        .config(config.clone());
                 }
                 JobEvent::ExecutionScheduled { .. } => {}
                 JobEvent::ExecutionCompleted => {}
@@ -478,24 +475,18 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::CongestionRescheduled { .. } => {}
             }
         }
-        builder.events(events).build()
+        h.build(events)
     }
 }
 
-#[derive(Debug, Builder)]
+#[derive(Debug)]
 pub struct NewJob {
-    #[builder(setter(into))]
     pub(super) id: JobId,
     pub(super) job_type: JobType,
-    #[builder(setter(custom))]
     pub(super) config: serde_json::Value,
-    #[builder(default)]
     pub(super) tracing_context: Option<TracingContext>,
-    #[builder(default)]
     pub(super) queue_id: Option<String>,
-    #[builder(setter(into, strip_option), default)]
     pub(super) unique_key: Option<String>,
-    #[builder(default)]
     pub(super) resident: bool,
     /// The job's first `execute_at`. `into_events` appends
     /// `ExecutionScheduled { attempt: 1, scheduled_at }` to the initial
@@ -504,16 +495,29 @@ pub struct NewJob {
     pub(super) schedule_at: DateTime<Utc>,
 }
 
+#[bon::bon]
 impl NewJob {
-    pub fn builder() -> NewJobBuilder {
-        NewJobBuilder::default()
-    }
-}
-
-impl NewJobBuilder {
-    pub fn config<C: serde::Serialize>(&mut self, config: C) -> Result<&mut Self, JobFault> {
-        self.config = Some(serde_json::to_value(config).map_err(CouldNotSerialize::Config)?);
-        Ok(self)
+    #[builder(on(String, into))]
+    pub fn new<C: serde::Serialize>(
+        #[builder(into)] id: JobId,
+        job_type: JobType,
+        config: C,
+        tracing_context: Option<TracingContext>,
+        queue_id: Option<String>,
+        unique_key: Option<String>,
+        #[builder(default)] resident: bool,
+        schedule_at: DateTime<Utc>,
+    ) -> Result<Self, JobFault> {
+        Ok(Self {
+            id,
+            job_type,
+            config: serde_json::to_value(config).map_err(CouldNotSerialize::Config)?,
+            tracing_context,
+            queue_id,
+            unique_key,
+            resident,
+            schedule_at,
+        })
     }
 }
 

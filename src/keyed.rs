@@ -531,11 +531,10 @@ where
                     .id(id)
                     .unique_key(spec.key.clone())
                     .job_type(self.job_type.clone())
-                    .config(spec.config)?
-                    .tracing_context(es_entity::context::TracingContext::current())
+                    .config(spec.config)
+                    .maybe_tracing_context(es_entity::context::TracingContext::current())
                     .schedule_at(wanted_at)
-                    .build()
-                    .expect("Could not build new job"),
+                    .build()?,
             );
             if let Some(waiter) = spec.waiter {
                 waits.push(Wait { callee: id, waiter });
