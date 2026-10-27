@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use es_entity::AtomicOperation;
 use es_entity::clock::ClockHandle;
 use es_entity::errlanes;
-use es_entity::errlanes::{Fatal, FatalKind, Fault, Laned, Transient, TransientKind};
+use es_entity::errlanes::{Fatal, FatalKind, Fault, Laned};
 use futures::FutureExt;
 use tracing::Span;
 
@@ -588,13 +588,8 @@ impl BatchDispatcher {
                     BatchItemOutcome::Complete => Disposition::Complete,
                     BatchItemOutcome::RescheduleIn(d) => Disposition::Fresh { at: now + d },
                     BatchItemOutcome::RescheduleAt(t) => Disposition::Fresh { at: t },
-                    // A per-item `BatchItemOutcome::Errored` is a plain string
-                    // the runner chose to report -- no lane payload travels
-                    // with it, so it is laned as `Transient(Other)`.
-                    BatchItemOutcome::Errored(reason) => Disposition::Fail {
-                        failure: Transient::new(TransientKind::Other)
-                            .with_context(reason)
-                            .into(),
+                    BatchItemOutcome::Errored(error) => Disposition::Fail {
+                        failure: Fault::classify(&*error).narrow_denied(),
                         attempt: self.attempts.get(&id).copied().unwrap_or(1),
                         run_duration: self.run_duration,
                     },

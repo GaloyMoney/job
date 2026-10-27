@@ -7,6 +7,7 @@
 mod helpers;
 
 use async_trait::async_trait;
+use es_entity::errlanes::{Fatal, Transient, TransientKind};
 use job::{
     Backoff, BatchItemOutcome, BatchOutcomes, BatchedJobInitializer, BatchedJobRunner,
     CurrentBatchedJob, JobBatchCompletion, JobId, JobPollerConfig, JobSpawner, JobSpec, JobStatus,
@@ -370,6 +371,122 @@ async fn per_item_outcomes_are_applied_independently() -> anyhow::Result<()> {
             "job at index {i} had unexpected terminal state"
         );
     }
+    Ok(())
+}
+
+/// Returns `Errored` with a `Fatal` for `fatal-*` items and with a
+/// `Transient` for the rest.
+struct LanedErrorInitializer {
+    job_type: JobType,
+}
+
+impl BatchedJobInitializer for LanedErrorInitializer {
+    type Config = BatchConfig;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn retry_on_error_settings(&self) -> RetrySettings {
+        RetrySettings {
+            backoff: Backoff::new(
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(120),
+                0,
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn init(
+        &self,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<
+        Box<dyn BatchedJobRunner<Config = Self::Config>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        Ok(Box::new(LanedErrorRunner))
+    }
+}
+
+struct LanedErrorRunner;
+
+#[async_trait]
+impl BatchedJobRunner for LanedErrorRunner {
+    type Config = BatchConfig;
+
+    async fn run_batch(
+        &self,
+        current_batch: CurrentBatchedJob<BatchConfig>,
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        let outcomes: BatchOutcomes = current_batch.outcomes_for_each(|item| {
+            if item.config().label.starts_with("fatal") {
+                BatchItemOutcome::Errored(Box::new(Fatal::invariant("broken")))
+            } else {
+                BatchItemOutcome::Errored(Box::new(Transient::new(TransientKind::Other)))
+            }
+        });
+        Ok(JobBatchCompletion::WithOutcomes(outcomes))
+    }
+}
+
+/// `BatchItemOutcome::Errored` is classified like a single job's `Err(e)`:
+/// the item's own lane picks its band, and both stay pending.
+#[tokio::test]
+async fn errored_items_land_in_the_band_their_own_lane_selects() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_batched_initializer(LanedErrorInitializer {
+        job_type: helpers::job_type("batched-errored-lanes"),
+    });
+
+    let fatal_id = JobId::new();
+    let transient_id = JobId::new();
+    spawner
+        .spawn_all(vec![
+            JobSpec::new(
+                fatal_id,
+                BatchConfig {
+                    label: "fatal".into(),
+                },
+            ),
+            JobSpec::new(
+                transient_id,
+                BatchConfig {
+                    label: "transient".into(),
+                },
+            ),
+        ])
+        .await?;
+    jobs.start_poll().await?;
+
+    let statuses = helpers::settle(&jobs, &[fatal_id, transient_id]).await?;
+    assert!(
+        matches!(
+            &statuses[0],
+            JobStatus::Pending {
+                attempt: 2,
+                band: RetryBand::Fatal,
+                ..
+            }
+        ),
+        "the Fatal item must land in the fatal band, got {:?}",
+        statuses[0]
+    );
+    assert!(
+        matches!(
+            &statuses[1],
+            JobStatus::Pending {
+                attempt: 2,
+                band: RetryBand::Transient,
+                ..
+            }
+        ),
+        "the Transient item must land in the transient band, got {:?}",
+        statuses[1]
+    );
     Ok(())
 }
 

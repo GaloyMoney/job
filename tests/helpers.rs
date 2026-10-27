@@ -75,15 +75,14 @@ pub fn job_type(prefix: &str) -> job::JobType {
 }
 
 /// An item a batched runner's `Errored` outcome (or a bisect search) blamed:
-/// retried, not killed -- pending at attempt 2 in the transient band with the
-/// error recorded.
+/// retried, not killed -- pending at attempt 2 with the error recorded, in
+/// whichever band the error's own lane selects.
 #[allow(dead_code)]
 pub fn is_isolated(status: &job::JobStatus) -> bool {
     matches!(
         status,
         job::JobStatus::Pending {
             attempt: 2,
-            band: job::RetryBand::Transient,
             last_error: Some(_),
             ..
         }
