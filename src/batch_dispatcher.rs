@@ -594,7 +594,7 @@ impl BatchDispatcher {
                         run_duration: self.run_duration,
                     },
                     BatchItemOutcome::Fail { error } => Disposition::Failed {
-                        reason: record_verdict(&Span::current(), &*error),
+                        reason: conclude_item_failed(id, &*error),
                     },
                 };
                 (id, disposition)
@@ -679,6 +679,25 @@ impl BatchDispatcher {
         self.record_seal_outcome(&outcome);
         Ok(())
     }
+}
+
+fn conclude_item_failed(
+    id: JobId,
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> String {
+    let span = tracing::info_span!(
+        "job.conclude_failed",
+        %id,
+        will_retry = tracing::field::Empty,
+        error = tracing::field::Empty,
+        error.lane = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        error.level = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        exception.type = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    );
+    record_verdict(&span, error)
 }
 
 impl Drop for BatchDispatcher {
