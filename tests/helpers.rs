@@ -74,6 +74,56 @@ pub fn job_type(prefix: &str) -> job::JobType {
     job::JobType::new(Box::leak(unique(prefix).into_boxed_str()))
 }
 
+/// An item a batched runner's `Errored` outcome (or a bisect search) blamed:
+/// retried, not killed -- pending at attempt 2 in the transient band with the
+/// error recorded.
+#[allow(dead_code)]
+pub fn is_isolated(status: &job::JobStatus) -> bool {
+    matches!(
+        status,
+        job::JobStatus::Pending {
+            attempt: 2,
+            band: job::RetryBand::Transient,
+            last_error: Some(_),
+            ..
+        }
+    )
+}
+
+/// Waits until every job is settled -- terminal, or isolated (see
+/// [`is_isolated`]) -- and returns their statuses in order.
+#[allow(dead_code)]
+pub async fn settle(jobs: &job::Jobs, ids: &[job::JobId]) -> anyhow::Result<Vec<job::JobStatus>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let mut statuses = Vec::with_capacity(ids.len());
+        for id in ids {
+            statuses.push(jobs.handle(*id).load().await?.state());
+        }
+        if statuses.iter().all(|s| s.is_terminal() || is_isolated(s)) {
+            return Ok(statuses);
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "items never settled; last statuses {statuses:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[allow(dead_code)]
+pub fn completed(statuses: &[job::JobStatus]) -> usize {
+    statuses
+        .iter()
+        .filter(|s| matches!(s, job::JobStatus::Completed { .. }))
+        .count()
+}
+
+#[allow(dead_code)]
+pub fn isolated(statuses: &[job::JobStatus]) -> usize {
+    statuses.iter().filter(|s| is_isolated(s)).count()
+}
+
 /// Block until `id`'s execution row reaches `state`, or `timeout` elapses.
 ///
 /// A condition-wait, not a sleep: it returns the instant the row is observed

@@ -10,6 +10,8 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::entity::RetryBand;
+
 /// Rust-side mirror of the `JobExecutionState` Postgres enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "jobexecutionstate", rename_all = "lowercase")]
@@ -44,7 +46,12 @@ impl JobExecutionRow {
     }
 
     /// The runtime [`JobStatus`] for a live row, given the job's `queue_id`.
-    pub(crate) fn status(&self, queue_id: Option<String>) -> JobStatus {
+    pub(crate) fn status(
+        &self,
+        queue_id: Option<String>,
+        band: RetryBand,
+        last_error: Option<String>,
+    ) -> JobStatus {
         match self.state {
             JobExecutionState::Pending => JobStatus::Pending {
                 scheduled_at: self
@@ -52,6 +59,8 @@ impl JobExecutionRow {
                     .expect("pending execution row always has execute_at"),
                 attempt: self.attempt(),
                 queue_id,
+                band,
+                last_error,
             },
             JobExecutionState::Running => JobStatus::Running {
                 attempt: self.attempt(),
@@ -64,16 +73,23 @@ impl JobExecutionRow {
 
 /// Runtime status of a job, carried by [`JobSnapshot::state`](crate::JobSnapshot::state).
 ///
-/// `Pending`/`Running` describe a live execution row; `Completed`/`Errored`
+/// `Pending`/`Running` describe a live execution row; `Completed`/`Failed`
 /// are terminal (the execution row has been removed). `queue_id` is immutable
 /// job metadata and is present on every variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
     /// The job is scheduled and waiting to be claimed by a poller.
+    ///
+    /// `band` and `last_error` describe a pending retry: the band the next
+    /// attempt was scheduled in and the error that put it there. A job that
+    /// has not failed since it was last scheduled reports
+    /// [`RetryBand::Transient`] and `None`.
     Pending {
         scheduled_at: DateTime<Utc>,
         attempt: u32,
         queue_id: Option<String>,
+        band: RetryBand,
+        last_error: Option<String>,
     },
     /// The job is currently executing on a poller instance.
     Running {
@@ -83,10 +99,10 @@ pub enum JobStatus {
     },
     /// The job reached terminal success.
     Completed { queue_id: Option<String> },
-    /// The job exhausted its retries and was marked as errored; `error` is
-    /// the final error string from the entity's last `ExecutionErrored` event.
-    Errored {
-        error: String,
+    /// The job returned [`JobCompletion::Fail`](crate::JobCompletion::Fail);
+    /// `reason` is the string it gave.
+    Failed {
+        reason: String,
         queue_id: Option<String>,
     },
 }
@@ -99,15 +115,12 @@ impl JobStatus {
             JobStatus::Pending { queue_id, .. }
             | JobStatus::Running { queue_id, .. }
             | JobStatus::Completed { queue_id }
-            | JobStatus::Errored { queue_id, .. } => queue_id.as_deref(),
+            | JobStatus::Failed { queue_id, .. } => queue_id.as_deref(),
         }
     }
 
     /// `true` once the job has reached a terminal state.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            JobStatus::Completed { .. } | JobStatus::Errored { .. }
-        )
+        matches!(self, JobStatus::Completed { .. } | JobStatus::Failed { .. })
     }
 }

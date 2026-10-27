@@ -12,6 +12,7 @@ use crate::{
     JobId,
     error::{CouldNotSerialize, JobFault},
     outcome::{JobReturnValue, JobTerminalState},
+    runner::Backoff,
 };
 
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize)]
@@ -107,11 +108,17 @@ pub enum JobEvent {
     },
     ExecutionErrored {
         error: String,
+        lane: FailureLane,
     },
     ReturnValueUpdated {
         return_value: JobReturnValue,
     },
     JobCompleted,
+    /// The job itself concluded it cannot succeed (`JobCompletion::Fail`).
+    /// The only failure-terminal event.
+    JobFailed {
+        reason: String,
+    },
     AttemptCounterReset,
     /// A batch's write was rescheduled because the *shared connection pool*
     /// was under pressure (`sqlx::Error::PoolTimedOut`), not because
@@ -125,43 +132,125 @@ pub enum JobEvent {
     },
 }
 
+/// The two lanes the job crate acts on. errlanes' `Lane` has no serde
+/// derive and carries Rejected/Denied, which `dispatch_job` has already
+/// narrowed away by the time a failure reaches the entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureLane {
+    Transient,
+    Fatal,
+}
+
+impl From<&JobFault> for FailureLane {
+    fn from(failure: &JobFault) -> Self {
+        if failure.is_fatal() {
+            FailureLane::Fatal
+        } else {
+            FailureLane::Transient
+        }
+    }
+}
+
+/// Which part of the retry curve a failed job's next attempt was scheduled
+/// on. The transient band logs at `WARN`, the fatal band at `ERROR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryBand {
+    Transient,
+    Fatal,
+}
+
+impl From<RetryBand> for FailureLane {
+    fn from(band: RetryBand) -> Self {
+        match band {
+            RetryBand::Transient => FailureLane::Transient,
+            RetryBand::Fatal => FailureLane::Fatal,
+        }
+    }
+}
+
+impl From<FailureLane> for RetryBand {
+    fn from(lane: FailureLane) -> Self {
+        match lane {
+            FailureLane::Transient => RetryBand::Transient,
+            FailureLane::Fatal => RetryBand::Fatal,
+        }
+    }
+}
+
+impl RetryBand {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RetryBand::Transient => "transient",
+            RetryBand::Fatal => "fatal",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RetryPolicy {
-    pub max_attempts: Option<u32>,
-    pub min_backoff: Duration,
-    pub max_backoff: Duration,
-    pub backoff_jitter_pct: u8,
+    pub backoff: Backoff,
     pub attempt_reset_after_healthy_run: Option<Duration>,
-    pub terminal_on_fatal: bool,
+}
+
+/// What `Job::maybe_schedule_retry` decided for one failed attempt.
+pub(crate) struct ScheduledRetry {
+    pub at: DateTime<Utc>,
+    pub next_attempt: u32,
+    pub band: RetryBand,
+    pub fatal_streak: u32,
+}
+
+fn doubled_ms(base_ms: u64, exponent: u32) -> u64 {
+    if base_ms == 0 {
+        0
+    } else if exponent >= 63 {
+        u64::MAX
+    } else {
+        base_ms.saturating_mul(1u64 << exponent)
+    }
 }
 
 impl RetryPolicy {
-    fn next_attempt_at(&self, now: DateTime<Utc>, attempt: u32) -> DateTime<Utc> {
-        let backoff_ms = self.calculate_backoff(attempt);
-        now + Duration::from_millis(backoff_ms)
-    }
+    /// The delay and band of the retry that follows a failed attempt
+    /// `attempt` (>= 1) of the given `lane`. `fatal_streak` is the number of
+    /// consecutive trailing `Fatal` failures INCLUDING this one.
+    pub(crate) fn next_retry(
+        &self,
+        lane: FailureLane,
+        attempt: u32,
+        fatal_streak: u32,
+    ) -> (Duration, RetryBand) {
+        let fatal_min_ms = self.backoff.fatal_min().as_millis() as u64;
+        let max_ms = self.backoff.max().as_millis() as u64;
+        let transient_ms = doubled_ms(
+            self.backoff.transient_min().as_millis() as u64,
+            attempt.saturating_sub(1),
+        );
 
-    fn calculate_backoff(&self, attempt: u32) -> u64 {
-        // Calculate base exponential backoff with overflow protection
-        let safe_attempt = attempt.saturating_sub(1).min(30);
-        let base_ms = self.min_backoff.as_millis() as u64;
-        let max_ms = self.max_backoff.as_millis() as u64;
+        let (delay_ms, band) = match lane {
+            FailureLane::Transient if transient_ms < fatal_min_ms => {
+                (transient_ms, RetryBand::Transient)
+            }
+            FailureLane::Transient => (transient_ms.min(max_ms), RetryBand::Fatal),
+            FailureLane::Fatal => {
+                let fatal_ms = doubled_ms(fatal_min_ms, fatal_streak.saturating_sub(1));
+                (transient_ms.max(fatal_ms).min(max_ms), RetryBand::Fatal)
+            }
+        };
 
-        // Use u64 arithmetic with saturation to prevent overflow
-        let backoff = base_ms.saturating_mul(1u64 << safe_attempt).min(max_ms);
-
-        // Apply jitter if configured
-        if self.backoff_jitter_pct == 0 {
-            backoff
+        let delay_ms = if self.backoff.jitter_pct() == 0 {
+            delay_ms
         } else {
-            self.apply_jitter(backoff, max_ms)
-        }
+            self.apply_jitter(delay_ms, max_ms)
+        };
+        (Duration::from_millis(delay_ms), band)
     }
 
     fn apply_jitter(&self, backoff_ms: u64, max_ms: u64) -> u64 {
         // Overflow-safe jitter: compute the magnitude in u128 (clamped to max_ms
         // and i64's range), then add with saturation.
-        let jitter_amount = ((backoff_ms as u128) * (self.backoff_jitter_pct as u128) / 100)
+        let jitter_amount = ((backoff_ms as u128) * (self.backoff.jitter_pct() as u128) / 100)
             .min(max_ms as u128)
             .min(i64::MAX as u128) as i64;
         let jitter = rng().random_range(-jitter_amount..=jitter_amount);
@@ -212,37 +301,88 @@ impl Job {
 
     /// Determine the terminal state of a job, if it has reached one.
     ///
-    /// - `Errored` if `JobCompleted` exists and the last execution event before it was
-    ///   `ExecutionErrored`
-    /// - `Completed` if `JobCompleted` exists (normal completion)
+    /// - `Completed` if the last event is `JobCompleted`
+    /// - `Failed` if the last event is `JobFailed`
     /// - `None` if the job has not reached a terminal state
     pub fn terminal_state(&self) -> Option<JobTerminalState> {
-        let mut rev = self.events.iter_all().rev();
-        match rev.next()? {
-            JobEvent::JobCompleted => match rev.next() {
-                Some(JobEvent::ExecutionErrored { .. }) => Some(JobTerminalState::Errored),
-                _ => Some(JobTerminalState::Completed),
-            },
+        match self.events.iter_all().next_back()? {
+            JobEvent::JobCompleted => Some(JobTerminalState::Completed),
+            JobEvent::JobFailed { .. } => Some(JobTerminalState::Failed),
+            _ => None,
+        }
+    }
+
+    /// The reason the job gave in `JobCompletion::Fail`, if it failed.
+    pub(crate) fn failure_reason(&self) -> Option<&str> {
+        match self.events.iter_all().next_back()? {
+            JobEvent::JobFailed { reason } => Some(reason.as_str()),
             _ => None,
         }
     }
 
     /// Returns the error string of the latest `ExecutionErrored` event, if any.
     ///
-    /// Recorded on **every** failed attempt, not only at terminal: a retry with
-    /// attempts remaining pushes `ExecutionErrored { error }` via
-    /// `schedule_retry`, and the terminal path pushes it via `error_job` before
-    /// `JobCompleted`. So this is `Some` for a mid-retry (still-running) job as
-    /// well as a terminally errored one — the signal a wedged, never-terminal
-    /// handler needs.
+    /// Recorded on **every** failed attempt, so this is `Some` for a
+    /// mid-retry (still-running) job -- the signal a wedged handler needs.
     pub(crate) fn last_error(&self) -> Option<&str> {
         self.events.iter_all().rev().find_map(|event| {
-            if let JobEvent::ExecutionErrored { error } = event {
+            if let JobEvent::ExecutionErrored { error, .. } = event {
                 Some(error.as_str())
             } else {
                 None
             }
         })
+    }
+
+    /// The band the job's pending retry sits in and the error that put it
+    /// there, derived from events alone: the last `ExecutionErrored`, if it
+    /// is the most recent execution-level event.
+    pub(crate) fn pending_retry(&self) -> (RetryBand, Option<String>) {
+        for event in self.events.iter_all().rev() {
+            match event {
+                JobEvent::ExecutionScheduled { .. }
+                | JobEvent::CongestionRescheduled { .. }
+                | JobEvent::ReturnValueUpdated { .. } => {}
+                JobEvent::ExecutionErrored { error, lane } => {
+                    return (RetryBand::from(*lane), Some(error.clone()));
+                }
+                _ => break,
+            }
+        }
+        (RetryBand::Transient, None)
+    }
+
+    /// Consecutive trailing `ExecutionErrored { lane: Fatal }` events,
+    /// counting from the most recent one. `CongestionRescheduled` and
+    /// `ExecutionAborted` are transparent (neither is evidence about the
+    /// job), as are the bookkeeping events that accompany a retry. Stops at
+    /// `ExecutionCompleted`, `JobCompleted`, `JobFailed`,
+    /// `AttemptCounterReset`, or a `Transient` error. 0 when the last error
+    /// was not Fatal.
+    pub(super) fn fatal_streak(&self) -> u32 {
+        let mut streak = 0;
+        for event in self.events.iter_all().rev() {
+            match event {
+                JobEvent::ExecutionErrored {
+                    lane: FailureLane::Fatal,
+                    ..
+                } => streak += 1,
+                JobEvent::ExecutionErrored {
+                    lane: FailureLane::Transient,
+                    ..
+                }
+                | JobEvent::ExecutionCompleted
+                | JobEvent::JobCompleted
+                | JobEvent::JobFailed { .. }
+                | JobEvent::AttemptCounterReset
+                | JobEvent::Initialized { .. } => break,
+                JobEvent::ExecutionScheduled { .. }
+                | JobEvent::ExecutionAborted { .. }
+                | JobEvent::CongestionRescheduled { .. }
+                | JobEvent::ReturnValueUpdated { .. } => {}
+            }
+        }
+        streak
     }
 
     /// Returns the raw return value attached to this job, if any.
@@ -307,19 +447,20 @@ impl Job {
     pub(super) fn schedule_retry(
         &mut self,
         error: String,
+        lane: FailureLane,
         scheduled_at: DateTime<Utc>,
         attempt: u32,
     ) {
-        self.events.push(JobEvent::ExecutionErrored { error });
+        self.events.push(JobEvent::ExecutionErrored { error, lane });
         self.events.push(JobEvent::ExecutionScheduled {
             attempt,
             scheduled_at,
         });
     }
 
-    pub(super) fn error_job(&mut self, error: String) {
-        self.events.push(JobEvent::ExecutionErrored { error });
-        self.events.push(JobEvent::JobCompleted);
+    pub(super) fn fail_job(&mut self, reason: String) {
+        self.events.push(JobEvent::ExecutionCompleted);
+        self.events.push(JobEvent::JobFailed { reason });
     }
 
     /// Reschedule after a pool-congestion classification
@@ -395,18 +536,11 @@ impl Job {
         es_entity::Idempotent::Executed(())
     }
 
-    /// `failure` is the classified [`JobFault`] that ended this attempt --
-    /// `failure.is_fatal()` is errlanes' claim that it will not succeed on
-    /// retry (a `Denied` was already narrowed to `Fatal(Denied)` at the job
-    /// boundary). Job acts on that claim only when the
-    /// type opts in with `retry_policy.terminal_on_fatal`, in which case the
-    /// job ends on THIS attempt regardless of the attempt-count budget. By
-    /// default the lane is reported but not acted on, and the error takes
-    /// the ordinary attempt-count path like any other -- see
-    /// `RetrySettings::terminal_on_fatal`. On exhaustion the failure is
-    /// narrowed into `Fatal(Exhausted)` before its text is persisted, so the
-    /// stored error says it was retried to exhaustion rather than reading
-    /// like its last transient alone.
+    /// Schedule the retry that follows a failed attempt. `failure` is the
+    /// classified [`JobFault`] that ended it (a `Denied` was already narrowed
+    /// to `Fatal(Denied)` at the job boundary); its lane picks where the
+    /// retry enters the backoff curve. Always schedules: nothing here ends a
+    /// job.
     pub(super) fn maybe_schedule_retry(
         &mut self,
         now: DateTime<Utc>,
@@ -414,7 +548,7 @@ impl Job {
         run_duration: Duration,
         retry_policy: &RetryPolicy,
         failure: &JobFault,
-    ) -> Option<(DateTime<Utc>, u32)> {
+    ) -> ScheduledRetry {
         let mut current_attempt = attempt.max(1);
         // Only a counter that has actually accumulated can be forgiven; every
         // completion path already sets `attempt_index = 1` in its own
@@ -425,24 +559,21 @@ impl Job {
             self.events.push(JobEvent::AttemptCounterReset);
         }
 
-        if failure.is_fatal() && retry_policy.terminal_on_fatal {
-            self.error_job(failure.message());
-            return None;
-        }
-
         let next_attempt = current_attempt.saturating_add(1);
-        let max_attempts = retry_policy.max_attempts.unwrap_or(u32::MAX);
-        if next_attempt > max_attempts {
-            // errlanes' own exhaustion: a Transient becomes Fatal(Exhausted)
-            // carrying `attempts` and the last transient; a Fatal passes
-            // through unchanged.
-            self.error_job(failure.clone().narrow_transient(current_attempt).message());
-            return None;
+        let prior_streak = self.fatal_streak();
+        let (delay, band) = retry_policy.next_retry(
+            FailureLane::from(failure),
+            current_attempt,
+            prior_streak.saturating_add(1),
+        );
+        let at = now + delay;
+        self.schedule_retry(failure.message(), FailureLane::from(band), at, next_attempt);
+        ScheduledRetry {
+            at,
+            next_attempt,
+            band,
+            fatal_streak: self.fatal_streak(),
         }
-
-        let reschedule_at = retry_policy.next_attempt_at(now, current_attempt);
-        self.schedule_retry(failure.message(), reschedule_at, next_attempt);
-        Some((reschedule_at, next_attempt))
     }
 }
 
@@ -471,6 +602,7 @@ impl TryFromEvents<JobEvent> for Job {
                 JobEvent::ExecutionErrored { .. } => {}
                 JobEvent::ReturnValueUpdated { .. } => {}
                 JobEvent::JobCompleted => {}
+                JobEvent::JobFailed { .. } => {}
                 JobEvent::AttemptCounterReset => {}
                 JobEvent::CongestionRescheduled { .. } => {}
             }
@@ -556,12 +688,13 @@ mod tests {
         use super::*;
         use chrono::Duration as ChronoDuration;
         use es_entity::clock::Clock;
-        use es_entity::errlanes::{Transient, TransientKind};
+        use es_entity::errlanes::{Fatal, FatalKind, Transient, TransientKind};
         use es_entity::events::GenericEvent;
         use serde_json::json;
         use std::time::Duration;
 
         const TEST_MIN_BACKOFF_SECS: u64 = 30;
+        const TEST_FATAL_MIN_BACKOFF_SECS: u64 = 480;
         const TEST_MAX_BACKOFF_SECS: u64 = 600;
         const TEST_HEALTHY_RUN_SECS: u64 = 60 * 60;
 
@@ -621,6 +754,7 @@ mod tests {
             (
                 JobEvent::ExecutionErrored {
                     error: error.to_string(),
+                    lane: FailureLane::Transient,
                 },
                 scheduled_at + ChronoDuration::seconds(1),
             )
@@ -657,22 +791,78 @@ mod tests {
                 .expect("no events")
         }
 
-        fn build_retry_policy(max_attempts: Option<u32>) -> RetryPolicy {
-            build_retry_policy_with_reset(max_attempts, Some(healthy_run()))
+        fn build_retry_policy() -> RetryPolicy {
+            build_retry_policy_with_reset(Some(healthy_run()))
         }
 
         fn build_retry_policy_with_reset(
-            max_attempts: Option<u32>,
             attempt_reset_after_healthy_run: Option<Duration>,
         ) -> RetryPolicy {
             RetryPolicy {
-                max_attempts,
-                min_backoff: Duration::from_secs(TEST_MIN_BACKOFF_SECS),
-                max_backoff: Duration::from_secs(TEST_MAX_BACKOFF_SECS),
-                backoff_jitter_pct: 0,
+                backoff: Backoff::new(
+                    Duration::from_secs(TEST_MIN_BACKOFF_SECS),
+                    Duration::from_secs(TEST_FATAL_MIN_BACKOFF_SECS),
+                    Duration::from_secs(TEST_MAX_BACKOFF_SECS),
+                    0,
+                ),
                 attempt_reset_after_healthy_run,
-                terminal_on_fatal: false,
             }
+        }
+
+        fn default_shape_policy() -> RetryPolicy {
+            RetryPolicy {
+                backoff: Backoff::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(512),
+                    Duration::from_secs(6 * 3600),
+                    0,
+                ),
+                attempt_reset_after_healthy_run: Some(healthy_run()),
+            }
+        }
+
+        fn fatal_failure() -> JobFault {
+            Fatal::invariant("broken").into()
+        }
+
+        fn empty_job() -> Job {
+            let job_id = JobId::new();
+            job_with_history(
+                job_id,
+                vec![(
+                    JobEvent::Initialized {
+                        id: job_id,
+                        job_type: JobType::new("banded"),
+                        config: json!({}),
+                        tracing_context: None,
+                        queue_id: None,
+                        unique_key: None,
+                    },
+                    Clock::now() - ChronoDuration::minutes(5),
+                )],
+            )
+        }
+
+        fn schedule(
+            job: &mut Job,
+            policy: &RetryPolicy,
+            attempt: u32,
+            failure: &JobFault,
+        ) -> (i64, ScheduledRetry) {
+            let now = Clock::now();
+            let retry = job.maybe_schedule_retry(now, attempt, SHORT_RUN, policy, failure);
+            ((retry.at - now).num_seconds(), retry)
+        }
+
+        fn last_errored_lane(job: &Job) -> FailureLane {
+            job.events
+                .iter_all()
+                .rev()
+                .find_map(|event| match event {
+                    JobEvent::ExecutionErrored { lane, .. } => Some(*lane),
+                    _ => None,
+                })
+                .expect("an ExecutionErrored event")
         }
 
         #[test]
@@ -694,11 +884,11 @@ mod tests {
             )];
             events.push(scheduled_event(1, &latest_window));
             let mut job = job_with_history(job_id, events);
-            let retry_policy = build_retry_policy(Some(3));
+            let retry_policy = build_retry_policy();
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(Clock::now(), 1, SHORT_RUN, &retry_policy, &retry_failure())
-                .expect("retry expected");
+                .next_attempt;
 
             assert_eq!(next_attempt, 2);
             let events: Vec<_> = job.events.iter_all().collect();
@@ -729,11 +919,11 @@ mod tests {
                 now - ChronoDuration::minutes(5),
             )];
             let mut job = job_with_history(job_id, events);
-            let retry_policy = build_retry_policy(Some(3));
+            let retry_policy = build_retry_policy();
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(Clock::now(), 0, SHORT_RUN, &retry_policy, &retry_failure())
-                .expect("retry expected when attempt starts at zero");
+                .next_attempt;
 
             assert_eq!(next_attempt, 2);
             let events: Vec<_> = job.events.iter_all().collect();
@@ -748,50 +938,7 @@ mod tests {
         }
 
         #[test]
-        fn maybe_schedule_retry_records_terminal_failure_when_limit_hit() {
-            let now = Clock::now();
-            let job_type = JobType::new("retry-terminal");
-            let job_id = JobId::new();
-            let first_window = schedule_window(now, ChronoDuration::minutes(5));
-            let second_window = schedule_window(now, ChronoDuration::minutes(1));
-            let mut events = vec![(
-                JobEvent::Initialized {
-                    id: job_id,
-                    job_type: job_type.clone(),
-                    config: json!({}),
-                    tracing_context: None,
-                    queue_id: None,
-                    unique_key: None,
-                },
-                now - ChronoDuration::minutes(10),
-            )];
-            push_attempt(&mut events, 1, &first_window, Some("first"));
-            events.push(scheduled_event(2, &second_window));
-            let mut job = job_with_history(job_id, events);
-            let retry_policy = build_retry_policy(Some(2));
-
-            assert!(
-                job.maybe_schedule_retry(
-                    Clock::now(),
-                    2,
-                    SHORT_RUN,
-                    &retry_policy,
-                    &retry_failure(),
-                )
-                .is_none(),
-                "should stop retrying when attempts exhausted"
-            );
-
-            let events: Vec<_> = job.events.iter_all().collect();
-            assert!(matches!(
-                events[events.len() - 2],
-                JobEvent::ExecutionErrored { .. }
-            ));
-            assert!(matches!(events.last(), Some(JobEvent::JobCompleted)));
-        }
-
-        #[test]
-        fn maybe_schedule_retry_resets_attempt_after_healthy_run() {
+        fn forgiveness_still_resets() {
             let now = Clock::now();
             let job_type = JobType::new("retry-reset");
             let job_id = JobId::new();
@@ -811,9 +958,9 @@ mod tests {
             push_attempt(&mut events, 1, &first_window, Some("first"));
             events.push(scheduled_event(2, &healthy_window));
             let mut job = job_with_history(job_id, events);
-            let retry_policy = build_retry_policy(Some(5));
+            let retry_policy = build_retry_policy();
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
                     2,
@@ -821,7 +968,7 @@ mod tests {
                     &retry_policy,
                     &retry_failure(),
                 )
-                .expect("retry expected");
+                .next_attempt;
 
             assert_eq!(
                 next_attempt, 2,
@@ -839,45 +986,6 @@ mod tests {
             assert!(matches!(
                 events.last(),
                 Some(JobEvent::ExecutionScheduled { attempt: 2, .. })
-            ));
-        }
-
-        #[test]
-        fn maybe_schedule_retry_allows_retry_when_next_attempt_hits_limit() {
-            let now = Clock::now();
-            let job_type = JobType::new("retry-max-boundary");
-            let job_id = JobId::new();
-            let first_window = schedule_window(now, ChronoDuration::minutes(5));
-            let latest_window = schedule_window(now, ChronoDuration::minutes(1));
-            let mut events = vec![(
-                JobEvent::Initialized {
-                    id: job_id,
-                    job_type: job_type.clone(),
-                    config: json!({}),
-                    tracing_context: None,
-                    queue_id: None,
-                    unique_key: None,
-                },
-                now - ChronoDuration::minutes(5),
-            )];
-            push_attempt(&mut events, 1, &first_window, Some("first"));
-            events.push(scheduled_event(2, &latest_window));
-            let mut job = job_with_history(job_id, events);
-            let retry_policy = build_retry_policy(Some(3));
-
-            let (_, next_attempt) = job
-                .maybe_schedule_retry(Clock::now(), 2, SHORT_RUN, &retry_policy, &retry_failure())
-                .expect("final retry should still be scheduled");
-
-            assert_eq!(next_attempt, 3);
-            let events: Vec<_> = job.events.iter_all().collect();
-            assert!(matches!(
-                events[events.len() - 2],
-                JobEvent::ExecutionErrored { .. }
-            ));
-            assert!(matches!(
-                events.last(),
-                Some(JobEvent::ExecutionScheduled { attempt: 3, .. })
             ));
         }
 
@@ -904,9 +1012,9 @@ mod tests {
             push_attempt(&mut events, 2, &second_window, Some("second"));
             events.push(scheduled_event(3, &healthy_window));
             let mut job = job_with_history(job_id, events);
-            let retry_policy = build_retry_policy(Some(3));
+            let retry_policy = build_retry_policy();
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
                     3,
@@ -914,7 +1022,7 @@ mod tests {
                     &retry_policy,
                     &retry_failure(),
                 )
-                .expect("a healthy run should reset attempt even at limit");
+                .next_attempt;
 
             assert_eq!(next_attempt, 2);
             let events: Vec<_> = job.events.iter_all().collect();
@@ -930,52 +1038,6 @@ mod tests {
                 events.last(),
                 Some(JobEvent::ExecutionScheduled { attempt: 2, .. })
             ));
-        }
-
-        #[test]
-        fn maybe_schedule_retry_with_unbounded_limit_handles_saturation() {
-            let now = Clock::now();
-            let job_type = JobType::new("retry-unbounded");
-            let job_id = JobId::new();
-            let attempt = u32::MAX;
-            let latest_window = schedule_window(now, ChronoDuration::minutes(1));
-            let mut events = vec![(
-                JobEvent::Initialized {
-                    id: job_id,
-                    job_type: job_type.clone(),
-                    config: json!({}),
-                    tracing_context: None,
-                    queue_id: None,
-                    unique_key: None,
-                },
-                now - ChronoDuration::minutes(1),
-            )];
-            events.push(scheduled_event(attempt, &latest_window));
-            let mut job = job_with_history(job_id, events);
-            let retry_policy = build_retry_policy(None);
-
-            let (_, next_attempt) = job
-                .maybe_schedule_retry(
-                    Clock::now(),
-                    attempt,
-                    SHORT_RUN,
-                    &retry_policy,
-                    &retry_failure(),
-                )
-                .expect("unbounded retries should permit another schedule");
-
-            assert_eq!(next_attempt, u32::MAX);
-            let events: Vec<_> = job.events.iter_all().collect();
-            assert!(matches!(
-                events[events.len() - 2],
-                JobEvent::ExecutionErrored { .. }
-            ));
-            match events.last() {
-                Some(JobEvent::ExecutionScheduled { attempt, .. }) => {
-                    assert_eq!(*attempt, u32::MAX);
-                }
-                other => panic!("expected execution scheduled event, got {other:?}"),
-            }
         }
 
         /// Build a history whose latest scheduled attempt is `attempt`, with
@@ -1030,9 +1092,9 @@ mod tests {
         #[test]
         fn long_running_execution_forgives_attempt_count() {
             let mut job = job_at_attempt_without_completion(20);
-            let retry_policy = build_retry_policy(Some(30));
+            let retry_policy = build_retry_policy();
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
                     20,
@@ -1040,7 +1102,7 @@ mod tests {
                     &retry_policy,
                     &retry_failure(),
                 )
-                .expect("retry expected");
+                .next_attempt;
 
             assert_eq!(next_attempt, 2, "a six-hour run forgives the counter");
             assert_eq!(reset_events(&job), 1, "exactly one reset event");
@@ -1051,13 +1113,13 @@ mod tests {
         #[test]
         fn fast_failure_does_not_forgive_attempt_count() {
             let mut job = job_at_attempt_without_completion(5);
-            let retry_policy = build_retry_policy(Some(30));
+            let retry_policy = build_retry_policy();
             // 24h of domain-clock time since the last schedule.
             let now = Clock::now() + ChronoDuration::hours(24);
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(now, 5, SHORT_RUN, &retry_policy, &retry_failure())
-                .expect("retry expected");
+                .next_attempt;
 
             assert_eq!(next_attempt, 6, "the counter must keep climbing");
             assert_eq!(
@@ -1074,9 +1136,9 @@ mod tests {
         #[test]
         fn reset_does_not_fire_at_first_attempt() {
             let mut job = job_at_attempt_without_completion(1);
-            let retry_policy = build_retry_policy(Some(30));
+            let retry_policy = build_retry_policy();
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
                     1,
@@ -1084,7 +1146,7 @@ mod tests {
                     &retry_policy,
                     &retry_failure(),
                 )
-                .expect("retry expected");
+                .next_attempt;
 
             assert_eq!(next_attempt, 2);
             assert_eq!(
@@ -1097,9 +1159,9 @@ mod tests {
         #[test]
         fn reset_disabled_when_threshold_is_none() {
             let mut job = job_at_attempt_without_completion(20);
-            let retry_policy = build_retry_policy_with_reset(Some(30), None);
+            let retry_policy = build_retry_policy_with_reset(None);
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
                     20,
@@ -1107,7 +1169,7 @@ mod tests {
                     &retry_policy,
                     &retry_failure(),
                 )
-                .expect("retry expected");
+                .next_attempt;
 
             assert_eq!(next_attempt, 21, "forgiveness is off; the counter climbs");
             assert_eq!(reset_events(&job), 0);
@@ -1116,9 +1178,9 @@ mod tests {
         #[test]
         fn run_duration_at_threshold_forgives() {
             let mut job = job_at_attempt_without_completion(7);
-            let retry_policy = build_retry_policy(Some(30));
+            let retry_policy = build_retry_policy();
 
-            let (_, next_attempt) = job
+            let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
                     7,
@@ -1126,7 +1188,7 @@ mod tests {
                     &retry_policy,
                     &retry_failure(),
                 )
-                .expect("retry expected");
+                .next_attempt;
 
             assert_eq!(next_attempt, 2, "the predicate is `>=`, so equality resets");
             assert_eq!(reset_events(&job), 1);
@@ -1168,8 +1230,8 @@ mod tests {
         }
 
         #[test]
-        fn maybe_schedule_retry_terminates_at_max_attempts_despite_domain_clock_jumps() {
-            let retry_policy = build_retry_policy(Some(4));
+        fn attempt_index_keeps_climbing_despite_domain_clock_jumps() {
+            let retry_policy = build_retry_policy();
             let job_type = JobType::new("issue-163-loop");
             let job_id = JobId::new();
             let mut now = Clock::now();
@@ -1194,7 +1256,6 @@ mod tests {
                 ),
             ];
             let mut attempt = 1u32;
-            let mut terminated = false;
             // Reload the entity from persisted history every cycle, exactly
             // like the real dispatch loop (each failure is a separate
             // transaction), then jump the domain clock forward by hours.
@@ -1202,41 +1263,225 @@ mod tests {
             // evidence the policy now accepts.
             for _ in 0..12 {
                 let mut job = job_from_raw_history(job_id, &history);
-                match job.maybe_schedule_retry(
+                let retry = job.maybe_schedule_retry(
                     now,
                     attempt,
                     SHORT_RUN,
                     &retry_policy,
                     &retry_failure(),
-                ) {
-                    Some((reschedule_at, next_attempt)) => {
-                        history.push((
-                            raw_event(JobEvent::ExecutionErrored {
-                                error: "boom".to_string(),
-                            }),
-                            now,
-                        ));
-                        history.push((
-                            raw_event(JobEvent::ExecutionScheduled {
-                                attempt: next_attempt,
-                                scheduled_at: reschedule_at,
-                            }),
-                            now,
-                        ));
-                        attempt = next_attempt;
-                        now += ChronoDuration::hours(6);
-                    }
-                    None => {
-                        terminated = true;
-                        break;
-                    }
-                }
+                );
+                assert_eq!(
+                    retry.next_attempt,
+                    attempt + 1,
+                    "domain-clock advancement alone must not reset the attempt counter (issue #163)"
+                );
+                assert!(
+                    job.terminal_state().is_none(),
+                    "nothing terminates a job by retrying"
+                );
+                history.push((
+                    raw_event(JobEvent::ExecutionErrored {
+                        error: "boom".to_string(),
+                        lane: FailureLane::Transient,
+                    }),
+                    now,
+                ));
+                history.push((
+                    raw_event(JobEvent::ExecutionScheduled {
+                        attempt: retry.next_attempt,
+                        scheduled_at: retry.at,
+                    }),
+                    now,
+                ));
+                attempt = retry.next_attempt;
+                now += ChronoDuration::hours(6);
             }
+            assert_eq!(attempt, 13);
+        }
+
+        #[test]
+        fn transient_climbs_from_transient_min() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+
+            for attempt in 1..=9 {
+                let (delay, retry) = schedule(&mut job, &policy, attempt, &retry_failure());
+                assert_eq!(delay, 1 << (attempt - 1), "attempt {attempt}");
+                assert_eq!(retry.band, RetryBand::Transient);
+                assert_eq!(last_errored_lane(&job), FailureLane::Transient);
+            }
+        }
+
+        #[test]
+        fn transient_streak_crosses_at_fatal_min() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+            for attempt in 1..=9 {
+                schedule(&mut job, &policy, attempt, &retry_failure());
+            }
+
+            let (delay, retry) = schedule(&mut job, &policy, 10, &retry_failure());
+
+            assert_eq!(delay, 512);
+            assert_eq!(retry.band, RetryBand::Fatal);
+            assert_eq!(last_errored_lane(&job), FailureLane::Fatal);
+            assert_eq!(retry.fatal_streak, 1);
+        }
+
+        #[test]
+        fn transient_streak_continues_past_crossing() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+            for attempt in 1..=11 {
+                schedule(&mut job, &policy, attempt, &retry_failure());
+            }
+
+            let (delay, retry) = schedule(&mut job, &policy, 12, &retry_failure());
+
+            assert_eq!(delay, 2048);
+            assert_eq!(retry.band, RetryBand::Fatal);
+        }
+
+        #[test]
+        fn fatal_enters_at_fatal_min() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+
+            let (delay, retry) = schedule(&mut job, &policy, 1, &fatal_failure());
+
+            assert_eq!(delay, 512);
+            assert_eq!(retry.band, RetryBand::Fatal);
+            assert_eq!(retry.fatal_streak, 1);
+            assert_eq!(job.fatal_streak(), 1);
+        }
+
+        #[test]
+        fn fatal_streak_doubles() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+
+            let delays: Vec<i64> = (1..=3)
+                .map(|attempt| schedule(&mut job, &policy, attempt, &fatal_failure()).0)
+                .collect();
+
+            assert_eq!(delays, vec![512, 1024, 2048]);
+            assert_eq!(job.fatal_streak(), 3);
+        }
+
+        #[test]
+        fn fatal_late_in_transient_streak_does_not_drop_back() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+            for attempt in 1..=12 {
+                schedule(&mut job, &policy, attempt, &retry_failure());
+            }
+
+            let (delay, retry) = schedule(&mut job, &policy, 13, &fatal_failure());
+
+            assert_eq!(delay, 4096);
+            assert_eq!(retry.band, RetryBand::Fatal);
+        }
+
+        #[test]
+        fn transient_after_fatal_returns_to_its_band() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+            schedule(&mut job, &policy, 1, &fatal_failure());
+
+            let (delay, retry) = schedule(&mut job, &policy, 2, &retry_failure());
+
+            assert_eq!(delay, 2);
+            assert_eq!(retry.band, RetryBand::Transient);
+            assert_eq!(retry.fatal_streak, 0);
+            assert_eq!(job.fatal_streak(), 0);
+        }
+
+        #[test]
+        fn max_caps_both_bands() {
+            let policy = default_shape_policy();
+            let max = 6 * 3600;
+
+            for attempt in [20, 1000, u32::MAX] {
+                let mut job = empty_job();
+                let (transient, _) = schedule(&mut job, &policy, attempt, &retry_failure());
+                let mut job = empty_job();
+                let (fatal, _) = schedule(&mut job, &policy, attempt, &fatal_failure());
+                assert_eq!(transient, max, "transient at attempt {attempt}");
+                assert_eq!(fatal, max, "fatal at attempt {attempt}");
+            }
+        }
+
+        #[test]
+        fn congestion_and_abort_are_transparent_to_fatal_streak() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+            schedule(&mut job, &policy, 1, &fatal_failure());
+            job.reschedule_congestion("pool".to_string(), Clock::now(), 2);
+            job.abort_execution("shutdown".to_string(), Clock::now(), 2);
+
+            let (_, retry) = schedule(&mut job, &policy, 2, &fatal_failure());
+
+            assert_eq!(retry.fatal_streak, 2);
+        }
+
+        #[test]
+        fn attempt_counter_reset_ends_fatal_streak() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+            for attempt in 1..=3 {
+                schedule(&mut job, &policy, attempt, &fatal_failure());
+            }
+            assert_eq!(job.fatal_streak(), 3);
+            job.events.push(JobEvent::AttemptCounterReset);
+            assert_eq!(job.fatal_streak(), 0);
+
+            let (_, retry) = schedule(&mut job, &policy, 1, &fatal_failure());
+
+            assert_eq!(retry.fatal_streak, 1);
+        }
+
+        #[test]
+        fn nothing_terminates_by_retrying() {
+            let policy = default_shape_policy();
+            let mut job = empty_job();
+            let panic: JobFault = Fatal::new(FatalKind::Panic).with_context("boom").into();
+
+            let (_, retry) = schedule(&mut job, &policy, 1000, &panic);
+
+            assert_eq!(retry.next_attempt, 1001);
+            assert!(job.terminal_state().is_none());
             assert!(
-                terminated,
-                "a permanently failing job must terminate at max_attempts; \
-                 domain-clock advancement alone must not reset the attempt counter (issue #163)"
+                !job.events.iter_all().any(|event| matches!(
+                    event,
+                    JobEvent::JobFailed { .. } | JobEvent::JobCompleted
+                ))
             );
+        }
+
+        #[test]
+        fn fail_job_is_terminal() {
+            let mut job = empty_job();
+
+            job.fail_job("r".to_string());
+
+            assert_eq!(job.terminal_state(), Some(JobTerminalState::Failed));
+            let snapshot = crate::JobSnapshot::from_parts(job, None, None);
+            assert_eq!(
+                snapshot.state(),
+                crate::JobStatus::Failed {
+                    reason: "r".to_string(),
+                    queue_id: None,
+                }
+            );
+        }
+
+        #[test]
+        fn backoff_invariant() {
+            let s = Duration::from_secs;
+            assert!(Backoff::try_new(s(1), s(1), s(6 * 3600), 20).is_err());
+            assert!(Backoff::try_new(s(1), s(512), s(100), 20).is_err());
+            assert!(Backoff::try_new(s(1), s(512), s(6 * 3600), 101).is_err());
+            assert!(Backoff::try_new(s(1), s(512), s(6 * 3600), 100).is_ok());
         }
     }
 
@@ -1244,21 +1489,25 @@ mod tests {
         use super::*;
         use std::time::Duration;
 
-        const MAX_BACKOFF_MS: u64 = 60_000;
+        const MAX_DELAY_MS: u64 = 60_000;
         const SECOND: Duration = Duration::from_secs(1);
 
-        fn retry_policy(
-            min_backoff: Duration,
-            max_backoff: Duration,
-            jitter_pct: u8,
-        ) -> RetryPolicy {
+        fn retry_policy(first_delay: Duration, max_delay: Duration, jitter_pct: u8) -> RetryPolicy {
             RetryPolicy {
-                max_attempts: None,
-                min_backoff,
-                max_backoff,
-                backoff_jitter_pct: jitter_pct,
+                backoff: Backoff::new(first_delay, max_delay, max_delay, jitter_pct),
                 attempt_reset_after_healthy_run: Some(Duration::from_secs(60 * 60)),
-                terminal_on_fatal: false,
+            }
+        }
+
+        trait TransientDelay {
+            fn calculate_backoff(&self, attempt: u32) -> u64;
+        }
+
+        impl TransientDelay for RetryPolicy {
+            fn calculate_backoff(&self, attempt: u32) -> u64 {
+                self.next_retry(FailureLane::Transient, attempt, 0)
+                    .0
+                    .as_millis() as u64
             }
         }
 
@@ -1278,10 +1527,10 @@ mod tests {
 
         #[test]
         fn exponential_backoff_grows_correctly() {
-            let min_backoff = Duration::from_millis(100);
-            let max_backoff = Duration::from_secs(60);
+            let first_delay = Duration::from_millis(100);
+            let max_delay = Duration::from_secs(60);
             let expected_delays = [100, 200, 400, 800];
-            let policy = retry_policy(min_backoff, max_backoff, 0);
+            let policy = retry_policy(first_delay, max_delay, 0);
 
             for (attempt, &expected) in (1..=4).zip(&expected_delays) {
                 let actual = policy.calculate_backoff(attempt);
@@ -1291,44 +1540,44 @@ mod tests {
 
         #[test]
         fn zero_attempt_handled_correctly() {
-            let min_backoff = Duration::from_millis(100);
-            let max_backoff = Duration::from_secs(60);
-            let policy = retry_policy(min_backoff, max_backoff, 0);
+            let first_delay = Duration::from_millis(100);
+            let max_delay = Duration::from_secs(60);
+            let policy = retry_policy(first_delay, max_delay, 0);
             let delay = policy.calculate_backoff(0);
 
             assert_delay_exact(delay, 100);
         }
 
         #[test]
-        fn high_attempts_capped_at_max_backoff() {
-            let min_backoff = Duration::from_millis(100);
-            let max_backoff = Duration::from_millis(MAX_BACKOFF_MS);
-            let policy = retry_policy(min_backoff, max_backoff, 0);
+        fn high_attempts_capped_at_max_delay() {
+            let first_delay = Duration::from_millis(100);
+            let max_delay = Duration::from_millis(MAX_DELAY_MS);
+            let policy = retry_policy(first_delay, max_delay, 0);
 
             for high_attempt in [20, 31, 100, 1000, u32::MAX] {
                 let delay = policy.calculate_backoff(high_attempt);
-                assert_delay_exact(delay, MAX_BACKOFF_MS);
+                assert_delay_exact(delay, MAX_DELAY_MS);
             }
         }
 
         #[test]
         fn attempts_capped_at_30() {
-            let min_backoff = Duration::from_millis(100);
-            let max_backoff = Duration::from_millis(MAX_BACKOFF_MS);
-            let policy = retry_policy(min_backoff, max_backoff, 0);
+            let first_delay = Duration::from_millis(100);
+            let max_delay = Duration::from_millis(MAX_DELAY_MS);
+            let policy = retry_policy(first_delay, max_delay, 0);
             let backoff31 = policy.calculate_backoff(31);
             let backoff100 = policy.calculate_backoff(100);
 
             assert_eq!(backoff31, backoff100, "Both should be capped at attempt 30");
-            assert_eq!(backoff31, MAX_BACKOFF_MS);
-            assert_eq!(backoff100, MAX_BACKOFF_MS);
+            assert_eq!(backoff31, MAX_DELAY_MS);
+            assert_eq!(backoff100, MAX_DELAY_MS);
         }
 
         #[test]
         fn jitter_adds_randomness() {
-            let min_backoff = Duration::from_millis(100);
-            let max_backoff = Duration::from_secs(60);
-            let policy = retry_policy(min_backoff, max_backoff, 20);
+            let first_delay = Duration::from_millis(100);
+            let max_delay = Duration::from_secs(60);
+            let policy = retry_policy(first_delay, max_delay, 20);
             let delay = policy.calculate_backoff(1);
 
             assert_delay_in_range(delay, 80, 120);
@@ -1336,9 +1585,9 @@ mod tests {
 
         #[test]
         fn jitter_never_negative() {
-            let min_backoff = Duration::from_millis(100);
-            let max_backoff = Duration::from_secs(60);
-            let policy = retry_policy(min_backoff, max_backoff, 20);
+            let first_delay = Duration::from_millis(100);
+            let max_delay = Duration::from_secs(60);
+            let policy = retry_policy(first_delay, max_delay, 20);
 
             for _ in 0..10 {
                 let delay = policy.calculate_backoff(1);
@@ -1348,9 +1597,9 @@ mod tests {
 
         #[test]
         fn deterministic_without_jitter() {
-            let min_backoff = Duration::from_millis(100);
-            let max_backoff = Duration::from_secs(60);
-            let policy = retry_policy(min_backoff, max_backoff, 0);
+            let first_delay = Duration::from_millis(100);
+            let max_delay = Duration::from_secs(60);
+            let policy = retry_policy(first_delay, max_delay, 0);
             let backoff1 = policy.calculate_backoff(5);
             let backoff2 = policy.calculate_backoff(5);
 
@@ -1381,12 +1630,13 @@ mod tests {
         #[test]
         fn should_reset_attempt_count_is_false_when_disabled() {
             let policy = RetryPolicy {
-                max_attempts: None,
-                min_backoff: Duration::from_secs(30),
-                max_backoff: Duration::from_secs(600),
-                backoff_jitter_pct: 0,
+                backoff: Backoff::new(
+                    Duration::from_secs(30),
+                    Duration::from_secs(480),
+                    Duration::from_secs(600),
+                    0,
+                ),
                 attempt_reset_after_healthy_run: None,
-                terminal_on_fatal: false,
             };
 
             assert!(
@@ -1398,15 +1648,16 @@ mod tests {
         #[test]
         fn apply_jitter_survives_huge_backoff_without_overflow() {
             // The result must stay within [0, max_ms] and never panic, even
-            // with a huge max_backoff, across many jitter draws.
+            // with a huge max delay, across many jitter draws.
             let huge = u64::MAX; // > i64::MAX
             let policy = RetryPolicy {
-                max_attempts: None,
-                min_backoff: Duration::from_millis(huge),
-                max_backoff: Duration::from_millis(huge),
-                backoff_jitter_pct: u8::MAX,
+                backoff: Backoff::new(
+                    Duration::from_millis(huge - 2),
+                    Duration::from_millis(huge - 1),
+                    Duration::from_millis(huge),
+                    100,
+                ),
                 attempt_reset_after_healthy_run: None,
-                terminal_on_fatal: false,
             };
             for _ in 0..256 {
                 let backoff = policy.calculate_backoff(1);

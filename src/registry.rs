@@ -214,29 +214,16 @@ impl JobRegistry {
     }
 
     /// Register a [`ResidentJobInitializer`]. Returns the job type that was
-    /// registered. Retry is always eternal (`n_attempts: None`) regardless
-    /// of what [`ResidentJobInitializer::retry_on_error_settings`] returns —
-    /// a resident job can never be exhausted into a terminal error — and no
-    /// concurrency entry is created: at most one job of this type ever
-    /// exists, so there is nothing to cap.
+    /// registered. The type's
+    /// [`ResidentJobInitializer::retry_on_error_settings`] apply as-is, like
+    /// any other type's. No concurrency entry is created: at most one job of
+    /// this type ever exists, so there is nothing to cap.
     pub fn add_resident_initializer<I: ResidentJobInitializer>(
         &mut self,
         initializer: I,
     ) -> JobType {
         let job_type = initializer.job_type();
-        // `terminal_on_fatal: false` alongside `n_attempts: None` for the
-        // same reason: a resident job can never be exhausted into a
-        // terminal error, and `maybe_schedule_retry`'s `terminal` branch (a
-        // runner classified as Fatal/Denied) would end the job on the
-        // attempt that produced it. Forced rather than merely defaulted:
-        // the type's own `retry_on_error_settings()` could turn it on, and
-        // a resident has no terminal state to go to (see
-        // `ResidentJobCompletion`).
-        let retry_settings = RetrySettings {
-            n_attempts: None,
-            terminal_on_fatal: false,
-            ..initializer.retry_on_error_settings()
-        };
+        let retry_settings = initializer.retry_on_error_settings();
         self.initializers.insert(
             job_type.clone(),
             Box::new(ErasedResidentInitializer(initializer)),

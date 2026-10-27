@@ -1,10 +1,11 @@
 //! Span-assertion half of the `Denied` disposition coverage (see
-//! `tests/lanes.rs::denied_runner_error_goes_terminal_with_terminal_on_fatal`
-//! for the disposition half): job narrows a `Denied` runner error to
-//! `Fatal(Denied)` at the boundary (job is not an authorization boundary --
-//! see the handoff's §2.4), so `job.fail_job`'s span must record
+//! `tests/lanes.rs::denied_runner_error_retries_in_the_fatal_band` for the
+//! disposition half): job narrows a `Denied` runner error to `Fatal(Denied)`
+//! at the boundary (job is not an authorization boundary -- see the
+//! handoff's §2.4), so `job.fail_job`'s span must record
 //! `error.lane = "fatal"` / `error.code = "denied"`, not `"denied"`/
-//! `"FORBIDDEN"`.
+//! `"FORBIDDEN"`, and -- being fatal -- `retry.band = "fatal"` at `ERROR`
+//! with `will_retry = true` on its first failure.
 //!
 //! Deliberately its own file/binary, not a test function alongside the rest
 //! of `tests/lanes.rs`. `tracing`'s per-callsite "interest" cache is
@@ -25,8 +26,8 @@ mod span_capture;
 use async_trait::async_trait;
 use es_entity::errlanes::Denied;
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSvcConfig,
-    JobTerminalState, JobType, Jobs, RetrySettings,
+    Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
+    JobSvcConfig, JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -65,15 +66,12 @@ impl JobInitializer for AlwaysDeniedInitializer {
 
     fn retry_on_error_settings(&self) -> RetrySettings {
         RetrySettings {
-            n_attempts: Some(30),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            // Opts into acting on the lane, so the job ends on attempt one
-            // and there is exactly one `job.fail_job` span to assert on.
-            // The span fields below are recorded either way -- reporting
-            // the lane never depended on this knob -- but a 30-attempt
-            // retry would leave 30 spans to disambiguate.
-            terminal_on_fatal: true,
+            backoff: Backoff::new(
+                Duration::from_millis(2),
+                Duration::from_millis(5),
+                Duration::from_millis(20),
+                0,
+            ),
             ..Default::default()
         }
     }
@@ -106,13 +104,37 @@ async fn denied_runner_error_is_recorded_as_fatal_denied_on_fail_job_span() -> a
 
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-    assert_eq!(attempts.lock().await.clone(), vec![1]);
 
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fields.get("job.fail_job", "retry.band").is_none() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "no job.fail_job span recorded retry.band; captured: {}",
+            fields.debug_dump()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        attempts.lock().await.starts_with(&[1]),
+        "the denied runner must have run"
+    );
+
+    assert_eq!(
+        fields.get("job.fail_job", "retry.band").as_deref(),
+        Some("fatal"),
+        "a narrowed Denied must land in the fatal band on its first failure; captured: {}",
+        fields.debug_dump()
+    );
+    assert_eq!(
+        fields.get("job.fail_job", "will_retry").as_deref(),
+        Some("true"),
+        "an Err is always retried"
+    );
+    assert!(
+        fields.get("job.fail_job", "retry.fatal_streak").is_some(),
+        "the fatal streak must be recorded; captured: {}",
+        fields.debug_dump()
+    );
     assert_eq!(
         fields.get("job.fail_job", "error.lane").as_deref(),
         Some("fatal"),

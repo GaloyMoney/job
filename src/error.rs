@@ -91,6 +91,15 @@ pub struct InvalidConfig {
     pub message: String,
 }
 
+/// [`Backoff::try_new`](crate::Backoff::try_new) was given values that do
+/// not satisfy `transient_min < fatal_min <= max` and `jitter_pct <= 100`.
+#[derive(Debug, errlanes::Classify)]
+#[error("invalid backoff: {reason}")]
+#[classify(fatal(Config))]
+pub struct InvalidBackoff {
+    pub reason: &'static str,
+}
+
 /// A value the job service was asked to persist did not serialize. Named
 /// per payload rather than delegating to `serde_json::Error`'s own
 /// classification, so the operator-facing chain says *which* value failed:

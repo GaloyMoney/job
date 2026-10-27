@@ -166,7 +166,7 @@ pub trait BatchedJobRunner: Send + Sync + 'static {
 }
 
 /// How a single job within a batch should be progressed.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum BatchItemOutcome {
     /// Mark this job completed.
     Complete,
@@ -174,8 +174,9 @@ pub enum BatchItemOutcome {
     RescheduleIn(std::time::Duration),
     /// Schedule this job's next run at an exact time. Resets the attempt counter.
     RescheduleAt(DateTime<Utc>),
-    /// Treat this job as failed: it is retried per the type's
-    /// [`RetrySettings`], or marked errored once attempts are exhausted.
+    /// This attempt failed: the item is retried per the type's
+    /// [`RetrySettings`], laned `Transient(Other)`. It never ends the item;
+    /// use [`BatchItemOutcome::Fail`] for that.
     ///
     /// For failures detected without poisoning the shared transaction
     /// (validation, missing precondition, a domain rule saying "no"), just
@@ -188,7 +189,12 @@ pub enum BatchItemOutcome {
     /// [`es_entity::DbOp::with_savepoint`] directly): the savepoint rolls
     /// back only that item's writes, and the shared transaction stays usable
     /// for the rest of the batch.
-    Fail(String),
+    Errored(String),
+    /// Terminal for this item: the same verdict as
+    /// [`JobCompletion::Fail`](crate::JobCompletion::Fail). No retry.
+    Fail {
+        error: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Per-job dispositions returned by a batched runner.
@@ -419,7 +425,7 @@ impl<C> CurrentBatchedJob<C> {
     /// [`BatchItemOutcome::Complete`], though a successfully-released
     /// savepoint can still resolve to `RescheduleIn`/`RescheduleAt` if the
     /// item wants to run again later. `f`'s `Err` is translated to
-    /// [`BatchItemOutcome::Fail`] (via `E`'s `Display`), so the item is
+    /// [`BatchItemOutcome::Errored`] (via `E`'s `Display`), so the item is
     /// retried per the type's [`RetrySettings`] like any other failure.
     ///
     /// Typical use, feeding the result into
@@ -479,7 +485,7 @@ impl<C> CurrentBatchedJob<C> {
             .iter()
             .zip(results)
             .map(|(item, result)| {
-                let outcome = result.unwrap_or_else(|e| BatchItemOutcome::Fail(e.to_string()));
+                let outcome = result.unwrap_or_else(|e| BatchItemOutcome::Errored(e.to_string()));
                 (item.id, outcome)
             })
             .collect())
@@ -490,7 +496,7 @@ impl<C> CurrentBatchedJob<C> {
     /// sub-ranges — largest pending range first — until each culprit is
     /// isolated (or [`BisectBudget`] runs out). Clean items resolve to
     /// [`BatchItemOutcome::Complete`] in this very dispatch; each culprit to
-    /// [`BatchItemOutcome::Fail`] (via `E`'s `Display`, from its own
+    /// [`BatchItemOutcome::Errored`] (via `E`'s `Display`, from its own
     /// singleton probe — so the message is attributable).
     ///
     /// The counterpart of [`run_isolated`](Self::run_isolated) for **true
@@ -651,9 +657,9 @@ impl<C> CurrentBatchedJob<C> {
             .map(|(item, outcome)| {
                 let disposition = match outcome {
                     ItemOutcome::Complete => BatchItemOutcome::Complete,
-                    ItemOutcome::Failed(e) => BatchItemOutcome::Fail(e.to_string()),
+                    ItemOutcome::Failed(e) => BatchItemOutcome::Errored(e.to_string()),
                     ItemOutcome::Unresolved => {
-                        BatchItemOutcome::Fail(budget_exhausted_message.clone().unwrap_or_else(
+                        BatchItemOutcome::Errored(budget_exhausted_message.clone().unwrap_or_else(
                             || format!("bisect probe budget exhausted after {probes_used} probes"),
                         ))
                     }

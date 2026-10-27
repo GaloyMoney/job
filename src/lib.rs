@@ -122,9 +122,10 @@
 //!
 //! ## Retries
 //!
-//! Retry behaviour comes from [`JobInitializer::retry_on_error_settings`]. Once
-//! attempts are exhausted the job is marked as errored and removed from the
-//! queue.
+//! Retry behaviour comes from [`JobInitializer::retry_on_error_settings`]. A
+//! runner error never ends a job: it is retried on a [`Backoff`] curve whose
+//! entry point is chosen by the failure's errlanes lane. Only the job itself
+//! ends in failure, by returning [`JobCompletion::Fail`].
 //!
 //! ```ignore
 //! impl JobInitializer for MyInitializer {
@@ -132,9 +133,12 @@
 //!
 //!     fn retry_on_error_settings(&self) -> RetrySettings {
 //!         RetrySettings {
-//!             n_attempts: Some(5),
-//!             min_backoff: Duration::from_secs(10),
-//!             max_backoff: Duration::from_secs(300),
+//!             backoff: Backoff::new(
+//!                 Duration::from_secs(10),
+//!                 Duration::from_secs(160),
+//!                 Duration::from_secs(300),
+//!                 20,
+//!             ),
 //!             ..Default::default()
 //!         }
 //!     }
@@ -448,9 +452,10 @@ pub use batched::{
 };
 pub use config::*;
 pub use current::*;
-pub use entity::{Job, JobEvent, JobType};
+pub use entity::{FailureLane, Job, JobEvent, JobType, RetryBand};
 pub use error::{
-    AwaitError, AwaitInterrupted, AwaitTimeout, InvalidConfig, JobError, JobFault, JobRejection,
+    AwaitError, AwaitInterrupted, AwaitTimeout, InvalidBackoff, InvalidConfig, JobError, JobFault,
+    JobRejection,
 };
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use handle::{JobHandle, JobHandles};

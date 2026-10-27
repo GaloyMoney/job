@@ -24,7 +24,8 @@ use super::{
         AnyBatchedJobRunner, BatchItemOutcome, BatchOutcomes, BatchRunCtx, JobBatchCompletion,
         RawBatchItem, ShutdownRx,
     },
-    entity::JobType,
+    dispatcher::record_verdict,
+    entity::{JobType, RetryBand},
     error::JobFault,
     finalizer::{ClaimDisposition, Disposition, FinalizeOutcome, Finalizer},
     notifier::JobEventNotifier,
@@ -503,8 +504,6 @@ impl BatchDispatcher {
     /// a bug in the runner, not evidence about any particular job, so it is
     /// always `Fatal` -- the dispatcher's own contract check states the lane
     /// itself rather than inferring one from whatever the runner returned.
-    /// Whether a `Fatal` ends the job is then the type's
-    /// `RetrySettings::terminal_on_fatal` decision, like any other fatal.
     fn validate(&self, outcomes: &BatchOutcomes) -> Result<(), JobFault> {
         let expected: HashSet<JobId> = self.ids.iter().copied().collect();
         let mut seen: HashSet<JobId> = HashSet::with_capacity(outcomes.len());
@@ -589,18 +588,18 @@ impl BatchDispatcher {
                     BatchItemOutcome::Complete => Disposition::Complete,
                     BatchItemOutcome::RescheduleIn(d) => Disposition::Fresh { at: now + d },
                     BatchItemOutcome::RescheduleAt(t) => Disposition::Fresh { at: t },
-                    // A per-item `BatchItemOutcome::Fail` is a plain string
+                    // A per-item `BatchItemOutcome::Errored` is a plain string
                     // the runner chose to report -- no lane payload travels
-                    // with it, so it is laned as `Transient(Other)` so it can
-                    // never be terminal on its own regardless of
-                    // `terminal_on_fatal`; it goes through the ordinary
-                    // attempt-count retry path.
-                    BatchItemOutcome::Fail(reason) => Disposition::Fail {
+                    // with it, so it is laned as `Transient(Other)`.
+                    BatchItemOutcome::Errored(reason) => Disposition::Fail {
                         failure: Transient::new(TransientKind::Other)
                             .with_context(reason)
                             .into(),
                         attempt: self.attempts.get(&id).copied().unwrap_or(1),
                         run_duration: self.run_duration,
+                    },
+                    BatchItemOutcome::Fail { error } => Disposition::Failed {
+                        reason: record_verdict(&Span::current(), &*error),
                     },
                 };
                 (id, disposition)
@@ -613,22 +612,22 @@ impl BatchDispatcher {
     fn record_seal_outcome(&mut self, outcome: &FinalizeOutcome) {
         let span = Span::current();
         span.record("n_retried", outcome.retried.len());
-        span.record("n_errored", outcome.errored_terminal.len());
+        span.record("n_failed", outcome.failed.len());
         self.rescheduled |= outcome.any_rescheduled();
     }
 
     /// Fail every job in the batch with the same error — the batch's work was
     /// rolled back, so no job in it can be considered done. One
     /// [`Disposition::Fail`] per id through [`Finalizer::finalize`]: the
-    /// retry policy is applied to each job independently — some may be
-    /// rescheduled for another attempt while others exhaust their attempts
-    /// and become terminal, all in the same transaction.
+    /// retry policy is applied to each job independently — each is
+    /// rescheduled on the band its own attempt count and the failure's lane
+    /// select, all in the same transaction.
     ///
     /// A `failure.is_congestion()` error is routed to the finalizer's
     /// congestion reschedule instead of the retry-policy path: congestion carries no
     /// evidence any of these jobs is broken, so applying `RetryPolicy`'s
-    /// attempt escalation to it would walk perfectly good jobs toward
-    /// `max_attempts` termination for a condition they didn't cause. The
+    /// attempt escalation to it would walk perfectly good jobs up the
+    /// fatal band for a condition they didn't cause. The
     /// congestion branch also deliberately skips
     /// [`Self::try_recycle_own_type`], unlike the ordinary-error branch:
     /// right after evidence the pool is unhealthy, an immediate same-type
@@ -638,7 +637,7 @@ impl BatchDispatcher {
     /// back up by the next pool-aware poll instead.
     #[errlanes::instrument(name = "job.fail_batch", skip_all,
         fields(job_type = %self.job_type, n_items = self.ids.len(),
-               n_retried = tracing::field::Empty, n_errored = tracing::field::Empty)
+               n_retried = tracing::field::Empty, n_failed = tracing::field::Empty)
     )]
     async fn fail_batch(&mut self, failure: JobFault) -> Result<(), JobFault> {
         let span = tracing::Span::current();
@@ -669,9 +668,14 @@ impl BatchDispatcher {
         let outcome = finalizer
             .finalize(&items, |op, _| self.try_recycle_own_type(op))
             .await?;
+        let fatal_band = outcome.retried.is_empty()
+            || outcome
+                .retried
+                .iter()
+                .any(|(_, retry)| retry.band == RetryBand::Fatal);
         span.record(
             "error.level",
-            tracing::field::display(if outcome.retried.is_empty() {
+            tracing::field::display(if fatal_band {
                 tracing::Level::ERROR
             } else {
                 tracing::Level::WARN

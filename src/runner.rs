@@ -7,6 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{
     current::CurrentJob,
     entity::{Job, JobType, RetryPolicy},
+    error::InvalidBackoff,
     spawner::JobSpawner,
 };
 
@@ -107,6 +108,24 @@ pub enum JobCompletion {
     RescheduleAtWithOp(es_entity::DbOp<'static>, DateTime<Utc>),
     /// Schedule the next run at an exact timestamp and return a transaction that the job service will commit.
     RescheduleAtWithTx(sqlx::Transaction<'static, sqlx::Postgres>, DateTime<Utc>),
+    /// The job has concluded it cannot succeed. Terminal: no retry, no revive.
+    /// The error is classified for the span (lane, code, source chain) and its
+    /// message is recorded on the job; whatever the domain should know goes in
+    /// the op/tx handed back by the `With*` variants. `Box<dyn Error + Send +
+    /// Sync>` is `From<String>` and `From<&str>`, so a plain reason is
+    /// `Fail("…".into())`.
+    Fail(Box<dyn std::error::Error + Send + Sync>),
+    #[cfg(feature = "es-entity")]
+    /// Like [`JobCompletion::Fail`], returning an `EsEntity` operation that the job service will commit.
+    FailWithOp(
+        es_entity::DbOp<'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    ),
+    /// Like [`JobCompletion::Fail`], returning a transaction that the job service will commit.
+    FailWithTx(
+        sqlx::Transaction<'static, sqlx::Postgres>,
+        Box<dyn std::error::Error + Send + Sync>,
+    ),
 }
 
 #[async_trait]
@@ -120,32 +139,12 @@ pub trait JobRunner: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone)]
-/// Controls retry attempt limits, telemetry escalation thresholds, and exponential backoff behaviour.
-/// Use [`RetrySettings::n_warn_attempts`] to decide how many failures remain `WARN` events before
-/// escalation. Set it to `None` to keep every retry at `WARN`.
+/// Controls how a failed attempt is retried. A runner error never ends a job:
+/// it is retried on [`Backoff`]'s curve, and only the job itself can end in
+/// failure, by returning [`JobCompletion::Fail`].
 pub struct RetrySettings {
-    /// Maximum number of consecutive attempts before the job is failed for good. `None` retries
-    /// indefinitely.
-    ///
-    /// This budget is only enforceable if failures actually accumulate.
-    /// [`RetrySettings::attempt_reset_after_healthy_run`] forgives the counter back to `1`
-    /// whenever a single execution runs at least that long before failing, so set that threshold
-    /// ABOVE this type's typical *failing* run — otherwise a job that always fails slowly is
-    /// forgiven every time and never reaches this limit, and (because escalation keys off the
-    /// same counter) never escalates past `WARN` either.
-    pub n_attempts: Option<u32>,
-    /// Number of consecutive failures that can be emitted as `WARN` telemetry before the crate
-    /// promotes subsequent failures to `ERROR`. `None` disables escalation and keeps every retry
-    /// at `WARN`.
-    pub n_warn_attempts: Option<u32>,
-    /// Smallest backoff duration when rescheduling failures. Acts as the base for exponential
-    /// backoff growth.
-    pub min_backoff: std::time::Duration,
-    /// Maximum backoff duration. Once the exponentially increasing delay reaches this value it will
-    /// stop growing.
-    pub max_backoff: std::time::Duration,
-    /// Percentage (0-100) jitter applied to the computed backoff window to avoid thundering herds.
-    pub backoff_jitter_pct: u8,
+    /// The retry curve, divided into a transient and a fatal band.
+    pub backoff: Backoff,
     /// How long a single execution must run before its failure is treated as evidence the job had
     /// recovered, forgiving the accumulated attempt count back to `1`.
     ///
@@ -154,51 +153,116 @@ pub struct RetrySettings {
     /// entirely.
     ///
     /// Pick a value comfortably longer than a *failing* run of this job type: a deterministic
-    /// failure must not clear it, or the job can never reach `n_attempts`.
+    /// failure must not clear it, or the job never climbs to the fatal band.
     pub attempt_reset_after_healthy_run: Option<std::time::Duration>,
-    /// When `true`, a runner error classified as `Fatal` (a `Denied` is
-    /// narrowed into `Fatal(Denied)` at the job boundary -- job is not an
-    /// authorization boundary) ends the job on the attempt that produced
-    /// it, instead of going through this policy's ordinary attempt-count
-    /// retry.
-    ///
-    /// Defaults to `false`: the lane is *reported* on the span the moment
-    /// it is classified (`error.lane`, `error.code`, `exception.message`),
-    /// but it does not change what job does. errlanes semantics say a
-    /// `Fatal` will not succeed on retry -- and once that is trusted, this
-    /// is the right behaviour -- but job has no live experience yet with
-    /// how faithfully the crates upstream of it lane their errors, and a
-    /// `Fatal` that is really transient would turn a blip into a dead job.
-    /// Turn this on per job type as that confidence is earned; the
-    /// telemetry to earn it on is there from the start.
-    ///
-    /// Has no effect on resident types, which have no terminal state to go
-    /// to (see `ResidentJobCompletion`) and force it back off.
-    pub terminal_on_fatal: bool,
 }
 
-impl RetrySettings {
-    pub fn repeat_indefinitely() -> Self {
-        Self {
-            n_attempts: None,
-            ..Default::default()
+/// The retry curve, divided into two bands by the errlanes lane of the
+/// failure. Delays double per attempt from the band's entry point, are
+/// capped at `max`, and carry ±`jitter_pct` jitter.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    transient_min: std::time::Duration,
+    fatal_min: std::time::Duration,
+    max: std::time::Duration,
+    jitter_pct: u8,
+}
+
+impl Backoff {
+    /// Panics unless `transient_min < fatal_min <= max` and `jitter_pct <= 100`.
+    /// For literal settings at registration; config-driven values go through
+    /// [`Backoff::try_new`].
+    pub const fn new(
+        transient_min: std::time::Duration,
+        fatal_min: std::time::Duration,
+        max: std::time::Duration,
+        jitter_pct: u8,
+    ) -> Self {
+        if let Err(reason) = Self::check(transient_min, fatal_min, max, jitter_pct) {
+            panic!("{}", reason);
         }
+        Self {
+            transient_min,
+            fatal_min,
+            max,
+            jitter_pct,
+        }
+    }
+
+    /// Fallible [`Backoff::new`] for values that come from configuration.
+    pub fn try_new(
+        transient_min: std::time::Duration,
+        fatal_min: std::time::Duration,
+        max: std::time::Duration,
+        jitter_pct: u8,
+    ) -> Result<Self, InvalidBackoff> {
+        Self::check(transient_min, fatal_min, max, jitter_pct)
+            .map_err(|reason| InvalidBackoff { reason })?;
+        Ok(Self {
+            transient_min,
+            fatal_min,
+            max,
+            jitter_pct,
+        })
+    }
+
+    const fn check(
+        transient_min: std::time::Duration,
+        fatal_min: std::time::Duration,
+        max: std::time::Duration,
+        jitter_pct: u8,
+    ) -> Result<(), &'static str> {
+        if transient_min.as_nanos() >= fatal_min.as_nanos() {
+            return Err("transient_min must be less than fatal_min");
+        }
+        if fatal_min.as_nanos() > max.as_nanos() {
+            return Err("fatal_min must not exceed max");
+        }
+        if jitter_pct > 100 {
+            return Err("jitter_pct must be at most 100");
+        }
+        Ok(())
+    }
+
+    /// Smallest delay a `Transient` failure is retried at. The curve starts here.
+    pub fn transient_min(&self) -> std::time::Duration {
+        self.transient_min
+    }
+
+    /// Smallest delay a `Fatal` failure is retried at. A `Transient` streak
+    /// whose delay would reach this is narrowed to `Fatal(Exhausted)` and
+    /// continues from here, at `ERROR`.
+    pub fn fatal_min(&self) -> std::time::Duration {
+        self.fatal_min
+    }
+
+    /// Largest delay either band is retried at.
+    pub fn max(&self) -> std::time::Duration {
+        self.max
+    }
+
+    /// Percentage (0-100) jitter applied to each delay to avoid thundering herds.
+    pub fn jitter_pct(&self) -> u8 {
+        self.jitter_pct
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(512),
+            std::time::Duration::from_secs(6 * 60 * 60),
+            20,
+        )
     }
 }
 
 impl Default for RetrySettings {
     fn default() -> Self {
-        const SECS_IN_ONE_HOUR: u64 = 60 * 60;
         Self {
-            n_attempts: Some(30),
-            n_warn_attempts: Some(3),
-            min_backoff: std::time::Duration::from_secs(1),
-            max_backoff: std::time::Duration::from_secs(SECS_IN_ONE_HOUR),
-            backoff_jitter_pct: 20,
-            // Matches `max_backoff`: a job that cannot stay up for the longest
-            // backoff we would ever impose is not healthy.
-            attempt_reset_after_healthy_run: Some(std::time::Duration::from_secs(SECS_IN_ONE_HOUR)),
-            terminal_on_fatal: false,
+            backoff: Backoff::default(),
+            attempt_reset_after_healthy_run: Some(std::time::Duration::from_secs(60 * 60)),
         }
     }
 }
@@ -206,12 +270,8 @@ impl Default for RetrySettings {
 impl From<&RetrySettings> for RetryPolicy {
     fn from(settings: &RetrySettings) -> Self {
         Self {
-            max_attempts: settings.n_attempts,
-            min_backoff: settings.min_backoff,
-            max_backoff: settings.max_backoff,
-            backoff_jitter_pct: settings.backoff_jitter_pct,
+            backoff: settings.backoff.clone(),
             attempt_reset_after_healthy_run: settings.attempt_reset_after_healthy_run,
-            terminal_on_fatal: settings.terminal_on_fatal,
         }
     }
 }

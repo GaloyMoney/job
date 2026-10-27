@@ -12,7 +12,7 @@ mod helpers;
 
 use async_trait::async_trait;
 use job::{
-    BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob, JobBatchCompletion, JobId,
+    Backoff, BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob, JobBatchCompletion, JobId,
     JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
@@ -78,15 +78,16 @@ impl BatchedJobInitializer for CongestionOnceInitializer {
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
-        // Small `n_attempts`: if the congestion classification regressed
-        // and this went through the ordinary retry policy instead, the
-        // batch would burn an attempt and this cap makes that failure mode
-        // terminate (and therefore be caught by the completion assertion
-        // below) instead of quietly retrying its way to success.
+        // Short backoff: if the congestion classification regressed and this
+        // went through the ordinary retry policy instead, the batch would
+        // burn an attempt, which the `calls` assertion below catches.
         RetrySettings {
-            n_attempts: Some(2),
-            min_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(50),
+            backoff: Backoff::new(
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(50),
+                20,
+            ),
             ..Default::default()
         }
     }
@@ -107,7 +108,7 @@ impl BatchedJobInitializer for CongestionOnceInitializer {
 
 /// A batch that fails once with `PoolTimedOut` must reschedule and complete
 /// on its next dispatch WITHOUT ever going through `RetrySettings`'
-/// `n_attempts` cap, and WITHOUT losing its batching: the whole point of
+/// retry curve, and WITHOUT losing its batching: the whole point of
 /// leaving `attempt_index` unchanged is that the retry-solo rule
 /// (`poller.rs`, `attempt > 1` is dispatched alone) never sees this batch as
 /// a retry at all.

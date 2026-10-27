@@ -280,10 +280,12 @@ async fn retry_backoff_yields_to_an_older_parked_sibling() -> anyhow::Result<()>
         fail_first_n: 1,
         attempts_so_far: Arc::clone(&attempts),
         retry_settings: RetrySettings {
-            n_attempts: Some(5),
-            min_backoff: std::time::Duration::from_secs(30),
-            max_backoff: std::time::Duration::from_secs(60),
-            backoff_jitter_pct: 0,
+            backoff: job::Backoff::new(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(45),
+                std::time::Duration::from_secs(60),
+                0,
+            ),
             ..RetrySettings::default()
         },
     });

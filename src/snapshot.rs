@@ -44,16 +44,19 @@ impl JobSnapshot {
     }
 
     /// The runtime [`JobStatus`] at load time. `Pending`/`Running` come from
-    /// the execution row; `Completed`/`Errored` from the entity once the row
+    /// the execution row; `Completed`/`Failed` from the entity once the row
     /// is gone.
     pub fn state(&self) -> JobStatus {
         let queue_id = self.job.queue_id.clone();
         match &self.row {
-            Some(row) => row.status(queue_id),
+            Some(row) => {
+                let (band, last_error) = self.job.pending_retry();
+                row.status(queue_id, band, last_error)
+            }
             None => match self.job.terminal_state() {
                 Some(JobTerminalState::Completed) => JobStatus::Completed { queue_id },
-                Some(JobTerminalState::Errored) => JobStatus::Errored {
-                    error: self.job.last_error().unwrap_or_default().to_owned(),
+                Some(JobTerminalState::Failed) => JobStatus::Failed {
+                    reason: self.job.failure_reason().unwrap_or_default().to_owned(),
                     queue_id,
                 },
                 // `JobRepo::load_snapshot_by_id` keeps a row only for a
@@ -91,7 +94,7 @@ impl JobSnapshot {
 
     /// The latest error string, if the job has ever failed an attempt.
     ///
-    /// Unlike the terminal [`JobStatus::Errored`] error, this is available
+    /// Unlike the terminal [`JobStatus::Failed`] reason, this is available
     /// while the job is still running/retrying — the signal that distinguishes
     /// a wedged, never-terminal handler (crash-looping on the same error) from
     /// a merely slow or backlogged one.

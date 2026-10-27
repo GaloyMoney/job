@@ -12,7 +12,7 @@ mod helpers;
 
 use async_trait::async_trait;
 use job::{
-    CurrentJob, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSvcConfig,
+    Backoff, CurrentJob, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSvcConfig,
     JobTerminalState, JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
@@ -68,15 +68,16 @@ impl JobInitializer for CongestionOnceInitializer {
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
-        // Small `n_attempts`: if the congestion classification regressed and
-        // this went through the ordinary retry policy instead, the job
-        // would burn an attempt and this cap makes that failure mode
-        // terminate (and therefore be caught by the completion assertion
-        // below) instead of quietly retrying its way to success.
+        // Short backoff: if the congestion classification regressed and this
+        // went through the ordinary retry policy instead, the job would burn
+        // an attempt, which the `calls` assertion below catches.
         RetrySettings {
-            n_attempts: Some(2),
-            min_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(50),
+            backoff: Backoff::new(
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(50),
+                20,
+            ),
             ..Default::default()
         }
     }
@@ -95,7 +96,7 @@ impl JobInitializer for CongestionOnceInitializer {
 
 /// A solo job that fails once with `PoolTimedOut` must reschedule and
 /// complete on its next dispatch WITHOUT ever going through `RetrySettings`'
-/// `n_attempts` cap, and WITHOUT its `attempt_index` moving -- the
+/// retry curve, and WITHOUT its `attempt_index` moving -- the
 /// single-job counterpart of `pool_congestion.rs`'s
 /// `congestion_reschedule_keeps_job_batchable`.
 #[tokio::test]

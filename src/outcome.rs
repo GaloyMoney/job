@@ -65,9 +65,10 @@ impl JobOutcome {
         matches!(self.state, JobTerminalState::Completed)
     }
 
-    /// Returns `true` if the job exhausted retries and was marked as errored.
-    pub fn is_errored(&self) -> bool {
-        matches!(self.state, JobTerminalState::Errored)
+    /// Returns `true` if the job concluded it cannot succeed, by returning
+    /// [`JobCompletion::Fail`](crate::JobCompletion::Fail).
+    pub fn is_failed(&self) -> bool {
+        matches!(self.state, JobTerminalState::Failed)
     }
 }
 
@@ -81,7 +82,7 @@ pub trait JobOutcomes {
 
 impl JobOutcomes for Vec<JobOutcome> {
     fn failed_count(&self) -> usize {
-        self.iter().filter(|r| r.is_errored()).count()
+        self.iter().filter(|r| r.is_failed()).count()
     }
     fn all_succeeded(&self) -> bool {
         self.iter().all(|r| r.is_completed())
@@ -90,7 +91,7 @@ impl JobOutcomes for Vec<JobOutcome> {
 
 impl JobOutcomes for [JobOutcome] {
     fn failed_count(&self) -> usize {
-        self.iter().filter(|r| r.is_errored()).count()
+        self.iter().filter(|r| r.is_failed()).count()
     }
     fn all_succeeded(&self) -> bool {
         self.iter().all(|r| r.is_completed())
@@ -103,6 +104,6 @@ impl JobOutcomes for [JobOutcome] {
 pub enum JobTerminalState {
     /// The job completed successfully.
     Completed,
-    /// The job exhausted its retries and was marked as errored.
-    Errored,
+    /// The job returned [`JobCompletion::Fail`](crate::JobCompletion::Fail).
+    Failed,
 }

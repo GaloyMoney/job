@@ -18,9 +18,10 @@
 //!   never double-completed.
 //! - [`Disposition::Fail`]: run the type's `RetryPolicy`
 //!   (`Job::maybe_schedule_retry`) -- a retry goes back to `pending` at the
-//!   policy's backoff with the NEXT `attempt_index`; exhausted attempts
-//!   delete the row like a completion (terminal notification included) but
-//!   with the error recorded on the entity.
+//!   policy's backoff with the NEXT `attempt_index`, on the band the
+//!   failure's lane selects. Never terminal.
+//! - [`Disposition::Failed`]: delete the row like a completion (terminal
+//!   notification included), recording `JobFailed` with the job's reason.
 //! - [`Disposition::Fresh`]: back to `pending` at the caller's time with
 //!   `attempt_index = 1` -- a runner-requested reschedule (which has no
 //!   notion of "which attempt") or a rescue's "we don't know what happened,
@@ -78,7 +79,7 @@ use std::sync::{Arc, Weak};
 
 use super::{
     JobId,
-    entity::{Job, JobType, RetryPolicy},
+    entity::{Job, JobType, RetryPolicy, ScheduledRetry},
     error::{JobFault, TX_ABORT_MAX_ATTEMPTS},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
@@ -128,8 +129,9 @@ pub(crate) enum Disposition {
     /// The job ran to completion: execution row deleted, completion event.
     Complete,
     /// The job failed with `failure` on its `attempt`-th attempt: the
-    /// type's `RetryPolicy` decides between a backoff retry (next
-    /// `attempt_index`) and terminal deletion.
+    /// type's `RetryPolicy` schedules a backoff retry (next
+    /// `attempt_index`) on the band the failure's lane selects. Never
+    /// terminal.
     ///
     /// `run_duration` is how long the failing execution actually ran, on a
     /// monotonic clock. The retry policy forgives the accumulated attempt
@@ -137,12 +139,16 @@ pub(crate) enum Disposition {
     /// stayed up that long is evidence the job had recovered, whether or not
     /// it ever returned a completion.
     Fail {
-        /// The classified failure. The entity reads its lane for the
-        /// `terminal_on_fatal` decision and narrows it on exhaustion.
+        /// The classified failure. The entity reads its lane to pick the
+        /// band and narrows a transient streak that reaches `fatal_min`.
         failure: JobFault,
         attempt: u32,
         run_duration: std::time::Duration,
     },
+    /// The job concluded it cannot succeed (`JobCompletion::Fail`, or a
+    /// batch item's `BatchItemOutcome::Fail`): execution row deleted like a
+    /// completion, `JobFailed` recorded with `reason`.
+    Failed { reason: String },
     /// Back to `pending` at `at` with `attempt_index = 1`: a
     /// runner-requested reschedule or a rescue.
     Fresh { at: DateTime<Utc> },
@@ -157,16 +163,14 @@ pub(crate) enum Disposition {
 }
 
 /// What [`Finalizer::finalize_in_op`] actually did, for the caller's span
-/// fields and flag updates. `retried` carries each retry's NEXT
-/// `attempt_index` (for warn-threshold escalation); `errored_terminal`
-/// counts `Fail` DECISIONS that went terminal (whether or not the row was
-/// still this instance's to delete), mirroring the batch's `n_errored`
-/// accounting; `completed` counts only rows this instance actually deleted.
+/// fields and flag updates. `retried` carries each applied retry's decision
+/// (next `attempt_index`, band, fatal streak) for the failure telemetry;
+/// `failed` and `completed` count only rows this instance actually deleted.
 #[derive(Default)]
 pub(crate) struct FinalizeOutcome {
     pub(crate) completed: Vec<JobId>,
-    pub(crate) retried: Vec<(JobId, u32)>,
-    pub(crate) errored_terminal: Vec<JobId>,
+    pub(crate) retried: Vec<(JobId, ScheduledRetry)>,
+    pub(crate) failed: Vec<JobId>,
     /// Highest post-reschedule consecutive-congestion streak across the
     /// items, for [`Finalizer::reschedule_congested`]'s stuck-forever WARN.
     pub(crate) congestion_streak: u32,
@@ -337,10 +341,9 @@ impl Finalizer {
     /// registration here, which must land in the SAME transaction as the
     /// row writes: `BatchDispatcher::seal_in_own_op` /
     /// `rescue_claimed_rows` pass `try_recycle_own_type`, and
-    /// `JobDispatcher::fail_job` passes `recycle_into_claim` for the
-    /// exhausted-retries terminal delete (each guarded exactly-once on
-    /// their side, since a rolled-back attempt's dropped reservation
-    /// already released the unit).
+    /// `JobDispatcher::conclude_failed` registers `recycle_into_claim`
+    /// (each guarded exactly-once on their side, since a rolled-back
+    /// attempt's dropped reservation already released the unit).
     pub(crate) async fn finalize(
         &self,
         items: &[(JobId, Disposition)],
@@ -496,10 +499,10 @@ impl Finalizer {
         let mut retry_uuids: Vec<uuid::Uuid> = Vec::new();
         let mut retry_times: Vec<DateTime<Utc>> = Vec::new();
         let mut retry_attempts: Vec<i32> = Vec::new();
-        let mut retry_next: HashMap<JobId, u32> = HashMap::new();
+        let mut retry_next: HashMap<JobId, ScheduledRetry> = HashMap::new();
         let mut delete_uuids: Vec<uuid::Uuid> = Vec::new();
         let mut complete_ids: HashSet<JobId> = HashSet::new();
-        let mut fail_terminal_ids: HashSet<JobId> = HashSet::new();
+        let mut failed_reasons: HashMap<JobId, String> = HashMap::new();
 
         for (id, disposition) in items {
             let Some(mut job) = entities.remove(id) else {
@@ -531,24 +534,21 @@ impl Finalizer {
                     attempt,
                     run_duration,
                 } => {
-                    match job.maybe_schedule_retry(
+                    let retry = job.maybe_schedule_retry(
                         now,
                         *attempt,
                         *run_duration,
                         &retry_policy,
                         failure,
-                    ) {
-                        Some((reschedule_at, next_attempt)) => {
-                            retry_uuids.push(uuid::Uuid::from(*id));
-                            retry_times.push(reschedule_at);
-                            retry_attempts.push(next_attempt as i32);
-                            retry_next.insert(*id, next_attempt);
-                        }
-                        None => {
-                            delete_uuids.push(uuid::Uuid::from(*id));
-                            fail_terminal_ids.insert(*id);
-                        }
-                    }
+                    );
+                    retry_uuids.push(uuid::Uuid::from(*id));
+                    retry_times.push(retry.at);
+                    retry_attempts.push(retry.next_attempt as i32);
+                    retry_next.insert(*id, retry);
+                }
+                Disposition::Failed { reason } => {
+                    delete_uuids.push(uuid::Uuid::from(*id));
+                    failed_reasons.insert(*id, reason.clone());
                 }
             }
             staged.insert(*id, job);
@@ -692,8 +692,8 @@ impl Finalizer {
             for row in rows {
                 applied.insert(row.id);
                 applied_pending_uuids.push(uuid::Uuid::from(row.id));
-                if let Some(next_attempt) = retry_next.get(&row.id) {
-                    outcome.retried.push((row.id, *next_attempt));
+                if let Some(retry) = retry_next.remove(&row.id) {
+                    outcome.retried.push((row.id, retry));
                 }
             }
         }
@@ -701,7 +701,7 @@ impl Finalizer {
         let mut freed_queues: Vec<String> = Vec::new();
         let mut deleted_ids: HashSet<JobId> = HashSet::new();
         if !delete_uuids.is_empty() {
-            // One delete serves completions and exhausted retries alike --
+            // One delete serves completions and job-declared failures alike --
             // the `cleanup` CTE also drops the `job_execution_states` row
             // unless this type retains state past terminal (keyed with
             // `inherits_state`; batched types never are). The freed-queue
@@ -770,8 +770,11 @@ impl Finalizer {
                         job.complete_job();
                     }
                     outcome.completed.push(id);
-                } else if fail_terminal_ids.contains(&id) {
-                    outcome.errored_terminal.push(id);
+                } else if let Some(reason) = failed_reasons.remove(&id) {
+                    if let Some(job) = staged.get_mut(&id) {
+                        job.fail_job(reason);
+                    }
+                    outcome.failed.push(id);
                 }
             }
         }
@@ -1220,9 +1223,8 @@ mod runner_failure_classification_tests {
 
     /// A runner that knows nothing of errlanes gets `Fault::classify`'s
     /// `Fatal(Dependency)` safety default rather than vanishing -- but it
-    /// is NOT terminal on its own: `terminal_on_fatal` is `false` by
-    /// default, so it retries per policy. See
-    /// `tests/lanes.rs::unclassified_string_error_retries_per_policy`.
+    /// never terminal: it retries in the fatal band. See
+    /// `tests/lanes.rs::unclassified_string_error_retries_in_the_fatal_band`.
     #[test]
     fn classifies_a_bare_string_as_fatal_dependency_carrying_its_message() {
         let e = boxed(std::io::Error::other("boom"));

@@ -8,9 +8,9 @@ mod helpers;
 
 use async_trait::async_trait;
 use job::{
-    BatchItemOutcome, BatchOutcomes, BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob,
-    JobBatchCompletion, JobId, JobPollerConfig, JobSpawner, JobSpec, JobSvcConfig,
-    JobTerminalState, JobType, Jobs, RetrySettings,
+    Backoff, BatchItemOutcome, BatchOutcomes, BatchedJobInitializer, BatchedJobRunner,
+    CurrentBatchedJob, JobBatchCompletion, JobId, JobPollerConfig, JobSpawner, JobSpec, JobStatus,
+    JobSvcConfig, JobTerminalState, JobType, Jobs, RetryBand, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -280,13 +280,6 @@ impl BatchedJobInitializer for MixedOutcomeInitializer {
         self.job_type.clone()
     }
 
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
-    }
-
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
@@ -312,7 +305,9 @@ impl BatchedJobRunner for MixedOutcomeRunner {
             if item.config().label.starts_with("ok") {
                 BatchItemOutcome::Complete
             } else {
-                BatchItemOutcome::Fail(format!("rejected {}", item.config().label))
+                BatchItemOutcome::Fail {
+                    error: format!("rejected {}", item.config().label).into(),
+                }
             }
         });
         Ok(JobBatchCompletion::WithOutcomes(outcomes))
@@ -367,7 +362,7 @@ async fn per_item_outcomes_are_applied_independently() -> anyhow::Result<()> {
         let expected = if i < 4 {
             JobTerminalState::Completed
         } else {
-            JobTerminalState::Errored
+            JobTerminalState::Failed
         };
         assert_eq!(
             outcome.state(),
@@ -404,9 +399,12 @@ impl BatchedJobInitializer for FailFirstInitializer {
 
     fn retry_on_error_settings(&self) -> RetrySettings {
         RetrySettings {
-            n_attempts: Some(5),
-            min_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(50),
+            backoff: Backoff::new(
+                Duration::from_millis(10),
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                20,
+            ),
             ..Default::default()
         }
     }
@@ -524,13 +522,6 @@ impl BatchedJobInitializer for CheckpointBatchInitializer {
         self.job_type.clone()
     }
 
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
-    }
-
     fn init(
         &self,
         _: JobSpawner<Self::Config>,
@@ -560,7 +551,9 @@ impl BatchedJobRunner for CheckpointBatchRunner {
             if item.config().label.starts_with("ok") {
                 BatchItemOutcome::Complete
             } else {
-                BatchItemOutcome::Fail("intentional terminal failure".to_string())
+                BatchItemOutcome::Fail {
+                    error: "intentional terminal failure".into(),
+                }
             }
         });
         Ok(JobBatchCompletion::WithOutcomes(outcomes))
@@ -604,7 +597,7 @@ async fn checkpoint_rows_deleted_on_batched_terminal() -> anyhow::Result<()> {
         .await_all(Duration::from_secs(30))
         .await?;
     assert_eq!(outcomes[0].state(), JobTerminalState::Completed);
-    assert_eq!(outcomes[1].state(), JobTerminalState::Errored);
+    assert_eq!(outcomes[1].state(), JobTerminalState::Failed);
 
     let ids = [uuid::Uuid::from(ok_id), uuid::Uuid::from(bad_id)];
     let (count,): (i64,) =
@@ -614,7 +607,7 @@ async fn checkpoint_rows_deleted_on_batched_terminal() -> anyhow::Result<()> {
             .await?;
     assert_eq!(
         count, 0,
-        "checkpoint rows for both the completed and the errored-terminal \
+        "checkpoint rows for both the completed and the failed-terminal \
          batch items must be gone"
     );
 
@@ -639,7 +632,12 @@ impl BatchedJobInitializer for IncompleteOutcomeInitializer {
 
     fn retry_on_error_settings(&self) -> RetrySettings {
         RetrySettings {
-            n_attempts: Some(1),
+            backoff: Backoff::new(
+                Duration::from_millis(10),
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                0,
+            ),
             ..Default::default()
         }
     }
@@ -692,14 +690,42 @@ async fn undispositioned_items_fail_the_batch_rather_than_being_guessed() -> any
 
     jobs.start_poll().await?;
 
-    // n_attempts = 1, so the seal failure is terminal rather than retried
-    // forever: the job surfaces as Errored instead of silently completing.
-    let outcome = jobs
-        .handle(job_id)
-        .await_completion(Duration::from_secs(30))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-    Ok(())
+    // The contract violation is a `Fatal` invariant: the job is retried in the
+    // fatal band with the violation recorded, instead of silently completing.
+    await_fatal_retry(&jobs, job_id, "no outcome returned").await
+}
+
+/// Waits for `id` to be retried in the fatal band (`Pending` at attempt 2 or
+/// later) with `expected` in its recorded error, failing if it ever ends.
+async fn await_fatal_retry(jobs: &Jobs, id: JobId, expected: &str) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = jobs.handle(id).load().await?.state();
+        if let JobStatus::Pending {
+            attempt,
+            band,
+            last_error,
+            ..
+        } = &status
+            && *attempt >= 2
+        {
+            assert_eq!(*band, RetryBand::Fatal);
+            assert!(
+                last_error.as_deref().is_some_and(|e| e.contains(expected)),
+                "unexpected last_error: {last_error:?}"
+            );
+            return Ok(());
+        }
+        assert!(
+            !status.is_terminal(),
+            "a contract violation must never end the job, got {status:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw the retry; last status {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -979,7 +1005,12 @@ async fn unknown_outcome_id_is_rejected() -> anyhow::Result<()> {
         }
         fn retry_on_error_settings(&self) -> RetrySettings {
             RetrySettings {
-                n_attempts: Some(1),
+                backoff: Backoff::new(
+                    Duration::from_millis(10),
+                    Duration::from_millis(25),
+                    Duration::from_millis(50),
+                    0,
+                ),
                 ..Default::default()
             }
         }
@@ -1026,16 +1057,7 @@ async fn unknown_outcome_id_is_rejected() -> anyhow::Result<()> {
         .await?;
     jobs.start_poll().await?;
 
-    let outcome = jobs
-        .handle(job_id)
-        .await_completion(Duration::from_secs(30))
-        .await?;
-    assert_eq!(
-        outcome.state(),
-        JobTerminalState::Errored,
-        "an outcome naming a job outside the batch must fail the batch"
-    );
-    Ok(())
+    await_fatal_retry(&jobs, job_id, "not part of the batch").await
 }
 
 // ---------------------------------------------------------------------------
