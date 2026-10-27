@@ -80,7 +80,9 @@ async fn transient_runner_error_is_recorded_in_the_transient_band_at_warn() -> a
     spawner.spawn(JobId::new(), Cfg).await?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while fields.get("job.fail_job", "retry.band").is_none() {
+    while fields.get("job.fail_job", "retry.band").is_none()
+        || fields.get("job.fail_job", "retry.fatal_streak").is_none()
+    {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "no job.fail_job span recorded retry.band; captured: {}",

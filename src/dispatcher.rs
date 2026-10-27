@@ -511,13 +511,13 @@ impl JobDispatcher {
             }
             None => RetryBand::from(lane),
         };
-        span.record("retry.band", band.as_str());
         span.record("will_retry", true);
         let level = match band {
             RetryBand::Transient => tracing::Level::WARN,
             RetryBand::Fatal => tracing::Level::ERROR,
         };
         span.record("error.level", tracing::field::display(level));
+        span.record("retry.band", band.as_str());
         Ok(())
     }
 

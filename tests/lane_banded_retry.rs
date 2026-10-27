@@ -149,7 +149,8 @@ async fn await_state(
 /// The span-level half (`error.level = ERROR`, `retry.band = fatal`) is in
 /// `tests/lanes_denied_span.rs`.
 #[tokio::test]
-async fn a_deterministic_failer_never_dies_and_retries_on_the_fatal_band() -> anyhow::Result<()> {
+async fn a_deterministic_error_never_ends_the_job_and_retries_on_the_fatal_band()
+-> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let (clock, controller) = ClockHandle::manual();
     let config = JobSvcConfig::builder()
