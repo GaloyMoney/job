@@ -624,6 +624,17 @@ async fn max_probes_one_is_equivalent_to_fail_all() -> anyhow::Result<()> {
         "a single probe cannot attribute the failure, so every item is \
          isolated, saw {statuses:?}"
     );
+    assert!(
+        statuses.iter().all(|s| matches!(
+            s,
+            job::JobStatus::Pending {
+                band: job::RetryBand::Transient,
+                ..
+            }
+        )),
+        "an item the budget could not attribute retries in the transient \
+         band, saw {statuses:?}"
+    );
     assert_eq!(
         probes.load(Ordering::SeqCst),
         1,

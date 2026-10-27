@@ -661,14 +661,16 @@ impl<C> CurrentBatchedJob<C> {
                 let disposition = match outcome {
                     ItemOutcome::Complete => BatchItemOutcome::Complete,
                     ItemOutcome::Failed(e) => BatchItemOutcome::Errored(Box::new(e)),
-                    ItemOutcome::Unresolved => BatchItemOutcome::Errored(
-                        budget_exhausted_message
-                            .clone()
-                            .unwrap_or_else(|| {
+                    ItemOutcome::Unresolved => BatchItemOutcome::Errored(Box::new(
+                        es_entity::errlanes::Transient::new(
+                            es_entity::errlanes::TransientKind::Other,
+                        )
+                        .with_context(
+                            budget_exhausted_message.clone().unwrap_or_else(|| {
                                 format!("bisect probe budget exhausted after {probes_used} probes")
-                            })
-                            .into(),
-                    ),
+                            }),
+                        ),
+                    )),
                 };
                 (item.id, disposition)
             })
