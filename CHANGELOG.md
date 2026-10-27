@@ -1,3 +1,11 @@
+# [job release v0.19.0](https://github.com/GaloyMoney/job/releases/tag/0.19.0)
+
+
+
+### Features
+
+- [**breaking**] Lane-banded retry; terminal only via JobCompletion::Fail (#242)
+
 # [job release v0.18.5](https://github.com/GaloyMoney/job/releases/tag/0.18.5)
 
 
