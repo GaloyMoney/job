@@ -166,7 +166,7 @@ pub trait BatchedJobRunner: Send + Sync + 'static {
 }
 
 /// How a single job within a batch should be progressed.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum BatchItemOutcome {
     /// Mark this job completed.
     Complete,
@@ -174,8 +174,11 @@ pub enum BatchItemOutcome {
     RescheduleIn(std::time::Duration),
     /// Schedule this job's next run at an exact time. Resets the attempt counter.
     RescheduleAt(DateTime<Utc>),
-    /// Treat this job as failed: it is retried per the type's
-    /// [`RetrySettings`], or marked errored once attempts are exhausted.
+    /// This attempt failed: the item is retried per the type's
+    /// [`RetrySettings`]. The error is classified exactly like a single job's
+    /// `Err(e)` (`Fault::classify`, `Denied` narrowed to `Fatal`), so its lane
+    /// picks the band. It never ends the item; use [`BatchItemOutcome::Fail`]
+    /// for that.
     ///
     /// For failures detected without poisoning the shared transaction
     /// (validation, missing precondition, a domain rule saying "no"), just
@@ -188,7 +191,12 @@ pub enum BatchItemOutcome {
     /// [`es_entity::DbOp::with_savepoint`] directly): the savepoint rolls
     /// back only that item's writes, and the shared transaction stays usable
     /// for the rest of the batch.
-    Fail(String),
+    Errored(Box<dyn std::error::Error + Send + Sync>),
+    /// Terminal for this item: the same verdict as
+    /// [`JobCompletion::Fail`](crate::JobCompletion::Fail). No retry.
+    Fail {
+        error: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Per-job dispositions returned by a batched runner.
@@ -419,8 +427,9 @@ impl<C> CurrentBatchedJob<C> {
     /// [`BatchItemOutcome::Complete`], though a successfully-released
     /// savepoint can still resolve to `RescheduleIn`/`RescheduleAt` if the
     /// item wants to run again later. `f`'s `Err` is translated to
-    /// [`BatchItemOutcome::Fail`] (via `E`'s `Display`), so the item is
-    /// retried per the type's [`RetrySettings`] like any other failure.
+    /// [`BatchItemOutcome::Errored`] carrying `E` itself, so the item is
+    /// retried per the type's [`RetrySettings`], on the band `E`'s lane
+    /// selects, like any other failure.
     ///
     /// Typical use, feeding the result into
     /// [`JobBatchCompletion::WithOutcomesWithOp`]:
@@ -469,7 +478,7 @@ impl<C> CurrentBatchedJob<C> {
         + Sync,
     ) -> Result<BatchOutcomes, JobFault>
     where
-        E: std::fmt::Display,
+        E: std::error::Error + Send + Sync + 'static,
     {
         use es_entity::BatchIsolation;
 
@@ -479,7 +488,7 @@ impl<C> CurrentBatchedJob<C> {
             .iter()
             .zip(results)
             .map(|(item, result)| {
-                let outcome = result.unwrap_or_else(|e| BatchItemOutcome::Fail(e.to_string()));
+                let outcome = result.unwrap_or_else(|e| BatchItemOutcome::Errored(Box::new(e)));
                 (item.id, outcome)
             })
             .collect())
@@ -490,8 +499,8 @@ impl<C> CurrentBatchedJob<C> {
     /// sub-ranges — largest pending range first — until each culprit is
     /// isolated (or [`BisectBudget`] runs out). Clean items resolve to
     /// [`BatchItemOutcome::Complete`] in this very dispatch; each culprit to
-    /// [`BatchItemOutcome::Fail`] (via `E`'s `Display`, from its own
-    /// singleton probe — so the message is attributable).
+    /// [`BatchItemOutcome::Errored`] carrying `E` itself, from its own
+    /// singleton probe — so the error is attributable.
     ///
     /// The counterpart of [`run_isolated`](Self::run_isolated) for **true
     /// batch** implementations: a batch-load/mutate/batch-persist runner has
@@ -582,7 +591,7 @@ impl<C> CurrentBatchedJob<C> {
         + Sync,
     ) -> Result<BatchOutcomes, JobFault>
     where
-        E: std::error::Error + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         self.run_bisected_with(op, BisectBudget::default(), f).await
     }
@@ -607,7 +616,7 @@ impl<C> CurrentBatchedJob<C> {
         + Sync,
     ) -> Result<BatchOutcomes, JobFault>
     where
-        E: std::error::Error + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         use es_entity::{BatchIsolation, ItemOutcome};
 
@@ -651,12 +660,17 @@ impl<C> CurrentBatchedJob<C> {
             .map(|(item, outcome)| {
                 let disposition = match outcome {
                     ItemOutcome::Complete => BatchItemOutcome::Complete,
-                    ItemOutcome::Failed(e) => BatchItemOutcome::Fail(e.to_string()),
-                    ItemOutcome::Unresolved => {
-                        BatchItemOutcome::Fail(budget_exhausted_message.clone().unwrap_or_else(
-                            || format!("bisect probe budget exhausted after {probes_used} probes"),
-                        ))
-                    }
+                    ItemOutcome::Failed(e) => BatchItemOutcome::Errored(Box::new(e)),
+                    ItemOutcome::Unresolved => BatchItemOutcome::Errored(Box::new(
+                        es_entity::errlanes::Transient::new(
+                            es_entity::errlanes::TransientKind::Other,
+                        )
+                        .with_context(
+                            budget_exhausted_message.clone().unwrap_or_else(|| {
+                                format!("bisect probe budget exhausted after {probes_used} probes")
+                            }),
+                        ),
+                    )),
                 };
                 (item.id, disposition)
             })

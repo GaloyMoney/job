@@ -314,7 +314,7 @@ impl JobHandle {
         }
     }
 
-    /// Block until the job reaches a terminal state (completed or errored)
+    /// Block until the job reaches a terminal state (completed or failed)
     /// and return the outcome together with any result value the runner
     /// attached via [`CurrentJob::set_result`](crate::CurrentJob::set_result).
     ///

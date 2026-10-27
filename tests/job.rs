@@ -3,10 +3,10 @@ mod helpers;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
-    ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes, JobRunner,
-    JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs,
+    Backoff, ClockHandle, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobOutcomes,
+    JobRunner, JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs,
     KeyedJobInitializer, KeyedJobSpawner, ResidentJobCompletion, ResidentJobInitializer,
-    ResidentJobRunner, RetrySettings,
+    ResidentJobRunner, RetryBand, RetrySettings,
     error::{AwaitError, AwaitTimeout, JobError, JobRejection},
 };
 use serde::{Deserialize, Serialize};
@@ -977,13 +977,6 @@ impl JobInitializer for FailingJobInitializer {
         self.job_type.clone()
     }
 
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
-    }
-
     fn init(
         &self,
         _job: &Job,
@@ -1001,7 +994,7 @@ impl JobRunner for FailingJobRunner {
         &self,
         _current_job: CurrentJob,
     ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        Err("intentional failure".into())
+        Ok(JobCompletion::Fail("intentional failure".into()))
     }
 }
 
@@ -1014,13 +1007,6 @@ impl KeyedJobInitializer for FailingKeyedInitializer {
 
     fn job_type(&self) -> JobType {
         self.job_type.clone()
-    }
-
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
     }
 
     fn init(
@@ -1091,7 +1077,8 @@ async fn test_await_completion_on_error() -> anyhow::Result<()> {
     });
 
     let outcome = handle.await??;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    assert_eq!(outcome.state(), JobTerminalState::Failed);
+    assert!(outcome.is_failed());
 
     Ok(())
 }
@@ -1226,13 +1213,6 @@ impl JobInitializer for PartialResultThenErrorInitializer {
             .clone()
     }
 
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
-    }
-
     fn init(
         &self,
         _job: &Job,
@@ -1253,7 +1233,9 @@ impl JobRunner for PartialResultThenErrorRunner {
         // Simulate processing 50 items then failing — partial progress preserved
         current_job.set_result(&MyResult { value: 50 }).await?;
         current_job.set_result(&MyResult { value: 99 }).await?;
-        Err("intentional failure after setting result".into())
+        Ok(JobCompletion::Fail(
+            "intentional failure after setting result".into(),
+        ))
     }
 }
 
@@ -1276,7 +1258,7 @@ async fn test_await_completion_returns_partial_result_on_error() -> anyhow::Resu
         .handle(job_id)
         .await_completion(Duration::from_secs(30))
         .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    assert_eq!(outcome.state(), JobTerminalState::Failed);
     let result: MyResult = outcome
         .result()
         .expect("deserialize result")
@@ -1446,13 +1428,6 @@ impl JobInitializer for IncrementalResultThenErrorInitializer {
             .clone()
     }
 
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
-    }
-
     fn init(
         &self,
         _job: &Job,
@@ -1479,7 +1454,7 @@ impl JobRunner for IncrementalResultThenErrorRunner {
                 })
                 .await?;
         }
-        Err("failed at item 51".into())
+        Ok(JobCompletion::Fail("failed at item 51".into()))
     }
 }
 
@@ -1502,7 +1477,7 @@ async fn test_set_result_partial_progress_preserved_on_error() -> anyhow::Result
         .handle(job_id)
         .await_completion(Duration::from_secs(30))
         .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    assert_eq!(outcome.state(), JobTerminalState::Failed);
     let progress: BatchProgress = outcome
         .result()
         .expect("deserialize result")
@@ -2907,13 +2882,6 @@ impl JobInitializer for StateWritingFailingInitializer {
         self.job_type.clone()
     }
 
-    fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
-    }
-
     fn init(
         &self,
         _job: &Job,
@@ -2939,7 +2907,7 @@ impl JobRunner for StateWritingFailingRunner {
             .update_execution_state(CheckpointState { processed: 7 })
             .await?;
         self.wrote.notify_one();
-        Err("intentional failure".into())
+        Ok(JobCompletion::Fail("intentional failure".into()))
     }
 }
 
@@ -2969,7 +2937,7 @@ async fn checkpoint_row_deleted_on_errored_terminal() -> anyhow::Result<()> {
         .expect("runner never wrote its execution state");
 
     let outcome = handle.await_completion(Duration::from_secs(10)).await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    assert_eq!(outcome.state(), JobTerminalState::Failed);
 
     let (count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM job_execution_states WHERE id = $1")
@@ -3000,9 +2968,12 @@ impl JobInitializer for CheckpointThenFailOnceInitializer {
 
     fn retry_on_error_settings(&self) -> RetrySettings {
         RetrySettings {
-            n_attempts: Some(3),
-            min_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(10),
+            backoff: Backoff::new(
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+                20,
+            ),
             ..Default::default()
         }
     }
@@ -3074,7 +3045,7 @@ async fn checkpoint_survives_retry() -> anyhow::Result<()> {
 }
 
 /// Drive jobs through the lifecycle and assert every `JobStatus` variant,
-/// including `queue_id` passthrough and the `Errored { error }` string.
+/// including `queue_id` passthrough and the `Failed { reason }` string.
 #[tokio::test]
 async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -3116,9 +3087,13 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
             scheduled_at: at,
             attempt,
             queue_id,
+            band,
+            last_error,
         } => {
             assert!((at - schedule_at).num_seconds().abs() < 1);
             assert_eq!(attempt, 1);
+            assert_eq!(band, RetryBand::Transient);
+            assert_eq!(last_error, None);
             assert_eq!(queue_id.as_deref(), Some(pending_queue.as_str()));
         }
         other => panic!("expected Pending, got {other:?}"),
@@ -3168,7 +3143,7 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
         }
     );
 
-    // Errored: a failing job in a queue; `error` is the final error string.
+    // Failed: a failing job in a queue; `reason` is the verdict's message.
     let errored_id = JobId::new();
     let errored_queue = helpers::unique("status-queue-errored");
     fail_spawner
@@ -3178,16 +3153,16 @@ async fn status_pending_running_completed_errored() -> anyhow::Result<()> {
     let outcome = errored_handle
         .await_completion(Duration::from_secs(10))
         .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    assert_eq!(outcome.state(), JobTerminalState::Failed);
     match errored_handle.load().await?.state() {
-        JobStatus::Errored { error, queue_id } => {
+        JobStatus::Failed { reason, queue_id } => {
             assert!(
-                error.contains("intentional failure"),
-                "unexpected error string: {error}"
+                reason.contains("intentional failure"),
+                "unexpected reason string: {reason}"
             );
             assert_eq!(queue_id.as_deref(), Some(errored_queue.as_str()));
         }
-        other => panic!("expected Errored, got {other:?}"),
+        other => panic!("expected Failed, got {other:?}"),
     }
 
     jobs.shutdown().await?;
@@ -3585,7 +3560,7 @@ async fn terminal_status_carries_queue_id() -> anyhow::Result<()> {
         }
     );
 
-    // Errored path.
+    // Failed path.
     let errored_id = JobId::new();
     let errored_queue = helpers::unique("terminal-q-err");
     fail_spawner
@@ -3595,12 +3570,12 @@ async fn terminal_status_carries_queue_id() -> anyhow::Result<()> {
     let outcome = errored_handle
         .await_completion(Duration::from_secs(10))
         .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    assert_eq!(outcome.state(), JobTerminalState::Failed);
     match errored_handle.load().await?.state() {
-        JobStatus::Errored { queue_id, .. } => {
+        JobStatus::Failed { queue_id, .. } => {
             assert_eq!(queue_id.as_deref(), Some(errored_queue.as_str()));
         }
-        other => panic!("expected Errored, got {other:?}"),
+        other => panic!("expected Failed, got {other:?}"),
     }
 
     jobs.shutdown().await?;
@@ -3780,8 +3755,22 @@ async fn resident_handle_resolves_the_resident_job() -> anyhow::Result<()> {
 
 /// A job that always fails, with retries remaining and a far-future backoff so
 /// it parks (non-terminal) after the first failure — the shape of obix's
-/// wedged, `repeat_indefinitely()` resident handler.
+/// wedged, default-retry resident handler.
 struct FailingWithRetriesInitializer;
+
+/// Always returns `Err`: an attempt that fails and is retried, as opposed to
+/// [`FailingJobRunner`]'s `Fail` verdict.
+struct ErroringJobRunner;
+
+#[async_trait]
+impl JobRunner for ErroringJobRunner {
+    async fn run(
+        &self,
+        _current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        Err("intentional failure".into())
+    }
+}
 
 impl JobInitializer for FailingWithRetriesInitializer {
     type Config = FailingJobConfig;
@@ -3795,11 +3784,14 @@ impl JobInitializer for FailingWithRetriesInitializer {
 
     fn retry_on_error_settings(&self) -> RetrySettings {
         RetrySettings {
-            n_attempts: Some(5),
             // Huge backoff: after attempt 1 fails it reschedules ~1h out, so it
             // stays Pending (non-terminal) with the error recorded.
-            min_backoff: Duration::from_secs(3600),
-            max_backoff: Duration::from_secs(3600),
+            backoff: Backoff::new(
+                Duration::from_secs(3600),
+                Duration::from_secs(7200),
+                Duration::from_secs(7200),
+                20,
+            ),
             ..Default::default()
         }
     }
@@ -3809,13 +3801,13 @@ impl JobInitializer for FailingWithRetriesInitializer {
         _job: &Job,
         _: JobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Box::new(FailingJobRunner))
+        Ok(Box::new(ErroringJobRunner))
     }
 }
 
 /// `A`: the last error is reachable while a job is still retrying (non-terminal),
-/// matches the `Errored { error }` string once terminal, and is `None` for a
-/// job that never failed.
+/// is `None` once a job ends in a `Fail` verdict, and is `None` for a job that
+/// never failed.
 #[tokio::test]
 async fn last_error_visible_mid_retry_and_terminal() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -3863,7 +3855,8 @@ async fn last_error_visible_mid_retry_and_terminal() -> anyhow::Result<()> {
         "unexpected mid-retry error"
     );
 
-    // Terminal errored: last_error equals the `Errored { error }` string.
+    // Terminal failed: a verdict is not an attempt error, so `last_error` stays
+    // `None` and the reason lives on `Failed { reason }`.
     let errored_id = JobId::new();
     fail_spawner.spawn(errored_id, FailingJobConfig).await?;
     let errored_handle = jobs.handle(errored_id);
@@ -3872,10 +3865,11 @@ async fn last_error_visible_mid_retry_and_terminal() -> anyhow::Result<()> {
         .await?;
     let terminal = errored_handle.load().await?;
     match terminal.state() {
-        JobStatus::Errored { error, .. } => {
-            assert_eq!(terminal.last_error(), Some(error.as_str()));
+        JobStatus::Failed { reason, .. } => {
+            assert!(reason.contains("intentional failure"));
+            assert_eq!(terminal.last_error(), None);
         }
-        other => panic!("expected Errored, got {other:?}"),
+        other => panic!("expected Failed, got {other:?}"),
     }
 
     // Never failed: last_error is None.
@@ -4658,7 +4652,7 @@ async fn spawn_keyed_respawns_after_error() -> anyhow::Result<()> {
         .handle(first_handle.id())
         .await_completion(Duration::from_secs(10))
         .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    assert_eq!(outcome.state(), JobTerminalState::Failed);
 
     let second_handle = spawner.spawn("k", FailingJobConfig).await?;
     assert_ne!(
@@ -4670,7 +4664,7 @@ async fn spawn_keyed_respawns_after_error() -> anyhow::Result<()> {
         .handle(second_handle.id())
         .await_completion(Duration::from_secs(10))
         .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    assert_eq!(outcome.state(), JobTerminalState::Failed);
 
     jobs.shutdown().await?;
     Ok(())

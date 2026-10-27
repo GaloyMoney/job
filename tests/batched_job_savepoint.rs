@@ -16,9 +16,9 @@ mod helpers;
 use async_trait::async_trait;
 use es_entity::AtomicOperation;
 use job::{
-    BatchItemOutcome, BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob,
-    JobBatchCompletion, JobId, JobSpawner, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs,
-    RetrySettings,
+    Backoff, BatchItemOutcome, BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob,
+    JobBatchCompletion, JobId, JobSpawner, JobSpec, JobStatus, JobSvcConfig, JobTerminalState,
+    JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -44,7 +44,9 @@ struct SavepointConfig {
 /// by the next try.
 struct SavepointInitializer {
     job_type: JobType,
-    n_attempts: Option<u32>,
+    /// `true`: an isolated item's retry comes due almost immediately.
+    /// `false`: it is parked far past the end of the test.
+    fast_retry: bool,
 }
 
 impl BatchedJobInitializer for SavepointInitializer {
@@ -55,10 +57,23 @@ impl BatchedJobInitializer for SavepointInitializer {
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
+        let backoff = if self.fast_retry {
+            Backoff::new(
+                Duration::from_millis(10),
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                20,
+            )
+        } else {
+            Backoff::new(
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(120),
+                0,
+            )
+        };
         RetrySettings {
-            n_attempts: self.n_attempts,
-            min_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(50),
+            backoff,
             ..Default::default()
         }
     }
@@ -132,9 +147,9 @@ async fn run_isolated_keeps_batch_mates_committing_after_a_per_item_db_error() -
 
     let spawner = jobs.add_batched_initializer(SavepointInitializer {
         job_type: helpers::job_type("batched-savepoint-conflict"),
-        // Terminal on the first failure: keeps this test's assertions about
-        // the *first pass* unambiguous (no retry churn to account for).
-        n_attempts: Some(1),
+        // Parked retries: keeps this test's assertions about the *first
+        // pass* unambiguous (no retry churn to account for).
+        fast_retry: false,
     });
 
     // Three items race for the same row: exactly one insert can win.
@@ -173,43 +188,34 @@ async fn run_isolated_keeps_batch_mates_committing_after_a_per_item_db_error() -
     jobs.start_poll().await?;
 
     let all: Vec<JobId> = conflict_ids.iter().chain(ok_ids.iter()).copied().collect();
-    let outcomes = jobs
-        .handles(all.clone())
-        .await_all(Duration::from_secs(30))
-        .await?;
+    let statuses = helpers::settle(&jobs, &all).await?;
 
     // The conflict-free controls must complete. Pre-savepoint, a per-item DB
     // error run straight against the batch's `op` would abort the whole
     // transaction and take these down with the conflicting items on every
     // attempt (the batch keeps re-forming with the same losers) — this is
     // the assertion that actually distinguishes isolation from poisoning.
-    for outcome in outcomes.iter().skip(3) {
-        assert_eq!(
-            outcome.state(),
-            JobTerminalState::Completed,
+    for status in statuses.iter().skip(3) {
+        assert!(
+            matches!(status, JobStatus::Completed { .. }),
             "a conflict-free batch-mate must complete regardless of another \
-             item's DB error"
+             item's DB error, saw {status:?}"
         );
     }
 
     // Of the three racing items, exactly one wins the insert and completes;
-    // the other two roll back to their own savepoint and, with n_attempts=1,
-    // surface as Errored rather than dragging the batch down.
-    let conflict_states: Vec<_> = outcomes.iter().take(3).map(|o| o.state()).collect();
-    let completed = conflict_states
-        .iter()
-        .filter(|s| **s == JobTerminalState::Completed)
-        .count();
-    let errored = conflict_states
-        .iter()
-        .filter(|s| **s == JobTerminalState::Errored)
-        .count();
+    // the other two roll back to their own savepoint and are isolated --
+    // pending at attempt 2 with the error recorded -- rather than dragging
+    // the batch down.
+    let conflict_states = &statuses[..3];
     assert_eq!(
-        completed, 1,
+        helpers::completed(conflict_states),
+        1,
         "exactly one conflicting item should win the insert, saw {conflict_states:?}"
     );
     assert_eq!(
-        errored, 2,
+        helpers::isolated(conflict_states),
+        2,
         "the losing items must be isolated failures, not a batch-wide one, \
          saw {conflict_states:?}"
     );
@@ -228,7 +234,7 @@ async fn run_isolated_failed_item_retries_solo_and_recovers() -> anyhow::Result<
 
     let spawner = jobs.add_batched_initializer(SavepointInitializer {
         job_type: helpers::job_type("batched-savepoint-retry"),
-        n_attempts: Some(5),
+        fast_retry: true,
     });
 
     // Two items share a key: the loser's first attempt hits a real

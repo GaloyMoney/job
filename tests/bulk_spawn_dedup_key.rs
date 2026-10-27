@@ -9,7 +9,7 @@ mod helpers;
 
 use async_trait::async_trait;
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec,
+    Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec,
     JobSvcConfig, JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
@@ -386,15 +386,15 @@ async fn dedup_key_survives_a_retry() -> anyhow::Result<()> {
         fail_first_n: 1,
         attempts_so_far: Arc::new(AtomicUsize::new(0)),
         retry_settings: RetrySettings {
-            n_attempts: Some(5),
-            n_warn_attempts: None,
-            min_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(10),
-            backoff_jitter_pct: 0,
+            backoff: Backoff::new(
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+                Duration::from_millis(10),
+                0,
+            ),
             // The test drives a deliberate failure and asserts on the
             // resulting attempt counter, so forgiveness must stay off.
             attempt_reset_after_healthy_run: None,
-            terminal_on_fatal: false,
         },
     });
     jobs.start_poll().await?;

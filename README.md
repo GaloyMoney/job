@@ -245,36 +245,50 @@ no caller on the other end of a job to tell no -- so a `Denied` anywhere in the 
 with `.narrow_denied()` into `Fatal(Denied)` on the spot: the span records `error.lane = "fatal"`,
 `error.code = "denied"`, not `"denied"`/`"FORBIDDEN"`.
 
-**Reporting the lane and acting on it are separate.** The span always says what the lane was. What job
-*does* with it is deliberately conservative for now:
+## Retries: one curve, two bands
 
-- A transient whose `is_congestion()` is true (`PoolTimeout` or `Congestion`) reschedules without
-  spending a retry attempt -- pool-wide pressure is no evidence that this particular job is broken.
-- Everything else -- `Transient`, `Fatal` (including a narrowed `Denied`), a panic (`Fatal(Panic)`),
-  an unlaned error -- goes through the ordinary attempt-count retry policy, exactly as every failure
-  did before `job` adopted errlanes. A `Fatal` is reported as fatal immediately but does not by
-  itself end the job.
-- Set `terminal_on_fatal` on a job type to act on the lane as well: a `Fatal` then ends that job on
-  the attempt that produced it.
+A runner's `Err(_)` always means "this attempt failed": the job is retried and **retrying never stops on
+its own**. There is no attempt cap and no terminal-on-fatal. A job that hit a real bug keeps retrying on
+the fatal band (never more than `max` apart); when the fix deploys, its next attempt succeeds.
+Misclassifying a failure costs time, never liveness.
 
-The asymmetry is intentional. Trusting a `Fatal` ends a job after one attempt, and a `Fatal` that was
-really transient would turn a blip into a dead job -- so that trust is opt-in per job type, earned on
-the telemetry, which is there from the first deploy.
+```text
+attempt n:   1   2   3   4   5    6    7   8    9     10    11    12    13    14    15 …
+delay:       1s  2s  4s  8s  16s  32s  1m  2m   4.3m  8.5m  17m   34m   1.1h  2.3h  4.6h  6h 6h …
+             ├────────── transient band / WARN ───────────┤ ├────────── fatal band / ERROR ──────────▶
+                                                     fatal_min = 512s
+```
 
-When attempts run out on the ordinary retry path, the stored error is not just the last transient's
-text: the entity narrows it into `Fatal(Exhausted)` first, so `ExecutionErrored.error` reads
-`fatal(exhausted): exhausted after N attempts: transient(...): ...` and a reader can tell "retried to
-exhaustion" apart from "fatal from the first attempt" without cross-referencing the attempt count.
+- **One backoff curve, two bands.** The failure's errlanes lane decides where the next retry *enters*
+  the curve: a `Transient` enters at `transient_min` and climbs; a `Fatal` (including a narrowed `Denied`,
+  a panic, and an unlaned error) enters at `fatal_min` and climbs. A transient streak whose delay reaches
+  `fatal_min` is narrowed to `Fatal(Exhausted)` and continues on the same curve. A transient whose
+  `is_congestion()` is true (`PoolTimeout` or `Congestion`) is rescheduled without spending an attempt --
+  pool-wide pressure is no evidence that this particular job is broken.
+- **The band is the operator contract.** The transient band logs at `WARN`; the fatal band logs at
+  `ERROR`, meaning *a human needs to look*. Nothing else sets the level.
+- **Only the job can end itself.** `Ok(JobCompletion::Complete…)` or `Ok(JobCompletion::Fail…)`. A
+  `Fail` is terminal -- no retry, no revive -- and its reason is recorded on the job
+  (`JobStatus::Failed { reason }`). Batched items end the same way with `BatchItemOutcome::Fail`;
+  `BatchItemOutcome::Errored` means "this attempt failed, retry the item". Residents and subscribers are
+  stream-bound and have no `Fail`.
+- **No operator verbs.** Deploy the fix and wait at most `max`; a type that cannot afford `max` sets a
+  lower one.
 
 The [`RetrySettings`](https://docs.rs/job/latest/job/struct.RetrySettings.html) that you configure for each
-[`JobInitializer`](https://docs.rs/job/latest/job/trait.JobInitializer.html) directly influence that
-telemetry:
+[`JobInitializer`](https://docs.rs/job/latest/job/trait.JobInitializer.html) shape the curve:
 
-- `n_attempts` caps how many times the dispatcher will retry before emitting a terminal `ERROR` and deleting the job execution.
-- `n_warn_attempts` controls how many consecutive failures remain `WARN` level events before the crate promotes them to `ERROR`. Setting it to `None` keeps every retry at `WARN`.
-- `min_backoff`, `max_backoff`, and `backoff_jitter_pct` determine the delay that is recorded in the `job.fail_job` span before the next retry is scheduled.
+- `backoff` is a [`Backoff`](https://docs.rs/job/latest/job/struct.Backoff.html): `transient_min`,
+  `fatal_min`, `max` and `jitter_pct`, constructed with `Backoff::new` (which panics on
+  `transient_min < fatal_min <= max` / `jitter_pct <= 100` violations) or the fallible
+  `Backoff::try_new` for config-driven values. The default is `1s` / `512s` / `6h` / `20%`.
 - `attempt_reset_after_healthy_run` lets a job be considered healthy again once a single execution has run for at least that long before failing (measured on a monotonic clock over the run itself, so neither an application-clock advance nor scheduler latency can satisfy it); the dispatcher resets the reported attempt counter accordingly. `None` disables forgiveness, and the counter then only ever resets on a completion.
-- `terminal_on_fatal` (default `false`) makes a `Fatal` runner error (including a narrowed `Denied`) end the job on the attempt that produced it, instead of taking the ordinary attempt-count retry. Leave it off until you trust how faithfully the crates behind a given job type lane their errors; the lane is reported on the span either way. Resident types force it off -- they have no terminal state to go to.
+
+The `job.fail_job` span reports `retry.band` (`transient` / `fatal`, the band of the *next* retry),
+`retry.fatal_streak`, and `will_retry` (`true` on every `Err`); `error.level` is `WARN` in the transient
+band and `ERROR` in the fatal band. A `Fail` verdict records `error.lane`, `error.code` and
+`exception.message` on `job.conclude_failed` with `will_retry = false`. A pending job's
+`JobStatus::Pending` carries the same `band` and its `last_error`.
 
 Together these make the emitted telemetry reflect both the severity and cadence of retryable failures, which is especially helpful when wiring the crate into alerting systems.
 

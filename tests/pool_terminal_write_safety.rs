@@ -10,8 +10,8 @@ mod helpers;
 
 use async_trait::async_trait;
 use job::{
-    BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob, JobBatchCompletion, JobId,
-    JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, RetrySettings,
+    BatchItemOutcome, BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob,
+    JobBatchCompletion, JobId, JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Postgres;
@@ -63,7 +63,20 @@ impl BatchedJobRunner for StarvePoolThenFailRunner {
                 Err(_) => break,
             }
         }
-        Err("real failure, shared pool now fully starved".into())
+        Ok(JobBatchCompletion::WithOutcomes(
+            current_batch
+                .items()
+                .iter()
+                .map(|item| {
+                    (
+                        item.id(),
+                        BatchItemOutcome::Fail {
+                            error: "real failure, shared pool now fully starved".into(),
+                        },
+                    )
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -80,13 +93,7 @@ impl BatchedJobInitializer for StarvePoolThenFailInitializer {
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
-        // `n_attempts: 1` so the single failure is immediately terminal --
-        // no need to wait through a backoff/retry cycle for this test's
-        // one assertion.
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
+        RetrySettings::default()
     }
 
     fn init(
@@ -114,10 +121,9 @@ impl BatchedJobInitializer for StarvePoolThenFailInitializer {
 /// `StarvePoolThenFailRunner`), so this observes the actual database
 /// outcome without depending on the thing under test.
 ///
-/// A deleted row is the exhausted-retries terminal signature (see
-/// `finalizer.rs`'s terminal `DELETE FROM job_executions`): with
-/// `n_attempts: 1` this is the only way this test's job execution row can
-/// disappear.
+/// A deleted row is the terminal signature (see `finalizer.rs`'s terminal
+/// `DELETE FROM job_executions`): the runner's `Fail` verdict is the only
+/// way this test's job execution row can disappear.
 async fn wait_for_execution_row_deleted(
     observer_pool: &sqlx::PgPool,
     id: JobId,

@@ -13,8 +13,9 @@ mod helpers;
 use async_trait::async_trait;
 use es_entity::AtomicOperation;
 use job::{
-    BatchedJobInitializer, BatchedJobRunner, BisectBudget, CurrentBatchedJob, JobBatchCompletion,
-    JobId, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySettings,
+    Backoff, BatchedJobInitializer, BatchedJobRunner, BisectBudget, CurrentBatchedJob,
+    JobBatchCompletion, JobId, JobSpec, JobSvcConfig, JobTerminalState, JobType, Jobs,
+    RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -82,12 +83,49 @@ impl BatchedJobRunner for BisectRunner {
     }
 }
 
+/// How soon an isolated item's retry comes due.
+#[derive(Clone, Copy)]
+enum Retry {
+    /// Due almost immediately: the item recovers on its solo retry within the
+    /// test.
+    Fast,
+    /// Due far past the end of the test: the item is observed isolated --
+    /// pending at attempt 2 with its error recorded -- and nothing re-runs it
+    /// while its dispatch's probe counts are being asserted.
+    Parked,
+}
+
+impl Retry {
+    fn settings(self) -> RetrySettings {
+        let backoff = match self {
+            Retry::Fast => Backoff::new(
+                Duration::from_millis(10),
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                20,
+            ),
+            Retry::Parked => Backoff::new(
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(120),
+                0,
+            ),
+        };
+        RetrySettings {
+            backoff,
+            ..Default::default()
+        }
+    }
+}
+
+use helpers::{completed, isolated, settle};
+
 struct BisectInitializer {
     job_type: JobType,
     table: String,
     budget: BisectBudget,
     probes: Arc<AtomicUsize>,
-    n_attempts: Option<u32>,
+    retry: Retry,
 }
 
 impl BatchedJobInitializer for BisectInitializer {
@@ -98,12 +136,7 @@ impl BatchedJobInitializer for BisectInitializer {
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
-        RetrySettings {
-            n_attempts: self.n_attempts,
-            min_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(50),
-            ..Default::default()
-        }
+        self.retry.settings()
     }
 
     fn init(
@@ -199,7 +232,7 @@ async fn happy_path_probes_once() -> anyhow::Result<()> {
         table: table.to_string(),
         budget: BisectBudget::default(),
         probes: Arc::clone(&probes),
-        n_attempts: Some(1),
+        retry: Retry::Parked,
     });
 
     let ids = spawn_batch(&spawner, table, 5, &[]).await?;
@@ -238,7 +271,7 @@ async fn single_culprit_isolates_under_default_auto_budget() -> anyhow::Result<(
         table: table.to_string(),
         budget: BisectBudget::default(),
         probes: Arc::clone(&probes),
-        n_attempts: Some(2),
+        retry: Retry::Fast,
     });
 
     // Culprit at position 0 of 10 — Auto's cap (2*ceil(log2(10))+1 = 9)
@@ -289,7 +322,7 @@ async fn largest_first_salvage_under_tight_budget() -> anyhow::Result<()> {
         table: table.to_string(),
         budget: BisectBudget::MaxProbes(4),
         probes: Arc::clone(&probes),
-        n_attempts: Some(2),
+        retry: Retry::Fast,
     });
 
     let ids = spawn_batch(&spawner, table, 10, &[0]).await?;
@@ -334,8 +367,8 @@ async fn all_bad_batch_resolves_every_item_under_full_resolution() -> anyhow::Re
         table: table.to_string(),
         budget: BisectBudget::FullResolution,
         probes: Arc::clone(&probes),
-        // Terminal on the first failure, deliberately: solo-retry recovery
-        // is already covered (with less simultaneous retry churn) by
+        // Parked retries, deliberately: solo-retry recovery is already
+        // covered (with less simultaneous retry churn) by
         // `single_culprit_isolates_under_default_auto_budget` and
         // `largest_first_salvage_under_tight_budget`. This test's only job
         // is the search's shape on the FIRST dispatch, so it doesn't need
@@ -343,20 +376,18 @@ async fn all_bad_batch_resolves_every_item_under_full_resolution() -> anyhow::Re
         // round trips were observed to make the test load-sensitive (timed
         // out under full-suite concurrency even at 45s) without adding any
         // coverage this test is actually responsible for.
-        n_attempts: Some(1),
+        retry: Retry::Parked,
     });
 
     let culprits: Vec<usize> = (0..6).collect();
     let ids = spawn_batch(&spawner, table, 6, &culprits).await?;
     jobs.start_poll().await?;
-    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    let statuses = settle(&jobs, &ids).await?;
 
-    assert!(
-        outcomes
-            .iter()
-            .all(|o| o.state() == JobTerminalState::Errored),
-        "every item exhausts its single attempt and errors out, saw {:?}",
-        outcomes.iter().map(|o| o.state()).collect::<Vec<_>>()
+    assert_eq!(
+        isolated(&statuses),
+        6,
+        "every item is isolated -- pending at attempt 2, not killed -- saw {statuses:?}"
     );
     assert_eq!(scratch_values(&pool, table).await?, vec![SENTINEL_KEY]);
     // The pathological case: `FullResolution` keeps halving until every
@@ -402,31 +433,31 @@ async fn scattered_culprits_do_not_poison_their_clean_siblings() -> anyhow::Resu
         table: table.to_string(),
         budget: BisectBudget::default(),
         probes: Arc::clone(&probes),
-        // Terminal on the first failure: this test asserts the salvage of
-        // the FIRST dispatch exactly, so no retry churn to account for.
-        n_attempts: Some(1),
+        // Parked retries: this test asserts the salvage of the FIRST
+        // dispatch exactly, so no retry churn to account for.
+        retry: Retry::Parked,
     });
 
     // One culprit per half of a 16-item batch — the minimum that used to
     // trip the old streak threshold.
     let ids = spawn_batch(&spawner, table, 16, &[0, 8]).await?;
     jobs.start_poll().await?;
-    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    let statuses = settle(&jobs, &ids).await?;
 
     // Largest-first under Auto (cap 2*ceil(log2 16)+1 = 9):
     //   [0,16)F [0,8)F [8,16)F [0,4)F [4,8)OK [8,12)F [12,16)OK [0,2)F [2,4)OK
     // salvaging 2..7 and 12..15 = 10 items; 0,1,8,9,10,11 budget-fail.
     // Under the old escalation heuristic this dispatch completed only 4.
-    let completed = outcomes
-        .iter()
-        .filter(|o| o.state() == JobTerminalState::Completed)
-        .count();
     assert_eq!(
-        completed,
+        completed(&statuses),
         10,
         "two scattered culprits must not cost their clean siblings a \
-         completion, saw {:?}",
-        outcomes.iter().map(|o| o.state()).collect::<Vec<_>>()
+         completion, saw {statuses:?}"
+    );
+    assert_eq!(
+        isolated(&statuses),
+        6,
+        "the six budget-failed items are isolated, not killed, saw {statuses:?}"
     );
     assert_eq!(probes.load(Ordering::SeqCst), 9, "Auto's cap at N=16");
     assert_eq!(
@@ -503,12 +534,7 @@ async fn domain_error_isolates_without_touching_the_db() -> anyhow::Result<()> {
         }
 
         fn retry_on_error_settings(&self) -> RetrySettings {
-            RetrySettings {
-                n_attempts: Some(1),
-                min_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                ..Default::default()
-            }
+            Retry::Parked.settings()
         }
 
         fn init(
@@ -542,23 +568,17 @@ async fn domain_error_isolates_without_touching_the_db() -> anyhow::Result<()> {
     }
     spawner.spawn_all(specs).await?;
     jobs.start_poll().await?;
-    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    let statuses = settle(&jobs, &ids).await?;
 
-    let completed = outcomes
-        .iter()
-        .filter(|o| o.state() == JobTerminalState::Completed)
-        .count();
-    let errored = outcomes
-        .iter()
-        .filter(|o| o.state() == JobTerminalState::Errored)
-        .count();
     assert_eq!(
-        completed, 4,
+        completed(&statuses),
+        4,
         "the four flag-free items must isolate and complete"
     );
     assert_eq!(
-        errored, 1,
-        "the single flagged item must isolate and error out"
+        isolated(&statuses),
+        1,
+        "the single flagged item must be isolated, not killed"
     );
     assert!(probes.load(Ordering::SeqCst) > 1);
 
@@ -580,32 +600,40 @@ async fn max_probes_one_is_equivalent_to_fail_all() -> anyhow::Result<()> {
         table: table.to_string(),
         budget: BisectBudget::MaxProbes(1),
         probes: Arc::clone(&probes),
-        // Terminal on the first failure. Recovery of budget-failed items
-        // through solo retry is covered by
-        // `largest_first_salvage_under_tight_budget`; asserting it here too
-        // would mean five simultaneous backoff+reclaim round trips, and
-        // retry churn of that size is what makes a test load-sensitive
-        // under full-suite concurrency. What this test is responsible for
-        // is the degenerate budget itself, which the first dispatch settles
-        // on its own.
-        n_attempts: Some(1),
+        // Parked retries. Recovery of budget-failed items through solo retry
+        // is covered by `largest_first_salvage_under_tight_budget`; asserting
+        // it here too would mean five simultaneous backoff+reclaim round
+        // trips, and retry churn of that size is what makes a test
+        // load-sensitive under full-suite concurrency. What this test is
+        // responsible for is the degenerate budget itself, which the first
+        // dispatch settles on its own.
+        retry: Retry::Parked,
     });
 
     let ids = spawn_batch(&spawner, table, 5, &[0]).await?;
     jobs.start_poll().await?;
-    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    let statuses = settle(&jobs, &ids).await?;
 
     // MaxProbes(1) probes the whole batch exactly once and, since it fails,
     // budget-fails every item in that same dispatch — no bisection at all.
     // This is the interpolation endpoint: equivalent to returning `Err` from
     // `run_batch` directly, just routed through the helper.
+    assert_eq!(
+        isolated(&statuses),
+        5,
+        "a single probe cannot attribute the failure, so every item is \
+         isolated, saw {statuses:?}"
+    );
     assert!(
-        outcomes
-            .iter()
-            .all(|o| o.state() == JobTerminalState::Errored),
-        "a single probe cannot attribute the failure, so every item fails, \
-         saw {:?}",
-        outcomes.iter().map(|o| o.state()).collect::<Vec<_>>()
+        statuses.iter().all(|s| matches!(
+            s,
+            job::JobStatus::Pending {
+                band: job::RetryBand::Transient,
+                ..
+            }
+        )),
+        "an item the budget could not attribute retries in the transient \
+         band, saw {statuses:?}"
     );
     assert_eq!(
         probes.load(Ordering::SeqCst),
@@ -635,7 +663,7 @@ async fn max_probes_zero_clamps_to_one() -> anyhow::Result<()> {
         table: table.to_string(),
         budget: BisectBudget::MaxProbes(0),
         probes: Arc::clone(&probes),
-        n_attempts: Some(1),
+        retry: Retry::Parked,
     });
 
     let ids = spawn_batch(&spawner, table, 3, &[]).await?;
@@ -672,7 +700,7 @@ async fn coupled_pair_resolves_deterministically_by_probe_order() -> anyhow::Res
         table: table.to_string(),
         budget: BisectBudget::default(),
         probes: Arc::clone(&probes),
-        n_attempts: Some(1),
+        retry: Retry::Parked,
     });
 
     // Two items race for the SAME key (not the sentinel table) — a real
@@ -694,19 +722,16 @@ async fn coupled_pair_resolves_deterministically_by_probe_order() -> anyhow::Res
     }
     spawner.spawn_all(specs).await?;
     jobs.start_poll().await?;
-    let outcomes = jobs.handles(ids).await_all(Duration::from_secs(30)).await?;
+    let statuses = settle(&jobs, &ids).await?;
 
-    let completed = outcomes
-        .iter()
-        .filter(|o| o.state() == JobTerminalState::Completed)
-        .count();
-    let errored = outcomes
-        .iter()
-        .filter(|o| o.state() == JobTerminalState::Errored)
-        .count();
-    assert_eq!(completed, 1, "exactly one of the coupled pair wins the key");
     assert_eq!(
-        errored, 1,
+        completed(&statuses),
+        1,
+        "exactly one of the coupled pair wins the key"
+    );
+    assert_eq!(
+        isolated(&statuses),
+        1,
         "the other resolves as an isolated failure, not a batch-wide one"
     );
     assert_eq!(scratch_values(&pool, table).await?, vec![42]);
@@ -811,10 +836,7 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
             self.job_type.clone()
         }
         fn retry_on_error_settings(&self) -> RetrySettings {
-            RetrySettings {
-                n_attempts: Some(1),
-                ..Default::default()
-            }
+            Retry::Parked.settings()
         }
         fn init(
             &self,
@@ -895,7 +917,7 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
 
     // The conflict was transient, so the re-probe wins and the batch settles
     // in this dispatch -- no item blamed, no retry attempt burnt, even though
-    // `n_attempts` is 1 and there is no second chance.
+    // the retry is parked far out and there is no second chance in the test.
     assert!(
         outcomes
             .iter()
@@ -1003,12 +1025,9 @@ async fn a_conflict_retry_is_not_charged_to_the_probe_budget() -> anyhow::Result
             self.job_type.clone()
         }
         fn retry_on_error_settings(&self) -> RetrySettings {
-            RetrySettings {
-                // Terminal on first failure: a budget-`Fail` therefore shows up
-                // as `Errored` rather than being hidden by a later retry.
-                n_attempts: Some(1),
-                ..Default::default()
-            }
+            // Parked retries: a budget-`Fail` therefore shows up as an
+            // isolated item rather than being hidden by a later retry.
+            Retry::Parked.settings()
         }
         fn init(
             &self,

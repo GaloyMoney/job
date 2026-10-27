@@ -53,7 +53,9 @@ impl JobRunner for StarvePoolThenFailRunner {
                 Err(_) => break,
             }
         }
-        Err("real failure, shared pool now fully starved".into())
+        Ok(JobCompletion::Fail(
+            "real failure, shared pool now fully starved".into(),
+        ))
     }
 }
 
@@ -70,13 +72,7 @@ impl JobInitializer for StarvePoolThenFailInitializer {
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
-        // `n_attempts: 1` so the single failure is immediately terminal --
-        // no need to wait through a backoff/retry cycle for this test's one
-        // assertion.
-        RetrySettings {
-            n_attempts: Some(1),
-            ..Default::default()
-        }
+        RetrySettings::default()
     }
 
     fn init(

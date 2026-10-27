@@ -14,7 +14,7 @@ use std::{
 use super::{
     JobId,
     current::CurrentJob,
-    entity::{Job, JobType},
+    entity::{FailureLane, Job, JobType, RetryBand},
     error::JobFault,
     finalizer::{ClaimDisposition, Disposition, Finalizer},
     notifier::JobEventNotifier,
@@ -23,6 +23,25 @@ use super::{
     runner::*,
     tracker::{JobTracker, UnitReservation},
 };
+
+/// Classify a `Fail` verdict's error without narrowing, record its lane,
+/// code and source chain on `span` with `will_retry = false`, and return the
+/// message persisted as the job's failure reason. The level follows the
+/// lane, so an unlaned error (`Fatal(Dependency)`) reads as `ERROR`.
+pub(crate) fn record_verdict(
+    span: &Span,
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> String {
+    let verdict = Fault::classify(error);
+    verdict.record(span);
+    let level = match verdict.lane().level() {
+        errlanes::Level::Warn => tracing::Level::WARN,
+        _ => tracing::Level::ERROR,
+    };
+    span.record("error.level", tracing::field::display(level));
+    span.record("will_retry", false);
+    error.to_string()
+}
 
 #[derive(Debug)]
 pub struct PolledJob {
@@ -41,7 +60,6 @@ pub(crate) struct JobDispatcher {
     /// the poller alive on its own -- mirrors `spawner.rs`'s `PollerHandle`.
     poller: Weak<JobPoller>,
     repo: Arc<JobRepo>,
-    retry_settings: RetrySettings,
     runner: Option<Box<dyn JobRunner>>,
     tracker: Arc<JobTracker>,
     job_type: JobType,
@@ -87,7 +105,7 @@ impl JobDispatcher {
             poller.clone(),
             repo.clone(),
             notifier,
-            retry_settings.clone(),
+            retry_settings,
             retains_state,
             instance_id,
             clock.clone(),
@@ -95,7 +113,6 @@ impl JobDispatcher {
         Self {
             poller,
             repo,
-            retry_settings,
             runner: Some(runner),
             tracker,
             job_type,
@@ -133,7 +150,7 @@ impl JobDispatcher {
             poller.clone(),
             repo.clone(),
             notifier,
-            retry_settings.clone(),
+            retry_settings,
             retains_state,
             instance_id,
             clock.clone(),
@@ -141,7 +158,6 @@ impl JobDispatcher {
         Self {
             poller,
             repo,
-            retry_settings,
             runner: Some(runner),
             tracker,
             job_type,
@@ -253,6 +269,21 @@ impl JobDispatcher {
                 Ok(JobCompletion::CompleteWithTx(mut tx)) => {
                     span.record("conclusion", "CompleteWithTx");
                     self.complete_job(&mut tx, job.id).await?;
+                    tx.commit().await?;
+                }
+                Ok(JobCompletion::Fail(error)) => {
+                    span.record("conclusion", "Fail");
+                    self.conclude_failed_own(job.id, &*error).await?;
+                }
+                #[cfg(feature = "es-entity")]
+                Ok(JobCompletion::FailWithOp(mut op, error)) => {
+                    span.record("conclusion", "FailWithOp");
+                    self.conclude_failed(&mut op, job.id, &*error).await?;
+                    op.commit().await?;
+                }
+                Ok(JobCompletion::FailWithTx(mut tx, error)) => {
+                    span.record("conclusion", "FailWithTx");
+                    self.conclude_failed(&mut tx, job.id, &*error).await?;
                     tx.commit().await?;
                 }
                 Ok(JobCompletion::RescheduleNow) => {
@@ -428,7 +459,9 @@ impl JobDispatcher {
             job_type = tracing::field::Empty,
             poller_id = tracing::field::Empty,
             attempt,
-            will_retry = tracing::field::Empty
+            will_retry = tracing::field::Empty,
+            retry.band = tracing::field::Empty,
+            retry.fatal_streak = tracing::field::Empty
         )
     )]
     async fn fail_job(
@@ -453,46 +486,38 @@ impl JobDispatcher {
                 .await;
         }
 
+        let lane = FailureLane::from(&failure);
         let items = [(
             id,
             Disposition::Fail {
-                failure,
+                failure: failure.clone(),
                 attempt,
                 run_duration,
             },
         )];
         let finalizer = self.finalizer.clone();
-        let outcome = finalizer
-            .finalize(&items, |op, outcome| {
-                // The exhausted-retries terminal delete frees this job's
-                // unit -- recycle it into an immediate same-type claim,
-                // exactly like a completion does.
-                if !outcome.errored_terminal.is_empty() {
-                    self.recycle_into_claim(op);
-                }
-            })
-            .await?;
+        let outcome = finalizer.finalize(&items, |_, _| {}).await?;
 
-        if let Some((_, next_attempt)) = outcome.retried.first() {
-            let exceeded_warn_attempts = self
-                .retry_settings
-                .n_warn_attempts
-                .is_some_and(|limit| *next_attempt > limit);
-            let level = if exceeded_warn_attempts {
-                tracing::Level::ERROR
-            } else {
-                tracing::Level::WARN
-            };
-            span.record("error.level", tracing::field::display(level));
-            span.record("will_retry", true);
-            self.rescheduled = true;
-        } else {
-            span.record(
-                "error.level",
-                tracing::field::display(tracing::Level::ERROR),
-            );
-            span.record("will_retry", false);
-        }
+        let band = match outcome.retried.first() {
+            Some((_, retry)) => {
+                if retry.band == RetryBand::Fatal && lane == FailureLane::Transient {
+                    failure
+                        .narrow_transient(retry.next_attempt.saturating_sub(1))
+                        .record(&span);
+                }
+                span.record("retry.fatal_streak", retry.fatal_streak);
+                self.rescheduled = true;
+                retry.band
+            }
+            None => RetryBand::from(lane),
+        };
+        span.record("will_retry", true);
+        let level = match band {
+            RetryBand::Transient => tracing::Level::WARN,
+            RetryBand::Fatal => tracing::Level::ERROR,
+        };
+        span.record("error.level", tracing::field::display(level));
+        span.record("retry.band", band.as_str());
         Ok(())
     }
 
@@ -540,6 +565,54 @@ impl JobDispatcher {
         let items = [(id, Disposition::Complete)];
         let outcome = self.finalizer.finalize_in_op(op, &items).await?;
         if !outcome.completed.is_empty() {
+            self.recycle_into_claim(op);
+        }
+        Ok(())
+    }
+
+    /// [`Self::conclude_failed`] in a transaction [`Finalizer::finalize`]
+    /// owns, so the terminal write gets its pool choice and abort-retry
+    /// policy exactly as a retry's write does.
+    #[errlanes::instrument(
+        name = "job.conclude_failed",
+        skip(self, error),
+        fields(id = %id, will_retry = tracing::field::Empty)
+    )]
+    async fn conclude_failed_own(
+        &mut self,
+        id: JobId,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> Result<(), JobFault> {
+        let reason = record_verdict(&Span::current(), error);
+        let items = [(id, Disposition::Failed { reason })];
+        let finalizer = self.finalizer.clone();
+        finalizer
+            .finalize(&items, |op, outcome| {
+                if !outcome.failed.is_empty() {
+                    self.recycle_into_claim(op);
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// End the job in failure via [`Disposition::Failed`] on the caller's op,
+    /// the way [`Self::complete_job`] ends it in success.
+    #[errlanes::instrument(
+        name = "job.conclude_failed",
+        skip(self, op, error),
+        fields(id = %id, will_retry = tracing::field::Empty)
+    )]
+    async fn conclude_failed(
+        &mut self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        id: JobId,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> Result<(), JobFault> {
+        let reason = record_verdict(&Span::current(), error);
+        let items = [(id, Disposition::Failed { reason })];
+        let outcome = self.finalizer.finalize_in_op(op, &items).await?;
+        if !outcome.failed.is_empty() {
             self.recycle_into_claim(op);
         }
         Ok(())

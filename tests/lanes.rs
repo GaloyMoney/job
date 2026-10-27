@@ -1,8 +1,8 @@
-//! Live-PG coverage for the lane-driven disposition matrix the errlanes
-//! full-adoption refactor introduced (`finalizer.rs`'s runner-failure classification,
-//! `JobDispatcher::fail_job`, `Job::maybe_schedule_retry`'s `terminal`
-//! parameter): what a runner's classified error does to the job, per
-//! `job-dev/handoff-errlanes-full-adoption.md` §3.7.
+//! Live-PG coverage for the lane-banded retry matrix (`finalizer.rs`'s
+//! runner-failure classification, `JobDispatcher::fail_job`,
+//! `Job::maybe_schedule_retry`): what a runner's classified error does to
+//! the job. A runner error never ends a job; its lane picks the band the
+//! retry is scheduled in, and `JobStatus::Pending` reports that band.
 //!
 //! One job type per test (`helpers::job_type` suffixes for uniqueness), and
 //! every runner reports its own invocations' attempt numbers through a
@@ -15,9 +15,9 @@ mod helpers;
 use async_trait::async_trait;
 use es_entity::errlanes::{Denied, Fatal, FatalKind, Transient, TransientKind};
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobStatus,
-    JobSvcConfig, JobTerminalState, JobType, Jobs, ResidentJobCompletion, ResidentJobInitializer,
-    ResidentJobRunner, RetrySettings,
+    Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
+    JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs, ResidentJobCompletion,
+    ResidentJobInitializer, ResidentJobRunner, RetryBand, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -92,22 +92,70 @@ async fn start(label: &str) -> anyhow::Result<(Jobs, sqlx::PgPool, JobType)> {
     Ok((jobs, pool, helpers::job_type(label)))
 }
 
+/// Polls the job's `JobStatus` until `predicate` holds, or fails the test.
+async fn await_status(
+    jobs: &Jobs,
+    id: JobId,
+    what: &str,
+    predicate: impl Fn(&JobStatus) -> bool,
+) -> anyhow::Result<JobStatus> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = jobs.handle(id).load().await?.state();
+        if predicate(&status) {
+            return Ok(status);
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}; last status {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A job that has been retried at least three times: `Pending` at attempt 4
+/// or later.
+fn retried_at_least_thrice(status: &JobStatus) -> bool {
+    matches!(status, JobStatus::Pending { attempt, .. } if *attempt >= 4)
+}
+
+/// A short curve whose transient band cannot cross `fatal_min` within the
+/// handful of attempts these tests wait for, and whose fatal band is short
+/// enough to wait through.
+fn short_backoff() -> RetrySettings {
+    RetrySettings {
+        backoff: Backoff::new(
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            0,
+        ),
+        ..Default::default()
+    }
+}
+
+fn short_fatal_backoff() -> RetrySettings {
+    RetrySettings {
+        backoff: Backoff::new(
+            Duration::from_millis(2),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            0,
+        ),
+        ..Default::default()
+    }
+}
+
 /// A `Transient` runner error (not `PoolTimeout`/`Congestion`, which take
-/// the congestion-reschedule path instead) goes through the ordinary
-/// `RetryPolicy`: each failure spends an attempt, `attempt_index` climbs by
-/// one per retry.
+/// the congestion-reschedule path instead) is retried in the transient band:
+/// `attempt_index` climbs by one per retry and the job never ends.
 #[tokio::test]
 async fn transient_runner_error_retries_with_attempt_plus_one() -> anyhow::Result<()> {
     let (mut jobs, _pool, job_type) = start("lanes-transient-retries").await?;
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let spawner = jobs.add_initializer(AlwaysFailsInitializer {
         job_type,
-        retry: RetrySettings {
-            n_attempts: Some(3),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            ..Default::default()
-        },
+        retry: short_backoff(),
         attempts: Arc::clone(&attempts),
         build_error: || {
             Box::new(Transient::new(TransientKind::Other))
@@ -118,16 +166,22 @@ async fn transient_runner_error_retries_with_attempt_plus_one() -> anyhow::Resul
 
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    let status = await_status(&jobs, id, "a retry at attempt 4", retried_at_least_thrice).await?;
+    assert!(
+        matches!(
+            status,
+            JobStatus::Pending {
+                band: RetryBand::Transient,
+                last_error: Some(_),
+                ..
+            }
+        ),
+        "a transient failure must wait in the transient band, got {status:?}"
+    );
 
     let seen = attempts.lock().await.clone();
-    assert_eq!(
-        seen,
-        vec![1, 2, 3],
+    assert!(
+        seen.starts_with(&[1, 2, 3]),
         "a transient failure must spend an ordinary retry attempt each time, got {seen:?}"
     );
 
@@ -135,24 +189,17 @@ async fn transient_runner_error_retries_with_attempt_plus_one() -> anyhow::Resul
     Ok(())
 }
 
-/// A `Fatal` runner error takes the ordinary attempt-count retry path by
-/// default: `terminal_on_fatal` is `false`, so errlanes' claim that this
-/// will not succeed on retry is *reported* on the span but not acted on.
-/// Until there is live experience with how faithfully upstream crates lane
-/// their errors, a `Fatal` that is really transient must not turn a blip
-/// into a dead job.
+/// A `Fatal` runner error is retried in the fatal band from its first
+/// failure and the job never ends: errlanes' claim that it will not succeed
+/// on retry selects the schedule and the log level, never death, so a
+/// `Fatal` that is really transient costs time and nothing else.
 #[tokio::test]
-async fn fatal_runner_error_retries_by_default() -> anyhow::Result<()> {
+async fn fatal_runner_error_retries_in_the_fatal_band() -> anyhow::Result<()> {
     let (mut jobs, _pool, job_type) = start("lanes-fatal-retries").await?;
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let spawner = jobs.add_initializer(AlwaysFailsInitializer {
         job_type,
-        retry: RetrySettings {
-            n_attempts: Some(2),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            ..Default::default()
-        },
+        retry: short_fatal_backoff(),
         attempts: Arc::clone(&attempts),
         build_error: || {
             Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error + Send + Sync>
@@ -162,61 +209,22 @@ async fn fatal_runner_error_retries_by_default() -> anyhow::Result<()> {
 
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-
-    let seen = attempts.lock().await.clone();
-    assert_eq!(
-        seen,
-        vec![1, 2],
-        "a Fatal error must take the ordinary retry budget while `terminal_on_fatal` \
-         is off, got {seen:?}"
+    let status = await_status(&jobs, id, "a retry at attempt 4", retried_at_least_thrice).await?;
+    assert!(
+        matches!(
+            status,
+            JobStatus::Pending {
+                band: RetryBand::Fatal,
+                ..
+            }
+        ),
+        "a Fatal failure must wait in the fatal band, got {status:?}"
     );
 
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// The same always-`Fatal` runner with `terminal_on_fatal: true`: the type
-/// opts into trusting the lane, and the job ends on the attempt that
-/// produced it rather than spending its retry budget.
-#[tokio::test]
-async fn fatal_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Result<()> {
-    let (mut jobs, _pool, job_type) = start("lanes-fatal-terminal").await?;
-    let attempts = Arc::new(Mutex::new(Vec::new()));
-    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
-        job_type,
-        retry: RetrySettings {
-            n_attempts: Some(30),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            terminal_on_fatal: true,
-            ..Default::default()
-        },
-        attempts: Arc::clone(&attempts),
-        build_error: || {
-            Box::new(Fatal::new(FatalKind::Invariant)) as Box<dyn std::error::Error + Send + Sync>
-        },
-    });
-    jobs.start_poll().await?;
-
-    let id = JobId::new();
-    spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-
     let seen = attempts.lock().await.clone();
-    assert_eq!(
-        seen,
-        vec![1],
-        "terminal_on_fatal: true must end the job on the attempt that produced the \
-         Fatal, not burn the retry budget, got {seen:?}"
+    assert!(
+        seen.starts_with(&[1, 2, 3]),
+        "a Fatal error must be retried, got {seen:?}"
     );
 
     jobs.shutdown().await?;
@@ -224,22 +232,15 @@ async fn fatal_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Re
 }
 
 /// A plain, unlaned string error (no errlanes payload anywhere in its
-/// chain) gets `Fault::classify`'s `Fatal(Dependency)` default -- reported as
-/// fatal on the span, so it is visible -- and still takes an ordinary
-/// attempt-count retry, because `terminal_on_fatal` is off. Reporting the
-/// lane and acting on it are separate.
+/// chain) gets `Fault::classify`'s `Fatal(Dependency)` default -- so it
+/// lands in the fatal band, at `ERROR`, and is still retried forever.
 #[tokio::test]
-async fn unclassified_string_error_retries_per_policy() -> anyhow::Result<()> {
+async fn unclassified_string_error_retries_in_the_fatal_band() -> anyhow::Result<()> {
     let (mut jobs, _pool, job_type) = start("lanes-unclassified-retries").await?;
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let spawner = jobs.add_initializer(AlwaysFailsInitializer {
         job_type,
-        retry: RetrySettings {
-            n_attempts: Some(3),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            ..Default::default()
-        },
+        retry: short_fatal_backoff(),
         attempts: Arc::clone(&attempts),
         build_error: || "plain unlaned failure".into(),
     });
@@ -247,17 +248,22 @@ async fn unclassified_string_error_retries_per_policy() -> anyhow::Result<()> {
 
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    let status = await_status(&jobs, id, "a retry at attempt 4", retried_at_least_thrice).await?;
+    assert!(
+        matches!(
+            status,
+            JobStatus::Pending {
+                band: RetryBand::Fatal,
+                ..
+            }
+        ),
+        "an unclassified error must wait in the fatal band, got {status:?}"
+    );
 
     let seen = attempts.lock().await.clone();
-    assert_eq!(
-        seen,
-        vec![1, 2, 3],
-        "an unclassified error must retry on the ordinary attempt budget, got {seen:?}"
+    assert!(
+        seen.starts_with(&[1, 2, 3]),
+        "an unclassified error must be retried, got {seen:?}"
     );
 
     jobs.shutdown().await?;
@@ -266,11 +272,10 @@ async fn unclassified_string_error_retries_per_policy() -> anyhow::Result<()> {
 
 /// A panic inside `run` is classified as `Fatal(FatalKind::Panic)` (see
 /// `JobDispatcher::dispatch_job`), so the span says `error.lane = fatal`,
-/// `error.code = panic` straight away -- but like any other `Fatal` it is
-/// gated by `terminal_on_fatal`, which is off here. So the job spends its
-/// retry budget and errors only when that runs out.
+/// `error.code = panic` straight away and the retry waits in the fatal band.
+/// The job stays alive for a hotfix to pick up.
 #[tokio::test]
-async fn panicking_runner_errors_after_spending_its_retry_budget() -> anyhow::Result<()> {
+async fn panicking_runner_retries_in_the_fatal_band() -> anyhow::Result<()> {
     struct PanicInitializer {
         job_type: JobType,
     }
@@ -279,16 +284,8 @@ async fn panicking_runner_errors_after_spending_its_retry_budget() -> anyhow::Re
         fn job_type(&self) -> JobType {
             self.job_type.clone()
         }
-        // Small budget with a short backoff: the panic is retried now, so
-        // the default 30 attempts at a 1s floor would outlast the timeout
-        // below. Two attempts is enough to show it retried AND errored.
         fn retry_on_error_settings(&self) -> RetrySettings {
-            RetrySettings {
-                n_attempts: Some(2),
-                min_backoff: Duration::from_millis(5),
-                max_backoff: Duration::from_millis(20),
-                ..Default::default()
-            }
+            short_fatal_backoff()
         }
         fn init(
             &self,
@@ -315,79 +312,38 @@ async fn panicking_runner_errors_after_spending_its_retry_budget() -> anyhow::Re
 
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// A `Denied` runner error arrives as `Fatal(Denied)` (narrowed at the job
-/// boundary, since job is not an authorization boundary) and takes the
-/// ordinary retry path by default, same as any other `Fatal`:
-/// `terminal_on_fatal` gates it. The span-assertion half of this
-/// (`job.fail_job`'s `error.lane`/
-/// `error.code`) lives in `tests/lanes_denied_span.rs`: `tracing`'s
-/// per-callsite interest cache is process-wide, so a `set_default`
-/// subscriber trick like `span_capture` is only reliable isolated in its
-/// own test BINARY (a separate OS process), not merely its own test
-/// function within this one.
-#[tokio::test]
-async fn denied_runner_error_retries_by_default() -> anyhow::Result<()> {
-    let (mut jobs, _pool, job_type) = start("lanes-denied-retries").await?;
-    let attempts = Arc::new(Mutex::new(Vec::new()));
-    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
-        job_type,
-        retry: RetrySettings {
-            n_attempts: Some(2),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            ..Default::default()
-        },
-        attempts: Arc::clone(&attempts),
-        build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error + Send + Sync>,
-    });
-    jobs.start_poll().await?;
-
-    let id = JobId::new();
-    spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-
-    let seen = attempts.lock().await.clone();
-    assert_eq!(
-        seen,
-        vec![1, 2],
-        "Denied must take the ordinary retry budget while `terminal_on_fatal` is \
-         off, like Fatal, got {seen:?}"
+    let status = await_status(&jobs, id, "a retry at attempt 4", retried_at_least_thrice).await?;
+    assert!(
+        matches!(
+            status,
+            JobStatus::Pending {
+                band: RetryBand::Fatal,
+                ..
+            }
+        ),
+        "a panic must wait in the fatal band, got {status:?}"
     );
 
     jobs.shutdown().await?;
     Ok(())
 }
 
-/// The same always-`Denied` runner with `terminal_on_fatal: true`: the
-/// job ends on the attempt that produced it, exactly as for any other
-/// `Fatal` (the narrowed `Denied` IS a `Fatal` by the time this gates it).
+/// A `Denied` runner error arrives as `Fatal(Denied)` (narrowed at the job
+/// boundary, since job is not an authorization boundary) and is retried in
+/// the fatal band from its first failure, like any other `Fatal`. The
+/// span-assertion half of this (`job.fail_job`'s `error.lane`/`error.code`/
+/// `retry.band`) lives in `tests/lanes_denied_span.rs`: `tracing`'s
+/// per-callsite interest cache is process-wide, so a `set_default`
+/// subscriber trick like `span_capture` is only reliable isolated in its
+/// own test BINARY (a separate OS process), not merely its own test
+/// function within this one.
 #[tokio::test]
-async fn denied_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::Result<()> {
-    let (mut jobs, _pool, job_type) = start("lanes-denied-terminal").await?;
+async fn denied_runner_error_retries_in_the_fatal_band() -> anyhow::Result<()> {
+    let (mut jobs, _pool, job_type) = start("lanes-denied-retries").await?;
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let spawner = jobs.add_initializer(AlwaysFailsInitializer {
         job_type,
-        retry: RetrySettings {
-            n_attempts: Some(30),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            terminal_on_fatal: true,
-            ..Default::default()
-        },
+        retry: short_fatal_backoff(),
         attempts: Arc::clone(&attempts),
         build_error: || Box::new(Denied::default()) as Box<dyn std::error::Error + Send + Sync>,
     });
@@ -395,18 +351,22 @@ async fn denied_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::R
 
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
+    let status = await_status(&jobs, id, "a retry at attempt 4", retried_at_least_thrice).await?;
+    assert!(
+        matches!(
+            status,
+            JobStatus::Pending {
+                band: RetryBand::Fatal,
+                ..
+            }
+        ),
+        "Denied must wait in the fatal band, like Fatal, got {status:?}"
+    );
 
     let seen = attempts.lock().await.clone();
-    assert_eq!(
-        seen,
-        vec![1],
-        "terminal_on_fatal: true must end the job on the attempt that produced the \
-         Denied, got {seen:?}"
+    assert!(
+        seen.starts_with(&[1, 2, 3]),
+        "Denied must be retried, got {seen:?}"
     );
 
     jobs.shutdown().await?;
@@ -415,9 +375,8 @@ async fn denied_runner_error_goes_terminal_with_terminal_on_fatal() -> anyhow::R
 
 /// A resident job can never reach a terminal state (see
 /// `ResidentJobCompletion`'s doc), so a `Fatal` runner error must be
-/// rescheduled, not terminated: `JobRegistry::add_resident_initializer`
-/// forces `terminal_on_fatal: false` alongside `n_attempts: None` for exactly this
-/// reason. `await_completion` times out -- the job never becomes terminal --
+/// rescheduled, not terminated: no failure ends any job by retrying.
+/// `await_completion` times out -- the job never becomes terminal --
 /// and the runner keeps being invoked.
 #[tokio::test]
 async fn resident_job_returning_fatal_is_rescheduled_not_terminated() -> anyhow::Result<()> {
@@ -431,11 +390,7 @@ async fn resident_job_returning_fatal_is_rescheduled_not_terminated() -> anyhow:
             self.job_type.clone()
         }
         fn retry_on_error_settings(&self) -> RetrySettings {
-            RetrySettings {
-                min_backoff: Duration::from_millis(5),
-                max_backoff: Duration::from_millis(20),
-                ..Default::default()
-            }
+            short_fatal_backoff()
         }
         fn init(
             &self,
@@ -530,17 +485,10 @@ async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to
             self.job_type.clone()
         }
         fn retry_on_error_settings(&self) -> RetrySettings {
-            // A small cap: if congestion classification regressed and this
-            // went through the ordinary retry policy instead, the job
-            // would burn an attempt and this makes that failure mode
-            // terminate (and be caught by the assertion below) instead of
-            // quietly retrying its way to success.
-            RetrySettings {
-                n_attempts: Some(1),
-                min_backoff: Duration::from_millis(5),
-                max_backoff: Duration::from_millis(20),
-                ..Default::default()
-            }
+            // If congestion classification regressed and this went through
+            // the ordinary retry policy instead, the job would burn an
+            // attempt, which the `attempts` assertion below catches.
+            short_fatal_backoff()
         }
         fn init(
             &self,
@@ -605,67 +553,14 @@ async fn laned_pool_timeout_with_no_sqlx_source_takes_the_congestion_path_end_to
     Ok(())
 }
 
-/// On exhaustion the entity narrows the failure itself (`Job::
-/// maybe_schedule_retry` -> `narrow_transient`) before persisting it: the
-/// stored error says the job was retried to exhaustion, not just that it
-/// last saw one more ordinary transient like every attempt before it.
-#[tokio::test]
-async fn exhausted_transient_is_persisted_as_fatal_exhausted() -> anyhow::Result<()> {
-    let (mut jobs, _pool, job_type) = start("lanes-exhausted-transient").await?;
-    let spawner = jobs.add_initializer(AlwaysFailsInitializer {
-        job_type,
-        retry: RetrySettings {
-            n_attempts: Some(2),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            ..Default::default()
-        },
-        attempts: Arc::new(Mutex::new(Vec::new())),
-        build_error: || {
-            Box::new(Transient::new(TransientKind::Other))
-                as Box<dyn std::error::Error + Send + Sync>
-        },
-    });
-    jobs.start_poll().await?;
-
-    let id = JobId::new();
-    spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-
-    match jobs.handle(id).load().await?.state() {
-        JobStatus::Errored { error, .. } => {
-            assert!(
-                error.starts_with("fatal(exhausted): exhausted after 2 attempts: transient(other)"),
-                "expected the exhausted wrapper naming the attempt count and the last \
-                 transient, got {error:?}"
-            );
-        }
-        other => panic!("expected Errored, got {other:?}"),
-    }
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// A `Fatal` that ends the job on its own attempt (`terminal_on_fatal:
-/// true`) is persisted as its own message with no wrapper: `narrow_transient`
-/// is only ever applied on the attempt-count exhaustion path, never here.
+/// A `Fatal` failure is persisted as its own message with no wrapper, and
+/// `JobStatus::Pending` carries it as `last_error`.
 #[tokio::test]
 async fn fatal_runner_error_is_persisted_as_its_own_message() -> anyhow::Result<()> {
     let (mut jobs, _pool, job_type) = start("lanes-fatal-persisted-message").await?;
     let spawner = jobs.add_initializer(AlwaysFailsInitializer {
         job_type,
-        retry: RetrySettings {
-            n_attempts: Some(30),
-            min_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-            terminal_on_fatal: true,
-            ..Default::default()
-        },
+        retry: short_fatal_backoff(),
         attempts: Arc::new(Mutex::new(Vec::new())),
         build_error: || {
             Box::new(Fatal::invariant("bad")) as Box<dyn std::error::Error + Send + Sync>
@@ -675,17 +570,12 @@ async fn fatal_runner_error_is_persisted_as_its_own_message() -> anyhow::Result<
 
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
-    let outcome = jobs
-        .handle(id)
-        .await_completion(Duration::from_secs(10))
-        .await?;
-    assert_eq!(outcome.state(), JobTerminalState::Errored);
-
-    match jobs.handle(id).load().await?.state() {
-        JobStatus::Errored { error, .. } => {
-            assert_eq!(error, "fatal(invariant): bad");
+    let status = await_status(&jobs, id, "a retry at attempt 4", retried_at_least_thrice).await?;
+    match status {
+        JobStatus::Pending { last_error, .. } => {
+            assert_eq!(last_error.as_deref(), Some("fatal(invariant): bad"));
         }
-        other => panic!("expected Errored, got {other:?}"),
+        other => panic!("expected Pending, got {other:?}"),
     }
 
     jobs.shutdown().await?;

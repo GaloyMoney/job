@@ -2,17 +2,14 @@
 //! EXECUTION EVIDENCE — how long the failing run itself stayed up, measured
 //! on a monotonic clock — and by nothing else.
 //!
-//! Three properties carry the feature, and each fails deterministically if
+//! Two properties carry the feature, and each fails deterministically if
 //! the mechanism is removed:
 //!
 //! - `a_long_running_execution_is_forgiven_and_never_terminates` — the #14
-//!   case. A job whose runs stay up past the threshold outlives
-//!   `n_attempts`, WITHOUT ever returning a completion. This is the shape a
+//!   case. A job whose runs stay up past the threshold has its counter held
+//!   down, WITHOUT ever returning a completion. This is the shape a
 //!   resident/daemon listener has (healthy means "still inside `run()`"), so
 //!   an `ExecutionCompleted`-based reset cannot serve it.
-//! - `a_fast_failure_terminates_at_max_attempts_despite_clock_jumps` — the
-//!   #163 case at the database level. A deterministic failure escalates to
-//!   terminal even as the application clock jumps a day between attempts.
 //! - `a_reclaimed_attempt_is_forgiven_by_the_next_healthy_run` — the SIGKILL
 //!   path. `reclaim_lost_jobs` bumps `attempt_index` in SQL with NO entity
 //!   event, so it is the one real producer of an inflated counter that no
@@ -29,10 +26,9 @@ mod helpers;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use es_entity::clock::ClockHandle;
 use job::{
-    CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobPollerConfig, JobRunner, JobSpawner,
-    JobSpec, JobSvcConfig, JobType, Jobs, RetrySettings,
+    Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobPollerConfig, JobRunner,
+    JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -73,31 +69,8 @@ impl JobRunner for RunsLongThenFails {
     }
 }
 
-/// Fails immediately: a deterministically broken job, which must be allowed
-/// to reach `n_attempts` and terminate.
-struct FailsFast {
-    ran: mpsc::UnboundedSender<DateTime<Utc>>,
-}
-
-#[async_trait]
-impl JobRunner for FailsFast {
-    async fn run(
-        &self,
-        _: CurrentJob,
-    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
-        let _ = self.ran.send(Utc::now());
-        Err("deterministic failure".into())
-    }
-}
-
-enum Behaviour {
-    RunsLongThenFails,
-    FailsFast,
-}
-
 struct Init {
     job_type: JobType,
-    behaviour: Behaviour,
     ran: mpsc::UnboundedSender<DateTime<Utc>>,
     retry: RetrySettings,
 }
@@ -118,14 +91,9 @@ impl JobInitializer for Init {
         _: &Job,
         _: JobSpawner<Self::Config>,
     ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(match self.behaviour {
-            Behaviour::RunsLongThenFails => Box::new(RunsLongThenFails {
-                ran: self.ran.clone(),
-            }) as Box<dyn JobRunner>,
-            Behaviour::FailsFast => Box::new(FailsFast {
-                ran: self.ran.clone(),
-            }),
-        })
+        Ok(Box::new(RunsLongThenFails {
+            ran: self.ran.clone(),
+        }))
     }
 }
 
@@ -182,11 +150,10 @@ where
 
 /// The #14 case, and the one PR #205's `ExecutionCompleted` predicate broke:
 /// a job that stays up past the threshold before failing is forgiven with no
-/// completion event anywhere in its history, so it outlives `n_attempts`
-/// indefinitely.
+/// completion event anywhere in its history, so its counter stays held down.
 ///
-/// Red without the mechanism: with forgiveness removed the job terminates on
-/// its 3rd failure and the 5th run never arrives.
+/// Red without the mechanism: with forgiveness removed the counter climbs
+/// past 2 and the row assertion never holds.
 #[tokio::test]
 async fn a_long_running_execution_is_forgiven_and_never_terminates() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -197,16 +164,15 @@ async fn a_long_running_execution_is_forgiven_and_never_terminates() -> anyhow::
     let (tx, mut ran) = mpsc::unbounded_channel();
     let spawner = jobs.add_initializer(Init {
         job_type: job_type.clone(),
-        behaviour: Behaviour::RunsLongThenFails,
         ran: tx,
         retry: RetrySettings {
-            n_attempts: Some(3),
-            n_warn_attempts: None,
-            min_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(10),
-            backoff_jitter_pct: 0,
+            backoff: Backoff::new(
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+                Duration::from_millis(10),
+                0,
+            ),
             attempt_reset_after_healthy_run: Some(HEALTHY_RUN),
-            terminal_on_fatal: false,
         },
     });
     jobs.start_poll().await?;
@@ -214,8 +180,6 @@ async fn a_long_running_execution_is_forgiven_and_never_terminates() -> anyhow::
     let id = JobId::new();
     spawner.spawn_all(vec![JobSpec::new(id, Cfg)]).await?;
 
-    // Five runs is two more than `n_attempts` allows without forgiveness, so
-    // simply arriving here is the assertion.
     for n in 1..=5 {
         next_run(&mut ran, &format!("run {n}")).await?;
     }
@@ -228,80 +192,6 @@ async fn a_long_running_execution_is_forgiven_and_never_terminates() -> anyhow::
         id,
         "a forgiven retry row",
         |row| matches!(row, Some((attempt, _)) if attempt <= 2),
-    )
-    .await?;
-
-    jobs.shutdown().await?;
-    Ok(())
-}
-
-/// The #163 case at the database level, which PR #205 never had: a job that
-/// fails deterministically must still reach `n_attempts` and go terminal, and
-/// advancing the application clock between attempts must not change that.
-///
-/// Red without the mechanism: restore an elapsed-domain-time reset and the
-/// clock jumps forgive every attempt, so the execution row never disappears
-/// and this times out.
-#[tokio::test]
-async fn a_fast_failure_terminates_at_max_attempts_despite_clock_jumps() -> anyhow::Result<()> {
-    let pool = helpers::init_pool().await?;
-    let (clock, controller) = ClockHandle::manual();
-    let config = JobSvcConfig::builder()
-        .pool(pool.clone())
-        .clock(clock.clone())
-        .build()
-        .unwrap();
-    let mut jobs = Jobs::init(config).await?;
-
-    let job_type = helpers::job_type("fast-failure-terminates");
-    let (tx, mut ran) = mpsc::unbounded_channel();
-    let spawner = jobs.add_initializer(Init {
-        job_type: job_type.clone(),
-        behaviour: Behaviour::FailsFast,
-        ran: tx,
-        retry: RetrySettings {
-            n_attempts: Some(3),
-            n_warn_attempts: None,
-            min_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(10),
-            backoff_jitter_pct: 0,
-            // Far longer than any run this job will ever manage.
-            attempt_reset_after_healthy_run: Some(Duration::from_secs(60 * 60)),
-            terminal_on_fatal: false,
-        },
-    });
-    jobs.start_poll().await?;
-
-    let id = JobId::new();
-    spawner.spawn_all(vec![JobSpec::new(id, Cfg)]).await?;
-
-    // Jump the domain clock by a day after each observed failure: under the
-    // old elapsed-time rule this cleared the reset threshold every single
-    // pass, and the job could never be exhausted.
-    //
-    // The wait for the retry row is load-bearing, not decoration. The runner
-    // reports at the START of its run, so advancing on that signal alone can
-    // land BEFORE the finalizer writes the retry row — the row would then be
-    // stamped `execute_at = advanced_now + min_backoff`, a millisecond into
-    // the simulated future that a frozen manual clock never reaches on its
-    // own, and the next attempt would never be dispatched.
-    for n in 1..=3 {
-        next_run(&mut ran, &format!("attempt {n}")).await?;
-        let next_attempt = n + 1;
-        if next_attempt <= 3 {
-            await_row(&pool, id, &format!("the retry row for attempt {next_attempt}"), |row| {
-                matches!(row, Some((attempt, ref state)) if attempt == next_attempt && state == "pending")
-            })
-            .await?;
-        }
-        controller.advance(Duration::from_secs(24 * 60 * 60)).await;
-    }
-
-    await_row(
-        &pool,
-        id,
-        "the exhausted job's execution row to be deleted",
-        |row| row.is_none(),
     )
     .await?;
 
@@ -334,18 +224,17 @@ async fn a_reclaimed_attempt_is_forgiven_by_the_next_healthy_run() -> anyhow::Re
     let (tx, mut ran) = mpsc::unbounded_channel();
     let spawner = jobs.add_initializer(Init {
         job_type: job_type.clone(),
-        behaviour: Behaviour::RunsLongThenFails,
         ran: tx,
         retry: RetrySettings {
-            n_attempts: Some(10),
-            n_warn_attempts: None,
             // Long, so the post-failure retry row parks and the poller cannot
             // re-claim it out from under the reclaim we are about to stage.
-            min_backoff: Duration::from_secs(60),
-            max_backoff: Duration::from_secs(60),
-            backoff_jitter_pct: 0,
+            backoff: Backoff::new(
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(120),
+                0,
+            ),
             attempt_reset_after_healthy_run: Some(HEALTHY_RUN),
-            terminal_on_fatal: false,
         },
     });
     jobs.start_poll().await?;

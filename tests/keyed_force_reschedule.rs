@@ -24,9 +24,10 @@ mod helpers;
 
 use async_trait::async_trait;
 use chrono::{DateTime, SubsecRound, Utc};
+use es_entity::errlanes::{Transient, TransientKind};
 use job::{
-    CurrentJob, Job, JobCompletion, JobRunner, JobSvcConfig, JobType, Jobs, KeyedJobInitializer,
-    KeyedJobSpawner, KeyedJobSpec, RetrySettings,
+    Backoff, CurrentJob, Job, JobCompletion, JobRunner, JobSvcConfig, JobType, Jobs,
+    KeyedJobInitializer, KeyedJobSpawner, KeyedJobSpec, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -90,6 +91,24 @@ impl JobRunner for AlwaysFails {
     }
 }
 
+/// Always fails with a `Transient`, so the type's retry curve keeps
+/// rescheduling it in the transient band. Every run's start instant goes down
+/// `runs`.
+struct AlwaysFailsTransient {
+    ran: mpsc::UnboundedSender<DateTime<Utc>>,
+}
+
+#[async_trait]
+impl JobRunner for AlwaysFailsTransient {
+    async fn run(
+        &self,
+        _: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = self.ran.send(Utc::now());
+        Err(Box::new(Transient::new(TransientKind::Other)))
+    }
+}
+
 /// Never runs — these types exist only to give the poller a realistically
 /// sized registry to rotate over.
 struct Idle;
@@ -107,6 +126,7 @@ impl JobRunner for Idle {
 enum Behaviour {
     HoldThenComplete,
     AlwaysFails,
+    AlwaysFailsTransient,
     Idle,
 }
 
@@ -162,6 +182,9 @@ impl KeyedJobInitializer for Init {
                 n: Arc::clone(&self.n),
             }) as Box<dyn JobRunner>,
             Behaviour::AlwaysFails => Box::new(AlwaysFails {
+                ran: self.ran.clone(),
+            }),
+            Behaviour::AlwaysFailsTransient => Box::new(AlwaysFailsTransient {
                 ran: self.ran.clone(),
             }),
             Behaviour::Idle => Box::new(Idle),
@@ -379,7 +402,7 @@ async fn force_reschedule_never_shortens_a_retry_backoff() -> anyhow::Result<()>
     // shortest backoff window on a loaded CI runner. At 400ms the poller
     // could claim the row mid-burst, which is not a failure but does move
     // the row out from under the post-burst read.
-    let min_backoff = Duration::from_secs(1);
+    let first_delay = Duration::from_secs(1);
 
     let pool = helpers::init_pool().await?;
     let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
@@ -387,19 +410,20 @@ async fn force_reschedule_never_shortens_a_retry_backoff() -> anyhow::Result<()>
     let job_type = helpers::job_type("force-reschedule-backoff");
     let (tx, mut ran) = mpsc::unbounded_channel();
     let spawner = jobs.add_keyed_initializer(
-        Init::new(&job_type, Behaviour::AlwaysFails)
+        Init::new(&job_type, Behaviour::AlwaysFailsTransient)
             .reporting_to(tx)
             .with_retry(RetrySettings {
-                n_attempts: None,
-                min_backoff,
-                max_backoff: Duration::from_secs(60),
                 // Jitter off so the schedule is exactly doubling, and
                 // attempt-count forgiveness disabled outright so a slow
                 // machine cannot reset the counter to 1 mid-test (which would
                 // hand the row to the guard for the wrong reason).
-                backoff_jitter_pct: 0,
+                backoff: Backoff::new(
+                    first_delay,
+                    Duration::from_secs(32),
+                    Duration::from_secs(60),
+                    0,
+                ),
                 attempt_reset_after_healthy_run: None,
-                ..Default::default()
             }),
     );
     register_filler(&mut jobs);
@@ -443,7 +467,7 @@ async fn force_reschedule_never_shortens_a_retry_backoff() -> anyhow::Result<()>
 
     let gaps: Vec<chrono::TimeDelta> = starts.windows(2).map(|w| w[1] - w[0]).collect();
     for (i, gap) in gaps.iter().enumerate() {
-        let expected = min_backoff.as_millis() as i64 * (1 << i);
+        let expected = first_delay.as_millis() as i64 * (1 << i);
         assert!(
             gap.num_milliseconds() >= expected * 3 / 4,
             "gap {i} was {gap:?}, well under the {expected}ms backoff it should have waited"
@@ -452,6 +476,69 @@ async fn force_reschedule_never_shortens_a_retry_backoff() -> anyhow::Result<()>
     assert!(
         gaps[gaps.len() - 1] > gaps[0],
         "the backoff must still be growing across attempts: {gaps:?}"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// The fatal-band counterpart of the regression above: a keyed job whose
+/// unlaned failure (`Fatal(Dependency)`) has put it in the fatal band at
+/// attempt 3 must not have that backoff collapsed by `force_reschedule`
+/// respawns, or a fatal-band job would hot-loop at the event rate at `ERROR`.
+#[tokio::test]
+async fn force_reschedule_does_not_shorten_a_fatal_band_backoff() -> anyhow::Result<()> {
+    const BURST: usize = 5;
+
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let job_type = helpers::job_type("force-reschedule-fatal-band");
+    let (tx, mut ran) = mpsc::unbounded_channel();
+    let spawner = jobs.add_keyed_initializer(
+        Init::new(&job_type, Behaviour::AlwaysFails)
+            .reporting_to(tx)
+            .with_retry(RetrySettings {
+                backoff: Backoff::new(
+                    Duration::from_millis(500),
+                    Duration::from_secs(2),
+                    Duration::from_secs(10),
+                    0,
+                ),
+                attempt_reset_after_healthy_run: None,
+            }),
+    );
+    register_filler(&mut jobs);
+    jobs.start_poll().await?;
+
+    spawner.spawn_all(vec![KeyedJobSpec::new("k", Cfg)]).await?;
+
+    next_run(&mut ran).await?;
+    await_pending_at_attempt(&pool, &job_type, "k", 2).await?;
+    next_run(&mut ran).await?;
+    let scheduled = await_pending_at_attempt(&pool, &job_type, "k", 3).await?;
+    assert!(
+        scheduled > Utc::now() + chrono::TimeDelta::seconds(2),
+        "the second fatal failure must back off on the fatal band (4s), got {scheduled}"
+    );
+
+    for _ in 0..BURST {
+        let respawn = spawner
+            .spawn_all(vec![KeyedJobSpec::new("k", Cfg).force_reschedule()])
+            .await?;
+        assert!(!respawn[0].created(), "the failing job still holds the key");
+        assert!(
+            !respawn[0].pulled_forward(),
+            "a fatal-band row at attempt 3 must never be pulled forward"
+        );
+    }
+    let (execute_at, attempt, state) = row(&pool, &job_type, "k").await?.expect("the key is live");
+    assert_eq!(state, "pending");
+    assert_eq!(attempt, 3);
+    assert_eq!(
+        execute_at,
+        Some(scheduled),
+        "execute_at must be untouched after {BURST} respawns"
     );
 
     jobs.shutdown().await?;
