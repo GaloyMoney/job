@@ -67,9 +67,9 @@ impl JobInitializer for AlwaysDeniedInitializer {
     fn retry_on_error_settings(&self) -> RetrySettings {
         RetrySettings {
             backoff: Backoff::new(
-                Duration::from_millis(2),
-                Duration::from_millis(5),
-                Duration::from_millis(20),
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(240),
                 0,
             ),
             ..Default::default()
