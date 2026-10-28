@@ -282,6 +282,8 @@ The [`RetrySettings`](https://docs.rs/job/latest/job/struct.RetrySettings.html) 
   `fatal_min`, `max` and `jitter_pct`, constructed with `Backoff::new` (which panics on
   `transient_min < fatal_min <= max` / `jitter_pct <= 100` violations) or the fallible
   `Backoff::try_new` for config-driven values. The default is `1s` / `512s` / `6h` / `20%`.
+  `transient_min` must be at least 1 ms; a zero (or sub-millisecond) start would retry transients
+  immediately and forever without ever reaching the fatal band.
 - `attempt_reset_after_healthy_run` lets a job be considered healthy again once a single execution has run for at least that long before failing (measured on a monotonic clock over the run itself, so neither an application-clock advance nor scheduler latency can satisfy it); the dispatcher resets the reported attempt counter accordingly. `None` disables forgiveness, and the counter then only ever resets on a completion.
 
 The `job.fail_job` span reports `retry.band` (`transient` / `fatal`, the band of the *next* retry),

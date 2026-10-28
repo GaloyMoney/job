@@ -169,7 +169,8 @@ pub struct Backoff {
 }
 
 impl Backoff {
-    /// Panics unless `transient_min < fatal_min <= max` and `jitter_pct <= 100`.
+    /// Panics unless `1ms <= transient_min < fatal_min <= max` and
+    /// `jitter_pct <= 100`.
     /// For literal settings at registration; config-driven values go through
     /// [`Backoff::try_new`].
     pub const fn new(
@@ -212,6 +213,9 @@ impl Backoff {
         max: std::time::Duration,
         jitter_pct: u8,
     ) -> Result<(), &'static str> {
+        if transient_min.as_millis() == 0 {
+            return Err("transient_min must be at least 1ms");
+        }
         if transient_min.as_nanos() >= fatal_min.as_nanos() {
             return Err("transient_min must be less than fatal_min");
         }

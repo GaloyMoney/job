@@ -202,9 +202,7 @@ pub(crate) struct ScheduledRetry {
 }
 
 fn doubled_ms(base_ms: u64, exponent: u32) -> u64 {
-    if base_ms == 0 {
-        0
-    } else if exponent >= 63 {
+    if exponent >= 63 {
         u64::MAX
     } else {
         base_ms.saturating_mul(1u64 << exponent)
@@ -1482,6 +1480,9 @@ mod tests {
             assert!(Backoff::try_new(s(1), s(512), s(100), 20).is_err());
             assert!(Backoff::try_new(s(1), s(512), s(6 * 3600), 101).is_err());
             assert!(Backoff::try_new(s(1), s(512), s(6 * 3600), 100).is_ok());
+            assert!(Backoff::try_new(Duration::ZERO, s(512), s(6 * 3600), 20).is_err());
+            assert!(Backoff::try_new(Duration::from_micros(999), s(512), s(6 * 3600), 20).is_err());
+            assert!(Backoff::try_new(Duration::from_millis(1), s(512), s(6 * 3600), 20).is_ok());
         }
     }
 
