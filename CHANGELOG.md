@@ -1,3 +1,11 @@
+# [job release v0.19.1](https://github.com/GaloyMoney/job/releases/tag/0.19.1)
+
+
+
+### Bug Fixes
+
+- Reject a Backoff transient_min under 1ms (#243)
+
 # [job release v0.19.0](https://github.com/GaloyMoney/job/releases/tag/0.19.0)
 
 
