@@ -1357,9 +1357,11 @@ async fn a_pending_waiter_on_a_terminal_callee_is_moved_and_runs() -> anyhow::Re
 
 /// A callee id that never existed is neither live nor terminal: registering
 /// on it is rejected with `UnknownCallee`, through the service and through a
-/// handle alike, and nothing is written -- no receipt edge, and the waiter's
-/// own schedule is untouched. A terminal callee in the same batch does not
-/// soften the answer.
+/// handle alike, and nothing is written for any callee in the call -- no
+/// receipt edge, and the waiter's own schedule is untouched -- even when the
+/// caller commits the op anyway. A terminal callee in the same batch does not
+/// soften the answer and keeps its once-wake: registering on it alone
+/// afterwards still moves the waiter.
 #[tokio::test]
 async fn registering_on_a_job_that_never_existed_is_rejected() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
@@ -1398,11 +1400,31 @@ async fn registering_on_a_job_that_never_existed_is_rejected() -> anyhow::Result
         !wait_exists(&pool, unknown, waiter).await?,
         "no edge may be written for an unknown callee"
     );
+    assert!(
+        !wait_exists(&pool, terminal, waiter).await?,
+        "a rejected call must not spend the terminal sibling's receipt"
+    );
     let (at, _, state) = exec_row(&pool, waiter).await?.unwrap();
     assert_eq!(state, "pending");
     assert!(
         at.is_some_and(|at| at > Utc::now() + HOLD - chrono::TimeDelta::minutes(5)),
         "the waiter's schedule must be untouched, got {at:?}"
+    );
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    let attached = jobs
+        .register_waiter_in_op(&mut op, terminal, waiter)
+        .await?;
+    let (execute_at,): (Option<DateTime<Utc>>,) =
+        sqlx::query_as("SELECT execute_at FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(waiter))
+            .fetch_one(op.as_executor())
+            .await?;
+    op.commit().await?;
+    assert!(!attached);
+    assert!(
+        execute_at.is_some_and(|at| at <= Utc::now()),
+        "the terminal sibling must still wake the waiter once, got {execute_at:?}"
     );
 
     jobs.shutdown().await?;

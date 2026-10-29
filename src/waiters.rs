@@ -153,8 +153,9 @@ impl JobWaiters {
     /// had finished right after registration. The receipt is written only
     /// when the waiter's own execution row exists.
     ///
-    /// A callee with no `jobs` row is neither live nor terminal: nothing is
-    /// written for it and it is reported in `unknown`.
+    /// A callee with no `jobs` row is neither live nor terminal and is
+    /// reported in `unknown`; if there is one, nothing at all is written for
+    /// any wait in `waits`.
     async fn register_on_live_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
@@ -173,24 +174,25 @@ impl JobWaiters {
                 WHERE je.id = ANY($1)
                 ORDER BY je.queue_id, je.id
                 FOR SHARE
+            ), unknown AS (
+                SELECT DISTINCT t.job_id
+                FROM UNNEST($1::uuid[]) AS t(job_id)
+                WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = t.job_id)
             ), attached AS (
                 INSERT INTO job_waiters (job_id, waiter_job_id, created_at)
                 SELECT DISTINCT t.job_id, t.waiter_job_id, COALESCE($3, NOW())
                 FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
                 JOIN locked l ON l.id = t.job_id
+                WHERE NOT EXISTS (SELECT 1 FROM unknown)
                 ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET job_id = EXCLUDED.job_id
                 RETURNING job_id
-            ), unknown AS (
-                SELECT DISTINCT t.job_id
-                FROM UNNEST($1::uuid[]) AS t(job_id)
-                WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = t.job_id)
             ), told AS (
                 INSERT INTO job_waiters (job_id, waiter_job_id, created_at)
                 SELECT DISTINCT t.job_id, t.waiter_job_id, COALESCE($3, NOW())
                 FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
                 WHERE $4
+                  AND NOT EXISTS (SELECT 1 FROM unknown)
                   AND t.job_id NOT IN (SELECT id FROM locked)
-                  AND t.job_id NOT IN (SELECT job_id FROM unknown)
                   AND EXISTS (SELECT 1 FROM job_executions w WHERE w.id = t.waiter_job_id)
                 ON CONFLICT (job_id, waiter_job_id) DO NOTHING
                 RETURNING waiter_job_id
@@ -258,11 +260,11 @@ impl JobWaiters {
                 live.push(*wait);
             }
         }
-        self.insert_waiters_in_op(op, &same_op).await?;
         let registration = self.register_on_live_in_op(op, &live, true).await?;
         if let Some(&id) = registration.unknown.first() {
             return Err(UnknownCallee { id }.into());
         }
+        self.insert_waiters_in_op(op, &same_op).await?;
         let moved = self.move_or_mark_in_op(op, &registration.told, now).await?;
         let mut attached = registration.attached;
         attached.extend(same_op.into_iter().map(|w| w.callee));
