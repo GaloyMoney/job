@@ -50,13 +50,16 @@ mod helpers;
 
 use async_trait::async_trait;
 use chrono::{DateTime, SubsecRound, Utc};
+use es_entity::AtomicOperation;
 use job::{
     CurrentJob, Job, JobCompletion, JobHandles, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobSpec, JobSvcConfig, JobType, Jobs,
+    JobSpec, JobSvcConfig, JobType, Jobs, KeyedJobInitializer, KeyedJobSpawner,
+    RegisterWaiterError, UnknownCallee,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -445,6 +448,10 @@ async fn pull_forward_in_op_moves_a_parked_row_once_and_never_a_backoff() -> any
 /// completion leaves it — the row deleted) is an honest `false` with nothing
 /// written, so the caller reads the outcome instead of parking on a promise
 /// that can never be kept.
+///
+/// `other_waiter` is a bare `JobId` with no execution row, so the terminal
+/// registration writes no receipt and no mark for it either: a receipt is
+/// written only for a waiter that has an execution row to sweep it with.
 #[tokio::test]
 async fn register_waiter_in_op_attaches_to_a_live_job_and_rejects_a_terminal_one()
 -> anyhow::Result<()> {
@@ -765,6 +772,9 @@ async fn register_waiter_in_op_attaches_all_of_a_keyless_spawn_all_on_the_same_o
 /// buffered in this op's `ExecutionInsertHook`) -- attaches exactly the
 /// live and same-op ones. Pins that the routing is per-callee, not
 /// all-or-nothing.
+///
+/// `waiter` is a bare `JobId` with no execution row, so the terminal callee
+/// still writes nothing, exactly as in the D4 test.
 #[tokio::test]
 async fn register_waiter_in_op_partitions_same_op_live_and_terminal_callees() -> anyhow::Result<()>
 {
@@ -1033,5 +1043,500 @@ async fn register_waiter_in_op_same_op_rolls_back_with_the_op() -> anyhow::Resul
     );
 
     jobs.shutdown().await?;
+    Ok(())
+}
+
+// -- a waiter registered on an already-terminal callee is woken once ----------
+
+/// What a [`ScriptedWaiter`] registers on at the top of each run.
+#[derive(Clone)]
+enum WaitTarget {
+    Id(JobId),
+    Key(JobType, &'static str),
+}
+
+/// Registers itself on `target` in the same op as its own `HOLD` park, and
+/// reports `(start, attached)` per run. Once `finish` is set it completes
+/// instead. `Jobs` is injected after `start_poll` (an initializer is built
+/// before the `Jobs` it would need).
+struct ScriptedWaiter {
+    jobs: Arc<OnceLock<Jobs>>,
+    target: Arc<Mutex<WaitTarget>>,
+    finish: Arc<AtomicBool>,
+    ran: mpsc::UnboundedSender<(DateTime<Utc>, bool)>,
+}
+
+#[async_trait]
+impl JobRunner for ScriptedWaiter {
+    async fn run(
+        &self,
+        current_job: CurrentJob,
+    ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        let started = Utc::now();
+        if self.finish.load(Ordering::SeqCst) {
+            let _ = self.ran.send((started, false));
+            return Ok(JobCompletion::Complete);
+        }
+        let jobs = self.jobs.get().ok_or("jobs not injected")?;
+        let target = self.target.lock().unwrap().clone();
+        let handle = match target {
+            WaitTarget::Id(id) => jobs.handle(id),
+            WaitTarget::Key(job_type, key) => jobs
+                .keyed_handle(job_type, key)
+                .await?
+                .ok_or("the keyed callee was never spawned")?,
+        };
+        let mut op = current_job.begin_op().await?;
+        let attached = handle
+            .register_waiter_in_op(&mut op, *current_job.id())
+            .await?;
+        let _ = self.ran.send((started, attached));
+        Ok(JobCompletion::RescheduleAtWithOp(op, Utc::now() + HOLD))
+    }
+}
+
+struct ScriptedWaiterInit {
+    job_type: JobType,
+    jobs: Arc<OnceLock<Jobs>>,
+    target: Arc<Mutex<WaitTarget>>,
+    finish: Arc<AtomicBool>,
+    ran: mpsc::UnboundedSender<(DateTime<Utc>, bool)>,
+}
+
+impl JobInitializer for ScriptedWaiterInit {
+    type Config = CalleeCfg;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        _: &Job,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Box::new(ScriptedWaiter {
+            jobs: Arc::clone(&self.jobs),
+            target: Arc::clone(&self.target),
+            finish: Arc::clone(&self.finish),
+            ran: self.ran.clone(),
+        }))
+    }
+}
+
+/// First generation of a key completes on its first run; every later one is
+/// held `running` until released.
+struct GenerationsInit {
+    job_type: JobType,
+    release: Arc<AtomicBool>,
+    inits: AtomicUsize,
+}
+
+impl KeyedJobInitializer for GenerationsInit {
+    type Config = CalleeCfg;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        _: &Job,
+        _: KeyedJobSpawner<Self::Config>,
+    ) -> Result<Box<dyn JobRunner>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(if self.inits.fetch_add(1, Ordering::SeqCst) == 0 {
+            Box::new(CompleteImmediately) as Box<dyn JobRunner>
+        } else {
+            Box::new(Held {
+                release: Arc::clone(&self.release),
+            })
+        })
+    }
+}
+
+async fn eventually<F, Fut>(what: &str, mut cond: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<bool>>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !cond().await? {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+async fn completed(handle: &job::JobHandle) -> anyhow::Result<bool> {
+    Ok(matches!(
+        handle.load().await?.state(),
+        job::JobStatus::Completed { .. }
+    ))
+}
+
+async fn next_waiter_run(
+    ran: &mut mpsc::UnboundedReceiver<(DateTime<Utc>, bool)>,
+) -> anyhow::Result<(DateTime<Utc>, bool)> {
+    tokio::time::timeout(Duration::from_secs(30), ran.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for the waiter to run"))?
+        .ok_or_else(|| anyhow::anyhow!("waiter channel closed"))
+}
+
+/// A real, completed callee: spawned, run to `Completed`, execution row gone.
+async fn terminal_callee(spawner: &JobSpawner<CalleeCfg>) -> anyhow::Result<JobId> {
+    let id = JobId::new();
+    let handle = spawner.spawn(id, CalleeCfg).await?;
+    eventually("the callee to complete", || completed(&handle)).await?;
+    Ok(id)
+}
+
+/// One `Jobs` with a scripted waiter, a regular callee type that completes
+/// at once, and a keyed callee type whose first generation completes and
+/// whose later ones are held until `release`.
+struct WaiterRig {
+    jobs: Jobs,
+    waiter: JobSpawner<CalleeCfg>,
+    callee: JobSpawner<CalleeCfg>,
+    keyed: KeyedJobSpawner<CalleeCfg>,
+    keyed_type: JobType,
+    release: Arc<AtomicBool>,
+    target: Arc<Mutex<WaitTarget>>,
+    finish: Arc<AtomicBool>,
+    ran: mpsc::UnboundedReceiver<(DateTime<Utc>, bool)>,
+}
+
+async fn waiter_rig(pool: &sqlx::PgPool, name: &str) -> anyhow::Result<WaiterRig> {
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let injected = Arc::new(OnceLock::new());
+    let target = Arc::new(Mutex::new(WaitTarget::Id(JobId::new())));
+    let finish = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let keyed_type = helpers::job_type(&format!("{name}-keyed"));
+    let (tx, ran) = mpsc::unbounded_channel();
+    let waiter = jobs.add_initializer(ScriptedWaiterInit {
+        job_type: helpers::job_type(&format!("{name}-waiter")),
+        jobs: Arc::clone(&injected),
+        target: Arc::clone(&target),
+        finish: Arc::clone(&finish),
+        ran: tx,
+    });
+    let callee = jobs.add_initializer(CalleeInit {
+        job_type: helpers::job_type(&format!("{name}-callee")),
+        behaviour: CalleeBehaviour::Complete,
+    });
+    let keyed = jobs.add_keyed_initializer(GenerationsInit {
+        job_type: keyed_type.clone(),
+        release: Arc::clone(&release),
+        inits: AtomicUsize::new(0),
+    });
+    jobs.start_poll().await?;
+    injected.set(jobs.clone()).ok();
+    Ok(WaiterRig {
+        jobs,
+        waiter,
+        callee,
+        keyed,
+        keyed_type,
+        release,
+        target,
+        finish,
+        ran,
+    })
+}
+
+/// A running waiter registers on a callee that is already terminal and
+/// parks for `HOLD`. It is told once: `attached` is still `false`, a receipt
+/// edge is written, and the park it lands is pulled to now -- the mark is
+/// consumed (`woken_mark` is `None`) and a second run starts within seconds,
+/// not an hour later. That second run registers on the same terminal callee
+/// again, which is a no-op: the row then reads `pending` at `now + HOLD`
+/// steadily and no third run starts (no hot loop).
+#[tokio::test]
+async fn a_running_waiter_on_a_terminal_callee_is_woken_once() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let mut rig = waiter_rig(&pool, "waiters-told-once").await?;
+    let callee = terminal_callee(&rig.callee).await?;
+    *rig.target.lock().unwrap() = WaitTarget::Id(callee);
+
+    let waiter = JobId::new();
+    rig.waiter.spawn(waiter, CalleeCfg).await?;
+
+    let (first, attached) = next_waiter_run(&mut rig.ran).await?;
+    assert!(!attached, "a terminal callee is still never `attached`");
+    let (second, attached) = next_waiter_run(&mut rig.ran).await?;
+    assert!(!attached);
+    assert!(
+        second - first < chrono::TimeDelta::seconds(10),
+        "the park must be pulled to now by the tell, not left for the hour \
+         ({second} vs {first})"
+    );
+    assert!(
+        wait_exists(&pool, callee, waiter).await?,
+        "the receipt edge must exist for the told pair"
+    );
+
+    eventually("the second park to land", || async {
+        Ok(exec_row(&pool, waiter)
+            .await?
+            .is_some_and(|(at, _, state)| state == "pending" && at.is_some()))
+    })
+    .await?;
+    assert_eq!(
+        woken_mark(&pool, waiter).await?,
+        None,
+        "the park write must have consumed the mark"
+    );
+
+    for _ in 0..6 {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rig.ran.recv())
+                .await
+                .is_err(),
+            "a repeat registration on the same terminal callee must not wake again"
+        );
+        let (at, _, state) = exec_row(&pool, waiter).await?.unwrap();
+        assert_eq!(state, "pending");
+        let at = at.unwrap();
+        assert!(
+            at > Utc::now() + HOLD - chrono::TimeDelta::minutes(5),
+            "the park must stand at about now + HOLD, got {at}"
+        );
+    }
+
+    rig.jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A third party registers a `pending` waiter that is scheduled an hour out
+/// on a terminal callee: the waiter is MOVED to now (not merely marked),
+/// announced, and so runs promptly, with `attached == false` unchanged.
+#[tokio::test]
+async fn a_pending_waiter_on_a_terminal_callee_is_moved_and_runs() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: helpers::job_type("waiters-told-pending"),
+        behaviour: CalleeBehaviour::Complete,
+    });
+    jobs.start_poll().await?;
+
+    let callee = terminal_callee(&spawner).await?;
+    let waiter = JobId::new();
+    let waiter_handle = spawner
+        .spawn_at(waiter, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    let attached = jobs.register_waiter_in_op(&mut op, callee, waiter).await?;
+    let (execute_at,): (Option<DateTime<Utc>>,) =
+        sqlx::query_as("SELECT execute_at FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(waiter))
+            .fetch_one(op.as_executor())
+            .await?;
+    op.commit().await?;
+    assert!(!attached, "a terminal callee is still not attached");
+    assert!(
+        execute_at.is_some_and(|at| at <= Utc::now()),
+        "the pending waiter must be moved to now, got {execute_at:?}"
+    );
+
+    eventually("the moved waiter to run to completion", || {
+        completed(&waiter_handle)
+    })
+    .await?;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A callee id that never existed is neither live nor terminal: registering
+/// on it is rejected with `UnknownCallee`, through the service and through a
+/// handle alike, and nothing is written for any callee in the call -- no
+/// receipt edge, and the waiter's own schedule is untouched -- even when the
+/// caller commits the op anyway. A terminal callee in the same batch does not
+/// soften the answer and keeps its once-wake: registering on it alone
+/// afterwards still moves the waiter.
+#[tokio::test]
+async fn registering_on_a_job_that_never_existed_is_rejected() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: helpers::job_type("waiters-unknown-callee"),
+        behaviour: CalleeBehaviour::Complete,
+    });
+    jobs.start_poll().await?;
+
+    let terminal = terminal_callee(&spawner).await?;
+    let waiter = JobId::new();
+    spawner
+        .spawn_at(waiter, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+    let unknown = JobId::new();
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    let via_service = jobs.register_waiter_in_op(&mut op, unknown, waiter).await;
+    assert!(
+        matches!(&via_service, Err(RegisterWaiterError::Rejected(UnknownCallee { id })) if *id == unknown),
+        "expected UnknownCallee, got {via_service:?}"
+    );
+    let via_handles = jobs
+        .handles(vec![terminal, unknown])
+        .register_waiter_in_op(&mut op, waiter)
+        .await;
+    assert!(
+        matches!(&via_handles, Err(RegisterWaiterError::Rejected(UnknownCallee { id })) if *id == unknown),
+        "expected UnknownCallee, got {via_handles:?}"
+    );
+    op.commit().await?;
+
+    assert!(
+        !wait_exists(&pool, unknown, waiter).await?,
+        "no edge may be written for an unknown callee"
+    );
+    assert!(
+        !wait_exists(&pool, terminal, waiter).await?,
+        "a rejected call must not spend the terminal sibling's receipt"
+    );
+    let (at, _, state) = exec_row(&pool, waiter).await?.unwrap();
+    assert_eq!(state, "pending");
+    assert!(
+        at.is_some_and(|at| at > Utc::now() + HOLD - chrono::TimeDelta::minutes(5)),
+        "the waiter's schedule must be untouched, got {at:?}"
+    );
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    let attached = jobs
+        .register_waiter_in_op(&mut op, terminal, waiter)
+        .await?;
+    let (execute_at,): (Option<DateTime<Utc>>,) =
+        sqlx::query_as("SELECT execute_at FROM job_executions WHERE id = $1")
+            .bind(uuid::Uuid::from(waiter))
+            .fetch_one(op.as_executor())
+            .await?;
+    op.commit().await?;
+    assert!(!attached);
+    assert!(
+        execute_at.is_some_and(|at| at <= Utc::now()),
+        "the terminal sibling must still wake the waiter once, got {execute_at:?}"
+    );
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// The receipt is a tombstone that lives exactly as long as its waiter: it
+/// is not consumed by anything the callee does (it is dead), and the
+/// waiter's own termination sweeps it.
+#[tokio::test]
+async fn the_receipt_is_swept_with_the_waiter() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let mut rig = waiter_rig(&pool, "waiters-swept").await?;
+    let callee = terminal_callee(&rig.callee).await?;
+    *rig.target.lock().unwrap() = WaitTarget::Id(callee);
+
+    let waiter = JobId::new();
+    let handle = rig.waiter.spawn(waiter, CalleeCfg).await?;
+    next_waiter_run(&mut rig.ran).await?;
+    next_waiter_run(&mut rig.ran).await?;
+    assert!(wait_exists(&pool, callee, waiter).await?);
+    eventually("the second park to land", || async {
+        Ok(exec_row(&pool, waiter)
+            .await?
+            .is_some_and(|(at, _, state)| state == "pending" && at.is_some()))
+    })
+    .await?;
+
+    rig.finish.store(true, Ordering::SeqCst);
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    assert!(
+        rig.jobs
+            .pull_forward_in_op(&mut op, waiter, Utc::now())
+            .await?
+    );
+    op.commit().await?;
+    next_waiter_run(&mut rig.ran).await?;
+    eventually("the waiter to complete", || completed(&handle)).await?;
+    eventually("the receipt to be swept", || async {
+        Ok(!wait_exists(&pool, callee, waiter).await?)
+    })
+    .await?;
+
+    rig.jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Once-ness is per generation. A waiter told about a terminal generation 1
+/// of key K is not told again by it; generation 2 is a distinct callee, so
+/// a waiter that resolves K to it attaches through the live path and is
+/// woken when it finishes.
+#[tokio::test]
+async fn a_new_generation_under_the_key_is_a_new_callee() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let mut rig = waiter_rig(&pool, "waiters-generations").await?;
+    *rig.target.lock().unwrap() = WaitTarget::Key(rig.keyed_type.clone(), "k");
+
+    let gen1 = rig.keyed.spawn("k", CalleeCfg).await?;
+    eventually("generation 1 to complete", || completed(&gen1)).await?;
+
+    let waiter = JobId::new();
+    rig.waiter.spawn(waiter, CalleeCfg).await?;
+    let (_, attached) = next_waiter_run(&mut rig.ran).await?;
+    assert!(!attached, "generation 1 is terminal");
+    let (_, attached) = next_waiter_run(&mut rig.ran).await?;
+    assert!(!attached, "generation 1 is still terminal");
+    eventually("the second park to land", || async {
+        Ok(exec_row(&pool, waiter)
+            .await?
+            .is_some_and(|(at, _, state)| state == "pending" && at.is_some()))
+    })
+    .await?;
+    assert!(wait_exists(&pool, gen1.id(), waiter).await?);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), rig.ran.recv())
+            .await
+            .is_err(),
+        "generation 1 must wake the waiter once and no more"
+    );
+
+    let gen2 = rig.keyed.spawn("k", CalleeCfg).await?;
+    assert_ne!(gen1.id(), gen2.id());
+    eventually("generation 2 to be running", || async {
+        Ok(exec_row(&pool, gen2.id())
+            .await?
+            .is_some_and(|(_, _, state)| state == "running"))
+    })
+    .await?;
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    assert!(
+        rig.jobs
+            .pull_forward_in_op(&mut op, waiter, Utc::now())
+            .await?
+    );
+    op.commit().await?;
+    let (_, attached) = next_waiter_run(&mut rig.ran).await?;
+    assert!(attached, "generation 2 is live and attaches");
+    eventually("the live edge to commit", || async {
+        wait_exists(&pool, gen2.id(), waiter).await
+    })
+    .await?;
+
+    rig.finish.store(true, Ordering::SeqCst);
+    let released = Utc::now();
+    rig.release.store(true, Ordering::SeqCst);
+    let (woken, _) = next_waiter_run(&mut rig.ran).await?;
+    assert!(
+        woken - released < chrono::TimeDelta::seconds(10),
+        "generation 2 finishing must wake the waiter within seconds"
+    );
+
+    rig.jobs.shutdown().await?;
     Ok(())
 }

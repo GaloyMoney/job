@@ -10,7 +10,7 @@ use tracing::instrument;
 use super::{
     JobId,
     entity::JobType,
-    error::{CouldNotSerialize, JobFault},
+    error::{CouldNotSerialize, JobFault, RegisterWaiterError},
     outcome::JobReturnValue,
     repo::JobRepo,
 };
@@ -127,8 +127,20 @@ impl CurrentJob {
     /// for why the job is re-entered from the top rather than resumed, and
     /// what it must persist to survive that.
     ///
+    /// A handle absent from the result is already terminal. A caller that
+    /// holds the handle for its result reads the outcome
+    /// ([`JobHandle::load`](crate::JobHandle::load)). A caller that parks
+    /// anyway is woken once for it: the park is pulled to now by the write
+    /// that lands it, exactly as if the callee had finished a moment after
+    /// registration. A repeat registration of the same waiter on the same
+    /// terminal callee is a no-op and the park stands -- a terminal
+    /// transition is observed once, never zero times and never twice.
+    ///
     /// # Errors
     ///
+    /// Returns [`UnknownCallee`](crate::UnknownCallee) if any of the jobs
+    /// never existed: a handle absent from the result is terminal, never
+    /// unknown.
     /// Returns a `Transient` lane if the write loses a race it can retry
     /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(name = "job.current.wait_for_in_op", skip(self, op, handles), fields(id = %self.id))]
@@ -136,7 +148,7 @@ impl CurrentJob {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         handles: &crate::JobHandles,
-    ) -> Result<Vec<JobId>, JobFault> {
+    ) -> Result<Vec<JobId>, RegisterWaiterError> {
         handles.register_waiter_in_op(op, self.id).await
     }
 

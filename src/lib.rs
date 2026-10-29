@@ -327,6 +327,13 @@
 //!     .await?;
 //! ```
 //!
+//! [`Jobs::keyed_handle`] resolves the LIVE generation of a key when one
+//! exists, else the latest terminal generation. A waiter that parks on the
+//! latest terminal generation ([`JobHandle::register_waiter_in_op`]) re-enters
+//! once and then parks normally; a new generation under the same key is a new
+//! callee for this purpose, so a waiter told about the old one is woken again
+//! when the new one finishes.
+//!
 //! By default a keyed generation's execution state (see
 //! [`CurrentJob::update_execution_state`]) is deleted when it terminates, just
 //! like a regular job's. Set [`KeyedJobInitializer::inherits_state`] to make it
@@ -455,7 +462,7 @@ pub use current::*;
 pub use entity::{FailureLane, Job, JobEvent, JobType, RetryBand};
 pub use error::{
     AwaitError, AwaitInterrupted, AwaitTimeout, InvalidBackoff, InvalidConfig, JobError, JobFault,
-    JobRejection,
+    JobRejection, RegisterWaiterError, UnknownCallee,
 };
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use handle::{JobHandle, JobHandles};
@@ -933,9 +940,14 @@ impl Jobs {
     /// Register `waiter` to be woken when `callee` — a job that already
     /// exists — reaches a terminal state, with the semantics of
     /// [`JobSpec::waiter`]. `Ok(true)` if `callee` is live and the wait was
-    /// registered; `Ok(false)` if it is already terminal, in which case
-    /// nothing is written and the caller should read the outcome
-    /// ([`JobHandle::load`]) instead of parking. The answer is exact: the
+    /// registered; `Ok(false)` if it is already terminal. A caller that holds
+    /// the handle for its result reads the outcome ([`JobHandle::load`]). A
+    /// caller that parks anyway is woken once for it: the park is pulled to
+    /// now by the write that lands it, exactly as if the callee had finished
+    /// a moment after registration. A repeat registration of the same waiter
+    /// on the same terminal callee is a no-op and the park stands -- a
+    /// terminal transition is observed once, never zero times and never
+    /// twice. The answer is exact: the
     /// callee's execution row is share-locked for the rest of `op`, so its
     /// finalizer cannot slip between the check and the commit.
     ///
@@ -945,6 +957,13 @@ impl Jobs {
     /// A callee spawned on this same `op` (`spawn_in_op` / `spawn_all_in_op`,
     /// keyless or not) is live by construction and is attached; the wait
     /// and the spawn commit together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownCallee`] if `callee` never existed: `Ok(false)`
+    /// means terminal, never unknown.
+    /// Returns a `Transient` lane if the write loses a race it can retry
+    /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(
         name = "job.register_waiter_in_op",
         skip(self, op, callee, waiter),
@@ -955,16 +974,23 @@ impl Jobs {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         callee: impl Into<JobId>,
         waiter: impl Into<JobId>,
-    ) -> Result<bool, JobFault> {
+    ) -> Result<bool, RegisterWaiterError> {
         let (callee, waiter): (JobId, JobId) = (callee.into(), waiter.into());
         let span = tracing::Span::current();
         span.record("callee", tracing::field::display(callee));
         span.record("waiter", tracing::field::display(waiter));
-        Ok(!self
+        let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        let (attached, moved) = self
             .waiters
-            .register_waiters_in_op(op, &[waiters::Wait { callee, waiter }])
-            .await?
-            .is_empty())
+            .register_waiters_in_op(op, &[waiters::Wait { callee, waiter }], now)
+            .await?;
+        for (_, job_type) in moved {
+            self.notifier.execution_ready_in_op(op, &job_type).await?;
+            if let Some(poller) = self.poller_ref.get().and_then(|w| w.upgrade()) {
+                poller.register_claim_demand(op, &job_type, 1);
+            }
+        }
+        Ok(!attached.is_empty())
     }
 
     /// Mint a [`JobHandle`] for `id` — cheap and non-validating.

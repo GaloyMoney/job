@@ -9,8 +9,9 @@
 //! - Rejections are scoped to the methods that can produce them, never
 //!   pooled service-wide. Only the id-choosing `JobSpawner` methods can
 //!   reject (a caller-chosen duplicate id), so only they return
-//!   [`JobError`]; the awaits return [`AwaitError`] for their timeout;
-//!   everything else cannot reject and returns [`JobFault`].
+//!   [`JobError`]; the awaits return [`AwaitError`] for their timeout; the
+//!   waiter registrations return [`RegisterWaiterError`] for a callee that
+//!   never existed; everything else cannot reject and returns [`JobFault`].
 //! - Foreign error types stay raw on a `pub fn` when they are the only
 //!   error that site can produce (the serde accessors on
 //!   [`JobOutcome`](crate::JobOutcome), [`JobSnapshot`](crate::JobSnapshot)
@@ -37,6 +38,13 @@ pub type JobError = Fail<JobRejection, lanes!(Transient, Fatal)>;
 /// The carrier for [`JobHandle::await_completion`](crate::JobHandle::await_completion)
 /// and [`JobHandles::await_all`](crate::JobHandles::await_all).
 pub type AwaitError = Fail<AwaitTimeout, lanes!(Transient, Fatal)>;
+
+/// The carrier for the waiter registrations:
+/// [`Jobs::register_waiter_in_op`](crate::Jobs::register_waiter_in_op),
+/// [`JobHandle::register_waiter_in_op`](crate::JobHandle::register_waiter_in_op),
+/// [`JobHandles::register_waiter_in_op`](crate::JobHandles::register_waiter_in_op)
+/// and [`CurrentJob::wait_for_in_op`](crate::CurrentJob::wait_for_in_op).
+pub type RegisterWaiterError = Fail<UnknownCallee, lanes!(Transient, Fatal)>;
 
 #[derive(Debug, errlanes::Rejection, errlanes::Lift)]
 // `JobConstraintViolation` carries a synthetic conventional-name variant per
@@ -69,6 +77,16 @@ pub enum JobRejection {
 #[error("await timed out; still pending: {pending:?}")]
 pub struct AwaitTimeout {
     pub pending: Vec<JobId>,
+}
+
+/// A wait was registered on a job id that never existed. A callee that
+/// exists but has finished is not this: it reports terminal (`false`, or
+/// absent from the attached set) and wakes the waiter once.
+#[derive(Debug, errlanes::Rejection)]
+#[rejection(code = "JOB_UNKNOWN_CALLEE")]
+#[error("cannot wait on job {id}: no such job")]
+pub struct UnknownCallee {
+    pub id: JobId,
 }
 
 /// The waiter's notification channel closed before delivering a terminal
