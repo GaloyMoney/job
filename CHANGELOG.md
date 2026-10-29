@@ -1,3 +1,11 @@
+# [job release v0.19.2](https://github.com/GaloyMoney/job/releases/tag/0.19.2)
+
+
+
+### Bug Fixes
+
+- Wake a waiter registered on an already-terminal callee once (#244)
+
 # [job release v0.19.1](https://github.com/GaloyMoney/job/releases/tag/0.19.1)
 
 
