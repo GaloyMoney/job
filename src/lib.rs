@@ -462,7 +462,7 @@ pub use current::*;
 pub use entity::{FailureLane, Job, JobEvent, JobType, RetryBand};
 pub use error::{
     AwaitError, AwaitInterrupted, AwaitTimeout, InvalidBackoff, InvalidConfig, JobError, JobFault,
-    JobRejection,
+    JobRejection, RegisterWaiterError, UnknownCallee,
 };
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
 pub use handle::{JobHandle, JobHandles};
@@ -957,6 +957,13 @@ impl Jobs {
     /// A callee spawned on this same `op` (`spawn_in_op` / `spawn_all_in_op`,
     /// keyless or not) is live by construction and is attached; the wait
     /// and the spawn commit together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownCallee`] if `callee` never existed: `Ok(false)`
+    /// means terminal, never unknown.
+    /// Returns a `Transient` lane if the write loses a race it can retry
+    /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(
         name = "job.register_waiter_in_op",
         skip(self, op, callee, waiter),
@@ -967,7 +974,7 @@ impl Jobs {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         callee: impl Into<JobId>,
         waiter: impl Into<JobId>,
-    ) -> Result<bool, JobFault> {
+    ) -> Result<bool, RegisterWaiterError> {
         let (callee, waiter): (JobId, JobId) = (callee.into(), waiter.into());
         let span = tracing::Span::current();
         span.record("callee", tracing::field::display(callee));

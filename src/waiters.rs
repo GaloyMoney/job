@@ -8,7 +8,11 @@
 
 use sqlx::PgPool;
 
-use crate::{JobId, entity::JobType, error::JobFault};
+use crate::{
+    JobId,
+    entity::JobType,
+    error::{JobFault, RegisterWaiterError, UnknownCallee},
+};
 
 /// One wait to register: `waiter` is to be woken when `callee` reaches a
 /// terminal state. Every batch registration in this module -- and every
@@ -19,6 +23,18 @@ use crate::{JobId, entity::JobType, error::JobFault};
 pub(crate) struct Wait {
     pub(crate) callee: JobId,
     pub(crate) waiter: JobId,
+}
+
+/// What one share-locked registration found, each list distinct and sorted:
+/// see [`JobWaiters::register_on_live_in_op`].
+#[derive(Default)]
+struct Registration {
+    /// Live callees the waits were attached to.
+    attached: Vec<JobId>,
+    /// Waiters that received a receipt for a terminal callee this time.
+    told: Vec<JobId>,
+    /// Callees with no `jobs` row at all.
+    unknown: Vec<JobId>,
 }
 
 /// Writes and reads of `job_waiters`, plus the by-id pull-forward that a
@@ -120,28 +136,33 @@ impl JobWaiters {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
     ) -> Result<Vec<JobId>, JobFault> {
-        Ok(self.register_on_live_in_op(op, waits, None).await?.0)
+        Ok(self
+            .register_on_live_in_op(op, waits, false)
+            .await?
+            .attached)
     }
 
     /// The share-locked registration, optionally telling the waiter about
     /// callees that are already terminal.
     ///
-    /// With `told_at: None` this is the pure liveness proof of
-    /// [`Self::register_waiters_on_live_in_op`]. With `Some(now)`, a callee
-    /// that is terminal gets a receipt edge `(callee, waiter)` -- once, the
-    /// first time -- and that waiter is moved-or-marked at `now` by
-    /// [`Self::move_or_mark_in_op`], exactly as if the callee had finished
-    /// right after registration. The receipt is written only when the
-    /// waiter's own execution row exists. Returns the live callees attached
-    /// (a terminal callee is never among them) and the rows the tell moved.
+    /// With `tell == false` this is the pure liveness proof of
+    /// [`Self::register_waiters_on_live_in_op`]. With `true`, a callee that
+    /// is terminal gets a receipt edge `(callee, waiter)` -- once, the first
+    /// time -- and that waiter is reported in `told` for the caller to
+    /// move-or-mark ([`Self::move_or_mark_in_op`]), exactly as if the callee
+    /// had finished right after registration. The receipt is written only
+    /// when the waiter's own execution row exists.
+    ///
+    /// A callee with no `jobs` row is neither live nor terminal: nothing is
+    /// written for it and it is reported in `unknown`.
     async fn register_on_live_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
-        told_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<(Vec<JobId>, Vec<(JobId, JobType)>), JobFault> {
+        tell: bool,
+    ) -> Result<Registration, JobFault> {
         if waits.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Registration::default());
         }
         let callees: Vec<JobId> = waits.iter().map(|w| w.callee).collect();
         let waiters: Vec<JobId> = waits.iter().map(|w| w.waiter).collect();
@@ -159,12 +180,17 @@ impl JobWaiters {
                 JOIN locked l ON l.id = t.job_id
                 ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET job_id = EXCLUDED.job_id
                 RETURNING job_id
+            ), unknown AS (
+                SELECT DISTINCT t.job_id
+                FROM UNNEST($1::uuid[]) AS t(job_id)
+                WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = t.job_id)
             ), told AS (
                 INSERT INTO job_waiters (job_id, waiter_job_id, created_at)
                 SELECT DISTINCT t.job_id, t.waiter_job_id, COALESCE($3, NOW())
                 FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
                 WHERE $4
                   AND t.job_id NOT IN (SELECT id FROM locked)
+                  AND t.job_id NOT IN (SELECT job_id FROM unknown)
                   AND EXISTS (SELECT 1 FROM job_executions w WHERE w.id = t.waiter_job_id)
                 ON CONFLICT (job_id, waiter_job_id) DO NOTHING
                 RETURNING waiter_job_id
@@ -172,32 +198,33 @@ impl JobWaiters {
             SELECT 'attached' AS "kind!", job_id AS "id!: JobId" FROM attached
             UNION ALL
             SELECT 'told', waiter_job_id FROM told
+            UNION ALL
+            SELECT 'unknown', job_id FROM unknown
             "#,
             &callees as &[JobId],
             &waiters as &[JobId],
             op.maybe_now(),
-            told_at.is_some(),
+            tell,
         )
         .fetch_all(op.as_executor())
         .await?;
-        let mut attached: Vec<JobId> = Vec::new();
-        let mut told: Vec<JobId> = Vec::new();
+        let mut registration = Registration::default();
         for row in rows {
-            if row.kind == "attached" {
-                attached.push(row.id);
-            } else {
-                told.push(row.id);
+            match row.kind.as_str() {
+                "attached" => registration.attached.push(row.id),
+                "told" => registration.told.push(row.id),
+                _ => registration.unknown.push(row.id),
             }
         }
-        attached.sort_unstable();
-        attached.dedup();
-        told.sort_unstable();
-        told.dedup();
-        let moved = match told_at {
-            Some(now) => self.move_or_mark_in_op(op, &told, now).await?,
-            None => Vec::new(),
-        };
-        Ok((attached, moved))
+        for ids in [
+            &mut registration.attached,
+            &mut registration.told,
+            &mut registration.unknown,
+        ] {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        Ok(registration)
     }
 
     /// Register each `waits[n].waiter` on `waits[n].callee`, whether the
@@ -206,8 +233,9 @@ impl JobWaiters {
     /// terminal -- and the rows that registering moved, for the caller to
     /// announce.
     ///
-    /// A terminal callee gets no attachment, but its waiter is told once:
-    /// see [`Self::register_on_live_in_op`].
+    /// A terminal callee gets no attachment, but its waiter is told once
+    /// (see [`Self::register_on_live_in_op`]); a callee that never existed
+    /// is rejected with [`UnknownCallee`], never a silent absence.
     ///
     /// A callee whose execution row this op will insert at commit
     /// ([`crate::execution_hooks::ExecutionInsertHook::pending_ids`])
@@ -220,7 +248,7 @@ impl JobWaiters {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(Vec<JobId>, Vec<(JobId, JobType)>), JobFault> {
+    ) -> Result<(Vec<JobId>, Vec<(JobId, JobType)>), RegisterWaiterError> {
         let pending = crate::execution_hooks::ExecutionInsertHook::pending_ids(op);
         let (mut same_op, mut live): (Vec<Wait>, Vec<Wait>) = (Vec::new(), Vec::new());
         for wait in waits {
@@ -231,7 +259,12 @@ impl JobWaiters {
             }
         }
         self.insert_waiters_in_op(op, &same_op).await?;
-        let (mut attached, moved) = self.register_on_live_in_op(op, &live, Some(now)).await?;
+        let registration = self.register_on_live_in_op(op, &live, true).await?;
+        if let Some(&id) = registration.unknown.first() {
+            return Err(UnknownCallee { id }.into());
+        }
+        let moved = self.move_or_mark_in_op(op, &registration.told, now).await?;
+        let mut attached = registration.attached;
         attached.extend(same_op.into_iter().map(|w| w.callee));
         attached.sort_unstable();
         attached.dedup();

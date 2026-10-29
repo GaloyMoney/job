@@ -54,6 +54,7 @@ use es_entity::AtomicOperation;
 use job::{
     CurrentJob, Job, JobCompletion, JobHandles, JobId, JobInitializer, JobRunner, JobSpawner,
     JobSpec, JobSvcConfig, JobType, Jobs, KeyedJobInitializer, KeyedJobSpawner,
+    RegisterWaiterError, UnknownCallee,
 };
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -1349,6 +1350,60 @@ async fn a_pending_waiter_on_a_terminal_callee_is_moved_and_runs() -> anyhow::Re
         completed(&waiter_handle)
     })
     .await?;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// A callee id that never existed is neither live nor terminal: registering
+/// on it is rejected with `UnknownCallee`, through the service and through a
+/// handle alike, and nothing is written -- no receipt edge, and the waiter's
+/// own schedule is untouched. A terminal callee in the same batch does not
+/// soften the answer.
+#[tokio::test]
+async fn registering_on_a_job_that_never_existed_is_rejected() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let spawner = jobs.add_initializer(CalleeInit {
+        job_type: helpers::job_type("waiters-unknown-callee"),
+        behaviour: CalleeBehaviour::Complete,
+    });
+    jobs.start_poll().await?;
+
+    let terminal = terminal_callee(&spawner).await?;
+    let waiter = JobId::new();
+    spawner
+        .spawn_at(waiter, CalleeCfg, Utc::now() + HOLD)
+        .await?;
+    let unknown = JobId::new();
+
+    let mut op = es_entity::DbOp::init(&pool).await?;
+    let via_service = jobs.register_waiter_in_op(&mut op, unknown, waiter).await;
+    assert!(
+        matches!(&via_service, Err(RegisterWaiterError::Rejected(UnknownCallee { id })) if *id == unknown),
+        "expected UnknownCallee, got {via_service:?}"
+    );
+    let via_handles = jobs
+        .handles(vec![terminal, unknown])
+        .register_waiter_in_op(&mut op, waiter)
+        .await;
+    assert!(
+        matches!(&via_handles, Err(RegisterWaiterError::Rejected(UnknownCallee { id })) if *id == unknown),
+        "expected UnknownCallee, got {via_handles:?}"
+    );
+    op.commit().await?;
+
+    assert!(
+        !wait_exists(&pool, unknown, waiter).await?,
+        "no edge may be written for an unknown callee"
+    );
+    let (at, _, state) = exec_row(&pool, waiter).await?.unwrap();
+    assert_eq!(state, "pending");
+    assert!(
+        at.is_some_and(|at| at > Utc::now() + HOLD - chrono::TimeDelta::minutes(5)),
+        "the waiter's schedule must be untouched, got {at:?}"
+    );
 
     jobs.shutdown().await?;
     Ok(())

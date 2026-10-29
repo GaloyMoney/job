@@ -10,7 +10,7 @@ use tracing::instrument;
 use super::{
     JobId,
     entity::JobType,
-    error::{CouldNotSerialize, JobFault},
+    error::{CouldNotSerialize, JobFault, RegisterWaiterError},
     outcome::JobReturnValue,
     repo::JobRepo,
 };
@@ -138,6 +138,9 @@ impl CurrentJob {
     ///
     /// # Errors
     ///
+    /// Returns [`UnknownCallee`](crate::UnknownCallee) if any of the jobs
+    /// never existed: a handle absent from the result is terminal, never
+    /// unknown.
     /// Returns a `Transient` lane if the write loses a race it can retry
     /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(name = "job.current.wait_for_in_op", skip(self, op, handles), fields(id = %self.id))]
@@ -145,7 +148,7 @@ impl CurrentJob {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         handles: &crate::JobHandles,
-    ) -> Result<Vec<JobId>, JobFault> {
+    ) -> Result<Vec<JobId>, RegisterWaiterError> {
         handles.register_waiter_in_op(op, self.id).await
     }
 

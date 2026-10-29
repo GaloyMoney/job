@@ -13,6 +13,7 @@ use crate::{
     JobId, JobType,
     error::{
         AwaitError, AwaitInterrupted, AwaitTimeout, CouldNotDeserializeExecutionState, JobFault,
+        RegisterWaiterError,
     },
     notification_router::JobNotificationRouter,
     notifier::JobEventNotifier,
@@ -167,6 +168,8 @@ impl JobHandle {
     ///
     /// # Errors
     ///
+    /// Returns [`UnknownCallee`](crate::UnknownCallee) if this job never
+    /// existed: `Ok(false)` means terminal, never unknown.
     /// Returns a `Transient` lane if the write loses a race it can retry
     /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(name = "job.handle.register_waiter_in_op", skip(self, op, waiter), fields(id = %self.id, waiter))]
@@ -174,7 +177,7 @@ impl JobHandle {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waiter: impl Into<JobId>,
-    ) -> Result<bool, JobFault> {
+    ) -> Result<bool, RegisterWaiterError> {
         let waiter: JobId = waiter.into();
         tracing::Span::current().record("waiter", tracing::field::display(waiter));
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
@@ -452,6 +455,9 @@ impl JobHandles {
     ///
     /// # Errors
     ///
+    /// Returns [`UnknownCallee`](crate::UnknownCallee) if any of the jobs
+    /// never existed: a handle absent from the result is terminal, never
+    /// unknown.
     /// Returns a `Transient` lane if the write loses a race it can retry
     /// (a deadlock or serialization failure), or a `Fatal` otherwise.
     #[instrument(
@@ -463,7 +469,7 @@ impl JobHandles {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waiter: impl Into<JobId>,
-    ) -> Result<Vec<JobId>, JobFault> {
+    ) -> Result<Vec<JobId>, RegisterWaiterError> {
         let waiter: JobId = waiter.into();
         tracing::Span::current().record("waiter", tracing::field::display(waiter));
         if self.0.is_empty() {
