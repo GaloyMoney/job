@@ -153,9 +153,13 @@ impl JobHandle {
     /// Register `waiter` to be woken when THIS job reaches a terminal state,
     /// with the semantics of [`JobSpec::waiter`](crate::JobSpec::waiter).
     /// `Ok(true)` if this job is live and the wait was registered;
-    /// `Ok(false)` if it is already terminal, in which case nothing is
-    /// written and the caller should read the outcome ([`Self::load`])
-    /// instead of parking.
+    /// `Ok(false)` if it is already terminal. A caller that holds the handle
+    /// for its result reads the outcome ([`Self::load`]). A caller that parks
+    /// anyway is woken once for it: the park is pulled to now by the write
+    /// that lands it, exactly as if the callee had finished a moment after
+    /// registration. A repeat registration of the same waiter on the same
+    /// terminal callee is a no-op and the park stands -- a terminal
+    /// transition is observed once, never zero times and never twice.
     ///
     /// A job spawned on this same `op` (`spawn_in_op` / `spawn_all_in_op`,
     /// keyless or not) is live by construction and is attached; the wait
@@ -173,7 +177,8 @@ impl JobHandle {
     ) -> Result<bool, JobFault> {
         let waiter: JobId = waiter.into();
         tracing::Span::current().record("waiter", tracing::field::display(waiter));
-        Ok(!self
+        let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        let (attached, moved) = self
             .ops
             .waiters
             .register_waiters_in_op(
@@ -182,9 +187,23 @@ impl JobHandle {
                     callee: self.id,
                     waiter,
                 }],
+                now,
             )
-            .await?
-            .is_empty())
+            .await?;
+        self.announce_moved(op, moved, now).await?;
+        Ok(!attached.is_empty())
+    }
+
+    async fn announce_moved(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        moved: Vec<(JobId, JobType)>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), JobFault> {
+        for (_, job_type) in moved {
+            self.announce(op, job_type, at).await?;
+        }
+        Ok(())
     }
 
     /// The two signals a spawn fires, for a row a pull-forward just made
@@ -401,8 +420,13 @@ impl JobHandles {
     /// Register `waiter` to be woken when the jobs in this collection reach
     /// a terminal state, and report which of them were still live and so
     /// actually attached. A handle absent from the result is already
-    /// terminal: nothing was written for it, and its outcome is there to be
-    /// read ([`JobHandle::load`]) rather than waited on.
+    /// terminal. A caller that holds the handle for its result reads the
+    /// outcome ([`JobHandle::load`]). A caller that parks anyway is woken
+    /// once for it: the park is pulled to now by the write that lands it,
+    /// exactly as if the callee had finished a moment after registration. A
+    /// repeat registration of the same waiter on the same terminal callee is
+    /// a no-op and the park stands -- a terminal transition is observed once,
+    /// never zero times and never twice.
     ///
     /// **This is the durable counterpart to [`Self::await_all`], and the two
     /// are not interchangeable.** `await_all` is a *continuation*: the
@@ -453,11 +477,15 @@ impl JobHandles {
                 waiter,
             })
             .collect();
-        self.0[0]
+        let first = &self.0[0];
+        let now = op.maybe_now().unwrap_or_else(|| first.clock.now());
+        let (attached, moved) = first
             .ops
             .waiters
-            .register_waiters_in_op(op, &waits)
-            .await
+            .register_waiters_in_op(op, &waits, now)
+            .await?;
+        first.announce_moved(op, moved, now).await?;
+        Ok(attached)
     }
 
     /// Block until every job reaches a terminal state and return all

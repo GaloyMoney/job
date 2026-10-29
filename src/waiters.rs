@@ -120,8 +120,28 @@ impl JobWaiters {
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
     ) -> Result<Vec<JobId>, JobFault> {
+        Ok(self.register_on_live_in_op(op, waits, None).await?.0)
+    }
+
+    /// The share-locked registration, optionally telling the waiter about
+    /// callees that are already terminal.
+    ///
+    /// With `told_at: None` this is the pure liveness proof of
+    /// [`Self::register_waiters_on_live_in_op`]. With `Some(now)`, a callee
+    /// that is terminal gets a receipt edge `(callee, waiter)` -- once, the
+    /// first time -- and that waiter is moved-or-marked at `now` by
+    /// [`Self::move_or_mark_in_op`], exactly as if the callee had finished
+    /// right after registration. The receipt is written only when the
+    /// waiter's own execution row exists. Returns the live callees attached
+    /// (a terminal callee is never among them) and the rows the tell moved.
+    async fn register_on_live_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        waits: &[Wait],
+        told_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(Vec<JobId>, Vec<(JobId, JobType)>), JobFault> {
         if waits.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let callees: Vec<JobId> = waits.iter().map(|w| w.callee).collect();
         let waiters: Vec<JobId> = waits.iter().map(|w| w.waiter).collect();
@@ -132,30 +152,62 @@ impl JobWaiters {
                 WHERE je.id = ANY($1)
                 ORDER BY je.queue_id, je.id
                 FOR SHARE
+            ), attached AS (
+                INSERT INTO job_waiters (job_id, waiter_job_id, created_at)
+                SELECT DISTINCT t.job_id, t.waiter_job_id, COALESCE($3, NOW())
+                FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
+                JOIN locked l ON l.id = t.job_id
+                ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET job_id = EXCLUDED.job_id
+                RETURNING job_id
+            ), told AS (
+                INSERT INTO job_waiters (job_id, waiter_job_id, created_at)
+                SELECT DISTINCT t.job_id, t.waiter_job_id, COALESCE($3, NOW())
+                FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
+                WHERE $4
+                  AND t.job_id NOT IN (SELECT id FROM locked)
+                  AND EXISTS (SELECT 1 FROM job_executions w WHERE w.id = t.waiter_job_id)
+                ON CONFLICT (job_id, waiter_job_id) DO NOTHING
+                RETURNING waiter_job_id
             )
-            INSERT INTO job_waiters (job_id, waiter_job_id, created_at)
-            SELECT DISTINCT t.job_id, t.waiter_job_id, COALESCE($3, NOW())
-            FROM UNNEST($1::uuid[], $2::uuid[]) AS t(job_id, waiter_job_id)
-            JOIN locked l ON l.id = t.job_id
-            ON CONFLICT (job_id, waiter_job_id) DO UPDATE SET job_id = EXCLUDED.job_id
-            RETURNING job_id AS "job_id!: JobId"
+            SELECT 'attached' AS "kind!", job_id AS "id!: JobId" FROM attached
+            UNION ALL
+            SELECT 'told', waiter_job_id FROM told
             "#,
             &callees as &[JobId],
             &waiters as &[JobId],
             op.maybe_now(),
+            told_at.is_some(),
         )
         .fetch_all(op.as_executor())
         .await?;
-        let mut attached: Vec<JobId> = rows.into_iter().map(|r| r.job_id).collect();
+        let mut attached: Vec<JobId> = Vec::new();
+        let mut told: Vec<JobId> = Vec::new();
+        for row in rows {
+            if row.kind == "attached" {
+                attached.push(row.id);
+            } else {
+                told.push(row.id);
+            }
+        }
         attached.sort_unstable();
         attached.dedup();
-        Ok(attached)
+        told.sort_unstable();
+        told.dedup();
+        let moved = match told_at {
+            Some(now) => self.move_or_mark_in_op(op, &told, now).await?,
+            None => Vec::new(),
+        };
+        Ok((attached, moved))
     }
 
     /// Register each `waits[n].waiter` on `waits[n].callee`, whether the
     /// callee already exists or is being created on this same `op`.
-    /// Returns the callees attached; a callee absent from the result is
-    /// terminal and nothing was written for it.
+    /// Returns the callees attached -- a callee absent from the result is
+    /// terminal -- and the rows that registering moved, for the caller to
+    /// announce.
+    ///
+    /// A terminal callee gets no attachment, but its waiter is told once:
+    /// see [`Self::register_on_live_in_op`].
     ///
     /// A callee whose execution row this op will insert at commit
     /// ([`crate::execution_hooks::ExecutionInsertHook::pending_ids`])
@@ -167,7 +219,8 @@ impl JobWaiters {
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
         waits: &[Wait],
-    ) -> Result<Vec<JobId>, JobFault> {
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Vec<JobId>, Vec<(JobId, JobType)>), JobFault> {
         let pending = crate::execution_hooks::ExecutionInsertHook::pending_ids(op);
         let (mut same_op, mut live): (Vec<Wait>, Vec<Wait>) = (Vec::new(), Vec::new());
         for wait in waits {
@@ -178,11 +231,11 @@ impl JobWaiters {
             }
         }
         self.insert_waiters_in_op(op, &same_op).await?;
-        let mut attached = self.register_waiters_on_live_in_op(op, &live).await?;
+        let (mut attached, moved) = self.register_on_live_in_op(op, &live, Some(now)).await?;
         attached.extend(same_op.into_iter().map(|w| w.callee));
         attached.sort_unstable();
         attached.dedup();
-        Ok(attached)
+        Ok((attached, moved))
     }
 
     /// Wake every job waiting on one of `terminal`, and return the rows that
@@ -210,6 +263,10 @@ impl JobWaiters {
     /// after this the edge carries nothing. Edges to callees that have NOT
     /// finished have a different `job_id` and are untouched, so a waiter that
     /// re-parks stays attached to them.
+    ///
+    /// An edge whose callee was already terminal at registration is the
+    /// receipt that the waiter has been woken for it; it is never consumed by
+    /// a wake and is swept with the waiter by [`Self::delete_waits_of_in_op`].
     pub(crate) async fn wake_in_op(
         &self,
         op: &mut (impl es_entity::AtomicOperation + ?Sized),
@@ -217,6 +274,34 @@ impl JobWaiters {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<(JobId, JobType)>, JobFault> {
         if terminal.is_empty() {
+            return Ok(Vec::new());
+        }
+        let waiters = sqlx::query_scalar!(
+            r#"SELECT waiter_job_id AS "waiter_job_id!: JobId" FROM job_waiters WHERE job_id = ANY($1)"#,
+            terminal as &[JobId],
+        )
+        .fetch_all(op.as_executor())
+        .await?;
+        let moved = self.move_or_mark_in_op(op, &waiters, now).await?;
+        sqlx::query!(
+            "DELETE FROM job_waiters WHERE job_id = ANY($1)",
+            terminal as &[JobId],
+        )
+        .execute(op.as_executor())
+        .await?;
+        Ok(moved)
+    }
+
+    /// Move every `waiters` row that can be moved (`pending`, first attempt,
+    /// scheduled after `now`) to `now`; mark every other one `woken_at`.
+    /// Returns the rows moved, for the caller to announce.
+    pub(crate) async fn move_or_mark_in_op(
+        &self,
+        op: &mut (impl es_entity::AtomicOperation + ?Sized),
+        waiters: &[JobId],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<(JobId, JobType)>, JobFault> {
+        if waiters.is_empty() {
             return Ok(Vec::new());
         }
         let rows = sqlx::query!(
@@ -235,9 +320,7 @@ impl JobWaiters {
                                 AND je.attempt_index <= 1
                                 AND je.execute_at > $2, false) AS movable
                 FROM job_executions je
-                WHERE je.id IN (
-                        SELECT waiter_job_id FROM job_waiters WHERE job_id = ANY($1)
-                    )
+                WHERE je.id = ANY($1)
                 ORDER BY je.queue_id, je.id
                 FOR NO KEY UPDATE
             ), woken AS (
@@ -248,13 +331,11 @@ impl JobWaiters {
                   FROM locked l
                  WHERE je.id = l.id
                 RETURNING je.id, je.job_type, l.movable AS movable
-            ), consumed AS (
-                DELETE FROM job_waiters WHERE job_id = ANY($1)
             )
             SELECT id AS "id!: JobId", job_type AS "job_type!: JobType"
             FROM woken WHERE movable
             "#,
-            terminal as &[JobId],
+            waiters as &[JobId],
             now,
         )
         .fetch_all(op.as_executor())

@@ -127,6 +127,15 @@ impl CurrentJob {
     /// for why the job is re-entered from the top rather than resumed, and
     /// what it must persist to survive that.
     ///
+    /// A handle absent from the result is already terminal. A caller that
+    /// holds the handle for its result reads the outcome
+    /// ([`JobHandle::load`](crate::JobHandle::load)). A caller that parks
+    /// anyway is woken once for it: the park is pulled to now by the write
+    /// that lands it, exactly as if the callee had finished a moment after
+    /// registration. A repeat registration of the same waiter on the same
+    /// terminal callee is a no-op and the park stands -- a terminal
+    /// transition is observed once, never zero times and never twice.
+    ///
     /// # Errors
     ///
     /// Returns a `Transient` lane if the write loses a race it can retry
