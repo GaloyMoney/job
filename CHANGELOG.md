@@ -1,3 +1,12 @@
+# [job release v0.19.3](https://github.com/GaloyMoney/job/releases/tag/0.19.3)
+
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.20.4 (#247)
+- Bump tokio (#245)
+
 # [job release v0.19.2](https://github.com/GaloyMoney/job/releases/tag/0.19.2)
 
 
