@@ -707,6 +707,12 @@ where
                AND je.unique_key = t.unique_key
                AND je.state = 'pending'
                AND je.attempt_index <= 1
+               -- `t.target` is authored on the application clock (a caller's
+               -- `force_reschedule`/wake deadline), so only app-domain rows
+               -- are pulled; a wall-domain pending row (a wall-type retry or
+               -- congestion reschedule on its first attempt) keeps its own
+               -- clock's deadline.
+               AND je.retry_clock = 'app'
                AND je.execute_at > t.target
             RETURNING je.unique_key AS "unique_key!", je.execute_at AS "execute_at!"
             "#,

@@ -339,6 +339,10 @@ impl JobWaiters {
         if waiters.is_empty() {
             return Ok(Vec::new());
         }
+        // A wall-domain row wakes on the wall clock: its `movable` test and
+        // its pull-to time both use `$3` (wall now) instead of the
+        // application clock's `now`, so waking a wall-type job never depends
+        // on the application clock advancing.
         let rows = sqlx::query!(
             r#"
             -- Eligibility is decided INSIDE the locking CTE, not re-checked on
@@ -353,16 +357,22 @@ impl JobWaiters {
                 SELECT je.id,
                        COALESCE(je.state = 'pending'
                                 AND je.attempt_index <= 1
-                                AND je.execute_at > $2, false) AS movable
+                                AND je.execute_at > CASE WHEN je.retry_clock = 'wall'
+                                                         THEN $3::timestamptz
+                                                         ELSE $2::timestamptz END, false) AS movable
                 FROM job_executions je
                 WHERE je.id = ANY($1)
                 ORDER BY je.queue_id, je.id
                 FOR NO KEY UPDATE
             ), woken AS (
                 UPDATE job_executions je
-                   SET execute_at = CASE WHEN l.movable THEN LEAST(je.execute_at, $2)
+                   SET execute_at = CASE WHEN l.movable
+                                         THEN LEAST(je.execute_at,
+                                                    CASE WHEN je.retry_clock = 'wall'
+                                                         THEN $3::timestamptz
+                                                         ELSE $2::timestamptz END)
                                          ELSE je.execute_at END,
-                       woken_at = CASE WHEN l.movable THEN je.woken_at ELSE $2 END
+                       woken_at = CASE WHEN l.movable THEN je.woken_at ELSE $2::timestamptz END
                   FROM locked l
                  WHERE je.id = l.id
                 RETURNING je.id, je.job_type, l.movable AS movable
@@ -372,6 +382,7 @@ impl JobWaiters {
             "#,
             waiters as &[JobId],
             now,
+            chrono::Utc::now(),
         )
         .fetch_all(op.as_executor())
         .await?;
@@ -417,6 +428,12 @@ impl JobWaiters {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        // `target` is authored on the application clock, so only app-domain
+        // rows are eligible: a wall-domain row's deadline lives on another
+        // clock, and comparing or lowering it against an app-clock timestamp
+        // would be meaningless arithmetic. A first-attempt app row is the
+        // only shape a caller parks via `RescheduleAt`, so this guard changes
+        // no existing behavior.
         let rows = sqlx::query!(
             r#"
             WITH locked AS MATERIALIZED (
@@ -424,6 +441,7 @@ impl JobWaiters {
                 WHERE je.id = ANY($1)
                   AND je.state = 'pending'
                   AND je.attempt_index <= 1
+                  AND je.retry_clock = 'app'
                   AND je.execute_at > $2
                 ORDER BY je.queue_id, je.id
                 FOR NO KEY UPDATE
@@ -434,6 +452,7 @@ impl JobWaiters {
              WHERE je.id = l.id
                AND je.state = 'pending'
                AND je.attempt_index <= 1
+               AND je.retry_clock = 'app'
                AND je.execute_at > $2
             RETURNING je.id AS "id!: JobId", je.job_type AS "job_type!: JobType"
             "#,

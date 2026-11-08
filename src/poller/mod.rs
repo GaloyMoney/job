@@ -86,7 +86,7 @@ pub(crate) use budget::pool_connection_headroom;
 pub(crate) use hook::ClaimHook;
 
 use budget::PoolBudget;
-use claim_query::{CONTENTION_HEADROOM, JobPollResult, poll_jobs};
+use claim_query::{CONTENTION_HEADROOM, JobPollResult, WaitBudget, poll_jobs};
 use hook::{ClaimedRow, DispatchTarget, claim_due_heads_in_op};
 use plan::ClaimPlanner;
 use recheck::Recheck;
@@ -285,10 +285,10 @@ impl JobPoller {
                 break;
             }
 
-            let timeout = match self.poll_and_dispatch(woken_up).await {
-                Ok(duration) => {
+            let budget = match self.poll_and_dispatch(woken_up).await {
+                Ok(budget) => {
                     failures = 0;
-                    duration
+                    budget
                 }
                 Err(e) => {
                     failures += 1;
@@ -298,18 +298,29 @@ impl JobPoller {
                         failures,
                         "main loop error"
                     );
-                    Duration::from_millis(50 << failures.min(12))
+                    WaitBudget::both(Duration::from_millis(50 << failures.min(12)))
                 }
             };
 
+            // Two wait arms, one per clock domain: the application clock
+            // crosses its budget only when advanced (a manual clock may
+            // stand still indefinitely), the wall arm always elapses in real
+            // time. Whichever fires first wakes the loop for the next poll,
+            // which claims whatever is due on either clock -- so a
+            // wall-domain retry deadline is never hostage to the application
+            // clock standing still. On a realtime clock the two arms are the
+            // same timeline and the earlier simply wins.
             tokio::select! {
                 biased;
 
                 _ = poll_stop_rx.changed() => {
                     break;
                 }
-                result = self.clock.timeout(timeout, self.tracker.notified()) => {
+                result = self.clock.timeout(budget.app, self.tracker.notified()) => {
                     woken_up = result.is_ok();
+                }
+                _ = tokio::time::sleep(budget.wall) => {
+                    woken_up = false;
                 }
             }
         }
@@ -330,13 +341,13 @@ impl JobPoller {
             n_claim_clamped_by_pool
         )
     )]
-    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<Duration, JobFault> {
+    async fn poll_and_dispatch(self: &Arc<Self>, woken_up: bool) -> Result<WaitBudget, JobFault> {
         let span = Span::current();
         span.record("poller_id", tracing::field::display(self.instance_id));
         let Some(n_jobs_to_poll) = self.tracker.next_batch_size() else {
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
-            return Ok(MAX_WAIT);
+            return Ok(WaitBudget::both(MAX_WAIT));
         };
         let unit_budget = self.budget.unit_budget();
         let plan = self.planner.plan(n_jobs_to_poll, unit_budget);
@@ -347,7 +358,7 @@ impl JobPoller {
             }
             span.record("next_poll_in", tracing::field::debug(MAX_WAIT));
             span.record("n_jobs_to_start", 0);
-            return Ok(MAX_WAIT);
+            return Ok(WaitBudget::both(MAX_WAIT));
         }
 
         let result = poll_jobs(
@@ -364,15 +375,15 @@ impl JobPoller {
 
         let (rows, window) = match result {
             JobPollResult::WaitTillNextJob(window) => {
-                let duration = self.recheck.bounded_sleep(
-                    window.sleep_for(self.clock.now()),
+                let budget = self.recheck.bounded_sleep(
+                    window.wait_budget(self.clock.now(), chrono::Utc::now()),
                     0,
                     window.excluded_due,
                     plan.rotation_lap,
                 );
-                span.record("next_poll_in", tracing::field::debug(duration));
+                span.record("next_poll_in", tracing::field::debug(budget.app));
                 span.record("n_jobs_to_start", 0);
-                return Ok(duration);
+                return Ok(budget);
             }
             JobPollResult::Jobs { jobs, window } => (jobs, window),
         };
@@ -380,14 +391,14 @@ impl JobPoller {
         span.record("n_jobs_to_start", jobs_len);
 
         let base = if jobs_len == n_jobs_to_poll {
-            Duration::ZERO
+            WaitBudget::both(Duration::ZERO)
         } else {
-            window.sleep_for(self.clock.now())
+            window.wait_budget(self.clock.now(), chrono::Utc::now())
         };
         let next_poll_in =
             self.recheck
                 .bounded_sleep(base, jobs_len, window.excluded_due, plan.rotation_lap);
-        span.record("next_poll_in", tracing::field::debug(next_poll_in));
+        span.record("next_poll_in", tracing::field::debug(next_poll_in.app));
 
         if !rows.is_empty() {
             self.load_and_dispatch_claimed(rows).await?;

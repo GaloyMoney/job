@@ -127,6 +127,22 @@
 //! entry point is chosen by the failure's errlanes lane. Only the job itself
 //! ends in failure, by returning [`JobCompletion::Fail`].
 //!
+//! ### Which clock a retry is scheduled on
+//!
+//! By default a retry deadline is written against the application clock the
+//! service was configured with — right for business-shaped work, whose
+//! tests advance a manual clock across backoff delays. A job type whose
+//! failures are *operational* (an outbox relay blocked by an upstream
+//! outage, any infrastructure mirror) can instead declare
+//! [`RetrySettings::retry_clock`] = [`RetryClock::Wall`]: its failure
+//! retries and pool-congestion reschedules are then scheduled against the
+//! wall clock, so they come due in real time even on a simulated application
+//! clock that has stopped advancing — the state a demo sandbox's finished
+//! seed leaves behind, where an app-clock deadline written past the freeze
+//! is unreachable and the job wedges `pending` indefinitely. Spawn deadlines
+//! and a runner's own `Reschedule*` completions always stay on the
+//! application clock; those timestamps are authored against it.
+//!
 //! ```ignore
 //! impl JobInitializer for MyInitializer {
 //!     // ...
@@ -139,6 +155,7 @@
 //!                 Duration::from_secs(300),
 //!                 20,
 //!             ),
+//!             retry_clock: RetryClock::Wall, // operational, not business time
 //!             ..Default::default()
 //!         }
 //!     }

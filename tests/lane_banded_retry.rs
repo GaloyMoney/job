@@ -13,7 +13,7 @@ use es_entity::clock::ClockHandle;
 use es_entity::errlanes::Fatal;
 use job::{
     Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs, RetryBand, RetrySettings,
+    JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs, RetryBand, RetryClock, RetrySettings,
     error::{JobError, JobRejection},
 };
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ fn deterministic_retry() -> RetrySettings {
             0,
         ),
         attempt_reset_after_healthy_run: None,
+        retry_clock: RetryClock::default(),
     }
 }
 

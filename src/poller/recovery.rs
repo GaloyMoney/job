@@ -241,16 +241,23 @@ impl Recovery {
                         SELECT
                             job_type,
                             COUNT(*)::INT4 AS "count!: i32",
-                            EXTRACT(EPOCH FROM ($1::timestamptz - MIN(execute_at)))::FLOAT8
-                                AS "max_pending_duration_secs!: f64"
+                            MIN(EXTRACT(EPOCH FROM (
+                                (CASE WHEN retry_clock = 'wall' THEN $3::timestamptz
+                                      ELSE $1::timestamptz END)
+                                - execute_at
+                            )))::FLOAT8 AS "max_pending_duration_secs!: f64"
                         FROM job_executions
                         WHERE state = 'pending'
-                        AND execute_at <= $1::timestamptz
+                        AND (
+                            (retry_clock = 'app' AND execute_at <= $1::timestamptz)
+                            OR (retry_clock = 'wall' AND execute_at <= $3::timestamptz)
+                        )
                         AND job_type = ANY($2)
                         GROUP BY job_type
                         "#,
                             now,
                             &supported_job_types as _,
+                            chrono::Utc::now(),
                         )
                         .fetch_all(&pool)
                         .await

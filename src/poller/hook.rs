@@ -94,7 +94,11 @@ pub(super) async fn claim_due_heads_in_op(
         r#"
         WITH heads AS (
             SELECT id, execute_at FROM job_executions
-            WHERE job_type = $1 AND state = 'pending' AND execute_at <= $2
+            WHERE job_type = $1 AND state = 'pending'
+              AND (
+                    (retry_clock = 'app' AND execute_at <= $2)
+                    OR (retry_clock = 'wall' AND execute_at <= $5)
+              )
               AND (NOT $6 OR attempt_index = 1)
             ORDER BY execute_at, id
             LIMIT $3

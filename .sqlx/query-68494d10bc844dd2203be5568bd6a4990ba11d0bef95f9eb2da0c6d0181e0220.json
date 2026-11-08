@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        SELECT\n                            job_type,\n                            COUNT(*)::INT4 AS \"count!: i32\",\n                            MIN(EXTRACT(EPOCH FROM (\n                                (CASE WHEN retry_clock = 'wall' THEN $3::timestamptz\n                                      ELSE $1::timestamptz END)\n                                - execute_at\n                            )))::FLOAT8 AS \"max_pending_duration_secs!: f64\"\n                        FROM job_executions\n                        WHERE state = 'pending'\n                        AND (\n                            (retry_clock = 'app' AND execute_at <= $1::timestamptz)\n                            OR (retry_clock = 'wall' AND execute_at <= $3::timestamptz)\n                        )\n                        AND job_type = ANY($2)\n                        GROUP BY job_type\n                        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "job_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "count!: i32",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "max_pending_duration_secs!: f64",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "TextArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "68494d10bc844dd2203be5568bd6a4990ba11d0bef95f9eb2da0c6d0181e0220"
+}
