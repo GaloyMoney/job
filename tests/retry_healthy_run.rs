@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use job::{
     Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobPollerConfig, JobRunner,
-    JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, RetrySettings,
+    JobSpawner, JobSpec, JobSvcConfig, JobType, Jobs, RetryClock, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -173,6 +173,7 @@ async fn a_long_running_execution_is_forgiven_and_never_terminates() -> anyhow::
                 0,
             ),
             attempt_reset_after_healthy_run: Some(HEALTHY_RUN),
+            retry_clock: RetryClock::default(),
         },
     });
     jobs.start_poll().await?;
@@ -235,6 +236,7 @@ async fn a_reclaimed_attempt_is_forgiven_by_the_next_healthy_run() -> anyhow::Re
                 0,
             ),
             attempt_reset_after_healthy_run: Some(HEALTHY_RUN),
+            retry_clock: RetryClock::default(),
         },
     });
     jobs.start_poll().await?;

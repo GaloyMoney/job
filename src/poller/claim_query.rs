@@ -129,7 +129,10 @@ pub(super) async fn poll_jobs(
                 FROM job_executions je
                 WHERE je.state = 'pending'
                   AND je.job_type = t.job_type
-                  AND je.execute_at <= $2::timestamptz
+                  AND (
+                        (je.retry_clock = 'app' AND je.execute_at <= $2::timestamptz)
+                        OR (je.retry_clock = 'wall' AND je.execute_at <= $5::timestamptz)
+                  )
                 ORDER BY je.execute_at, je.id
                 LIMIT t.type_window_limit
             ) d
@@ -172,11 +175,21 @@ pub(super) async fn poll_jobs(
             RETURNING je.id, selected_jobs.data_json, je.attempt_index, je.queue_id
         ),
         min_wait AS (
-            SELECT MIN(execute_at) AS next_due_at
+            -- One minimum per clock domain: the poller arms a separate wait
+            -- per domain (see `WaitBudget`), because a wall-domain deadline
+            -- crossed only by advancing real time must not be folded into the
+            -- application clock's budget (on a frozen manual clock that
+            -- budget never elapses) nor vice versa.
+            SELECT
+                MIN(execute_at) FILTER (WHERE retry_clock = 'app') AS next_due_app,
+                MIN(execute_at) FILTER (WHERE retry_clock = 'wall') AS next_due_wall
             FROM job_executions
             WHERE state = 'pending'
               AND job_type = ANY($4::text[] || $8::text[])
-              AND execute_at > $2::timestamptz
+              AND (
+                    (retry_clock = 'app' AND execute_at > $2::timestamptz)
+                    OR (retry_clock = 'wall' AND execute_at > $5::timestamptz)
+              )
         ),
         excluded_due AS (
             SELECT EXISTS (
@@ -187,7 +200,10 @@ pub(super) async fn poll_jobs(
                     FROM job_executions je
                     WHERE je.state = 'pending'
                       AND je.job_type = et.job_type
-                      AND je.execute_at <= $2::timestamptz
+                      AND (
+                            (je.retry_clock = 'app' AND je.execute_at <= $2::timestamptz)
+                            OR (je.retry_clock = 'wall' AND je.execute_at <= $5::timestamptz)
+                      )
                     LIMIT 1
                 ) probe
             ) AS excluded_due
@@ -213,7 +229,8 @@ pub(super) async fn poll_jobs(
                 u.data_json AS "data_json?: JsonValue",
                 u.attempt_index AS "attempt_index?",
                 u.queue_id AS "queue_id?",
-                NULL::TIMESTAMPTZ AS "next_due_at?",
+                NULL::TIMESTAMPTZ AS "next_due_app?",
+                NULL::TIMESTAMPTZ AS "next_due_wall?",
                 ps.may_have_more AS "may_have_more!",
                 ed.excluded_due AS "excluded_due!"
             FROM updated u, poll_status ps, excluded_due ed
@@ -223,7 +240,8 @@ pub(super) async fn poll_jobs(
                 NULL::JSONB AS "data_json?: JsonValue",
                 NULL::INT AS "attempt_index?",
                 NULL::VARCHAR AS "queue_id?",
-                mw.next_due_at AS "next_due_at?",
+                mw.next_due_app AS "next_due_app?",
+                mw.next_due_wall AS "next_due_wall?",
                 ps.may_have_more AS "may_have_more!",
                 ed.excluded_due AS "excluded_due!"
             FROM min_wait mw, poll_status ps, excluded_due ed
@@ -247,17 +265,52 @@ pub(super) async fn poll_jobs(
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PollWindow {
-    next_due_at: Option<DateTime<Utc>>,
+    next_due_app: Option<DateTime<Utc>>,
+    next_due_wall: Option<DateTime<Utc>>,
     may_have_more: bool,
     pub(super) excluded_due: bool,
 }
 
+/// How long the poller may wait, per clock domain: `app` is a budget on the
+/// application clock (a manual clock only crosses it when advanced), `wall`
+/// a budget on real time. Whichever elapses first in real time wakes the
+/// loop, and the next poll then claims whatever is due on either clock.
+/// Both are always `Some`-valued durations -- `MAX_WAIT` when the domain has
+/// no known deadline -- so each arm of the wait can always be armed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WaitBudget {
+    pub(crate) app: Duration,
+    pub(crate) wall: Duration,
+}
+
+impl WaitBudget {
+    pub(crate) const fn both(d: Duration) -> Self {
+        Self { app: d, wall: d }
+    }
+
+    /// Elementwise minimum, for callers that shrink a wait (the recheck
+    /// backoff): a shorter wake in either domain is always safe -- it only
+    /// costs an extra poll.
+    pub(crate) fn min(self, other: Duration) -> Self {
+        Self {
+            app: self.app.min(other),
+            wall: self.wall.min(other),
+        }
+    }
+}
+
 impl PollWindow {
-    pub(super) fn sleep_for(&self, now: DateTime<Utc>) -> Duration {
+    pub(super) fn wait_budget(
+        &self,
+        app_now: DateTime<Utc>,
+        wall_now: DateTime<Utc>,
+    ) -> WaitBudget {
         if self.may_have_more {
-            Duration::ZERO
-        } else {
-            duration_until(self.next_due_at, now)
+            return WaitBudget::both(Duration::ZERO);
+        }
+        WaitBudget {
+            app: duration_until(self.next_due_app, app_now),
+            wall: duration_until(self.next_due_wall, wall_now),
         }
     }
 }
@@ -277,7 +330,8 @@ struct JobPollRow {
     data_json: Option<JsonValue>,
     attempt_index: Option<i32>,
     queue_id: Option<String>,
-    next_due_at: Option<DateTime<Utc>>,
+    next_due_app: Option<DateTime<Utc>>,
+    next_due_wall: Option<DateTime<Utc>>,
     may_have_more: bool,
     excluded_due: bool,
 }
@@ -286,7 +340,8 @@ impl JobPollResult {
     fn from_rows(rows: Vec<JobPollRow>) -> Self {
         let mut jobs = Vec::with_capacity(rows.len());
         let mut window = PollWindow {
-            next_due_at: None,
+            next_due_app: None,
+            next_due_wall: None,
             may_have_more: false,
             excluded_due: false,
         };
@@ -300,7 +355,10 @@ impl JobPollResult {
                     attempt: attempt_index as u32,
                     queue_id: row.queue_id,
                 }),
-                _ => window.next_due_at = row.next_due_at,
+                _ => {
+                    window.next_due_app = row.next_due_app;
+                    window.next_due_wall = row.next_due_wall;
+                }
             }
         }
         if jobs.is_empty() {
@@ -419,7 +477,9 @@ mod tests {
             JobPollResult::Jobs { jobs, window } => {
                 assert_eq!(jobs.len(), row_limit as usize);
                 assert_eq!(
-                    window.sleep_for(chrono::Utc::now()),
+                    window
+                        .wait_budget(chrono::Utc::now(), chrono::Utc::now())
+                        .app,
                     Duration::ZERO,
                     "3 due rows were left behind by the row_limit: the poll \
                      must re-poll, not sleep until a deadline that does not exist"

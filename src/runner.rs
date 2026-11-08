@@ -155,6 +155,40 @@ pub struct RetrySettings {
     /// Pick a value comfortably longer than a *failing* run of this job type: a deterministic
     /// failure must not clear it, or the job never climbs to the fatal band.
     pub attempt_reset_after_healthy_run: Option<std::time::Duration>,
+    /// Which clock the retry deadline is measured on. See [`RetryClock`].
+    pub retry_clock: RetryClock,
+}
+
+/// Which clock a job type's failure retries (and pool-congestion reschedules)
+/// are scheduled against — the deadline written into the pending row's
+/// `execute_at`, which the poller compares against the same clock when
+/// deciding the row is due.
+///
+/// - [`RetryClock::App`] (the default): the application clock the service was
+///   configured with. Right for business-shaped work — an EOD that must run
+///   at the close of a *simulated* day should retry on that day's clock, and
+///   tests that advance a manual clock across backoff delays depend on it.
+/// - [`RetryClock::Wall`]: the wall clock. Right for infrastructure work whose
+///   failures are operational, not business-shaped — an outbox relay blocked
+///   by an upstream outage must retry in *real* time, because on a simulated
+///   clock that stops advancing (a demo sandbox whose seed has finished) an
+///   app-clock retry deadline sits in a business-time future nothing will
+///   ever reach, and the job wedges `pending` until some unrelated clock
+///   advance happens to cross it.
+///
+/// Only failure retries and congestion reschedules follow this setting.
+/// Spawn deadlines ([`crate::JobSpec`]) and a runner's own
+/// `RescheduleIn`/`RescheduleAt` completions stay on the application clock:
+/// those timestamps are authored against it by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetryClock {
+    /// The application clock ([`es_entity::clock::ClockHandle`]). The
+    /// default; unchanged behavior.
+    #[default]
+    App,
+    /// The wall clock (`chrono::Utc::now()`), so retries come due in real
+    /// time even when the application clock is frozen.
+    Wall,
 }
 
 /// The retry curve, divided into two bands by the errlanes lane of the
@@ -267,6 +301,7 @@ impl Default for RetrySettings {
         Self {
             backoff: Backoff::default(),
             attempt_reset_after_healthy_run: Some(std::time::Duration::from_secs(60 * 60)),
+            retry_clock: RetryClock::default(),
         }
     }
 }

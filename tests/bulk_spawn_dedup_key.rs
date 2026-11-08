@@ -10,7 +10,7 @@ mod helpers;
 use async_trait::async_trait;
 use job::{
     Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec,
-    JobSvcConfig, JobType, Jobs, RetrySettings,
+    JobSvcConfig, JobType, Jobs, RetryClock, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -395,6 +395,7 @@ async fn dedup_key_survives_a_retry() -> anyhow::Result<()> {
             // The test drives a deliberate failure and asserts on the
             // resulting attempt counter, so forgiveness must stay off.
             attempt_reset_after_healthy_run: None,
+            retry_clock: RetryClock::default(),
         },
     });
     jobs.start_poll().await?;
