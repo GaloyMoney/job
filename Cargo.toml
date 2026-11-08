@@ -7,6 +7,25 @@ version = "0.19.4-dev"
 license = "Apache-2.0"
 edition = "2024"
 categories = ["database"]
+# Explicit include set: `cargo package`'s default file selection drops
+# dot-directories (`.sqlx`) whenever the source tree has no VCS metadata —
+# which is exactly the shape nix's fetchgit produces when a consumer pins
+# this crate as a git dependency (crane vendors git deps via
+# `cargo package -l` on the fetchgit checkout). Without the offline query
+# cache every `query!` macro fails to expand for that consumer. Listing the
+# packaging set explicitly keeps `.sqlx` (and the embedded `migrations/`)
+# present with or without `.git`.
+include = [
+  "src/**",
+  "migrations/**",
+  ".sqlx/**",
+  "Cargo.toml",
+  "README.md",
+  "LICENSE",
+  "CHANGELOG.md",
+  "PERFORMANCE.md",
+  "SECURITY.md",
+]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
