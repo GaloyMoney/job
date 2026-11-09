@@ -191,6 +191,7 @@ impl JobPoller {
             recovery: Recovery {
                 pool: repo.pool().clone(),
                 clock: clock.clone(),
+                retry_schedule,
                 supported_job_types: registry.registered_job_types(),
                 instance_id,
                 tracker: Arc::clone(&tracker),
@@ -215,6 +216,15 @@ impl JobPoller {
 
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutdown_started.load(Ordering::SeqCst)
+    }
+
+    /// "Now" on the clock retry deadlines live on (`RetrySchedule::retry_now`):
+    /// the wall bound every claim statement here binds, and the base a
+    /// wall-domain wait is measured from.
+    fn retry_now(&self) -> DateTime<Utc> {
+        self.retry_schedule
+            .retry_now(&self.clock, self.clock.now())
+            .0
     }
 
     pub(crate) fn internal_pool(&self) -> &PgPool {
@@ -373,13 +383,14 @@ impl JobPoller {
             &plan.row_limits,
             CONTENTION_HEADROOM,
             &self.clock,
+            self.retry_schedule,
         )
         .await?;
 
         let (rows, window) = match result {
             JobPollResult::WaitTillNextJob(window) => {
                 let budget = self.recheck.bounded_sleep(
-                    window.wait_budget(self.clock.now(), chrono::Utc::now()),
+                    window.wait_budget(self.clock.now(), self.retry_now()),
                     0,
                     window.excluded_due,
                     plan.rotation_lap,
@@ -396,7 +407,7 @@ impl JobPoller {
         let base = if jobs_len == n_jobs_to_poll {
             WaitBudget::both(Duration::ZERO)
         } else {
-            window.wait_budget(self.clock.now(), chrono::Utc::now())
+            window.wait_budget(self.clock.now(), self.retry_now())
         };
         let next_poll_in =
             self.recheck
@@ -870,8 +881,17 @@ impl JobPoller {
         }
         let (per_unit_limit, fresh_only) = self.claim_shape(job_type);
         let limit = per_unit_limit * n_units as i64;
-        let rows =
-            claim_due_heads_in_op(op, job_type, self.instance_id, now, limit, fresh_only).await?;
+        let (retry_now, _) = self.retry_schedule.retry_now(&self.clock, now);
+        let rows = claim_due_heads_in_op(
+            op,
+            job_type,
+            self.instance_id,
+            now,
+            retry_now,
+            limit,
+            fresh_only,
+        )
+        .await?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }

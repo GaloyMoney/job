@@ -1,11 +1,12 @@
 //! Service and poller configuration types.
 
+use chrono::{DateTime, Utc};
 use es_entity::clock::{Clock, ClockHandle};
 use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
 
-use crate::error::InvalidConfig;
+use crate::{entity::ScheduleClock, error::InvalidConfig};
 
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,6 +159,15 @@ pub struct JobSvcConfig {
 ///
 /// On a realtime [`JobSvcConfig::clock`] the two schedules coincide and this
 /// setting has no observable effect.
+///
+/// The schedule is applied symmetrically: the same rule decides the clock a
+/// retry deadline is *written* on and the "now" every claim statement
+/// *compares* wall-domain deadlines against ([`Self::retry_now`]). Under
+/// `AppClock` that comparison bound is the application clock itself, so the
+/// claim predicate collapses to the single-clock range it had before retry
+/// clocks existed -- a simulated-clock harness that opts into `AppClock`
+/// pays nothing for the distinction, whichever way its clock sits relative
+/// to real time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrySchedule {
@@ -169,6 +179,32 @@ pub enum RetrySchedule {
     /// deadline. For tests that drive a manual clock across a backoff to
     /// make a retry fire without waiting for it.
     AppClock,
+}
+
+impl RetrySchedule {
+    /// "Now" on the clock retry deadlines live on, and which clock that is:
+    /// the finalizer writes a retry or congestion deadline from it, and the
+    /// poller binds the same value as the wall bound of every claim
+    /// predicate, so a deadline is always compared on the clock it was
+    /// written on.
+    ///
+    /// Real time under [`Realtime`](Self::Realtime), so the deadline comes
+    /// due however the application clock moves (or doesn't); the
+    /// application clock under [`AppClock`](Self::AppClock). On a realtime
+    /// application clock the two timelines are one, so `app_now` is kept
+    /// rather than reading the wall clock again: a statement then binds a
+    /// single instant, exactly as it always has in production.
+    pub(crate) fn retry_now(
+        self,
+        clock: &ClockHandle,
+        app_now: DateTime<Utc>,
+    ) -> (DateTime<Utc>, ScheduleClock) {
+        match self {
+            RetrySchedule::AppClock => (app_now, ScheduleClock::App),
+            RetrySchedule::Realtime if clock.is_manual() => (Utc::now(), ScheduleClock::Wall),
+            RetrySchedule::Realtime => (app_now, ScheduleClock::Wall),
+        }
+    }
 }
 
 #[bon::bon]

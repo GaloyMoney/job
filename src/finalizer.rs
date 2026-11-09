@@ -277,22 +277,11 @@ impl Finalizer {
     }
 
     /// The clock a retry or congestion deadline is written against, and
-    /// "now" on it: real time under [`RetrySchedule::Realtime`], so the
-    /// deadline comes due however the application clock moves (or doesn't);
-    /// the application clock under [`RetrySchedule::AppClock`].
-    ///
-    /// On a realtime application clock the two timelines are one, so the
-    /// op's `app_now` is kept rather than reading the wall clock again: the
-    /// deadline then derives from the same instant as the events recorded
-    /// in the op, exactly as it always has in production.
+    /// "now" on it -- [`RetrySchedule::retry_now`], from the op's `app_now`
+    /// so the deadline derives from the same instant as the events recorded
+    /// in the op.
     fn retry_now(&self, app_now: DateTime<Utc>) -> (DateTime<Utc>, ScheduleClock) {
-        match self.retry_schedule {
-            RetrySchedule::AppClock => (app_now, ScheduleClock::App),
-            RetrySchedule::Realtime if self.clock.is_manual() => {
-                (chrono::Utc::now(), ScheduleClock::Wall)
-            }
-            RetrySchedule::Realtime => (app_now, ScheduleClock::Wall),
-        }
+        self.retry_schedule.retry_now(&self.clock, app_now)
     }
 
     /// Reschedule `ids` after a congestion classification: every row

@@ -87,6 +87,7 @@ use std::time::Duration;
 
 use super::MAX_WAIT;
 use crate::JobId;
+use crate::config::RetrySchedule;
 use crate::dispatcher::PolledJob;
 
 pub(super) const CONTENTION_HEADROOM: i32 = 4;
@@ -107,8 +108,17 @@ pub(super) async fn poll_jobs(
     row_limits: &[i32],
     headroom: i32,
     clock: &ClockHandle,
+    retry_schedule: RetrySchedule,
 ) -> Result<JobPollResult, sqlx::Error> {
     let sim_now = clock.now();
+    // The wall bound of the due predicate is "now" on the clock retry
+    // deadlines were written on (`RetrySchedule::retry_now`), NOT the wall
+    // clock unconditionally: under `AppClock` it is `sim_now` itself, so the
+    // GREATEST/CASE predicate reduces to `execute_at <= sim_now` and the
+    // index range never widens to cover the gap between a simulated clock
+    // and real time. `alive_at` is liveness and stays on real time
+    // regardless (the lost-job handler compares it against `Utc::now()`).
+    let (retry_now, _) = retry_schedule.retry_now(clock, sim_now);
     let wall_now = chrono::Utc::now();
     Span::current().record("now", tracing::field::display(sim_now));
 
@@ -133,11 +143,13 @@ pub(super) async fn poll_jobs(
                   -- GREATEST bound comes first so the prefix scan keeps an
                   -- index range on execute_at; the CASE then drops rows
                   -- inside that range that are not yet due on their own
-                  -- clock. On a realtime clock $2 = $5 and it rejects nothing.
-                  AND je.execute_at <= GREATEST($2::timestamptz, $5::timestamptz)
+                  -- clock. Whenever $2 = $9 (a realtime clock, or the
+                  -- AppClock schedule) the range is $2's alone and the CASE
+                  -- rejects nothing.
+                  AND je.execute_at <= GREATEST($2::timestamptz, $9::timestamptz)
                   AND CASE je.retry_clock
                         WHEN 'app' THEN je.execute_at <= $2::timestamptz
-                        ELSE je.execute_at <= $5::timestamptz
+                        ELSE je.execute_at <= $9::timestamptz
                       END
                 ORDER BY je.execute_at, je.id
                 LIMIT t.type_window_limit
@@ -192,10 +204,10 @@ pub(super) async fn poll_jobs(
             FROM job_executions
             WHERE state = 'pending'
               AND job_type = ANY($4::text[] || $8::text[])
-              AND execute_at > LEAST($2::timestamptz, $5::timestamptz)
+              AND execute_at > LEAST($2::timestamptz, $9::timestamptz)
               AND CASE retry_clock
                     WHEN 'app' THEN execute_at > $2::timestamptz
-                    ELSE execute_at > $5::timestamptz
+                    ELSE execute_at > $9::timestamptz
                   END
         ),
         excluded_due AS (
@@ -207,10 +219,10 @@ pub(super) async fn poll_jobs(
                     FROM job_executions je
                     WHERE je.state = 'pending'
                       AND je.job_type = et.job_type
-                      AND je.execute_at <= GREATEST($2::timestamptz, $5::timestamptz)
+                      AND je.execute_at <= GREATEST($2::timestamptz, $9::timestamptz)
                       AND CASE je.retry_clock
                             WHEN 'app' THEN je.execute_at <= $2::timestamptz
-                            ELSE je.execute_at <= $5::timestamptz
+                            ELSE je.execute_at <= $9::timestamptz
                           END
                     LIMIT 1
                 ) probe
@@ -263,6 +275,7 @@ pub(super) async fn poll_jobs(
         row_limits,
         headroom,
         rotation_excluded as _,
+        retry_now,
     )
     .fetch_all(pool)
     .await?;
@@ -308,17 +321,20 @@ impl WaitBudget {
 }
 
 impl PollWindow {
+    /// `retry_now` is the same wall-domain bound the poll compared against
+    /// (`RetrySchedule::retry_now`), so a wall deadline's remaining wait is
+    /// measured on the clock it was written on.
     pub(super) fn wait_budget(
         &self,
         app_now: DateTime<Utc>,
-        wall_now: DateTime<Utc>,
+        retry_now: DateTime<Utc>,
     ) -> WaitBudget {
         if self.may_have_more {
             return WaitBudget::both(Duration::ZERO);
         }
         WaitBudget {
             app: duration_until(self.next_due_app, app_now),
-            wall: duration_until(self.next_due_wall, wall_now),
+            wall: duration_until(self.next_due_wall, retry_now),
         }
     }
 }
@@ -428,6 +444,7 @@ mod tests {
             &row_limits,
             CONTENTION_HEADROOM,
             &clock,
+            RetrySchedule::default(),
         )
         .await?;
 
@@ -478,6 +495,7 @@ mod tests {
             &[row_limit],
             CONTENTION_HEADROOM,
             &ClockHandle::realtime(),
+            RetrySchedule::default(),
         )
         .await?;
 
@@ -541,6 +559,7 @@ mod tests {
             &row_limits,
             CONTENTION_HEADROOM,
             &clock,
+            RetrySchedule::default(),
         )
         .await?;
 
@@ -740,6 +759,74 @@ mod tests {
              accepted 2 bufs/row ceiling (see this file's header for the \
              crossover this trades against):\n{plan_text}"
         );
+
+        Ok(())
+    }
+
+    /// The read side of `RetrySchedule`: under `AppClock` the poll binds
+    /// the application clock as the wall bound too, so a wall-tagged
+    /// deadline that real time has crossed is NOT due while the (frozen)
+    /// application clock has not -- the predicate is a single-clock range
+    /// again, and the index never widens to the gap between the two clocks.
+    /// The same row IS claimed under `Realtime`, pinning that the collapse
+    /// is the schedule's doing and not a seeding accident.
+    #[tokio::test]
+    async fn app_clock_schedule_measures_wall_deadlines_on_the_application_clock()
+    -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let instance_id = uuid::Uuid::now_v7();
+        let job_type = format!("retry-bound-{}", uuid::Uuid::now_v7());
+        let (clock, _controller) = ClockHandle::manual();
+        let frozen_at = clock.now();
+
+        let id = seed_pending_job(
+            &pool,
+            &job_type,
+            frozen_at + chrono::Duration::milliseconds(100),
+        )
+        .await?;
+        sqlx::query("UPDATE job_executions SET retry_clock = 'wall' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await?;
+        // Real time crosses the deadline; the application clock never moves.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let pollable_types = vec![JobType::from_owned(job_type.clone())];
+        let poll = |schedule: RetrySchedule| {
+            let pool = pool.clone();
+            let pollable_types = pollable_types.clone();
+            let clock = clock.clone();
+            async move {
+                poll_jobs(
+                    &pool,
+                    4,
+                    instance_id,
+                    &pollable_types,
+                    &[],
+                    &[4],
+                    CONTENTION_HEADROOM,
+                    &clock,
+                    schedule,
+                )
+                .await
+            }
+        };
+
+        match poll(RetrySchedule::AppClock).await? {
+            JobPollResult::WaitTillNextJob(_) => {}
+            other => panic!(
+                "under AppClock a wall-tagged deadline past real time but not past \
+                 the frozen application clock must not be due, got {other:?}"
+            ),
+        }
+        match poll(RetrySchedule::Realtime).await? {
+            JobPollResult::Jobs { jobs, .. } => {
+                assert_eq!(jobs.len(), 1, "under Realtime the same row is due");
+                assert_eq!(jobs[0].id, id);
+            }
+            other => panic!("expected the wall-due row to be claimed, got {other:?}"),
+        }
 
         Ok(())
     }

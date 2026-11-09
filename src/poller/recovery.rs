@@ -25,13 +25,14 @@ use std::time::Duration;
 use es_entity::clock::ClockHandle;
 
 use crate::{
-    JobId, entity::JobType, execution_hooks::PromoteHeadsHook, notifier::JobEventNotifier,
-    task::OwnedTaskHandle, tracker::JobTracker,
+    JobId, config::RetrySchedule, entity::JobType, execution_hooks::PromoteHeadsHook,
+    notifier::JobEventNotifier, task::OwnedTaskHandle, tracker::JobTracker,
 };
 
 pub(super) struct Recovery {
     pub(super) pool: PgPool,
     pub(super) clock: ClockHandle,
+    pub(super) retry_schedule: RetrySchedule,
     pub(super) supported_job_types: Vec<JobType>,
     pub(super) instance_id: uuid::Uuid,
     pub(super) tracker: Arc<JobTracker>,
@@ -219,6 +220,7 @@ impl Recovery {
     pub(super) fn spawn_stale_jobs_handler(&self) -> OwnedTaskHandle {
         let pool = self.pool.clone();
         let clock = self.clock.clone();
+        let retry_schedule = self.retry_schedule;
         let supported_job_types = self.supported_job_types.clone();
         let pending_jobs_check_interval = self.pending_jobs_check_interval;
         OwnedTaskHandle::new(spawn_named_task!(
@@ -227,6 +229,10 @@ impl Recovery {
                 loop {
                     tokio::time::sleep(pending_jobs_check_interval).await;
                     let now = clock.now();
+                    // Same wall bound the claim statements use, so "stale"
+                    // means "due and unclaimed" on the clock each deadline
+                    // was written on.
+                    let (retry_now, _) = retry_schedule.retry_now(&clock, now);
 
                     let span = tracing::info_span!(
                         parent: None,
@@ -258,7 +264,7 @@ impl Recovery {
                         "#,
                             now,
                             &supported_job_types as _,
-                            chrono::Utc::now(),
+                            retry_now,
                         )
                         .fetch_all(&pool)
                         .await
