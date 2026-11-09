@@ -63,6 +63,7 @@ pub(super) async fn build_poller(
             router,
             notifier,
             ClockHandle::realtime(),
+            crate::config::RetrySchedule::default(),
         )
         .await?,
     ))

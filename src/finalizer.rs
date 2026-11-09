@@ -79,7 +79,8 @@ use std::sync::{Arc, Weak};
 
 use super::{
     JobId,
-    entity::{Job, JobType, RetryPolicy, ScheduledRetry},
+    config::RetrySchedule,
+    entity::{Job, JobType, RetryPolicy, ScheduleClock, ScheduledRetry},
     error::{JobFault, TX_ABORT_MAX_ATTEMPTS},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
@@ -239,6 +240,10 @@ pub(crate) struct Finalizer {
     retains_state: bool,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
+    /// Which clock failure retries and congestion reschedules are written
+    /// against (see [`RetrySchedule`]). Every other disposition's deadline
+    /// is on `clock`.
+    retry_schedule: RetrySchedule,
 }
 
 impl Finalizer {
@@ -251,6 +256,7 @@ impl Finalizer {
         retains_state: bool,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
+        retry_schedule: RetrySchedule,
     ) -> Self {
         // Derived from the repo's pool rather than threaded down, the same
         // way the poller derives its own (`poller::JobPoller::new`): a
@@ -266,6 +272,26 @@ impl Finalizer {
             retains_state,
             instance_id,
             clock,
+            retry_schedule,
+        }
+    }
+
+    /// The clock a retry or congestion deadline is written against, and
+    /// "now" on it: real time under [`RetrySchedule::Realtime`], so the
+    /// deadline comes due however the application clock moves (or doesn't);
+    /// the application clock under [`RetrySchedule::AppClock`].
+    ///
+    /// On a realtime application clock the two timelines are one, so the
+    /// op's `app_now` is kept rather than reading the wall clock again: the
+    /// deadline then derives from the same instant as the events recorded
+    /// in the op, exactly as it always has in production.
+    fn retry_now(&self, app_now: DateTime<Utc>) -> (DateTime<Utc>, ScheduleClock) {
+        match self.retry_schedule {
+            RetrySchedule::AppClock => (app_now, ScheduleClock::App),
+            RetrySchedule::Realtime if self.clock.is_manual() => {
+                (chrono::Utc::now(), ScheduleClock::Wall)
+            }
+            RetrySchedule::Realtime => (app_now, ScheduleClock::Wall),
         }
     }
 
@@ -288,14 +314,9 @@ impl Finalizer {
         message: String,
     ) -> Result<(), JobFault> {
         let jitter_ms = rng().random_range(-CONGESTION_JITTER_MS..=CONGESTION_JITTER_MS);
-        // Pool congestion is an operational condition, but the reschedule
-        // keeps the type's retry clock so an `App` type's manual-clock tests
-        // (which advance the clock past the 2s congestion delay) are
-        // unchanged, while a `Wall` type stays reachable on a frozen clock.
-        let domain_now = match self.retry_settings.retry_clock {
-            crate::runner::RetryClock::App => self.clock.now(),
-            crate::runner::RetryClock::Wall => chrono::Utc::now(),
-        };
+        // Pool congestion is an operational condition: the reschedule is on
+        // the retry schedule's clock, like a failure retry.
+        let (domain_now, _) = self.retry_now(self.clock.now());
         let at = domain_now + chrono::Duration::milliseconds(CONGESTION_DELAY_MS + jitter_ms);
         let items: Vec<(JobId, Disposition)> = ids
             .iter()
@@ -479,18 +500,12 @@ impl Finalizer {
             return Ok(outcome);
         }
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
-        // The clock a failure retry's deadline is measured on: `Wall` types
-        // schedule against real time so their retries come due even while
-        // the application clock stands still (see `RetryClock`). `now` from
-        // the op remains the application clock for every other disposition.
-        let retry_now = match self.retry_settings.retry_clock {
-            crate::runner::RetryClock::App => now,
-            crate::runner::RetryClock::Wall => chrono::Utc::now(),
-        };
-        let retry_clock = match self.retry_settings.retry_clock {
-            crate::runner::RetryClock::App => "app",
-            crate::runner::RetryClock::Wall => "wall",
-        };
+        // Failure retries and congestion reschedules are measured on the
+        // retry schedule's clock (real time by default, so they come due
+        // however the application clock moves); `now` from the op remains
+        // the application clock for every other disposition.
+        let (retry_now, schedule_clock) = self.retry_now(now);
+        let retry_clock = schedule_clock.as_column_value();
         let retry_policy = RetryPolicy::from(&self.retry_settings);
 
         let ids: Vec<JobId> = items.iter().map(|(id, _)| *id).collect();
@@ -546,7 +561,8 @@ impl Finalizer {
                 } => {
                     congestion_uuids.push(uuid::Uuid::from(*id));
                     congestion_times.push(*at);
-                    let streak = job.reschedule_congestion(message.clone(), *at, *attempt);
+                    let streak =
+                        job.reschedule_congestion(message.clone(), *at, schedule_clock, *attempt);
                     congestion_streaks.insert(*id, streak);
                 }
                 Disposition::Fail {
@@ -556,6 +572,7 @@ impl Finalizer {
                 } => {
                     let retry = job.maybe_schedule_retry(
                         retry_now,
+                        schedule_clock,
                         *attempt,
                         *run_duration,
                         &retry_policy,
@@ -1178,6 +1195,7 @@ mod deadlock_regression_tests {
                 false,
                 instance_id,
                 ClockHandle::realtime(),
+                RetrySchedule::default(),
             );
 
             // The contestant holds B before `finalize()` even starts and

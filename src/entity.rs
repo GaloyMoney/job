@@ -85,6 +85,36 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for JobType {
     }
 }
 
+/// The clock a scheduled deadline is measured on -- recorded on
+/// [`JobEvent::ExecutionScheduled`] so a job's history says which clock each
+/// `scheduled_at` belongs to, and mirrored by the `retry_clock` column the
+/// poller compares the deadline against.
+///
+/// Spawn deadlines, a runner's `Reschedule*` completions and rescues are
+/// always [`App`](Self::App). Failure retries and congestion reschedules are
+/// [`Wall`](Self::Wall) under the default
+/// [`RetrySchedule::Realtime`](crate::RetrySchedule::Realtime) and `App`
+/// under [`RetrySchedule::AppClock`](crate::RetrySchedule::AppClock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleClock {
+    /// The application clock the service was configured with.
+    #[default]
+    App,
+    /// The wall clock.
+    Wall,
+}
+
+impl ScheduleClock {
+    /// The `job_executions.retry_clock` value this clock is stored as.
+    pub(crate) fn as_column_value(self) -> &'static str {
+        match self {
+            ScheduleClock::App => "app",
+            ScheduleClock::Wall => "wall",
+        }
+    }
+}
+
 #[derive(EsEvent, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[es_event(id = "JobId", event_context = false)]
@@ -101,6 +131,11 @@ pub enum JobEvent {
     ExecutionScheduled {
         attempt: u32,
         scheduled_at: DateTime<Utc>,
+        /// The clock `scheduled_at` is measured on. Events recorded before
+        /// this field existed were all application-clock deadlines, which
+        /// is what the default deserializes to.
+        #[serde(default)]
+        clock: ScheduleClock,
     },
     ExecutionCompleted,
     ExecutionAborted {
@@ -421,6 +456,7 @@ impl Job {
         self.events.push(JobEvent::ExecutionScheduled {
             attempt: 1,
             scheduled_at,
+            clock: ScheduleClock::App,
         });
     }
 
@@ -434,6 +470,7 @@ impl Job {
         self.events.push(JobEvent::ExecutionScheduled {
             attempt,
             scheduled_at,
+            clock: ScheduleClock::App,
         });
     }
 
@@ -447,12 +484,14 @@ impl Job {
         error: String,
         lane: FailureLane,
         scheduled_at: DateTime<Utc>,
+        clock: ScheduleClock,
         attempt: u32,
     ) {
         self.events.push(JobEvent::ExecutionErrored { error, lane });
         self.events.push(JobEvent::ExecutionScheduled {
             attempt,
             scheduled_at,
+            clock,
         });
     }
 
@@ -482,12 +521,14 @@ impl Job {
         &mut self,
         error: String,
         scheduled_at: DateTime<Utc>,
+        clock: ScheduleClock,
         attempt: u32,
     ) -> u32 {
         self.events.push(JobEvent::CongestionRescheduled { error });
         self.events.push(JobEvent::ExecutionScheduled {
             attempt,
             scheduled_at,
+            clock,
         });
         self.consecutive_congestion_reschedules()
     }
@@ -542,6 +583,7 @@ impl Job {
     pub(super) fn maybe_schedule_retry(
         &mut self,
         now: DateTime<Utc>,
+        clock: ScheduleClock,
         attempt: u32,
         run_duration: Duration,
         retry_policy: &RetryPolicy,
@@ -565,7 +607,13 @@ impl Job {
             prior_streak.saturating_add(1),
         );
         let at = now + delay;
-        self.schedule_retry(failure.message(), FailureLane::from(band), at, next_attempt);
+        self.schedule_retry(
+            failure.message(),
+            FailureLane::from(band),
+            at,
+            clock,
+            next_attempt,
+        );
         ScheduledRetry {
             at,
             next_attempt,
@@ -672,6 +720,7 @@ impl IntoEvents<JobEvent> for NewJob {
                 JobEvent::ExecutionScheduled {
                     attempt: 1,
                     scheduled_at: self.schedule_at,
+                    clock: ScheduleClock::App,
                 },
             ],
         )
@@ -743,6 +792,7 @@ mod tests {
                 JobEvent::ExecutionScheduled {
                     attempt,
                     scheduled_at: window.retry_scheduled_at,
+                    clock: ScheduleClock::App,
                 },
                 window.failure_recorded_at,
             )
@@ -848,7 +898,14 @@ mod tests {
             failure: &JobFault,
         ) -> (i64, ScheduledRetry) {
             let now = Clock::now();
-            let retry = job.maybe_schedule_retry(now, attempt, SHORT_RUN, policy, failure);
+            let retry = job.maybe_schedule_retry(
+                now,
+                ScheduleClock::App,
+                attempt,
+                SHORT_RUN,
+                policy,
+                failure,
+            );
             ((retry.at - now).num_seconds(), retry)
         }
 
@@ -885,7 +942,14 @@ mod tests {
             let retry_policy = build_retry_policy();
 
             let next_attempt = job
-                .maybe_schedule_retry(Clock::now(), 1, SHORT_RUN, &retry_policy, &retry_failure())
+                .maybe_schedule_retry(
+                    Clock::now(),
+                    ScheduleClock::App,
+                    1,
+                    SHORT_RUN,
+                    &retry_policy,
+                    &retry_failure(),
+                )
                 .next_attempt;
 
             assert_eq!(next_attempt, 2);
@@ -920,7 +984,14 @@ mod tests {
             let retry_policy = build_retry_policy();
 
             let next_attempt = job
-                .maybe_schedule_retry(Clock::now(), 0, SHORT_RUN, &retry_policy, &retry_failure())
+                .maybe_schedule_retry(
+                    Clock::now(),
+                    ScheduleClock::App,
+                    0,
+                    SHORT_RUN,
+                    &retry_policy,
+                    &retry_failure(),
+                )
                 .next_attempt;
 
             assert_eq!(next_attempt, 2);
@@ -961,6 +1032,7 @@ mod tests {
             let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
+                    ScheduleClock::App,
                     2,
                     healthy_run(),
                     &retry_policy,
@@ -1015,6 +1087,7 @@ mod tests {
             let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
+                    ScheduleClock::App,
                     3,
                     healthy_run(),
                     &retry_policy,
@@ -1095,6 +1168,7 @@ mod tests {
             let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
+                    ScheduleClock::App,
                     20,
                     Duration::from_secs(6 * 60 * 60),
                     &retry_policy,
@@ -1116,7 +1190,14 @@ mod tests {
             let now = Clock::now() + ChronoDuration::hours(24);
 
             let next_attempt = job
-                .maybe_schedule_retry(now, 5, SHORT_RUN, &retry_policy, &retry_failure())
+                .maybe_schedule_retry(
+                    now,
+                    ScheduleClock::App,
+                    5,
+                    SHORT_RUN,
+                    &retry_policy,
+                    &retry_failure(),
+                )
                 .next_attempt;
 
             assert_eq!(next_attempt, 6, "the counter must keep climbing");
@@ -1139,6 +1220,7 @@ mod tests {
             let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
+                    ScheduleClock::App,
                     1,
                     Duration::from_secs(6 * 60 * 60),
                     &retry_policy,
@@ -1162,6 +1244,7 @@ mod tests {
             let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
+                    ScheduleClock::App,
                     20,
                     Duration::from_secs(6 * 60 * 60),
                     &retry_policy,
@@ -1181,6 +1264,7 @@ mod tests {
             let next_attempt = job
                 .maybe_schedule_retry(
                     Clock::now(),
+                    ScheduleClock::App,
                     7,
                     healthy_run(),
                     &retry_policy,
@@ -1249,6 +1333,7 @@ mod tests {
                     raw_event(JobEvent::ExecutionScheduled {
                         attempt: 1,
                         scheduled_at: now - ChronoDuration::minutes(1),
+                        clock: ScheduleClock::App,
                     }),
                     now - ChronoDuration::minutes(2),
                 ),
@@ -1263,6 +1348,7 @@ mod tests {
                 let mut job = job_from_raw_history(job_id, &history);
                 let retry = job.maybe_schedule_retry(
                     now,
+                    ScheduleClock::App,
                     attempt,
                     SHORT_RUN,
                     &retry_policy,
@@ -1288,6 +1374,7 @@ mod tests {
                     raw_event(JobEvent::ExecutionScheduled {
                         attempt: retry.next_attempt,
                         scheduled_at: retry.at,
+                        clock: ScheduleClock::App,
                     }),
                     now,
                 ));
@@ -1414,7 +1501,7 @@ mod tests {
             let policy = default_shape_policy();
             let mut job = empty_job();
             schedule(&mut job, &policy, 1, &fatal_failure());
-            job.reschedule_congestion("pool".to_string(), Clock::now(), 2);
+            job.reschedule_congestion("pool".to_string(), Clock::now(), ScheduleClock::App, 2);
             job.abort_execution("shutdown".to_string(), Clock::now(), 2);
 
             let (_, retry) = schedule(&mut job, &policy, 2, &fatal_failure());

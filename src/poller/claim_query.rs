@@ -129,10 +129,16 @@ pub(super) async fn poll_jobs(
                 FROM job_executions je
                 WHERE je.state = 'pending'
                   AND je.job_type = t.job_type
-                  AND (
-                        (je.retry_clock = 'app' AND je.execute_at <= $2::timestamptz)
-                        OR (je.retry_clock = 'wall' AND je.execute_at <= $5::timestamptz)
-                  )
+                  -- Due on the clock the row's deadline is measured on. The
+                  -- GREATEST bound comes first so the prefix scan keeps an
+                  -- index range on execute_at; the CASE then drops rows
+                  -- inside that range that are not yet due on their own
+                  -- clock. On a realtime clock $2 = $5 and it rejects nothing.
+                  AND je.execute_at <= GREATEST($2::timestamptz, $5::timestamptz)
+                  AND CASE je.retry_clock
+                        WHEN 'app' THEN je.execute_at <= $2::timestamptz
+                        ELSE je.execute_at <= $5::timestamptz
+                      END
                 ORDER BY je.execute_at, je.id
                 LIMIT t.type_window_limit
             ) d
@@ -186,10 +192,11 @@ pub(super) async fn poll_jobs(
             FROM job_executions
             WHERE state = 'pending'
               AND job_type = ANY($4::text[] || $8::text[])
-              AND (
-                    (retry_clock = 'app' AND execute_at > $2::timestamptz)
-                    OR (retry_clock = 'wall' AND execute_at > $5::timestamptz)
-              )
+              AND execute_at > LEAST($2::timestamptz, $5::timestamptz)
+              AND CASE retry_clock
+                    WHEN 'app' THEN execute_at > $2::timestamptz
+                    ELSE execute_at > $5::timestamptz
+                  END
         ),
         excluded_due AS (
             SELECT EXISTS (
@@ -200,10 +207,11 @@ pub(super) async fn poll_jobs(
                     FROM job_executions je
                     WHERE je.state = 'pending'
                       AND je.job_type = et.job_type
-                      AND (
-                            (je.retry_clock = 'app' AND je.execute_at <= $2::timestamptz)
-                            OR (je.retry_clock = 'wall' AND je.execute_at <= $5::timestamptz)
-                      )
+                      AND je.execute_at <= GREATEST($2::timestamptz, $5::timestamptz)
+                      AND CASE je.retry_clock
+                            WHEN 'app' THEN je.execute_at <= $2::timestamptz
+                            ELSE je.execute_at <= $5::timestamptz
+                          END
                     LIMIT 1
                 ) probe
             ) AS excluded_due

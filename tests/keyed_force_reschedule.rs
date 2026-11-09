@@ -27,7 +27,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 use es_entity::errlanes::{Transient, TransientKind};
 use job::{
     Backoff, CurrentJob, Job, JobCompletion, JobRunner, JobSvcConfig, JobType, Jobs,
-    KeyedJobInitializer, KeyedJobSpawner, KeyedJobSpec, RetryClock, RetrySettings,
+    KeyedJobInitializer, KeyedJobSpawner, KeyedJobSpec, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -424,7 +424,6 @@ async fn force_reschedule_never_shortens_a_retry_backoff() -> anyhow::Result<()>
                     0,
                 ),
                 attempt_reset_after_healthy_run: None,
-                retry_clock: RetryClock::default(),
             }),
     );
     register_filler(&mut jobs);
@@ -507,7 +506,6 @@ async fn force_reschedule_does_not_shorten_a_fatal_band_backoff() -> anyhow::Res
                     0,
                 ),
                 attempt_reset_after_healthy_run: None,
-                retry_clock: RetryClock::default(),
             }),
     );
     register_filler(&mut jobs);

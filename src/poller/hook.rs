@@ -95,10 +95,11 @@ pub(super) async fn claim_due_heads_in_op(
         WITH heads AS (
             SELECT id, execute_at FROM job_executions
             WHERE job_type = $1 AND state = 'pending'
-              AND (
-                    (retry_clock = 'app' AND execute_at <= $2)
-                    OR (retry_clock = 'wall' AND execute_at <= $5)
-              )
+              AND execute_at <= GREATEST($2::timestamptz, $5::timestamptz)
+              AND CASE retry_clock
+                    WHEN 'app' THEN execute_at <= $2::timestamptz
+                    ELSE execute_at <= $5::timestamptz
+                  END
               AND (NOT $6 OR attempt_index = 1)
             ORDER BY execute_at, id
             LIMIT $3

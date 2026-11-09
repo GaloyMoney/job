@@ -1,14 +1,15 @@
-//! `RetryClock::Wall`: failure retries of a wall-domain job type come due in
-//! real time even while the application clock stands still, and the default
-//! (`App`) behavior is unchanged.
+//! Retries back off in real time, whatever clock the service was configured
+//! with: a failure retry (and a pool-congestion reschedule) comes due even
+//! while a manual application clock is never advanced. The one switch,
+//! `JobSvcConfig::retry_schedule = RetrySchedule::AppClock`, puts retry
+//! deadlines back on the application clock for tests that drive it.
 //!
 //! The motivating shape is an infrastructure job — an outbox relay mirroring
 //! events to object storage, say — running under a simulated application
 //! clock that a demo seed has stopped advancing. An app-clock retry deadline
 //! written past the freeze can never come due: the row wedges `pending`
 //! until some unrelated clock advance happens to cross it, and everything
-//! fenced on the job's progress stalls behind it. A wall-domain retry
-//! crosses in real time instead.
+//! fenced on the job's progress stalls behind it.
 
 mod helpers;
 
@@ -16,8 +17,9 @@ use async_trait::async_trait;
 use es_entity::clock::ClockHandle;
 use es_entity::errlanes::Fatal;
 use job::{
-    Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobStatus, JobSvcConfig, JobType, Jobs, RetryClock, RetrySettings,
+    Backoff, BatchedJobInitializer, BatchedJobRunner, CurrentBatchedJob, CurrentJob, Job,
+    JobBatchCompletion, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner, JobSpec,
+    JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs, RetrySchedule, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -40,7 +42,6 @@ fn quick_backoff() -> RetrySettings {
             0,
         ),
         attempt_reset_after_healthy_run: None,
-        retry_clock: RetryClock::Wall,
     }
 }
 
@@ -69,7 +70,6 @@ struct FixableInitializer {
     job_type: JobType,
     fixed: Arc<AtomicBool>,
     runs: Arc<AtomicUsize>,
-    retry: RetrySettings,
 }
 
 impl JobInitializer for FixableInitializer {
@@ -80,7 +80,7 @@ impl JobInitializer for FixableInitializer {
     }
 
     fn retry_on_error_settings(&self) -> RetrySettings {
-        self.retry.clone()
+        quick_backoff()
     }
 
     fn init(
@@ -95,30 +95,80 @@ impl JobInitializer for FixableInitializer {
     }
 }
 
+/// A batched runner whose FIRST invocation fails with `PoolTimedOut` -- the
+/// client-side error `JobFault::is_congestion` classifies as pool
+/// congestion -- and whose every later invocation completes.
+struct CongestionOnceRunner {
+    invocations: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl BatchedJobRunner for CongestionOnceRunner {
+    type Config = Cfg;
+
+    async fn run_batch(
+        &self,
+        _: CurrentBatchedJob<Cfg>,
+    ) -> Result<JobBatchCompletion, Box<dyn std::error::Error + Send + Sync>> {
+        if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(Box::new(sqlx::Error::PoolTimedOut));
+        }
+        Ok(JobBatchCompletion::CompleteAll)
+    }
+}
+
+struct CongestionOnceInitializer {
+    job_type: JobType,
+    invocations: Arc<AtomicUsize>,
+}
+
+impl BatchedJobInitializer for CongestionOnceInitializer {
+    type Config = Cfg;
+
+    fn job_type(&self) -> JobType {
+        self.job_type.clone()
+    }
+
+    fn init(
+        &self,
+        _: JobSpawner<Self::Config>,
+    ) -> Result<
+        Box<dyn BatchedJobRunner<Config = Self::Config>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        Ok(Box::new(CongestionOnceRunner {
+            invocations: Arc::clone(&self.invocations),
+        }))
+    }
+}
+
 async fn execution_row(
     pool: &sqlx::PgPool,
     id: JobId,
-) -> anyhow::Result<Option<(i32, String, Option<chrono::DateTime<chrono::Utc>>)>> {
+) -> anyhow::Result<Option<(i32, String, Option<chrono::DateTime<chrono::Utc>>, String)>> {
     Ok(sqlx::query_as(
-        "SELECT attempt_index, state::text, execute_at FROM job_executions WHERE id = $1",
+        "SELECT attempt_index, state::text, execute_at, retry_clock::text \
+         FROM job_executions WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
     .await?)
 }
 
+/// Wait for `id` to be parked `pending` at `attempt`; returns its deadline
+/// and the clock the row says that deadline is on.
 async fn await_pending_at(
     pool: &sqlx::PgPool,
     id: JobId,
     attempt: i32,
-) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+) -> anyhow::Result<(chrono::DateTime<chrono::Utc>, String)> {
     let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
     loop {
-        if let Some((got, state, Some(execute_at))) = execution_row(pool, id).await?
+        if let Some((got, state, Some(execute_at), retry_clock)) = execution_row(pool, id).await?
             && got == attempt
             && state == "pending"
         {
-            return Ok(execute_at);
+            return Ok((execute_at, retry_clock));
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
@@ -145,13 +195,12 @@ async fn await_complete(jobs: &Jobs, id: JobId) -> anyhow::Result<()> {
     }
 }
 
-/// The regression: a wall-domain job fails once under a manual clock that is
-/// never advanced, and its retry still fires — the retry deadline was
-/// written against real time, and the poller's wall wait arm crosses it — so
-/// the deployed fix (flipping `fixed`) is picked up with no clock advance at
-/// all.
+/// The default: a job fails once under a manual clock that is never
+/// advanced, and its retry still fires -- the retry deadline was written
+/// against real time, and the poller's wall wait arm crosses it -- so the
+/// deployed fix (flipping `fixed`) is picked up with no clock advance at all.
 #[tokio::test]
-async fn a_wall_domain_retry_fires_without_advancing_the_clock() -> anyhow::Result<()> {
+async fn a_retry_fires_in_real_time_without_advancing_the_clock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let (clock, _controller) = ClockHandle::manual();
     let config = JobSvcConfig::builder()
@@ -164,10 +213,9 @@ async fn a_wall_domain_retry_fires_without_advancing_the_clock() -> anyhow::Resu
     let runs = Arc::new(AtomicUsize::new(0));
     let before = chrono::Utc::now();
     let spawner = jobs.add_initializer(FixableInitializer {
-        job_type: helpers::job_type("retry-clock-wall"),
+        job_type: helpers::job_type("retry-clock-realtime"),
         fixed: Arc::clone(&fixed),
         runs: Arc::clone(&runs),
-        retry: quick_backoff(),
     });
     jobs.start_poll().await?;
 
@@ -175,9 +223,10 @@ async fn a_wall_domain_retry_fires_without_advancing_the_clock() -> anyhow::Resu
     spawner.spawn(id, Cfg).await?;
 
     // First dispatch fails; the retry must be scheduled ~50ms out on the
-    // WALL clock — ahead of the (frozen) application clock, whose freeze is
-    // the whole point.
-    let execute_at = await_pending_at(&pool, id, 2).await?;
+    // WALL clock -- ahead of the (frozen) application clock, whose freeze is
+    // the whole point -- and the row must say so.
+    let (execute_at, retry_clock) = await_pending_at(&pool, id, 2).await?;
+    assert_eq!(retry_clock, "wall");
     let wall_delta = chrono::Utc::now() - before;
     let app_delta = execute_at - clock.now();
     assert!(
@@ -201,17 +250,18 @@ async fn a_wall_domain_retry_fires_without_advancing_the_clock() -> anyhow::Resu
     Ok(())
 }
 
-/// The control: the same failure under an app-domain (default) type stays
-/// parked on the frozen clock — the retry must NOT fire in real time — and
-/// advances only when the clock does. Pins that the wall arm does not
-/// accidentally claim app-domain deadlines.
+/// The switch: under `RetrySchedule::AppClock` the same failure stays parked
+/// on the frozen clock -- the retry must NOT fire in real time -- and
+/// advances only when the clock does. Pins both that the switch works and
+/// that the wall arm does not claim app-domain deadlines.
 #[tokio::test]
-async fn an_app_domain_retry_still_waits_for_the_clock() -> anyhow::Result<()> {
+async fn an_app_clock_retry_waits_for_the_clock() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let (clock, controller) = ClockHandle::manual();
     let config = JobSvcConfig::builder()
         .pool(pool.clone())
         .clock(clock.clone())
+        .retry_schedule(RetrySchedule::AppClock)
         .build()
         .unwrap();
     let mut jobs = Jobs::init(config).await?;
@@ -221,24 +271,21 @@ async fn an_app_domain_retry_still_waits_for_the_clock() -> anyhow::Result<()> {
         job_type: helpers::job_type("retry-clock-app"),
         fixed: Arc::clone(&fixed),
         runs: Arc::clone(&runs),
-        retry: RetrySettings {
-            retry_clock: RetryClock::App,
-            ..quick_backoff()
-        },
     });
     jobs.start_poll().await?;
 
     let id = JobId::new();
     spawner.spawn(id, Cfg).await?;
-    let execute_at = await_pending_at(&pool, id, 2).await?;
+    let (execute_at, retry_clock) = await_pending_at(&pool, id, 2).await?;
+    assert_eq!(retry_clock, "app");
 
     // Real time elapses far past the 50ms backoff; the retry must stay
     // parked because its deadline is on the application clock.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let (_, state, _) = execution_row(&pool, id)
+    let (_, state, _, _) = execution_row(&pool, id)
         .await?
         .expect("the row exists while its retry is parked");
-    assert_eq!(state, "pending", "an app-domain retry must not fire early");
+    assert_eq!(state, "pending", "an app-clock retry must not fire early");
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 
     // Crossing the deadline on the application clock fires it as always.
@@ -249,6 +296,42 @@ async fn an_app_domain_retry_still_waits_for_the_clock() -> anyhow::Result<()> {
         .await;
     await_complete(&jobs, id).await?;
     assert!(runs.load(Ordering::SeqCst) >= 2);
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
+/// Pool congestion is operational too: a batch rescheduled for
+/// `PoolTimedOut` under a never-advanced manual clock comes due in real time
+/// (the ~2s congestion delay) and completes, with no clock advance.
+#[tokio::test]
+async fn a_congestion_reschedule_fires_in_real_time_without_advancing_the_clock()
+-> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let (clock, _controller) = ClockHandle::manual();
+    let config = JobSvcConfig::builder()
+        .pool(pool.clone())
+        .clock(clock)
+        .build()
+        .unwrap();
+    let mut jobs = Jobs::init(config).await?;
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let spawner = jobs.add_batched_initializer(CongestionOnceInitializer {
+        job_type: helpers::job_type("retry-clock-congestion"),
+        invocations: Arc::clone(&invocations),
+    });
+    jobs.start_poll().await?;
+
+    let id = JobId::new();
+    spawner.spawn_all(vec![JobSpec::new(id, Cfg)]).await?;
+
+    // The congestion park keeps attempt 1 and is on the wall clock.
+    let (_, retry_clock) = await_pending_at(&pool, id, 1).await?;
+    assert_eq!(retry_clock, "wall");
+
+    let outcomes = jobs.handles(vec![id]).await_all(POLL_TIMEOUT).await?;
+    assert_eq!(outcomes[0].state(), JobTerminalState::Completed);
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
 
     jobs.shutdown().await?;
     Ok(())

@@ -129,19 +129,19 @@
 //!
 //! ### Which clock a retry is scheduled on
 //!
-//! By default a retry deadline is written against the application clock the
-//! service was configured with — right for business-shaped work, whose
-//! tests advance a manual clock across backoff delays. A job type whose
-//! failures are *operational* (an outbox relay blocked by an upstream
-//! outage, any infrastructure mirror) can instead declare
-//! [`RetrySettings::retry_clock`] = [`RetryClock::Wall`]: its failure
-//! retries and pool-congestion reschedules are then scheduled against the
-//! wall clock, so they come due in real time even on a simulated application
-//! clock that has stopped advancing — the state a demo sandbox's finished
-//! seed leaves behind, where an app-clock deadline written past the freeze
-//! is unreachable and the job wedges `pending` indefinitely. Spawn deadlines
-//! and a runner's own `Reschedule*` completions always stay on the
-//! application clock; those timestamps are authored against it.
+//! Retries back off in **real time**, whatever clock the service was
+//! configured with. A retry is operational — "the upstream was down, try
+//! again in 30s" means thirty real seconds — so failure retries and
+//! pool-congestion reschedules are written against the wall clock and
+//! claimed against it, and come due even while a simulated application
+//! clock stands still (a demo sandbox whose seed has finished) or races (a
+//! seed advancing a day per second). Everything else a job does stays on
+//! [`JobSvcConfig::clock`]: the rows and events it writes while running,
+//! spawn deadlines, and a runner's own `RescheduleIn`/`RescheduleAt`. The
+//! mechanism is internal — a pending row records which clock its deadline
+//! is on and the poller waits on both — with one service-level switch,
+//! [`JobSvcConfig::retry_schedule`] = [`RetrySchedule::AppClock`], for tests
+//! that drive a manual clock across a backoff to make a retry fire.
 //!
 //! ```ignore
 //! impl JobInitializer for MyInitializer {
@@ -155,7 +155,6 @@
 //!                 Duration::from_secs(300),
 //!                 20,
 //!             ),
-//!             retry_clock: RetryClock::Wall, // operational, not business time
 //!             ..Default::default()
 //!         }
 //!     }
@@ -476,7 +475,7 @@ pub use batched::{
 };
 pub use config::*;
 pub use current::*;
-pub use entity::{FailureLane, Job, JobEvent, JobType, RetryBand};
+pub use entity::{FailureLane, Job, JobEvent, JobType, RetryBand, ScheduleClock};
 pub use error::{
     AwaitError, AwaitInterrupted, AwaitTimeout, InvalidBackoff, InvalidConfig, JobError, JobFault,
     JobRejection, RegisterWaiterError, UnknownCallee,
@@ -753,6 +752,7 @@ impl Jobs {
             Arc::clone(&self.router),
             Arc::clone(&self.notifier),
             self.clock.clone(),
+            self.config.retry_schedule,
         )
         .await?;
 

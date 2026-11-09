@@ -248,10 +248,11 @@ impl Recovery {
                             )))::FLOAT8 AS "max_pending_duration_secs!: f64"
                         FROM job_executions
                         WHERE state = 'pending'
-                        AND (
-                            (retry_clock = 'app' AND execute_at <= $1::timestamptz)
-                            OR (retry_clock = 'wall' AND execute_at <= $3::timestamptz)
-                        )
+                        AND execute_at <= GREATEST($1::timestamptz, $3::timestamptz)
+                        AND CASE retry_clock
+                                WHEN 'app' THEN execute_at <= $1::timestamptz
+                                ELSE execute_at <= $3::timestamptz
+                            END
                         AND job_type = ANY($2)
                         GROUP BY job_type
                         "#,

@@ -43,7 +43,7 @@ use super::{
     JobId,
     batch_dispatcher::BatchDispatcher,
     batched::{RawBatchItem, ShutdownRx},
-    config::JobPollerConfig,
+    config::{JobPollerConfig, RetrySchedule},
     dispatcher::*,
     entity::{Job, JobType},
     error::JobFault,
@@ -113,6 +113,7 @@ pub(crate) struct JobPoller {
         tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
     >,
     clock: ClockHandle,
+    retry_schedule: RetrySchedule,
     internal_pool: PgPool,
     shutdown_started: Arc<AtomicBool>,
     budget: PoolBudget,
@@ -171,6 +172,7 @@ impl JobPoller {
         router: Arc<JobNotificationRouter>,
         notifier: Arc<JobEventNotifier>,
         clock: ClockHandle,
+        retry_schedule: RetrySchedule,
     ) -> Result<Self, sqlx::Error> {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<
             tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
@@ -205,6 +207,7 @@ impl JobPoller {
             instance_id,
             shutdown_tx,
             clock,
+            retry_schedule,
             internal_pool,
             shutdown_started: Arc::new(AtomicBool::new(false)),
         })
@@ -518,6 +521,7 @@ impl JobPoller {
             runner,
             self.instance_id,
             self.clock.clone(),
+            self.retry_schedule,
             &items,
         );
         let subs = ShutdownSubs {
@@ -641,6 +645,7 @@ impl JobPoller {
             runner,
             self.instance_id,
             self.clock.clone(),
+            self.retry_schedule,
         );
         let subs = ShutdownSubs {
             job: self.shutdown_tx.subscribe(),
@@ -685,6 +690,7 @@ impl JobPoller {
             runner,
             self.instance_id,
             self.clock.clone(),
+            self.retry_schedule,
         );
         self.spawn_dispatch_task(dispatcher, job, polled_job, subs);
         Ok(())
@@ -738,6 +744,7 @@ impl JobPoller {
             runner,
             self.instance_id,
             self.clock.clone(),
+            self.retry_schedule,
             &items,
         );
         self.spawn_batch_dispatch_task(dispatcher, items, subs);
