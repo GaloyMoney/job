@@ -30,6 +30,14 @@
     (system: let
       overlays = [
         (import rust-overlay)
+        # nixpkgs' sqlx-cli 0.9.0 fails to link on darwin and linux
+        # (`cannot find -lsqlite3`): sqlite is missing from its buildInputs.
+        # Drop this once nixpkgs fixes the package.
+        (final: prev: {
+          sqlx-cli = prev.sqlx-cli.overrideAttrs (old: {
+            buildInputs = (old.buildInputs or []) ++ [prev.sqlite];
+          });
+        })
       ];
       pkgs = import nixpkgs {
         inherit system overlays;
