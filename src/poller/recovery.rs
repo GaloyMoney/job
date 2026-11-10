@@ -247,7 +247,7 @@ impl Recovery {
                         SELECT
                             job_type,
                             COUNT(*)::INT4 AS "count!: i32",
-                            MIN(EXTRACT(EPOCH FROM (
+                            MAX(EXTRACT(EPOCH FROM (
                                 (CASE WHEN retry_clock = 'wall' THEN $3::timestamptz
                                       ELSE $1::timestamptz END)
                                 - execute_at
@@ -334,7 +334,11 @@ async fn reclaim_lost_jobs(
             FOR NO KEY UPDATE
         )
         UPDATE job_executions je
-        SET state = 'pending', execute_at = $3, attempt_index = attempt_index + 1, poller_instance_id = NULL
+        -- `$3` is the application clock's now, so the row returns to the app
+        -- domain: left tagged 'wall', a reclaimed wall retry would wait for
+        -- real time to reach a (possibly far-future) simulated timestamp.
+        SET state = 'pending', execute_at = $3, attempt_index = attempt_index + 1,
+            poller_instance_id = NULL, retry_clock = 'app'
         FROM locked l WHERE je.id = l.id
         RETURNING je.id AS "id!: JobId", je.job_type AS "job_type!: JobType",
                   je.alive_at AS "alive_at!"
@@ -525,6 +529,44 @@ mod tests {
         assert_eq!(row.0, "running");
         assert_eq!(row.1, Some(self_id));
         assert_eq!(row.2, 1);
+
+        Ok(())
+    }
+
+    /// A lost wall-domain retry is rescheduled at the application clock's
+    /// now, so it must come back tagged 'app' -- otherwise the poller would
+    /// compare that app-clock timestamp against wall time and, under a
+    /// simulated clock running ahead, park the job until real time catches up.
+    #[tokio::test]
+    async fn reclaim_retags_a_lost_wall_retry_onto_the_app_clock() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let job_type = format!("reclaim-retag-{}", uuid::Uuid::now_v7());
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let lost = seed_running_job(&pool, &job_type, uuid::Uuid::now_v7(), stale).await?;
+        sqlx::query("UPDATE job_executions SET retry_clock = 'wall' WHERE id = $1")
+            .bind(uuid::Uuid::from(lost))
+            .execute(&pool)
+            .await?;
+
+        let types = vec![JobType::from_owned(job_type)];
+        reclaim_lost_jobs(
+            &pool,
+            uuid::Uuid::now_v7(),
+            &types,
+            chrono::Utc::now() - chrono::Duration::seconds(60),
+            chrono::Utc::now(),
+            &[],
+        )
+        .await?;
+
+        let (state, clock): (String, String) = sqlx::query_as(
+            "SELECT state::text, retry_clock::text FROM job_executions WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(lost))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(state, "pending");
+        assert_eq!(clock, "app");
 
         Ok(())
     }

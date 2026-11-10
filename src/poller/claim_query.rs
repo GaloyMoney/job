@@ -629,15 +629,22 @@ mod tests {
         let plan: JsonValue = sqlx::query_scalar(
             r#"
             EXPLAIN (FORMAT JSON)
-            SELECT MIN(execute_at) AS next_due_at
+            SELECT
+                MIN(execute_at) FILTER (WHERE retry_clock = 'app') AS next_due_app,
+                MIN(execute_at) FILTER (WHERE retry_clock = 'wall') AS next_due_wall
             FROM job_executions
             WHERE state = 'pending'
               AND job_type = ANY($1::text[] || $2::text[])
-              AND execute_at > $3::timestamptz
+              AND execute_at > LEAST($3::timestamptz, $4::timestamptz)
+              AND CASE retry_clock
+                    WHEN 'app' THEN execute_at > $3::timestamptz
+                    ELSE execute_at > $4::timestamptz
+                  END
             "#,
         )
         .bind(&pollable)
         .bind(&excluded)
+        .bind(chrono::Utc::now())
         .bind(chrono::Utc::now())
         .fetch_one(&mut *conn)
         .await?;
@@ -717,15 +724,22 @@ mod tests {
         let plan: JsonValue = sqlx::query_scalar(
             r#"
             EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
-            SELECT MIN(execute_at) AS next_due_at
+            SELECT
+                MIN(execute_at) FILTER (WHERE retry_clock = 'app') AS next_due_app,
+                MIN(execute_at) FILTER (WHERE retry_clock = 'wall') AS next_due_wall
             FROM job_executions
             WHERE state = 'pending'
               AND job_type = ANY($1::text[] || $2::text[])
-              AND execute_at > $3::timestamptz
+              AND execute_at > LEAST($3::timestamptz, $4::timestamptz)
+              AND CASE retry_clock
+                    WHEN 'app' THEN execute_at > $3::timestamptz
+                    ELSE execute_at > $4::timestamptz
+                  END
             "#,
         )
         .bind(&scope)
         .bind(&empty)
+        .bind(chrono::Utc::now())
         .bind(chrono::Utc::now())
         .fetch_one(&mut *conn)
         .await?;

@@ -187,9 +187,12 @@ async fn kill_remaining_jobs(
             FOR NO KEY UPDATE
         )
         UPDATE job_executions je
+        -- `$1` is the application clock's now: retag the row 'app' so a
+        -- killed wall retry is not compared against wall time.
         SET state = 'pending',
             execute_at = $1,
-            poller_instance_id = NULL
+            poller_instance_id = NULL,
+            retry_clock = 'app'
         FROM locked l WHERE je.id = l.id
         RETURNING je.id as "id!: JobId", je.attempt_index
         "#,
@@ -336,6 +339,35 @@ mod tests {
         .await?;
         assert_eq!(row.0, "pending", "execution must be released for reclaim");
         assert_eq!(row.1, None, "released execution must not stay owned");
+
+        Ok(())
+    }
+
+    /// The forced reschedule writes the application clock's now, so a killed
+    /// wall-domain retry must come back tagged 'app'.
+    #[tokio::test]
+    async fn kill_remaining_jobs_retags_a_wall_retry_onto_the_app_clock() -> anyhow::Result<()> {
+        let pool = init_pool().await?;
+        let repo = Arc::new(JobRepo::new(&pool));
+        let instance_id = uuid::Uuid::now_v7();
+        let job_type = format!("kill-retag-{}", uuid::Uuid::now_v7());
+
+        let id = seed_running_entity(&pool, &repo, &job_type, instance_id).await?;
+        sqlx::query("UPDATE job_executions SET retry_clock = 'wall' WHERE id = $1")
+            .bind(uuid::Uuid::from(id))
+            .execute(&pool)
+            .await?;
+
+        kill_remaining_jobs(Arc::clone(&repo), instance_id, ClockHandle::realtime()).await?;
+
+        let (state, clock): (String, String) = sqlx::query_as(
+            "SELECT state::text, retry_clock::text FROM job_executions WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from(id))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(state, "pending");
+        assert_eq!(clock, "app");
 
         Ok(())
     }
