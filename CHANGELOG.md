@@ -1,3 +1,15 @@
+# [job release v0.19.5](https://github.com/GaloyMoney/job/releases/tag/0.19.5)
+
+
+
+### Bug Fixes
+
+- Compile the es-entity-gated tests under sqlx 0.9 (#252)
+
+### Features
+
+- Retries back off in real time by default; service-level RetrySchedule (supersedes #249) (#250)
+
 # [job release v0.19.4](https://github.com/GaloyMoney/job/releases/tag/0.19.4)
 
 
