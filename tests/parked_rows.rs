@@ -902,7 +902,7 @@ async fn key_share_blocks_only_the_delete() -> anyhow::Result<()> {
     async fn blocked_by_key_share(
         pool: &sqlx::PgPool,
         queue: &str,
-        sql: &str,
+        sql: &'static str,
         uuid: uuid::Uuid,
     ) -> anyhow::Result<bool> {
         let mut holder = pool.begin().await?;
