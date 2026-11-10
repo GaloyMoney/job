@@ -21,6 +21,9 @@ use job::{
     JobType, Jobs, RetrySettings,
 };
 use serde::{Deserialize, Serialize};
+// Every dynamic SQL string in this file interpolates a test-owned scratch
+// table name, never input -- safe to assert for sqlx 0.9's `SqlSafeStr`.
+use sqlx::AssertSqlSafe;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,10 +108,10 @@ impl BatchedJobRunner for SavepointRunner {
                 if item.attempt() == 1
                     && let Some(key) = item.config().conflict_key
                 {
-                    sqlx::query(&format!(
+                    sqlx::query(AssertSqlSafe(format!(
                         "INSERT INTO {} (v) VALUES ($1)",
                         item.config().table
-                    ))
+                    )))
                     .bind(key)
                     .execute(sp.as_executor())
                     .await?;
@@ -126,12 +129,14 @@ impl BatchedJobRunner for SavepointRunner {
 /// genuine conflict even if the racing items land in different batches on
 /// different pooled connections, not just within one transaction.
 async fn reset_scratch_table(pool: &sqlx::PgPool, table: &str) -> anyhow::Result<()> {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
         .execute(pool)
         .await?;
-    sqlx::query(&format!("CREATE TABLE {table} (v INT PRIMARY KEY)"))
-        .execute(pool)
-        .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE TABLE {table} (v INT PRIMARY KEY)"
+    )))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
