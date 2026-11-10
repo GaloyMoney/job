@@ -18,6 +18,9 @@ use job::{
     RetrySettings,
 };
 use serde::{Deserialize, Serialize};
+// Every dynamic SQL string in this file interpolates a test-owned scratch
+// table name, never input -- safe to assert for sqlx 0.9's `SqlSafeStr`.
+use sqlx::AssertSqlSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -70,9 +73,9 @@ impl BatchedJobRunner for BisectRunner {
                     .filter(|item| !item.config().culprit || item.attempt() == 1)
                     .map(|item| item.config().key)
                     .collect();
-                sqlx::query(&format!(
+                sqlx::query(AssertSqlSafe(format!(
                     "INSERT INTO {table} (v) SELECT * FROM UNNEST($1::int[])"
-                ))
+                )))
                 .bind(&keys)
                 .execute(sp.as_executor())
                 .await?;
@@ -155,27 +158,32 @@ impl BatchedJobInitializer for BisectInitializer {
 }
 
 async fn reset_scratch_table(pool: &sqlx::PgPool, table: &str) -> anyhow::Result<()> {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
         .execute(pool)
         .await?;
-    sqlx::query(&format!("CREATE TABLE {table} (v INT PRIMARY KEY)"))
-        .execute(pool)
-        .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE TABLE {table} (v INT PRIMARY KEY)"
+    )))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 async fn seed_sentinel(pool: &sqlx::PgPool, table: &str) -> anyhow::Result<()> {
-    sqlx::query(&format!("INSERT INTO {table} (v) VALUES ($1)"))
-        .bind(SENTINEL_KEY)
-        .execute(pool)
-        .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO {table} (v) VALUES ($1)"
+    )))
+    .bind(SENTINEL_KEY)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 async fn scratch_values(pool: &sqlx::PgPool, table: &str) -> anyhow::Result<Vec<i32>> {
-    let rows: Vec<(i32,)> = sqlx::query_as(&format!("SELECT v FROM {table} ORDER BY v"))
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<(i32,)> =
+        sqlx::query_as(AssertSqlSafe(format!("SELECT v FROM {table} ORDER BY v")))
+            .fetch_all(pool)
+            .await?;
     Ok(rows.into_iter().map(|(v,)| v).collect())
 }
 
@@ -768,10 +776,12 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
     reset_scratch_table(&pool, table).await?;
     // Two rows the probe and the helper will contend over, in opposite orders.
     for v in [1, 2] {
-        sqlx::query(&format!("INSERT INTO {table} (v) VALUES ($1)"))
-            .bind(v)
-            .execute(&pool)
-            .await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {table} (v) VALUES ($1)"
+        )))
+        .bind(v)
+        .execute(&pool)
+        .await?;
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -808,13 +818,17 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
                     // reach for row 2 and block. Blocking here first is what
                     // makes this side the deadlock victim.
                     let _ = helper_ready.acquire().await;
-                    sqlx::query(&format!("SELECT v FROM {table} WHERE v = 1 FOR UPDATE"))
-                        .fetch_one(sp.as_executor())
-                        .await?;
+                    sqlx::query(AssertSqlSafe(format!(
+                        "SELECT v FROM {table} WHERE v = 1 FOR UPDATE"
+                    )))
+                    .fetch_one(sp.as_executor())
+                    .await?;
                     probe_ready.add_permits(4096);
-                    sqlx::query(&format!("SELECT v FROM {table} WHERE v = 2 FOR UPDATE"))
-                        .fetch_one(sp.as_executor())
-                        .await?;
+                    sqlx::query(AssertSqlSafe(format!(
+                        "SELECT v FROM {table} WHERE v = 2 FOR UPDATE"
+                    )))
+                    .fetch_one(sp.as_executor())
+                    .await?;
                     Ok::<_, sqlx::Error>(())
                 })
                 .await?;
@@ -889,9 +903,9 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
     let helper_table = table.to_string();
     let helper = tokio::spawn(async move {
         let mut tx = helper_pool.begin().await?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "SELECT v FROM {helper_table} WHERE v = 2 FOR UPDATE"
-        ))
+        )))
         .fetch_one(&mut *tx)
         .await?;
         helper_ready.add_permits(4096);
@@ -902,9 +916,9 @@ async fn a_deadlocked_probe_is_re_run_whole_never_split() -> anyhow::Result<()> 
         // Postgres aborts, and the probe is the side under test.
         let _ = probe_ready.acquire().await;
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(AssertSqlSafe(format!(
             "SELECT v FROM {helper_table} WHERE v = 1 FOR UPDATE"
-        ))
+        )))
         .fetch_one(&mut *tx)
         .await;
         let _ = tx.rollback().await;
@@ -958,10 +972,12 @@ async fn a_conflict_retry_is_not_charged_to_the_probe_budget() -> anyhow::Result
     let pool = helpers::init_pool().await?;
     reset_scratch_table(&pool, table).await?;
     for v in [1, 2] {
-        sqlx::query(&format!("INSERT INTO {table} (v) VALUES ($1)"))
-            .bind(v)
-            .execute(&pool)
-            .await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {table} (v) VALUES ($1)"
+        )))
+        .bind(v)
+        .execute(&pool)
+        .await?;
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -996,13 +1012,17 @@ async fn a_conflict_retry_is_not_charged_to_the_probe_budget() -> anyhow::Result
                     async move |sp, _slice| {
                         probes.fetch_add(1, Ordering::SeqCst);
                         let _ = helper_ready.acquire().await;
-                        sqlx::query(&format!("SELECT v FROM {table} WHERE v = 1 FOR UPDATE"))
-                            .fetch_one(sp.as_executor())
-                            .await?;
+                        sqlx::query(AssertSqlSafe(format!(
+                            "SELECT v FROM {table} WHERE v = 1 FOR UPDATE"
+                        )))
+                        .fetch_one(sp.as_executor())
+                        .await?;
                         probe_ready.add_permits(4096);
-                        sqlx::query(&format!("SELECT v FROM {table} WHERE v = 2 FOR UPDATE"))
-                            .fetch_one(sp.as_executor())
-                            .await?;
+                        sqlx::query(AssertSqlSafe(format!(
+                            "SELECT v FROM {table} WHERE v = 2 FOR UPDATE"
+                        )))
+                        .fetch_one(sp.as_executor())
+                        .await?;
                         Ok::<_, sqlx::Error>(())
                     },
                 )
@@ -1078,17 +1098,17 @@ async fn a_conflict_retry_is_not_charged_to_the_probe_budget() -> anyhow::Result
     let helper_table = table.to_string();
     let helper = tokio::spawn(async move {
         let mut tx = helper_pool.begin().await?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "SELECT v FROM {helper_table} WHERE v = 2 FOR UPDATE"
-        ))
+        )))
         .fetch_one(&mut *tx)
         .await?;
         helper_ready.add_permits(4096);
         let _ = probe_ready.acquire().await;
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(AssertSqlSafe(format!(
             "SELECT v FROM {helper_table} WHERE v = 1 FOR UPDATE"
-        ))
+        )))
         .fetch_one(&mut *tx)
         .await;
         let _ = tx.rollback().await;

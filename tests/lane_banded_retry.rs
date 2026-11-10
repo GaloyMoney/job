@@ -326,6 +326,9 @@ async fn fail_is_terminal_wakes_waiters_and_respawning_the_same_id_is_duplicate_
 mod with_op {
     use super::*;
     use es_entity::AtomicOperation;
+    // `TABLE` is a test-owned constant, never input -- safe to assert for
+    // sqlx 0.9's `SqlSafeStr`.
+    use sqlx::AssertSqlSafe;
 
     const TABLE: &str = "lane_banded_fail_with_op";
 
@@ -338,10 +341,12 @@ mod with_op {
             current_job: CurrentJob,
         ) -> Result<JobCompletion, Box<dyn std::error::Error + Send + Sync>> {
             let mut op = current_job.begin_op().await?;
-            sqlx::query(&format!("INSERT INTO {TABLE} (id) VALUES ($1)"))
-                .bind(uuid::Uuid::from(*current_job.id()))
-                .execute(op.as_executor())
-                .await?;
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {TABLE} (id) VALUES ($1)"
+            )))
+            .bind(uuid::Uuid::from(*current_job.id()))
+            .execute(op.as_executor())
+            .await?;
             Ok(JobCompletion::FailWithOp(op, "nope".into()))
         }
     }
@@ -371,12 +376,14 @@ mod with_op {
     #[tokio::test]
     async fn fail_with_op_commits_the_op() -> anyhow::Result<()> {
         let pool = helpers::init_pool().await?;
-        sqlx::query(&format!("DROP TABLE IF EXISTS {TABLE}"))
+        sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {TABLE}")))
             .execute(&pool)
             .await?;
-        sqlx::query(&format!("CREATE TABLE {TABLE} (id UUID PRIMARY KEY)"))
-            .execute(&pool)
-            .await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE TABLE {TABLE} (id UUID PRIMARY KEY)"
+        )))
+        .execute(&pool)
+        .await?;
 
         let config = JobSvcConfig::builder().pool(pool.clone()).build().unwrap();
         let mut jobs = Jobs::init(config).await?;
@@ -393,11 +400,12 @@ mod with_op {
             .await?;
         assert!(outcome.is_failed());
 
-        let (count,): (i64,) =
-            sqlx::query_as(&format!("SELECT COUNT(*) FROM {TABLE} WHERE id = $1"))
-                .bind(uuid::Uuid::from(id))
-                .fetch_one(&pool)
-                .await?;
+        let (count,): (i64,) = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {TABLE} WHERE id = $1"
+        )))
+        .bind(uuid::Uuid::from(id))
+        .fetch_one(&pool)
+        .await?;
         assert_eq!(count, 1, "the op handed back with the verdict must commit");
 
         jobs.shutdown().await?;
