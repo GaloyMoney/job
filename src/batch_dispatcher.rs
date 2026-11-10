@@ -24,6 +24,7 @@ use super::{
         AnyBatchedJobRunner, BatchItemOutcome, BatchOutcomes, BatchRunCtx, JobBatchCompletion,
         RawBatchItem, ShutdownRx,
     },
+    config::RetrySchedule,
     dispatcher::record_verdict,
     entity::{JobType, RetryBand},
     error::JobFault,
@@ -101,6 +102,7 @@ impl BatchDispatcher {
         runner: Box<dyn AnyBatchedJobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
+        retry_schedule: RetrySchedule,
         items: &[RawBatchItem],
     ) -> Self {
         let ids: Vec<JobId> = items.iter().map(|item| item.job.id).collect();
@@ -117,6 +119,7 @@ impl BatchDispatcher {
             false, // batched types are never keyed, so never retain state
             instance_id,
             clock.clone(),
+            retry_schedule,
         );
         Self {
             poller,
@@ -153,6 +156,7 @@ impl BatchDispatcher {
         runner: Box<dyn AnyBatchedJobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
+        retry_schedule: RetrySchedule,
         items: &[RawBatchItem],
     ) -> Self {
         let ids: Vec<JobId> = items.iter().map(|item| item.job.id).collect();
@@ -169,6 +173,7 @@ impl BatchDispatcher {
             false, // batched types are never keyed, so never retain state
             instance_id,
             clock.clone(),
+            retry_schedule,
         );
         Self {
             poller,

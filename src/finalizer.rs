@@ -79,7 +79,8 @@ use std::sync::{Arc, Weak};
 
 use super::{
     JobId,
-    entity::{Job, JobType, RetryPolicy, ScheduledRetry},
+    config::RetrySchedule,
+    entity::{Job, JobType, RetryPolicy, ScheduleClock, ScheduledRetry},
     error::{JobFault, TX_ABORT_MAX_ATTEMPTS},
     execution_hooks::PromoteHeadsHook,
     notifier::JobEventNotifier,
@@ -239,6 +240,10 @@ pub(crate) struct Finalizer {
     retains_state: bool,
     instance_id: uuid::Uuid,
     clock: ClockHandle,
+    /// Which clock failure retries and congestion reschedules are written
+    /// against (see [`RetrySchedule`]). Every other disposition's deadline
+    /// is on `clock`.
+    retry_schedule: RetrySchedule,
 }
 
 impl Finalizer {
@@ -251,6 +256,7 @@ impl Finalizer {
         retains_state: bool,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
+        retry_schedule: RetrySchedule,
     ) -> Self {
         // Derived from the repo's pool rather than threaded down, the same
         // way the poller derives its own (`poller::JobPoller::new`): a
@@ -266,7 +272,16 @@ impl Finalizer {
             retains_state,
             instance_id,
             clock,
+            retry_schedule,
         }
+    }
+
+    /// The clock a retry or congestion deadline is written against, and
+    /// "now" on it -- [`RetrySchedule::retry_now`], from the op's `app_now`
+    /// so the deadline derives from the same instant as the events recorded
+    /// in the op.
+    fn retry_now(&self, app_now: DateTime<Utc>) -> (DateTime<Utc>, ScheduleClock) {
+        self.retry_schedule.retry_now(&self.clock, app_now)
     }
 
     /// Reschedule `ids` after a congestion classification: every row
@@ -288,7 +303,10 @@ impl Finalizer {
         message: String,
     ) -> Result<(), JobFault> {
         let jitter_ms = rng().random_range(-CONGESTION_JITTER_MS..=CONGESTION_JITTER_MS);
-        let at = self.clock.now() + chrono::Duration::milliseconds(CONGESTION_DELAY_MS + jitter_ms);
+        // Pool congestion is an operational condition: the reschedule is on
+        // the retry schedule's clock, like a failure retry.
+        let (domain_now, _) = self.retry_now(self.clock.now());
+        let at = domain_now + chrono::Duration::milliseconds(CONGESTION_DELAY_MS + jitter_ms);
         let items: Vec<(JobId, Disposition)> = ids
             .iter()
             .map(|id| {
@@ -471,6 +489,12 @@ impl Finalizer {
             return Ok(outcome);
         }
         let now = op.maybe_now().unwrap_or_else(|| self.clock.now());
+        // Failure retries and congestion reschedules are measured on the
+        // retry schedule's clock (real time by default, so they come due
+        // however the application clock moves); `now` from the op remains
+        // the application clock for every other disposition.
+        let (retry_now, schedule_clock) = self.retry_now(now);
+        let retry_clock = schedule_clock.as_column_value();
         let retry_policy = RetryPolicy::from(&self.retry_settings);
 
         let ids: Vec<JobId> = items.iter().map(|(id, _)| *id).collect();
@@ -526,7 +550,8 @@ impl Finalizer {
                 } => {
                     congestion_uuids.push(uuid::Uuid::from(*id));
                     congestion_times.push(*at);
-                    let streak = job.reschedule_congestion(message.clone(), *at, *attempt);
+                    let streak =
+                        job.reschedule_congestion(message.clone(), *at, schedule_clock, *attempt);
                     congestion_streaks.insert(*id, streak);
                 }
                 Disposition::Fail {
@@ -535,7 +560,8 @@ impl Finalizer {
                     run_duration,
                 } => {
                     let retry = job.maybe_schedule_retry(
-                        now,
+                        retry_now,
+                        schedule_clock,
                         *attempt,
                         *run_duration,
                         &retry_policy,
@@ -579,6 +605,10 @@ impl Finalizer {
                 -- statement both honour the mark and clear it.
                 UPDATE job_executions AS je
                 SET state = 'pending', attempt_index = 1, poller_instance_id = NULL,
+                    -- A fresh reschedule's `at` was authored on the application
+                    -- clock (a runner's `Reschedule*` or a rescue), so the row
+                    -- returns to the app domain however it was last parked.
+                    retry_clock = 'app',
                     -- A park a wake already overtook: the callee landed while
                     -- this job was still running, so the wake could not move
                     -- the row (a running row has no `execute_at`) and left a
@@ -633,7 +663,8 @@ impl Finalizer {
                     FOR UPDATE
                 )
                 UPDATE job_executions AS je
-                SET state = 'pending', execute_at = t.execute_at, poller_instance_id = NULL
+                SET state = 'pending', execute_at = t.execute_at, poller_instance_id = NULL,
+                    retry_clock = $4::text::JobRetryClock
                 FROM to_reschedule t
                 WHERE je.id = t.id
                 RETURNING je.id AS "id!: JobId"
@@ -641,6 +672,7 @@ impl Finalizer {
                 &congestion_uuids,
                 &congestion_times,
                 self.instance_id,
+                retry_clock,
             )
             .fetch_all(op.as_executor())
             .await?;
@@ -677,7 +709,7 @@ impl Finalizer {
                 UPDATE job_executions AS je
                 SET state = 'pending', execute_at = t.execute_at,
                     attempt_index = t.attempt_index, poller_instance_id = NULL,
-                    woken_at = NULL
+                    retry_clock = $5::text::JobRetryClock, woken_at = NULL
                 FROM to_retry t
                 WHERE je.id = t.id
                 RETURNING je.id AS "id!: JobId"
@@ -686,6 +718,7 @@ impl Finalizer {
                 &retry_times,
                 &retry_attempts,
                 self.instance_id,
+                retry_clock,
             )
             .fetch_all(op.as_executor())
             .await?;
@@ -1151,6 +1184,7 @@ mod deadlock_regression_tests {
                 false,
                 instance_id,
                 ClockHandle::realtime(),
+                RetrySchedule::default(),
             );
 
             // The contestant holds B before `finalize()` even starts and

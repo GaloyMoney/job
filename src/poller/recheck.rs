@@ -38,6 +38,8 @@ use std::time::Duration;
 
 use crate::tracker::JobTracker;
 
+use super::claim_query::WaitBudget;
+
 const RECHECK_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const RECHECK_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -64,11 +66,11 @@ impl Recheck {
 
     pub(super) fn bounded_sleep(
         &self,
-        base: Duration,
+        base: WaitBudget,
         jobs_claimed: usize,
         excluded_due: bool,
         rotation_lap: usize,
-    ) -> Duration {
+    ) -> WaitBudget {
         if !excluded_due {
             self.streak.store(0, Ordering::Relaxed);
             self.backoff_ms.store(
@@ -79,11 +81,11 @@ impl Recheck {
         }
         if jobs_claimed > 0 {
             self.streak.store(0, Ordering::Relaxed);
-            return Duration::ZERO;
+            return WaitBudget::both(Duration::ZERO);
         }
         let streak = self.streak.fetch_add(1, Ordering::Relaxed) + 1;
         if streak <= rotation_lap.saturating_mul(2) {
-            return Duration::ZERO;
+            return WaitBudget::both(Duration::ZERO);
         }
         let backoff_ms = self.backoff_ms.load(Ordering::Relaxed);
         self.backoff_ms.store(
@@ -93,7 +95,7 @@ impl Recheck {
             Ordering::Relaxed,
         );
         self.arm(Duration::from_millis(backoff_ms as u64));
-        base
+        base.min(Duration::from_millis(backoff_ms as u64))
     }
 
     pub(super) fn arm(&self, delay: Duration) {
@@ -171,7 +173,7 @@ mod tests {
         let mut first_non_zero = None;
         for i in 0..(bound + 10) {
             let sleep = poller.poll_and_dispatch(false).await?;
-            if sleep == Duration::ZERO {
+            if sleep.app == Duration::ZERO {
                 zeros += 1;
             } else {
                 first_non_zero = Some((i, sleep));
@@ -193,7 +195,7 @@ mod tests {
         );
         assert_eq!(zeros, polls_before_stop);
         assert!(
-            sleep > Duration::ZERO,
+            sleep.app > Duration::ZERO,
             "the tripped poll must fall back to an honest sleep"
         );
         assert!(

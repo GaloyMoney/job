@@ -13,6 +13,7 @@ use std::{
 
 use super::{
     JobId,
+    config::RetrySchedule,
     current::CurrentJob,
     entity::{FailureLane, Job, JobType, RetryBand},
     error::JobFault,
@@ -99,6 +100,7 @@ impl JobDispatcher {
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
+        retry_schedule: RetrySchedule,
     ) -> Self {
         tracker.dispatch_job(id, &job_type);
         let finalizer = Finalizer::new(
@@ -109,6 +111,7 @@ impl JobDispatcher {
             retains_state,
             instance_id,
             clock.clone(),
+            retry_schedule,
         );
         Self {
             poller,
@@ -144,6 +147,7 @@ impl JobDispatcher {
         runner: Box<dyn JobRunner>,
         instance_id: uuid::Uuid,
         clock: ClockHandle,
+        retry_schedule: RetrySchedule,
     ) -> Self {
         reservation.into_live(id);
         let finalizer = Finalizer::new(
@@ -154,6 +158,7 @@ impl JobDispatcher {
             retains_state,
             instance_id,
             clock.clone(),
+            retry_schedule,
         );
         Self {
             poller,

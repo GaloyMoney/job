@@ -75,11 +75,16 @@ pub(crate) struct ClaimedRow {
 pub(crate) static PROBE_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// `now` is the application clock, `retry_now` the wall-domain bound from
+/// `RetrySchedule::retry_now` (the same pair `poll_jobs` binds, see there);
+/// `alive_at` is always real time.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn claim_due_heads_in_op(
     op: &mut (impl es_entity::AtomicOperation + ?Sized),
     job_type: &JobType,
     instance_id: uuid::Uuid,
     now: DateTime<Utc>,
+    retry_now: DateTime<Utc>,
     limit: i64,
     fresh_only: bool,
 ) -> Result<Vec<ClaimedRow>, sqlx::Error> {
@@ -94,7 +99,12 @@ pub(super) async fn claim_due_heads_in_op(
         r#"
         WITH heads AS (
             SELECT id, execute_at FROM job_executions
-            WHERE job_type = $1 AND state = 'pending' AND execute_at <= $2
+            WHERE job_type = $1 AND state = 'pending'
+              AND execute_at <= GREATEST($2::timestamptz, $7::timestamptz)
+              AND CASE retry_clock
+                    WHEN 'app' THEN execute_at <= $2::timestamptz
+                    ELSE execute_at <= $7::timestamptz
+                  END
               AND (NOT $6 OR attempt_index = 1)
             ORDER BY execute_at, id
             LIMIT $3
@@ -118,6 +128,7 @@ pub(super) async fn claim_due_heads_in_op(
         instance_id,
         wall_now,
         fresh_only,
+        retry_now,
     )
     .fetch_all(op.as_executor())
     .await

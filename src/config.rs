@@ -1,11 +1,12 @@
 //! Service and poller configuration types.
 
+use chrono::{DateTime, Utc};
 use es_entity::clock::{Clock, ClockHandle};
 use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
 
-use crate::error::InvalidConfig;
+use crate::{entity::ScheduleClock, error::InvalidConfig};
 
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +138,73 @@ pub struct JobSvcConfig {
     /// Clock handle for time operations. Defaults to the global clock.
     /// The global clock is realtime unless an artificial clock was installed.
     pub clock: ClockHandle,
+    /// Which clock failure retries and pool-congestion reschedules are
+    /// scheduled on. Defaults to [`RetrySchedule::Realtime`]; see that type.
+    pub retry_schedule: RetrySchedule,
+}
+
+/// Which clock a failed attempt's retry deadline (and a pool-congestion
+/// reschedule's) is measured on. Everything else a job does -- the rows and
+/// events it writes while running, spawn deadlines, a runner's own
+/// `RescheduleIn`/`RescheduleAt` -- always uses [`JobSvcConfig::clock`].
+///
+/// A retry is an operational matter, not a business one: "the upstream was
+/// down, try again in 30s" means thirty real seconds, whatever simulated
+/// date the application thinks it is. So by default retries back off in
+/// real time even when the application clock is a manual one that stands
+/// still (a demo sandbox whose seed has finished) or races (a seed advancing
+/// a day per second) -- on a frozen clock an application-clock retry
+/// deadline would never come due and the job would wedge `pending`; on a
+/// racing one every backoff would elapse at once.
+///
+/// On a realtime [`JobSvcConfig::clock`] the two schedules coincide and this
+/// setting has no observable effect.
+///
+/// The schedule is applied symmetrically: the same rule decides the clock a
+/// retry deadline is *written* on and the "now" every claim statement
+/// *compares* wall-domain deadlines against. Under
+/// `AppClock` that comparison bound is the application clock itself, so the
+/// claim predicate collapses to the single-clock range it had before retry
+/// clocks existed -- a simulated-clock harness that opts into `AppClock`
+/// pays nothing for the distinction, whichever way its clock sits relative
+/// to real time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrySchedule {
+    /// Retry deadlines are written and compared against the wall clock. The
+    /// default.
+    #[default]
+    Realtime,
+    /// Retry deadlines follow [`JobSvcConfig::clock`] like every other
+    /// deadline. For tests that drive a manual clock across a backoff to
+    /// make a retry fire without waiting for it.
+    AppClock,
+}
+
+impl RetrySchedule {
+    /// "Now" on the clock retry deadlines live on, and which clock that is:
+    /// the finalizer writes a retry or congestion deadline from it, and the
+    /// poller binds the same value as the wall bound of every claim
+    /// predicate, so a deadline is always compared on the clock it was
+    /// written on.
+    ///
+    /// Real time under [`Realtime`](Self::Realtime), so the deadline comes
+    /// due however the application clock moves (or doesn't); the
+    /// application clock under [`AppClock`](Self::AppClock). On a realtime
+    /// application clock the two timelines are one, so `app_now` is kept
+    /// rather than reading the wall clock again: a statement then binds a
+    /// single instant, exactly as it always has in production.
+    pub(crate) fn retry_now(
+        self,
+        clock: &ClockHandle,
+        app_now: DateTime<Utc>,
+    ) -> (DateTime<Utc>, ScheduleClock) {
+        match self {
+            RetrySchedule::AppClock => (app_now, ScheduleClock::App),
+            RetrySchedule::Realtime if clock.is_manual() => (Utc::now(), ScheduleClock::Wall),
+            RetrySchedule::Realtime => (app_now, ScheduleClock::Wall),
+        }
+    }
 }
 
 #[bon::bon]
@@ -150,6 +218,7 @@ impl JobSvcConfig {
         #[builder(into)] pool: Option<sqlx::PgPool>,
         #[builder(default)] poller_config: JobPollerConfig,
         #[builder(into, default = Clock::handle().clone())] clock: ClockHandle,
+        #[builder(default)] retry_schedule: RetrySchedule,
     ) -> Result<Self, InvalidConfig> {
         match (pg_con.as_ref(), pool.as_ref()) {
             (None, None) => {
@@ -188,6 +257,7 @@ impl JobSvcConfig {
             pool,
             poller_config,
             clock,
+            retry_schedule,
         })
     }
 }

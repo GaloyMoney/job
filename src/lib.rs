@@ -127,6 +127,22 @@
 //! entry point is chosen by the failure's errlanes lane. Only the job itself
 //! ends in failure, by returning [`JobCompletion::Fail`].
 //!
+//! ### Which clock a retry is scheduled on
+//!
+//! Retries back off in **real time**, whatever clock the service was
+//! configured with. A retry is operational — "the upstream was down, try
+//! again in 30s" means thirty real seconds — so failure retries and
+//! pool-congestion reschedules are written against the wall clock and
+//! claimed against it, and come due even while a simulated application
+//! clock stands still (a demo sandbox whose seed has finished) or races (a
+//! seed advancing a day per second). Everything else a job does stays on
+//! [`JobSvcConfig::clock`]: the rows and events it writes while running,
+//! spawn deadlines, and a runner's own `RescheduleIn`/`RescheduleAt`. The
+//! mechanism is internal — a pending row records which clock its deadline
+//! is on and the poller waits on both — with one service-level switch,
+//! [`JobSvcConfig::retry_schedule`] = [`RetrySchedule::AppClock`], for tests
+//! that drive a manual clock across a backoff to make a retry fire.
+//!
 //! ```ignore
 //! impl JobInitializer for MyInitializer {
 //!     // ...
@@ -459,7 +475,7 @@ pub use batched::{
 };
 pub use config::*;
 pub use current::*;
-pub use entity::{FailureLane, Job, JobEvent, JobType, RetryBand};
+pub use entity::{FailureLane, Job, JobEvent, JobType, RetryBand, ScheduleClock};
 pub use error::{
     AwaitError, AwaitInterrupted, AwaitTimeout, InvalidBackoff, InvalidConfig, JobError, JobFault,
     JobRejection, RegisterWaiterError, UnknownCallee,
@@ -736,6 +752,7 @@ impl Jobs {
             Arc::clone(&self.router),
             Arc::clone(&self.notifier),
             self.clock.clone(),
+            self.config.retry_schedule,
         )
         .await?;
 

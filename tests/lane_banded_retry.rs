@@ -13,7 +13,8 @@ use es_entity::clock::ClockHandle;
 use es_entity::errlanes::Fatal;
 use job::{
     Backoff, CurrentJob, Job, JobCompletion, JobId, JobInitializer, JobRunner, JobSpawner,
-    JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs, RetryBand, RetrySettings,
+    JobStatus, JobSvcConfig, JobTerminalState, JobType, Jobs, RetryBand, RetrySchedule,
+    RetrySettings,
     error::{JobError, JobRejection},
 };
 use serde::{Deserialize, Serialize};
@@ -153,9 +154,12 @@ async fn a_deterministic_error_never_ends_the_job_and_retries_on_the_fatal_band(
 -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let (clock, controller) = ClockHandle::manual();
+    // This test walks the manual clock across the fatal band's 512s/1024s/
+    // 2048s backoffs, so the retry deadlines must be on that clock.
     let config = JobSvcConfig::builder()
         .pool(pool.clone())
         .clock(clock.clone())
+        .retry_schedule(RetrySchedule::AppClock)
         .build()
         .unwrap();
     let mut jobs = Jobs::init(config).await?;
@@ -209,9 +213,12 @@ async fn a_deterministic_error_never_ends_the_job_and_retries_on_the_fatal_band(
 async fn a_deployed_hotfix_is_picked_up_by_the_next_dispatch() -> anyhow::Result<()> {
     let pool = helpers::init_pool().await?;
     let (clock, controller) = ClockHandle::manual();
+    // The hotfix is picked up by advancing the manual clock past the 512s
+    // deadline, so that deadline must be on the manual clock.
     let config = JobSvcConfig::builder()
         .pool(pool.clone())
         .clock(clock.clone())
+        .retry_schedule(RetrySchedule::AppClock)
         .build()
         .unwrap();
     let mut jobs = Jobs::init(config).await?;

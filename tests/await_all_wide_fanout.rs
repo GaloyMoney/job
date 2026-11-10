@@ -53,6 +53,19 @@ async fn xact_count(pool: &sqlx::PgPool) -> anyhow::Result<i64> {
     Ok(row.0.unwrap_or(0) + row.1.unwrap_or(0))
 }
 
+/// Postgres reports a backend's transaction counts to `pg_stat_database`
+/// lazily: an idle backend whose flush was deferred can hold them for up to
+/// `PGSTAT_IDLE_INTERVAL` (10 s). Read immediately after the 20k-job run, the
+/// counter is still absorbing that run's commits, which then land inside the
+/// measured window -- locally 350..4300 phantom statements against a true
+/// `await_all` cost of ~60, and over the N/2 budget on a slow CI runner.
+/// Waiting past the flush horizon before each read attributes only the
+/// measured call's own statements to the delta.
+async fn settled_xact_count(pool: &sqlx::PgPool) -> anyhow::Result<i64> {
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    xact_count(pool).await
+}
+
 async fn wait_until(
     mut f: impl AsyncFnMut() -> anyhow::Result<bool>,
     attempts: usize,
@@ -121,10 +134,9 @@ async fn await_all_over_a_wide_fanout_does_not_exhaust_the_pool() -> anyhow::Res
 
     let handles = jobs.handles(ids.clone());
 
-    let before = xact_count(&pool).await?;
+    let before = settled_xact_count(&pool).await?;
     let outcomes = handles.await_all(Duration::from_secs(60)).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let after = xact_count(&pool).await?;
+    let after = settled_xact_count(&pool).await?;
 
     assert_eq!(outcomes.len(), N);
     assert!(
