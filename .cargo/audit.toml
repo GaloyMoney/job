@@ -1,2 +1,6 @@
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0459: `libsqlite3-sys` < 0.39, only via sqlx's optional
+# `sqlite` backend, which job never enables (`cargo tree -i libsqlite3-sys
+# --target all` prints nothing). sqlx 0.9.0 caps libsqlite3-sys below 0.38,
+# so the patched version can't resolve yet. Drop once sqlx allows >= 0.39.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0459"]
