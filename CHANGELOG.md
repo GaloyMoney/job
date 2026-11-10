@@ -1,3 +1,11 @@
+# [job release v0.19.4](https://github.com/GaloyMoney/job/releases/tag/0.19.4)
+
+
+
+### Miscellaneous Tasks
+
+- Bump es-entity to 0.21.0 and sqlx to 0.9 (#251)
+
 # [job release v0.19.3](https://github.com/GaloyMoney/job/releases/tag/0.19.3)
 
 
