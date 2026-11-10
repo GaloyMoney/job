@@ -162,7 +162,7 @@ pub struct JobSvcConfig {
 ///
 /// The schedule is applied symmetrically: the same rule decides the clock a
 /// retry deadline is *written* on and the "now" every claim statement
-/// *compares* wall-domain deadlines against ([`Self::retry_now`]). Under
+/// *compares* wall-domain deadlines against. Under
 /// `AppClock` that comparison bound is the application clock itself, so the
 /// claim predicate collapses to the single-clock range it had before retry
 /// clocks existed -- a simulated-clock harness that opts into `AppClock`
