@@ -144,6 +144,21 @@ async fn selective_pause_is_durable_drains_running_work_and_does_not_spend_attem
         racing.await?
     };
     assert!(!status(&jobs, &pool).await?.is_quiesced());
+    let unpolled = Jobs::init(
+        JobSvcConfig::builder()
+            .pool(pool.clone())
+            .execution_control(true)
+            .build()?,
+    )
+    .await?;
+    assert!(
+        !unpolled
+            .execution_control()
+            .unwrap()
+            .status()
+            .await?
+            .is_quiesced()
+    );
     let mut queued = vec![raced];
     for _ in 0..2 {
         queued.push(business.spawn(JobId::new(), ()).await?);
@@ -169,6 +184,15 @@ async fn selective_pause_is_durable_drains_running_work_and_does_not_spend_attem
     release.add_permits(1);
     first.await_completion(Duration::from_secs(10)).await?;
     assert!(status(&jobs, &pool).await?.is_quiesced());
+    assert!(
+        unpolled
+            .execution_control()
+            .unwrap()
+            .status()
+            .await?
+            .is_quiesced()
+    );
+    drop(unpolled);
     let (restarted, _, _) = worker(&pool, &started, &release).await?;
     infra
         .spawn(JobId::new(), ())

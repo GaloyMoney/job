@@ -311,8 +311,9 @@ impl JobPoller {
                 result = self.clock.timeout(timeout, self.tracker.notified()) => {
                     woken_up = result.is_ok();
                 }
-                _ = tokio::time::sleep(crate::execution_control::CONTROL_POLL_INTERVAL),
-                    if self.repo.execution_control().is_some() => {
+                _ = tokio::time::sleep(crate::execution_control::poll_interval(
+                    (failures > 0).then_some(timeout),
+                )), if self.repo.execution_control().is_some() => {
                     woken_up = false;
                 }
             }
