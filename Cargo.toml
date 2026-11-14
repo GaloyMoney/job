@@ -7,6 +7,8 @@ version = "0.19.6-dev"
 license = "Apache-2.0"
 edition = "2024"
 categories = ["database"]
+# Preserve offline query data when vendoring archives without Git metadata.
+include = ["src/**", "tests/**", "examples/**", "migrations/**", ".sqlx/**", "Cargo.toml", "build.rs", "README*", "LICENSE*"]
 # Explicit include set: `cargo package`'s default file selection drops
 # dot-directories (`.sqlx`) whenever the source tree has no VCS metadata —
 # which is exactly the shape nix's fetchgit produces when a consumer pins
