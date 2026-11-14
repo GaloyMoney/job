@@ -1,3 +1,12 @@
+# [job release v0.20.0](https://github.com/GaloyMoney/job/releases/tag/0.20.0)
+
+
+
+### Miscellaneous Tasks
+
+- [**breaking**] Adopt es-entity 0.22 and SQLx 0.8.6 (#255)
+- Align toolchain with lana-bank at 1.100.0 (#254)
+
 # [job release v0.19.5](https://github.com/GaloyMoney/job/releases/tag/0.19.5)
 
 
