@@ -316,7 +316,9 @@ impl JobPoller {
             };
 
             let budget = if self.repo.execution_control().is_some() {
-                budget.min(crate::execution_control::CONTROL_POLL_INTERVAL)
+                budget.min(crate::execution_control::poll_interval(
+                    (failures > 0).then_some(budget.app),
+                ))
             } else {
                 budget
             };

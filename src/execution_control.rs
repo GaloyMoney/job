@@ -9,6 +9,10 @@ use crate::{JobType, error::JobFault};
 
 pub(crate) const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+pub(crate) fn poll_interval(error_backoff: Option<Duration>) -> Duration {
+    error_backoff.unwrap_or(CONTROL_POLL_INTERVAL)
+}
+
 #[derive(Clone)]
 pub struct ExecutionControl {
     pool: PgPool,
@@ -158,6 +162,18 @@ impl QuiescenceSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polling_control_preserves_error_backoff() {
+        assert_eq!(poll_interval(None), CONTROL_POLL_INTERVAL);
+        for delay in [
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            Duration::from_secs(120),
+        ] {
+            assert_eq!(poll_interval(Some(delay)), delay);
+        }
+    }
 
     #[test]
     fn admission_defaults_to_running_and_pause_is_an_explicit_allow_list() {
