@@ -137,6 +137,8 @@ pub struct JobSvcConfig {
     /// Clock handle for time operations. Defaults to the global clock.
     /// The global clock is realtime unless an artificial clock was installed.
     pub clock: ClockHandle,
+    /// Opt in on every worker sharing this database before using execution control.
+    pub execution_control: bool,
 }
 
 #[bon::bon]
@@ -150,6 +152,7 @@ impl JobSvcConfig {
         #[builder(into)] pool: Option<sqlx::PgPool>,
         #[builder(default)] poller_config: JobPollerConfig,
         #[builder(into, default = Clock::handle().clone())] clock: ClockHandle,
+        #[builder(default)] execution_control: bool,
     ) -> Result<Self, InvalidConfig> {
         match (pg_con.as_ref(), pool.as_ref()) {
             (None, None) => {
@@ -188,6 +191,7 @@ impl JobSvcConfig {
             pool,
             poller_config,
             clock,
+            execution_control,
         })
     }
 }

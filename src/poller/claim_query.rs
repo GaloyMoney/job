@@ -80,7 +80,6 @@
 use chrono::{DateTime, Utc};
 use es_entity::clock::ClockHandle;
 use serde_json::Value as JsonValue;
-use sqlx::postgres::PgPool;
 use tracing::{Span, instrument};
 
 use std::time::Duration;
@@ -99,7 +98,7 @@ pub(super) const CONTENTION_HEADROOM: i32 = 4;
 )]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn poll_jobs(
-    pool: &PgPool,
+    pool: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     n_jobs_to_poll: usize,
     instance_id: uuid::Uuid,
     pollable_types: &[crate::entity::JobType],

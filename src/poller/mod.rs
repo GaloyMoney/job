@@ -311,6 +311,10 @@ impl JobPoller {
                 result = self.clock.timeout(timeout, self.tracker.notified()) => {
                     woken_up = result.is_ok();
                 }
+                _ = tokio::time::sleep(crate::execution_control::CONTROL_POLL_INTERVAL),
+                    if self.repo.execution_control().is_some() => {
+                    woken_up = false;
+                }
             }
         }
 
@@ -350,17 +354,48 @@ impl JobPoller {
             return Ok(MAX_WAIT);
         }
 
-        let result = poll_jobs(
-            &self.internal_pool,
-            n_jobs_to_poll,
-            self.instance_id,
-            &plan.types,
-            &plan.rotation_excluded,
-            &plan.row_limits,
-            CONTENTION_HEADROOM,
-            &self.clock,
-        )
-        .await?;
+        let result = if let Some(control) = self.repo.execution_control() {
+            let mut op = es_entity::DbOp::init_with_clock(&self.internal_pool, &self.clock).await?;
+            let policy = control.lock_policy(&mut op).await?;
+            let (types, limits): (Vec<_>, Vec<_>) = plan
+                .types
+                .iter()
+                .cloned()
+                .zip(plan.row_limits.iter().copied())
+                .filter(|(job_type, _)| policy.allows(job_type))
+                .unzip();
+            let excluded: Vec<_> = plan
+                .rotation_excluded
+                .iter()
+                .filter(|job_type| policy.allows(job_type))
+                .cloned()
+                .collect();
+            let result = poll_jobs(
+                op.as_executor(),
+                n_jobs_to_poll,
+                self.instance_id,
+                &types,
+                &excluded,
+                &limits,
+                CONTENTION_HEADROOM,
+                &self.clock,
+            )
+            .await?;
+            op.commit().await?;
+            result
+        } else {
+            poll_jobs(
+                &self.internal_pool,
+                n_jobs_to_poll,
+                self.instance_id,
+                &plan.types,
+                &plan.rotation_excluded,
+                &plan.row_limits,
+                CONTENTION_HEADROOM,
+                &self.clock,
+            )
+            .await?
+        };
 
         let (rows, window) = match result {
             JobPollResult::WaitTillNextJob(window) => {
@@ -848,6 +883,11 @@ impl JobPoller {
         n_units: usize,
     ) -> Result<Vec<DispatchTarget>, sqlx::Error> {
         if n_units == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(control) = self.repo.execution_control()
+            && !control.lock_policy(op).await?.allows(job_type)
+        {
             return Ok(Vec::new());
         }
         let (per_unit_limit, fresh_only) = self.claim_shape(job_type);

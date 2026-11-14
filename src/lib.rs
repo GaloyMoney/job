@@ -425,6 +425,7 @@ mod config;
 mod current;
 mod dispatcher;
 mod entity;
+mod execution_control;
 mod execution_hooks;
 mod finalizer;
 mod handle;
@@ -465,6 +466,7 @@ pub use error::{
     JobRejection, RegisterWaiterError, UnknownCallee,
 };
 pub use es_entity::clock::{Clock, ClockController, ClockHandle};
+pub use execution_control::{ExecutionControl, QuiescenceSignal, QuiescenceStatus};
 pub use handle::{JobHandle, JobHandles};
 pub use job_execution::JobStatus;
 pub use keyed::{KeyedJobInitializer, KeyedJobSpawner, KeyedJobSpec};
@@ -532,7 +534,7 @@ impl Jobs {
                 .classify::<error::Migrate>()?;
         }
 
-        let repo = Arc::new(JobRepo::new(&pool));
+        let repo = Arc::new(JobRepo::new(&pool).with_execution_control(config.execution_control));
         let waiters = waiters::JobWaiters::new(&pool);
         let tracker = Arc::new(JobTracker::new(
             config.poller_config.min_jobs_per_process,
@@ -570,6 +572,11 @@ impl Jobs {
             poller_ref,
             clock,
         })
+    }
+
+    /// Present only when this service opted into database-wide execution control.
+    pub fn execution_control(&self) -> Option<&ExecutionControl> {
+        self.repo.execution_control()
     }
 
     /// Start the background poller that fetches and dispatches jobs from Postgres.
