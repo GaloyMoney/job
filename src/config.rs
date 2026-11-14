@@ -141,6 +141,9 @@ pub struct JobSvcConfig {
     /// Which clock failure retries and pool-congestion reschedules are
     /// scheduled on. Defaults to [`RetrySchedule::Realtime`]; see that type.
     pub retry_schedule: RetrySchedule,
+    /// Opt in on every worker sharing this database before using execution
+    /// control. Disabled services retain the existing claim path unchanged.
+    pub execution_control: bool,
 }
 
 /// Which clock a failed attempt's retry deadline (and a pool-congestion
@@ -219,6 +222,7 @@ impl JobSvcConfig {
         #[builder(default)] poller_config: JobPollerConfig,
         #[builder(into, default = Clock::handle().clone())] clock: ClockHandle,
         #[builder(default)] retry_schedule: RetrySchedule,
+        #[builder(default)] execution_control: bool,
     ) -> Result<Self, InvalidConfig> {
         match (pg_con.as_ref(), pool.as_ref()) {
             (None, None) => {
@@ -258,6 +262,7 @@ impl JobSvcConfig {
             poller_config,
             clock,
             retry_schedule,
+            execution_control,
         })
     }
 }

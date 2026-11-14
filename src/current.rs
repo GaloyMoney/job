@@ -55,6 +55,13 @@ impl CurrentJob {
         }
     }
 
+    pub fn quiescence_signal(&self) -> crate::QuiescenceSignal {
+        crate::QuiescenceSignal {
+            control: self.repo.execution_control().cloned(),
+            job_type: self.job_type.clone(),
+        }
+    }
+
     pub fn attempt(&self) -> u32 {
         self.attempt
     }

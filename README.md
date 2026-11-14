@@ -142,6 +142,40 @@ let shard_spawner = jobs.add_keyed_initializer(ShardListenerInitializer);
 shard_spawner.spawn(format!("shard-{shard_id}"), ShardConfig { shard_id }).await?;
 ```
 
+### Selective pause and graceful quiescence
+
+Opt every worker sharing the database into `JobSvcConfig::builder().execution_control(true)`
+before using `Jobs::execution_control()`. The default is off and keeps the existing
+claim path. Apply the shipped `execution_control` migration as well as the setup migration.
+
+`ExecutionControl::pause_in_op(op, allowed_types)` stops new claims database-wide,
+except for the explicitly allowed infrastructure types (for example an outbox relay).
+It does not abort running work. `status_in_op(op).is_quiesced()` is true only while
+paused and no disallowed execution remains running. Queued work stays pending/parked,
+without consuming failure attempts. `resume_in_op(op)` restores admission; workers
+observe it in real time even when the application clock is frozen. All three methods
+can share the application's maintenance transaction.
+
+Normal polls, spawn-side short circuits, and completion-time recycling all read the
+policy under a transaction-held shared row lock. Pause/resume updates take the
+exclusive counterpart, so a completed pause cannot be overtaken by a stale claim.
+The status read holds that same admission lock while counting running executions.
+Do not include unrelated business work or job enqueues in the pause/resume transaction:
+keep the exclusive control transaction short.
+
+Finite runners finish normally. Long-lived runners cooperate: clone
+`current_job.quiescence_signal()`, observe `signal.requested()` while idle or
+`signal.is_requested()` at safe boundaries, finish the admitted batch, durably
+checkpoint, and return `Ok(JobCompletion::RescheduleNow)` (or the resident equivalent).
+Never cancel a batch in the middle or report a pause as an error. A runner that does
+not cooperate keeps quiescence false; the service never force-aborts it to claim a
+successful drain. Allowed infrastructure runners are not signaled.
+
+Pausing is not shutdown: heartbeats, finalization, and database listeners remain
+active, and the durable policy also applies to newly started workers. This is an
+opt-in cluster protocol; an older or non-participating worker can ignore the policy,
+so complete the worker rollout before a controller relies on quiescence.
+
 ### Parameterized Job Types
 
 For cases where the job type is configured at runtime,
