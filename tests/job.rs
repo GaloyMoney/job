@@ -2866,6 +2866,90 @@ async fn checkpoint_row_deleted_on_terminal() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `Jobs::reset_execution_state` removes only the named type's persisted
+/// checkpoint and reports how many rows it removed -- the rewind mechanism
+/// for a job whose checkpoint points into a store a database snapshot does
+/// not carry (see that method's docs for the safe calling window).
+#[tokio::test]
+async fn reset_execution_state_removes_only_the_named_type() -> anyhow::Result<()> {
+    let pool = helpers::init_pool().await?;
+    let config = JobSvcConfig::builder()
+        .pool(pool)
+        .build()
+        .expect("Failed to build JobsConfig");
+
+    let mut jobs = Jobs::init(config).await?;
+
+    let rewound = helpers::job_type("reset-execution-state-rewound");
+    let untouched = helpers::job_type("reset-execution-state-untouched");
+    let (rewound_wrote, rewound_release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let (untouched_wrote, untouched_release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let rewound_spawner = jobs.add_initializer(StateWritingInitializer {
+        job_type: rewound.clone(),
+        wrote: Arc::clone(&rewound_wrote),
+        release: Arc::clone(&rewound_release),
+    });
+    let untouched_spawner = jobs.add_initializer(StateWritingInitializer {
+        job_type: untouched.clone(),
+        wrote: Arc::clone(&untouched_wrote),
+        release: Arc::clone(&untouched_release),
+    });
+    jobs.start_poll().await?;
+
+    let rewound_id = JobId::new();
+    rewound_spawner.spawn(rewound_id, ResultJobConfig).await?;
+    let untouched_id = JobId::new();
+    untouched_spawner
+        .spawn(untouched_id, ResultJobConfig)
+        .await?;
+
+    // Release both runners past their first gate so each writes its
+    // checkpoint, then parks on the second gate.
+    rewound_release.notify_one();
+    untouched_release.notify_one();
+    for wrote in [&rewound_wrote, &untouched_wrote] {
+        tokio::time::timeout(Duration::from_secs(10), wrote.notified())
+            .await
+            .expect("runner never wrote its execution state");
+    }
+
+    let removed = jobs.reset_execution_state(rewound.clone()).await?;
+    assert_eq!(removed, 1, "exactly the named type's row is removed");
+    assert_eq!(
+        jobs.handle(rewound_id)
+            .load()
+            .await?
+            .execution_state::<CheckpointState>()?,
+        None,
+        "the named type's next run starts cold"
+    );
+    assert_eq!(
+        jobs.handle(untouched_id)
+            .load()
+            .await?
+            .execution_state::<CheckpointState>()?,
+        Some(CheckpointState { processed: 42 }),
+        "every other type's checkpoint is untouched"
+    );
+
+    let removed = jobs
+        .reset_execution_state(helpers::job_type("reset-execution-state-never"))
+        .await?;
+    assert_eq!(removed, 0, "a type with no persisted state removes nothing");
+
+    rewound_release.notify_one();
+    untouched_release.notify_one();
+    jobs.handle(rewound_id)
+        .await_completion(Duration::from_secs(10))
+        .await?;
+    jobs.handle(untouched_id)
+        .await_completion(Duration::from_secs(10))
+        .await?;
+
+    jobs.shutdown().await?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StateWritingFailingConfig;
 

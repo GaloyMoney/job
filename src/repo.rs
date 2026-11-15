@@ -301,6 +301,26 @@ impl JobRepo {
         Ok(row.map(|r| r.execution_state_json))
     }
 
+    /// Delete the persisted execution state of every job of `job_type`,
+    /// returning the number of rows removed. The mechanism behind
+    /// [`crate::Jobs::reset_execution_state`]; the when is that method's
+    /// contract.
+    pub(super) async fn delete_execution_state_by_job_type(
+        &self,
+        job_type: &JobType,
+    ) -> Result<u64, JobFault> {
+        let result = sqlx::query!(
+            r#"
+            DELETE FROM job_execution_states
+            WHERE id IN (SELECT id FROM jobs WHERE job_type = $1)
+            "#,
+            job_type as &JobType,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Load a point-in-time [`JobSnapshot`] for `id`: the execution row (if the
     /// job is still schedulable/running) paired with the durable entity, plus
     /// the execution state.

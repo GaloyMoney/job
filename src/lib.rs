@@ -1242,6 +1242,39 @@ impl Jobs {
         Ok(id.map(|id| self.handle(id)))
     }
 
+    /// Delete the persisted execution state of every job of `job_type` —
+    /// the checkpoint a runner writes via
+    /// [`CurrentJob::update_execution_state`](crate::CurrentJob::update_execution_state)
+    /// — and return the number of rows removed.
+    ///
+    /// The rewind mechanism for a job whose checkpoint points into a store
+    /// the database does not carry. A replica restored from a database
+    /// snapshot wakes with every cursor intact but the stores they describe
+    /// (landed files, mirrors, caches) empty; resuming from the restored
+    /// checkpoint would skip everything the snapshot did not carry. Deleting
+    /// the state makes the next run start cold — an outbox subscriber replays
+    /// the stream from the beginning, landing into the store the instance
+    /// actually has.
+    ///
+    /// **Call it while the job cannot run** — at boot, before
+    /// [`start_poll`](Self::start_poll) claims or the job is spawned — so no
+    /// runner races the delete and re-persists its checkpoint mid-flight.
+    /// The method is a plain committed delete; it cannot enforce that window
+    /// itself, and a live runner's next checkpoint write simply re-creates
+    /// its row. A type with no persisted state (a genuinely fresh job)
+    /// removes nothing and returns `0`.
+    ///
+    /// Scoped to `job_type`: the state of every other type is untouched.
+    #[instrument(name = "job.reset_execution_state", skip(self))]
+    pub async fn reset_execution_state(
+        &self,
+        job_type: impl Into<JobType> + std::fmt::Debug,
+    ) -> Result<u64, JobFault> {
+        self.repo
+            .delete_execution_state_by_job_type(&job_type.into())
+            .await
+    }
+
     /// Mint a [`JobHandle`] for the keyed job of `(job_type, key)`, if one
     /// exists (see [`KeyedJobSpawner::spawn`]). Resolves the LIVE generation
     /// when one exists, else the latest terminal generation. `None` when no
