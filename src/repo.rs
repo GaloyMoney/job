@@ -28,11 +28,24 @@ const DEDUP_KEY_LOCK_CLASS: i32 = 1;
 )]
 pub struct JobRepo {
     pool: PgPool,
+    execution_control: Option<crate::ExecutionControl>,
 }
 
 impl JobRepo {
     pub(super) fn new(pool: &PgPool) -> Self {
-        Self { pool: pool.clone() }
+        Self {
+            pool: pool.clone(),
+            execution_control: None,
+        }
+    }
+
+    pub(super) fn with_execution_control(mut self, enabled: bool) -> Self {
+        self.execution_control = enabled.then(|| crate::ExecutionControl::new(&self.pool));
+        self
+    }
+
+    pub(crate) fn execution_control(&self) -> Option<&crate::ExecutionControl> {
+        self.execution_control.as_ref()
     }
 
     /// The shared enforcement point of [`crate::JobSpec::dedup_key`] AND
