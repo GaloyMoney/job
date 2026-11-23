@@ -48,6 +48,7 @@ bon = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+opentelemetry = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -60,11 +61,18 @@ schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [workspace.dependencies]
 
-es-entity = "0.22.0"
+es-entity = "0.22.2-dev"
+
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+tracing-opentelemetry = "0.34"
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -80,3 +88,7 @@ uuid = { version = "1.23", features = ["serde", "v7"] }
 futures = "0.3"
 rand = "0.10"
 schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"] }
+
+# Temporary integration pin until the es-entity change is released.
+[patch.crates-io]
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "9f7936b5" }

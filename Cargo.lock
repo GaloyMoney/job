@@ -482,9 +482,8 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "errlanes"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df50dcc38d38c168c220ae53f6f5cadd73a1812a4ff44f45e2daa1735a77329b"
+version = "0.22.2-dev"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=9f7936b5#9f7936b5eb3d4642aa9f722a171b5e412c8e3377"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -494,9 +493,8 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d0c0e6471b89ca3be64caa038ca5a7377173b81320a4d2634625e34b27bf6e5"
+version = "0.22.2-dev"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=9f7936b5#9f7936b5eb3d4642aa9f722a171b5e412c8e3377"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -508,9 +506,8 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4270ada67ac1c5c417b7ed9aa58e2fdf45e051defe1c6acd387849f5827e313a"
+version = "0.22.2-dev"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=9f7936b5#9f7936b5eb3d4642aa9f722a171b5e412c8e3377"
 dependencies = [
  "async-stream",
  "chrono",
@@ -521,7 +518,7 @@ dependencies = [
  "imbl",
  "opentelemetry",
  "opentelemetry_sdk",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project",
  "schemars 1.2.3",
  "serde",
@@ -535,9 +532,8 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac93d4f2f0372d60334769d6c7cc1dddbc3232c49721084bdebe6ae922ea0783"
+version = "0.22.2-dev"
+source = "git+https://github.com/GaloyMoney/es-entity?rev=9f7936b5#9f7936b5eb3d4642aa9f722a171b5e412c8e3377"
 dependencies = [
  "convert_case",
  "darling 0.24.0",
@@ -657,8 +653,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d930c203dd0b6ff06e0201a4a2fe9149b43c684fd4420555b26d21b1a02956f"
 dependencies = [
  "futures-core",
- "lock_api",
- "parking_lot",
+ "lock_api 0.4.14",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -1070,6 +1066,8 @@ dependencies = [
  "chrono",
  "es-entity",
  "futures",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "rand 0.10.3",
  "schemars 1.2.3",
  "serde",
@@ -1078,6 +1076,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
 ]
@@ -1104,9 +1103,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libm"
@@ -1147,6 +1146,15 @@ name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
 dependencies = [
  "scopeguard",
 ]
@@ -1294,8 +1302,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -1307,6 +1325,18 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link",
 ]
@@ -1387,9 +1417,9 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "pluralizer"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b3eba432a00a1f6c16f39147847a870e94e2e9b992759b503e330efec778cbe"
+checksum = "04ce2d0ba56221e6c35e611c313f5cdff3686691d59ff212a042256cc0b93c37"
 dependencies = [
  "once_cell",
  "regex",
@@ -1957,7 +1987,7 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
 ]
 
 [[package]]
@@ -1972,9 +2002,9 @@ dependencies = [
 
 [[package]]
 name = "sqlparser"
-version = "0.63.0"
+version = "0.64.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3679862809bd1f92e563cf6fd820e28f39135303668001c10331d5027183e8b4"
+checksum = "92e0d273b4f8ddd14a35ed36862acbc9cc96cec578e36ee1881a9d42e0e0f2c8"
 dependencies = [
  "log",
 ]
@@ -2443,8 +2473,10 @@ checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
 dependencies = [
  "js-sys",
  "opentelemetry",
+ "smallvec",
  "tracing",
  "tracing-core",
+ "tracing-log",
  "tracing-subscriber",
  "web-time",
 ]
