@@ -1,3 +1,11 @@
+# [job release v0.20.1](https://github.com/GaloyMoney/job/releases/tag/0.20.1)
+
+
+
+### Miscellaneous Tasks
+
+- Bump uuid (#246)
+
 # [job release v0.20.0](https://github.com/GaloyMoney/job/releases/tag/0.20.0)
 
 
