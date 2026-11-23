@@ -68,7 +68,7 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [workspace.dependencies]
 
-es-entity = "0.22.2-dev"
+es-entity = "0.22.0"
 
 opentelemetry = "0.33"
 opentelemetry_sdk = "0.33"
@@ -91,4 +91,4 @@ schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"]
 
 # Temporary integration pin until the es-entity change is released.
 [patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "9f7936b5" }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "2bc7da2790c27985ec8896f521014aa0e0cf9424" }
