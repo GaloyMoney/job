@@ -91,4 +91,4 @@ schemars = { version = "1.0", features = ["derive", "chrono04", "rust_decimal1"]
 
 # Temporary integration pin until the es-entity change is released.
 [patch.crates-io]
-es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "2bc7da2790c27985ec8896f521014aa0e0cf9424" }
+es-entity = { git = "https://github.com/GaloyMoney/es-entity", rev = "6e5838a5638befd14f0db3236239d27a9f532aa6" }
