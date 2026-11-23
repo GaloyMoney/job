@@ -282,7 +282,7 @@ impl BatchDispatcher {
             .await;
         if let Err(ref error) = result {
             error.record(&span);
-            errlanes::emit(error);
+            span.in_scope(|| errlanes::emit(error));
         }
         result
     }
