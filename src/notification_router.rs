@@ -306,11 +306,6 @@ async fn register_waiters(
 /// A nonzero `n_resolved` therefore means notification delivery is lagging and
 /// the sweep is carrying completion delivery — the early warning that would have
 /// surfaced the 35 h wedge in minutes — so it is logged at `warn`.
-#[instrument(
-    name = "job.notification_router.sweep_waiters",
-    skip_all,
-    fields(n_waiters, oldest_waiter_age_secs, n_resolved)
-)]
 async fn sweep_waiters(waiters: &mut WaiterMap, liveness: &JobWaiters, repo: &JobRepo) {
     // Prune dropped receivers
     waiters.retain(|_, w| {
@@ -318,14 +313,28 @@ async fn sweep_waiters(waiters: &mut WaiterMap, liveness: &JobWaiters, repo: &Jo
         !w.senders.is_empty()
     });
 
-    let span = Span::current();
+    // Nothing on this instance is waiting for a job: the tick has nothing to
+    // report, so it opens no span. A span here would be a ROOT (the sweep
+    // task has no parent context), i.e. a one-span trace of its own exported
+    // at every `sweep_interval` — the normal state of a quiet instance, and
+    // indistinguishable from a real trace in a trace backend.
     if waiters.is_empty() {
-        span.record("n_waiters", 0);
-        span.record("oldest_waiter_age_secs", 0u64);
-        span.record("n_resolved", 0);
         return;
     }
 
+    sweep_waiters_with_work(waiters, liveness, repo).await
+}
+
+/// [`sweep_waiters`]' reporting half, reached only with at least one live
+/// waiter — so every span it opens carries real `n_waiters`/
+/// `oldest_waiter_age_secs`/`n_resolved` fields.
+#[instrument(
+    name = "job.notification_router.sweep_waiters",
+    skip_all,
+    fields(n_waiters, oldest_waiter_age_secs, n_resolved)
+)]
+async fn sweep_waiters_with_work(waiters: &mut WaiterMap, liveness: &JobWaiters, repo: &JobRepo) {
+    let span = Span::current();
     let n_waiters = waiters.len();
     let oldest_age = waiters
         .values()

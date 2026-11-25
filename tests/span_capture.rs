@@ -30,6 +30,19 @@ impl SpanFields {
             .and_then(|fields| fields.get(field).cloned())
     }
 
+    /// Whether a span named `span_name` was opened at all.
+    ///
+    /// An entry exists from `on_new_span`, so this is true even for a span
+    /// whose fields are all `Empty` and never recorded — which is what makes
+    /// it the assertion for "this code path must not open a span".
+    #[allow(dead_code)]
+    pub fn created(&self, span_name: &str) -> bool {
+        self.0
+            .lock()
+            .expect("span fields lock")
+            .contains_key(span_name)
+    }
+
     #[allow(dead_code)]
     pub fn debug_dump(&self) -> String {
         format!("{:?}", self.0.lock().expect("span fields lock"))

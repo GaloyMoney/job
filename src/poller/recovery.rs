@@ -234,16 +234,8 @@ impl Recovery {
                     // was written on.
                     let (retry_now, _) = retry_schedule.retry_now(&clock, now);
 
-                    let span = tracing::info_span!(
-                        parent: None,
-                        "job.check_stale_pending_jobs",
-                        n_stale_pending = tracing::field::Empty,
-                        max_pending_duration_secs = tracing::field::Empty,
-                    );
-
-                    async {
-                        match sqlx::query!(
-                            r#"
+                    let checked = sqlx::query!(
+                        r#"
                         SELECT
                             job_type,
                             COUNT(*)::INT4 AS "count!: i32",
@@ -262,45 +254,58 @@ impl Recovery {
                         AND job_type = ANY($2)
                         GROUP BY job_type
                         "#,
-                            now,
-                            &supported_job_types as _,
-                            retry_now,
-                        )
-                        .fetch_all(&pool)
-                        .await
-                        {
-                            Ok(rows) => {
-                                let mut total_stale: i64 = 0;
-                                let mut max_pending_secs: f64 = 0.0;
+                        now,
+                        &supported_job_types as _,
+                        retry_now,
+                    )
+                    .fetch_all(&pool)
+                    .await;
 
-                                for row in &rows {
-                                    total_stale += row.count as i64;
-                                    if row.max_pending_duration_secs > max_pending_secs {
-                                        max_pending_secs = row.max_pending_duration_secs;
-                                    }
-                                    tracing::warn!(
-                                        job_type = %row.job_type,
-                                        count = row.count,
-                                        max_pending_duration_secs = row.max_pending_duration_secs,
-                                        "stale pending jobs detected"
-                                    );
+                    // A check that finds nothing opens no span: on a quiet
+                    // instance it runs at every `pending_jobs_check_interval`
+                    // and, being a `parent: None` root, exported a one-span
+                    // trace of its own each time. The span is still opened when
+                    // the query failed, so that error lands on one.
+                    if matches!(&checked, Ok(rows) if rows.is_empty()) {
+                        continue;
+                    }
+                    let span = tracing::info_span!(
+                        parent: None,
+                        "job.check_stale_pending_jobs",
+                        n_stale_pending = tracing::field::Empty,
+                        max_pending_duration_secs = tracing::field::Empty,
+                    );
+                    // Reporting only: no await while the span is entered.
+                    let _enter = span.enter();
+                    match checked {
+                        Ok(rows) => {
+                            let mut total_stale: i64 = 0;
+                            let mut max_pending_secs: f64 = 0.0;
+
+                            for row in &rows {
+                                total_stale += row.count as i64;
+                                if row.max_pending_duration_secs > max_pending_secs {
+                                    max_pending_secs = row.max_pending_duration_secs;
                                 }
-
-                                Span::current().record("n_stale_pending", total_stale);
-                                Span::current()
-                                    .record("max_pending_duration_secs", max_pending_secs);
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    exception.message = %e,
-                                    exception.type = std::any::type_name_of_val(&e),
-                                    "failed to check stale pending jobs"
+                                tracing::warn!(
+                                    job_type = %row.job_type,
+                                    count = row.count,
+                                    max_pending_duration_secs = row.max_pending_duration_secs,
+                                    "stale pending jobs detected"
                                 );
                             }
+
+                            Span::current().record("n_stale_pending", total_stale);
+                            Span::current().record("max_pending_duration_secs", max_pending_secs);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                exception.message = %e,
+                                exception.type = std::any::type_name_of_val(&e),
+                                "failed to check stale pending jobs"
+                            );
                         }
                     }
-                    .instrument(span)
-                    .await;
                 }
             }
         ))
