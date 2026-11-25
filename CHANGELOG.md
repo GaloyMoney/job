@@ -1,3 +1,11 @@
+# [job release v0.21.0](https://github.com/GaloyMoney/job/releases/tag/0.21.0)
+
+
+
+### Miscellaneous Tasks
+
+- [**breaking**] Adopt es-entity 0.24.0 span links and tracestate (#257)
+
 # [job release v0.20.1](https://github.com/GaloyMoney/job/releases/tag/0.20.1)
 
 
