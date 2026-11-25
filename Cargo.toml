@@ -48,6 +48,7 @@ bon = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+opentelemetry = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -60,11 +61,18 @@ schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [workspace.dependencies]
 
-es-entity = "0.23.0"
+es-entity = "0.24.0"
+
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+tracing-opentelemetry = "0.34"
 
 anyhow = "1.0"
 async-trait = "0.1"

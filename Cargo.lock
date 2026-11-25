@@ -389,9 +389,9 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "errlanes"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94421e21ce6bb82b0a920ce34bc65f1d757c82dfae223dfc39c2d2eae8ca42b0"
+checksum = "217826a958e6ea429212ebfd10aefb34626fa842c63586fbd885423b02c49792"
 dependencies = [
  "errlanes-derive",
  "serde_json",
@@ -401,9 +401,9 @@ dependencies = [
 
 [[package]]
 name = "errlanes-derive"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3144bfa59aa030e6a5bb8faaf8390ec64a9c28c71cf13a218d2040be7813a032"
+checksum = "589029a070e2a52a9ccc1945f9520f643e05d6feb8d12af3e638af1f5041e6f9"
 dependencies = [
  "convert_case",
  "darling",
@@ -415,9 +415,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef4b5796d324b40ed91102c6d4984ddb9699810378f7584dd3b95437cff72fb6"
+checksum = "cdc4e26392c5663180d92468aea96ec8d1cfafcd71436d8fca1d646001d3e923"
 dependencies = [
  "async-stream",
  "chrono",
@@ -442,9 +442,9 @@ dependencies = [
 
 [[package]]
 name = "es-entity-macros"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82e49a83413fc687ecb3c6130ab98cf2a6c2f34d29d1b2e9244155b27c851ac9"
+checksum = "0407aa583e33bb4a570cc69b9724fa7e8d26694d6d38d3c9e15bf820fa02c8b7"
 dependencies = [
  "convert_case",
  "darling",
@@ -1022,6 +1022,8 @@ dependencies = [
  "chrono",
  "es-entity",
  "futures",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "rand 0.10.4",
  "schemars 1.2.3",
  "serde",
@@ -1030,6 +1032,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
 ]
@@ -2247,8 +2250,10 @@ checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
 dependencies = [
  "js-sys",
  "opentelemetry",
+ "smallvec",
  "tracing",
  "tracing-core",
+ "tracing-log",
  "tracing-subscriber",
  "web-time",
 ]
