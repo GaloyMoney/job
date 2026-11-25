@@ -441,13 +441,30 @@ impl Job {
         }
     }
 
-    pub(crate) fn inject_tracing_parent(&self) {
+    fn tracing_context(&self) -> Option<&TracingContext> {
         if let JobEvent::Initialized {
             tracing_context: Some(tracing_context),
             ..
         } = self.events.iter_all().next().expect("first event")
         {
-            tracing_context.inject_as_parent();
+            Some(tracing_context)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn apply_tracing_parent(&self, span: &tracing::Span) {
+        if let Some(context) = self.tracing_context() {
+            let _ = context.apply_parent(span);
+        }
+    }
+
+    pub(crate) fn apply_tracing_link(&self, span: &tracing::Span) {
+        if let Some(context) = self.tracing_context() {
+            context.apply_link(
+                span,
+                vec![opentelemetry::KeyValue::new("job.id", self.id.to_string())],
+            );
         }
     }
 

@@ -242,13 +242,53 @@ impl BatchDispatcher {
         poller.register_claim_recycle(op, &self.job_type, reservation);
     }
 
-    #[errlanes::instrument(
-        name = "job.execute_batch",
-        skip_all,
-        fields(job_type, n_items, poller_id, conclusion, now, claim_disposition)
-    )]
-    #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_batch(
+        self,
+        items: Vec<RawBatchItem>,
+        shutdown_rx: ShutdownRx,
+    ) -> Result<(), JobFault> {
+        use tracing::Instrument;
+
+        let span = tracing::info_span!(
+            parent: None,
+            "job.execute_batch",
+            job_type = tracing::field::Empty,
+            n_items = tracing::field::Empty,
+            poller_id = tracing::field::Empty,
+            conclusion = tracing::field::Empty,
+            now = tracing::field::Empty,
+            claim_disposition = tracing::field::Empty,
+            error = tracing::field::Empty,
+            error.lane = tracing::field::Empty,
+            error.code = tracing::field::Empty,
+            error.level = tracing::field::Empty,
+            exception.message = tracing::field::Empty,
+            exception.type = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
+        // A batch of one keeps the per-job trace lineage of the non-batched
+        // path. A multi-item batch has no single parent, so link every
+        // producer instead of silently discarding all of their identities.
+        if let [only] = items.as_slice() {
+            only.job.apply_tracing_parent(&span);
+        } else {
+            for item in &items {
+                item.job.apply_tracing_link(&span);
+            }
+        }
+        let result = self
+            .execute_batch_inner(items, shutdown_rx)
+            .instrument(span.clone())
+            .await;
+        if let Err(ref error) = result {
+            error.record(&span);
+            span.in_scope(|| errlanes::emit(error));
+        }
+        result
+    }
+
+    #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
+    async fn execute_batch_inner(
         mut self,
         items: Vec<RawBatchItem>,
         shutdown_rx: ShutdownRx,
@@ -258,13 +298,6 @@ impl BatchDispatcher {
         span.record("n_items", items.len());
         span.record("poller_id", tracing::field::display(self.instance_id));
         span.record("now", tracing::field::display(self.clock.now()));
-
-        // A batch of one keeps the per-job trace lineage of the non-batched
-        // path. With more than one there is no single parent to adopt, so the
-        // batch span stands on its own and items are identified by id.
-        if let [only] = items.as_slice() {
-            only.job.inject_tracing_parent();
-        }
 
         #[cfg(feature = "es-entity")]
         {

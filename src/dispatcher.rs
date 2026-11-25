@@ -193,13 +193,48 @@ impl JobDispatcher {
             .mark_finished_without_releasing_unit(&[self.id]);
     }
 
-    #[errlanes::instrument(
-        name = "job.execute_job",
-        skip_all,
-        fields(job_id, job_type, attempt, conclusion, now, claim_disposition)
-    )]
-    #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
     pub async fn execute_job(
+        self,
+        job: Job,
+        polled_job: PolledJob,
+        shutdown_rx: tokio::sync::broadcast::Receiver<
+            tokio::sync::mpsc::Sender<tokio::sync::oneshot::Receiver<()>>,
+        >,
+    ) -> Result<(), JobFault> {
+        use tracing::Instrument;
+
+        let span = tracing::info_span!(
+            parent: None,
+            "job.execute_job",
+            job_id = tracing::field::Empty,
+            job_type = tracing::field::Empty,
+            attempt = tracing::field::Empty,
+            poller_id = tracing::field::Empty,
+            conclusion = tracing::field::Empty,
+            now = tracing::field::Empty,
+            claim_disposition = tracing::field::Empty,
+            error = tracing::field::Empty,
+            error.lane = tracing::field::Empty,
+            error.code = tracing::field::Empty,
+            error.level = tracing::field::Empty,
+            exception.message = tracing::field::Empty,
+            exception.type = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
+        job.apply_tracing_parent(&span);
+        let result = self
+            .execute_job_inner(job, polled_job, shutdown_rx)
+            .instrument(span.clone())
+            .await;
+        if let Err(ref error) = result {
+            error.record(&span);
+            span.in_scope(|| errlanes::emit(error));
+        }
+        result
+    }
+
+    #[cfg_attr(feature = "es-entity", es_entity::es_event_context)]
+    async fn execute_job_inner(
         mut self,
         job: Job,
         polled_job: PolledJob,
@@ -213,7 +248,6 @@ impl JobDispatcher {
         span.record("poller_id", tracing::field::display(self.instance_id));
         span.record("attempt", polled_job.attempt);
         span.record("now", tracing::field::display(self.clock.now()));
-        job.inject_tracing_parent();
         #[cfg(feature = "es-entity")]
         {
             let mut ctx = es_entity::EventContext::current();
