@@ -171,6 +171,13 @@ impl JobInitializer for TenantJobInitializer {
 In order to use the jobs crate migrations need to run on Postgres to initialize the tables.
 You can either let the library run them, copy them into your project or add them to your migrations via code.
 
+Job records its migrations in a `_sqlx_migrations_job` table of its own, so they can share a
+database with another crate's migration set without version or checksum collisions.
+
+> **Upgrading a database migrated into `_sqlx_migrations`:** the new bookkeeping table starts
+> empty, so running the migrations against such a database fails with "already exists". Recreate
+> the database, or copy the applied rows into `_sqlx_migrations_job` before starting.
+
 Option 1.
 Let the library run the migrations - this is useful when you are not using sqlx in the rest of your project.
 To avoid compilation errors set `export SQLX_OFFLINE=true` in your dev shell.
@@ -200,6 +207,12 @@ You can also add the job migrations in code when you run your own migrations wit
 ```rust
 use job::IncludeMigrations;
 sqlx::migrate!().include_job_migrations().run(&pool).await?;
+```
+
+Option 4.
+You can run the crate's migrator directly, into its own bookkeeping table:
+```rust
+job::MIGRATOR.run(&pool).await?;
 ```
 
 ### Optional Features
