@@ -1,5 +1,8 @@
 //! Helpers for bundling the crate's SQL migrations with your own.
 
+/// The crate's migrations, recorded in `_sqlx_migrations_job` (see `sqlx.toml`).
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
 /// Extend an `sqlx::migrate!()` call with Job's migrations.
 pub trait IncludeMigrations {
     /// Append the Job crate migrations to the current migrator.

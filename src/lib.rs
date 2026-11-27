@@ -542,7 +542,7 @@ impl Jobs {
         };
 
         if config.exec_migrations {
-            sqlx::migrate!()
+            crate::migrate::MIGRATOR
                 .run(&pool)
                 .await
                 .classify::<error::Migrate>()?;

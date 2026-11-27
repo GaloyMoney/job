@@ -19,6 +19,7 @@ include = [
   "src/**",
   "migrations/**",
   ".sqlx/**",
+  "sqlx.toml",
   "Cargo.toml",
   "README.md",
   "LICENSE",
@@ -79,7 +80,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
 bon = "3"
 tracing = { version = "0.1" }
-sqlx = { version = "0.9.1", default-features = false, features = ["macros", "migrate", "runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json" ] }
+sqlx = { version = "0.9.1", default-features = false, features = ["macros", "migrate", "runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "sqlx-toml" ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3.19"
